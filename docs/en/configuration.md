@@ -70,11 +70,14 @@ installation.
 | `OPENAI_API_KEY` | API key for the compatible gateway |
 | `BASE_URL` | OpenAI-compatible API base URL |
 | `MODEL` | Recall-planner model |
-| `EMB_MODEL` | QMD embedding model |
-| `RERANK_MODEL` | QMD reranking model |
+| `EMB_MODEL` | Remote QMD embedding model; empty uses local `Qwen3-Embedding-0.6B` |
+| `RERANK_MODEL` | QMD reranking model; empty uses local `Qwen3-Reranker-0.6B` |
 
-These values support remote QMD models and the recall planner. Do not assume
-that an OpenAI-compatible endpoint has the same privacy properties as OpenAI.
+Empty `EMB_MODEL` and `RERANK_MODEL` values keep the mode fully local and do
+not require `OPENAI_API_KEY` or `BASE_URL`. The local models are downloaded
+from Hugging Face on first use and run on the CPU by default. Do not assume
+that a remote OpenAI-compatible endpoint has the same privacy properties as
+OpenAI.
 
 ## Encrypted backups
 

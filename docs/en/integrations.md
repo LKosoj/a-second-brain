@@ -70,12 +70,14 @@ sudo npm install -g @tobilu/qmd@2.5.3
 qmd --version
 ```
 
-The default mode uses a local embedding model and does not require the
-OpenAI-compatible variables below. The first embedding run may download model
-files. To use a remote embedding provider, set `OPENAI_API_KEY` and
-`EMB_MODEL`; set `BASE_URL` for a non-default compatible endpoint.
-`RERANK_MODEL` is optional. `MODEL` belongs to the recall planner rather than
-QMD indexing.
+The default mode is fully local and does not require the OpenAI-compatible
+variables below. When `EMB_MODEL` is empty, the project uses
+`Qwen3-Embedding-0.6B`; when `RERANK_MODEL` is empty, QMD uses
+`Qwen3-Reranker-0.6B`. The models are downloaded from Hugging Face during the
+first embedding or query run and use the CPU by default. To use a remote
+embedding provider, set `OPENAI_API_KEY` and `EMB_MODEL`; set `BASE_URL` for a
+non-default compatible endpoint. `MODEL` belongs to the recall planner rather
+than QMD indexing.
 
 ```dotenv
 OPENAI_API_KEY=

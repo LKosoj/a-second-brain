@@ -89,6 +89,21 @@ def test_cli_reference_documents_all_public_commands() -> None:
         assert "| `2` |" in page
 
 
+def test_qmd_local_model_defaults_are_documented_in_both_languages() -> None:
+    for language in ("en", "ru"):
+        integrations = (
+            PROJECT_ROOT / f"docs/{language}/integrations.md"
+        ).read_text(encoding="utf-8")
+        configuration = (
+            PROJECT_ROOT / f"docs/{language}/configuration.md"
+        ).read_text(encoding="utf-8")
+
+        for page in (integrations, configuration):
+            assert "Qwen3-Embedding-0.6B" in page
+            assert "Qwen3-Reranker-0.6B" in page
+            assert "CPU" in page
+
+
 def test_bilingual_documentation_links_resolve() -> None:
     pages = [
         PROJECT_ROOT / "README.md",
