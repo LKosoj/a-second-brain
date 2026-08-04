@@ -104,6 +104,21 @@ def test_qmd_local_model_defaults_are_documented_in_both_languages() -> None:
             assert "CPU" in page
 
 
+def test_kimi_backend_is_documented_in_both_languages() -> None:
+    for language in ("en", "ru"):
+        integrations = (
+            PROJECT_ROOT / f"docs/{language}/integrations.md"
+        ).read_text(encoding="utf-8")
+        configuration = (
+            PROJECT_ROOT / f"docs/{language}/configuration.md"
+        ).read_text(encoding="utf-8")
+
+        assert "Kimi Code" in integrations
+        assert "`kimi login`" in integrations
+        assert "`.agents/skills`" in integrations
+        assert "`kimi`" in configuration
+
+
 def test_bilingual_documentation_links_resolve() -> None:
     pages = [
         PROJECT_ROOT / "README.md",

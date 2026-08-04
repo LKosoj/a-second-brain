@@ -131,6 +131,9 @@ def test_agent_instructions_separate_public_and_private_skills() -> None:
     assert "src/d_brain/resources/project_template/skills/<name>" in instructions
     assert "vault/skills/private/<name>" in instructions
     assert "skills/<name> -> private/<name>" in instructions
+    assert "Kimi Code discovers that same shared tree through `.agents/skills`" in (
+        instructions
+    )
 
 
 def test_private_skills_are_explicitly_ignored() -> None:

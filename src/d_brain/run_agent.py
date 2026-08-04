@@ -27,7 +27,11 @@ def _resolve_mcp_config(workdir: Path) -> str | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run selected AI CLI with a prompt")
-    parser.add_argument("--ai-cli", default="claude", help="claude|codex|qwen|gemini")
+    parser.add_argument(
+        "--ai-cli",
+        default="claude",
+        help="claude|codex|qwen|gemini|kimi",
+    )
     parser.add_argument(
         "--workdir",
         default=".",

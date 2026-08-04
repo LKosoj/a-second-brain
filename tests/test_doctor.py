@@ -49,6 +49,28 @@ def test_doctor_passes_without_printing_secret_values(
     assert "gemini-secret" not in rendered
 
 
+def test_doctor_accepts_kimi_and_shows_login_hint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initialize_project(tmp_path)
+    environment = {**_valid_environment(), "AI_CLI": "kimi"}
+    monkeypatch.setattr(
+        doctor.shutil,
+        "which",
+        lambda command: f"/usr/bin/{command}"
+        if command in {"uv", "jq", "kimi"}
+        else None,
+    )
+    output = io.StringIO()
+
+    status = doctor.run_doctor(tmp_path, environ=environment, stream=output)
+
+    assert status == 0
+    assert "[OK] AI_CLI selects 'kimi'" in output.getvalue()
+    assert "run: kimi login" in output.getvalue()
+
+
 def test_doctor_fails_when_env_file_is_missing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

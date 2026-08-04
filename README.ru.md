@@ -24,7 +24,7 @@ PLAUD, отвечать по содержимому vault и создавать 
 - токен Telegram-бота от BotFather;
 - API-ключ Deepgram для распознавания голоса;
 - один установленный и авторизованный AI CLI: Claude Code, Codex CLI,
-  Qwen Code или Gemini CLI.
+  Qwen Code, Gemini CLI или Kimi Code.
 
 Todoist, веб-экстракция, PLAUD, QMD и зашифрованные резервные копии
 необязательны и требуют дополнительных зависимостей и настроек. См. разделы

@@ -228,6 +228,8 @@ Use `vault/.claude/docs/prompt-source-map.md` for the full source-of-truth map.
   relative discovery symlink: `skills/<name> -> private/<name>`.
 - `.claude/skills`, `.agents/skills`, `.codex/skills`, and `.qwen/skills` point
   to the same root `skills` tree. Do not keep separate CLI copies.
+- Kimi Code discovers that same shared tree through `.agents/skills`; do not
+  create a separate Kimi skills copy.
 - The `.gitignore` skill allowlist keeps private discovery symlinks local. When
   adding a public skill, add its root path to that allowlist.
 - Every `SKILL.md` must contain `name` and `description`.

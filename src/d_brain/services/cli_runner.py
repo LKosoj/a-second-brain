@@ -13,8 +13,9 @@ from d_brain.services.cli_json_stream import (
     recover_cli_error_from_raw_stream,
     recover_cli_text_from_raw_stream,
 )
+from d_brain.services.kimi_acp import run_kimi_acp
 
-AiCliName = Literal["claude", "codex", "qwen", "gemini"]
+AiCliName = Literal["claude", "codex", "qwen", "gemini", "kimi"]
 
 _TERMINAL_BACKEND_MARKERS = (
     "quota exceeded",
@@ -115,6 +116,10 @@ CLI_SPECS: dict[AiCliName, CliSpec] = {
         ),
         structured_output=True,
     ),
+    "kimi": CliSpec(
+        name="kimi",
+        argv_prefix=("kimi", "acp"),
+    ),
 }
 
 
@@ -181,8 +186,10 @@ class CliRunner:
         return CLI_SPECS[self.ai_cli]
 
     def build_command(self, prompt: str) -> list[str]:
-        """Build argv for one-shot execution."""
+        """Build argv for backend execution."""
 
+        if self.ai_cli == "kimi":
+            return list(self.spec.argv_prefix)
         return [*self.spec.argv_prefix, prompt]
 
     def _decode_stdout(self, stdout: str) -> str:
@@ -224,6 +231,19 @@ class CliRunner:
             for key, value in extra_env.items():
                 if value:
                     env[key] = value
+
+        if self.ai_cli == "kimi":
+            try:
+                output = run_kimi_acp(prompt, self.workdir, env, timeout)
+            except TimeoutError:
+                raise
+            except Exception as exc:
+                detail = str(exc)
+                raise CliExecutionError(detail, stderr=detail) from exc
+            terminal = detect_terminal_backend_message(output)
+            if terminal:
+                raise CliExecutionError(terminal, stdout=output)
+            return output
 
         use_stdin = bool(self.spec.stdin_prefix)
         cmd = (

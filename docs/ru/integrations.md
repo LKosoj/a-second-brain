@@ -22,6 +22,7 @@ AI_CLI=claude
 | Codex CLI | `codex login` |
 | Qwen Code | `qwen auth qwen-oauth` |
 | Gemini CLI | настройте поддерживаемые учётные данные Google/Gemini |
+| Kimi Code | `kimi login` |
 
 Проверка установки и авторизации:
 
@@ -32,6 +33,11 @@ a-second-brain doctor --smoke
 Для выполнения workflow агентский CLI получает выбранный контекст из vault.
 Считайте поставщика CLI и настроенный model gateway обработчиками приватных
 данных.
+
+Kimi Code запускается в официальном режиме ACP (`kimi acp`). ACP — это
+протокол обмена запросами через ввод и вывод процесса, поэтому текст запроса
+не попадает в аргументы команды. Общие скиллы Kimi находит через
+`.agents/skills`; отдельная копия для Kimi не нужна.
 
 ## Deepgram
 

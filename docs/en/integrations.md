@@ -22,6 +22,7 @@ Supported values and common authentication commands:
 | Codex CLI | `codex login` |
 | Qwen Code | `qwen auth qwen-oauth` |
 | Gemini CLI | configure a supported Google/Gemini credential |
+| Kimi Code | `kimi login` |
 
 Validate installation and authentication:
 
@@ -31,6 +32,11 @@ a-second-brain doctor --smoke
 
 Agent CLIs receive selected vault context for the requested workflow. Treat the
 CLI vendor and its configured model gateway as processors of private data.
+
+Kimi Code runs through its official ACP mode (`kimi acp`). ACP is the protocol
+used to exchange requests over the process input and output, so prompt text is
+not placed in command-line arguments. Kimi discovers the shared project skills
+through `.agents/skills`; no separate Kimi copy is needed.
 
 ## Deepgram
 

@@ -1,4 +1,8 @@
+import json
+import os
 import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -17,11 +21,11 @@ from d_brain.services.cli_runner import (
 
 @pytest.mark.parametrize(
     "value",
-    ["claude", "codex", "qwen", "gemini", "CLAUDE", " QWEN "],
+    ["claude", "codex", "qwen", "gemini", "kimi", "CLAUDE", " QWEN "],
 )
 def test_normalize_ai_cli_accepts_supported_values(value: str) -> None:
     normalized = normalize_ai_cli(value)
-    assert normalized in {"claude", "codex", "qwen", "gemini"}
+    assert normalized in {"claude", "codex", "qwen", "gemini", "kimi"}
 
 
 def test_normalize_ai_cli_rejects_unknown_value() -> None:
@@ -85,6 +89,89 @@ def test_build_command_uses_backend_specific_prefix(
     command = runner.build_command("hello")
     assert command[:-1] == expected_prefix
     assert command[-1] == "hello"
+
+
+def test_build_command_never_puts_kimi_prompt_in_argv() -> None:
+    runner = CliRunner(Path("."), "kimi")
+
+    assert runner.build_command("secret prompt") == ["kimi", "acp"]
+
+
+def test_kimi_uses_acp_stdio_without_prompt_in_argv(tmp_path: Path) -> None:
+    executable = tmp_path / "kimi"
+    marker = tmp_path / "request.json"
+    executable.write_text(
+        textwrap.dedent(
+            f"""\
+            #!{sys.executable}
+            import json
+            import os
+            import sys
+            from pathlib import Path
+
+            def send(message):
+                print(json.dumps(message), flush=True)
+
+            for line in sys.stdin:
+                request = json.loads(line)
+                method = request.get("method")
+                if method == "initialize":
+                    send({{
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": {{
+                            "protocolVersion": request["params"]["protocolVersion"],
+                            "agentCapabilities": {{}},
+                        }},
+                    }})
+                elif method == "session/new":
+                    send({{
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": {{"sessionId": "test-session"}},
+                    }})
+                elif method == "session/prompt":
+                    prompt = request["params"]["prompt"][0]["text"]
+                    Path(os.environ["KIMI_TEST_MARKER"]).write_text(json.dumps({{
+                        "argv": sys.argv[1:],
+                        "prompt": prompt,
+                    }}))
+                    send({{
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {{
+                            "sessionId": "test-session",
+                            "update": {{
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": {{
+                                    "type": "text",
+                                    "text": "{{\\\"ok\\\": true}}",
+                                }},
+                            }},
+                        }},
+                    }})
+                    send({{
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": {{"stopReason": "end_turn"}},
+                    }})
+            """
+        )
+    )
+    executable.chmod(0o755)
+    env_path = f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}"
+    runner = CliRunner(tmp_path, "kimi")
+    prompt = "secret prompt that must stay off argv"
+
+    output = runner.run(
+        prompt,
+        timeout=5,
+        extra_env={"PATH": env_path, "KIMI_TEST_MARKER": str(marker)},
+    )
+
+    assert output == '{"ok": true}'
+    request = json.loads(marker.read_text())
+    assert request == {"argv": ["acp"], "prompt": prompt}
 
 
 @pytest.mark.parametrize("backend", ["claude", "codex", "qwen", "gemini"])

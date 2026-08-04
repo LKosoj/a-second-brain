@@ -21,7 +21,7 @@ authenticated.
 
 | Variable | Default | Purpose |
 |---|---:|---|
-| `AI_CLI` | `claude` | `claude`, `codex`, `qwen`, or `gemini` |
+| `AI_CLI` | `claude` | `claude`, `codex`, `qwen`, `gemini`, or `kimi` |
 | `CONTENT_LANGUAGE` | `ru` | Language used for saved and generated content |
 | `OWNER_FULL_NAME` | empty | Owner matching in task-assignment prompts |
 | `VAULT_PATH` | `./vault` | Private Obsidian-compatible vault |

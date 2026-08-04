@@ -21,7 +21,7 @@
 
 | Переменная | По умолчанию | Назначение |
 |---|---:|---|
-| `AI_CLI` | `claude` | `claude`, `codex`, `qwen` или `gemini` |
+| `AI_CLI` | `claude` | `claude`, `codex`, `qwen`, `gemini` или `kimi` |
 | `CONTENT_LANGUAGE` | `ru` | Язык сохраняемых и генерируемых материалов |
 | `OWNER_FULL_NAME` | пусто | Имя владельца для назначения задач в промптах |
 | `VAULT_PATH` | `./vault` | Приватный Obsidian-совместимый vault |

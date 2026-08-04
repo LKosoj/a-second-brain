@@ -11,7 +11,8 @@ public code repository.
 - `uv` and `jq`
 - a Telegram bot token from BotFather
 - a Deepgram API key for voice transcription
-- one supported AI CLI: Claude Code, Codex CLI, Qwen Code, or Gemini CLI
+- one supported AI CLI: Claude Code, Codex CLI, Qwen Code, Gemini CLI, or
+  Kimi Code
 - an unprivileged Linux account
 
 Optional integrations add their own requirements. See

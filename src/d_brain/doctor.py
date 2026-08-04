@@ -18,7 +18,7 @@ from dotenv import dotenv_values
 from d_brain.manifest import ManifestValidationError, VaultManifest, load_manifest
 
 CheckLevel = Literal["OK", "INFO", "WARN", "ERR"]
-SUPPORTED_AI_CLIS = frozenset({"claude", "codex", "qwen", "gemini"})
+SUPPORTED_AI_CLIS = frozenset({"claude", "codex", "qwen", "gemini", "kimi"})
 
 
 @dataclass(frozen=True)
@@ -287,6 +287,8 @@ class ProjectDoctor:
                     "GOOGLE_GENAI_USE_VERTEXAI",
                 )
             )
+        if self.ai_cli == "kimi":
+            return False
 
         commands = {
             "claude": (["claude", "auth", "status"], '"loggedIn": true'),
@@ -313,6 +315,7 @@ class ProjectDoctor:
             "codex": "codex login",
             "qwen": "qwen auth qwen-oauth",
             "gemini": "configure GOOGLE_API_KEY or GEMINI_API_KEY",
+            "kimi": "kimi login",
         }.get(self.ai_cli, "configure the selected AI CLI")
 
     def _run_smoke(self) -> None:

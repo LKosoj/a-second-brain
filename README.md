@@ -24,7 +24,7 @@ ignored by Git and must remain private.
 - a Telegram bot token from BotFather
 - a Deepgram API key for voice transcription
 - one installed and authenticated AI CLI: Claude Code, Codex CLI, Qwen Code,
-  or Gemini CLI
+  Gemini CLI, or Kimi Code
 
 Todoist, web extraction, PLAUD, QMD, and encrypted backups are optional and
 have additional requirements. See [Integrations](docs/en/integrations.md) and

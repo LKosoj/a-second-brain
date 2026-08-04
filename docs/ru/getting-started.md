@@ -11,7 +11,8 @@ vault не попали в публичный репозиторий с кодо
 - `uv` и `jq`;
 - токен Telegram-бота от BotFather;
 - API-ключ Deepgram для распознавания голосовых сообщений;
-- один поддерживаемый AI CLI: Claude Code, Codex CLI, Qwen Code или Gemini CLI;
+- один поддерживаемый AI CLI: Claude Code, Codex CLI, Qwen Code, Gemini CLI
+  или Kimi Code;
 - непривилегированная учётная запись Linux.
 
 Для дополнительных интеграций могут потребоваться другие программы и ключи.

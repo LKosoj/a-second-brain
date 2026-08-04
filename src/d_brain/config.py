@@ -66,7 +66,7 @@ class Settings(BaseSettings):
         default="ru",
         description="Language used for generated saved content and prompts",
     )
-    ai_cli: Literal["claude", "codex", "qwen", "gemini"] = Field(
+    ai_cli: Literal["claude", "codex", "qwen", "gemini", "kimi"] = Field(
         default="claude",
         description="CLI backend used for agent processing",
     )
