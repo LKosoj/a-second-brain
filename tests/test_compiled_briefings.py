@@ -489,9 +489,11 @@ def test_compiled_briefings_target_path_rejects_traversal(
 
 def test_compiled_briefings_drain_queue_reports_non_retriable_errors(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     vault_path = tmp_path / "vault"
     service = _compiled_service(vault_path)
+    monkeypatch.setattr(service, "is_available", lambda: True)
     service.refresh_after_write = lambda **kwargs: {  # type: ignore[method-assign]
         "updated": [],
         "errors": ["unsupported-path"],

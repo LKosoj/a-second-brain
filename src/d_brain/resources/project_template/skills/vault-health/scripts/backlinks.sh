@@ -16,6 +16,6 @@ if [ -z "$TARGET" ]; then
 fi
 
 # Search for wikilinks to target (with or without .md, with or without alias)
-rg -l "\[\[$TARGET" "$VAULT_DIR" --glob '*.md' 2>/dev/null | \
+grep -rlF --include='*.md' "[[$TARGET" "$VAULT_DIR" 2>/dev/null | \
     sed "s|$VAULT_DIR/||" | \
     sort
