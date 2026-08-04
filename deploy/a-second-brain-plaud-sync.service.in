@@ -1,0 +1,12 @@
+[Unit]
+Description=A Second Brain PLAUD sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@PROJECT_DIR@
+EnvironmentFile=@PROJECT_DIR@/.env
+ExecStart=@UV_BIN@ run --frozen --no-dev python -m d_brain.run_plaud_sync
+NoNewPrivileges=true
+PrivateTmp=true

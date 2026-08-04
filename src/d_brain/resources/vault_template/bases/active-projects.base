@@ -1,0 +1,37 @@
+filters:
+  and:
+    - 'file.ext == "md"'
+    - file.path.startsWith("compiled/projects/")
+    - 'status == "active" || status == "draft" || status == "pending"'
+formulas:
+  updated_quarter: 'updated ? updated.format("YYYY-[Q]Q") : ""'
+  age_days: 'updated ? ((today() - updated) / 86400000).round() : null'
+properties:
+  file.name:
+    displayName: Project
+  description:
+    displayName: Description
+  status:
+    displayName: Status
+  updated:
+    displayName: Updated
+  formula.updated_quarter:
+    displayName: Quarter
+  formula.age_days:
+    displayName: Age (days)
+  tier:
+    displayName: Memory tier
+views:
+  - type: table
+    name: Active projects
+    order:
+      - file.name
+      - description
+      - status
+      - updated
+      - formula.updated_quarter
+      - formula.age_days
+      - tier
+    sort:
+      - property: updated
+        direction: DESC

@@ -1,0 +1,31 @@
+filters:
+  and:
+    - 'file.ext == "md"'
+    - or:
+        - file.path.startsWith("business/")
+        - file.path.startsWith("projects/")
+formulas:
+  days_untouched: '((now() - file.mtime) / 86400000).round()'
+properties:
+  file.name:
+    displayName: Note
+  description:
+    displayName: Description
+  file.mtime:
+    displayName: Last modified
+  formula.days_untouched:
+    displayName: Days untouched
+  tier:
+    displayName: Memory tier
+views:
+  - type: table
+    name: Business context
+    order:
+      - file.name
+      - description
+      - file.mtime
+      - formula.days_untouched
+      - tier
+    sort:
+      - property: file.mtime
+        direction: DESC

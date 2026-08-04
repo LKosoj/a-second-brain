@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "qmd_index": "dbrain",
+  "context_budget_bytes": 200000,
+  "memory_root": "vault",
+  "user_content_roots": [
+    "vault/MEMORY.md",
+    "vault/daily",
+    "vault/goals",
+    "vault/business",
+    "vault/projects",
+    "vault/thoughts",
+    "vault/imports",
+    "vault/compiled",
+    "vault/summaries",
+    "vault/MOC"
+  ],
+  "infrastructure": [
+    "vault/.claude",
+    "vault/.codex",
+    "vault/.obsidian",
+    "vault/.compiled",
+    "vault/.graph",
+    "vault/.qmd",
+    "vault/.session",
+    "vault/.trash",
+    "vault/templates",
+    "vault/skills"
+  ],
+  "frontmatter_required": {
+    "default": ["type", "last_accessed", "relevance", "tier"],
+    "daily": ["type", "date", "last_accessed", "relevance", "tier"],
+    "import": ["type", "last_accessed", "relevance", "tier"],
+    "derived": ["type", "description", "last_accessed", "relevance", "tier"],
+    "thought-card": [
+      "type", "description", "tags", "status", "created", "updated",
+      "last_accessed", "relevance", "tier"
+    ],
+    "reflection": [
+      "type", "description", "tags", "date", "created", "updated",
+      "last_accessed", "relevance", "tier"
+    ],
+    "epistemic": [
+      "type", "description", "epistemic_confidence", "epistemic_scope",
+      "epistemic_state", "created", "updated", "last_accessed",
+      "relevance", "tier"
+    ],
+    "goal": ["type", "description", "last_accessed", "relevance", "tier"],
+    "index": ["type", "description", "last_accessed", "relevance", "tier"],
+    "flat-context": ["type", "description", "last_accessed", "relevance", "tier"],
+    "template": ["type", "description"],
+    "technical": ["type", "last_accessed", "relevance", "tier"],
+    "home": ["type", "description", "last_accessed", "relevance", "tier"]
+  }
+}

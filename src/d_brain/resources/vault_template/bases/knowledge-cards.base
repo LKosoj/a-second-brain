@@ -1,0 +1,30 @@
+filters:
+  and:
+    - 'file.ext == "md"'
+    - file.path.startsWith("thoughts/")
+properties:
+  file.name:
+    displayName: Card
+  type:
+    displayName: Type
+  description:
+    displayName: Description
+  tags:
+    displayName: Tags
+  status:
+    displayName: Status
+  tier:
+    displayName: Memory tier
+views:
+  - type: table
+    name: Knowledge cards
+    order:
+      - file.name
+      - type
+      - description
+      - tags
+      - status
+      - tier
+    sort:
+      - property: file.name
+        direction: ASC

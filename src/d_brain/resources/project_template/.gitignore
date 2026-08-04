@@ -1,0 +1,60 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Private data and runtime state
+vault/
+vault/skills/private/
+.vault-backups/
+logs/
+
+# Generated skill discovery links. Public skills are explicitly allowed.
+skills/*
+!skills/agent-memory
+!skills/anythingllm-search
+!skills/architecture-diagram
+!skills/arxiv
+!skills/blogwatcher
+!skills/content-research-writer
+!skills/datetime
+!skills/dbrain-processor
+!skills/decision-framework
+!skills/doc-coauthoring
+!skills/docx
+!skills/excalidraw
+!skills/graph-builder
+!skills/humanizer
+!skills/ms-project
+!skills/multi-agent-brainstorm
+!skills/negotiation-prep
+!skills/playwright-cli
+!skills/pptx
+!skills/ru-editor
+!skills/sequential-thinking
+!skills/todoist-ai
+!skills/vault-health
+!skills/vault-retrieval
+!skills/youtube-transcript
+
+# Python and local tools
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+node_modules/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

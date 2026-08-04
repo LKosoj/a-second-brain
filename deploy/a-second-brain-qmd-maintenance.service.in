@@ -1,0 +1,10 @@
+[Unit]
+Description=A Second Brain QMD weekly maintenance
+
+[Service]
+Type=oneshot
+WorkingDirectory=@PROJECT_DIR@
+EnvironmentFile=@PROJECT_DIR@/.env
+ExecStart=@UV_BIN@ run --frozen --no-dev a-second-brain qmd cleanup
+NoNewPrivileges=true
+PrivateTmp=true

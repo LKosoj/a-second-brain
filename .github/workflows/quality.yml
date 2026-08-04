@@ -1,0 +1,37 @@
+name: Quality
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v8
+        with:
+          version: "0.11.26"
+
+      - name: Sync locked dependencies
+        run: uv sync --frozen --group dev
+
+      - name: Ruff
+        run: uv run --frozen ruff check .
+
+      - name: Mypy
+        run: uv run --frozen mypy src
+
+      - name: Tests
+        run: uv run --frozen pytest -q
+
+      - name: Build
+        run: uv build
+
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2

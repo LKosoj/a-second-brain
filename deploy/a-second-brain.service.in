@@ -1,0 +1,17 @@
+[Unit]
+Description=A Second Brain Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT_DIR@
+EnvironmentFile=@PROJECT_DIR@/.env
+ExecStart=@UV_BIN@ run --frozen --no-dev a-second-brain run
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

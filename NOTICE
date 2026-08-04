@@ -1,0 +1,8 @@
+A Second Brain
+
+This distribution is derived from the MIT-licensed Agent Second Brain project.
+The original copyright and license notice are preserved in LICENSE.
+
+The public distribution contains only application code, generic templates, and
+tests. User vault content, credentials, logs, backups, and private repository
+history are intentionally excluded.

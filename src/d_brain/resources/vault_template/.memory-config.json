@@ -1,0 +1,17 @@
+{
+  "tiers": {
+    "active": 7,
+    "warm": 21,
+    "cold": 60
+  },
+  "decay_rate": 0.015,
+  "relevance_floor": 0.1,
+  "skip_patterns": [
+    "_index.md"
+  ],
+  "type_inference": {
+    "business/": "crm",
+    "projects/": "project"
+  },
+  "use_git_dates": false
+}

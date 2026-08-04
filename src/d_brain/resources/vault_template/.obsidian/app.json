@@ -1,0 +1,8 @@
+{
+  "userIgnoreFilters": [
+    ".graph/",
+    ".sync/",
+    ".memory-entries.json",
+    ".session/"
+  ]
+}

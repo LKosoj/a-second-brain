@@ -1,0 +1,37 @@
+filters:
+  and:
+    - 'file.ext == "md"'
+    - or:
+        - 'file.path == "MEMORY.md"'
+        - 'file.path.startsWith("daily/")'
+        - 'file.path.startsWith("goals/")'
+        - 'file.path.startsWith("business/")'
+        - 'file.path.startsWith("projects/")'
+        - 'file.path.startsWith("thoughts/")'
+        - 'file.path.startsWith("imports/")'
+        - 'file.path.startsWith("compiled/")'
+        - 'file.path.startsWith("summaries/")'
+        - 'file.path.startsWith("MOC/")'
+properties:
+  file.name:
+    displayName: Note
+  description:
+    displayName: Description
+  tier:
+    displayName: Memory tier
+  last_accessed:
+    displayName: Last accessed
+views:
+  - type: table
+    name: Memory tiers
+    groupBy:
+      property: tier
+      direction: ASC
+    order:
+      - file.name
+      - description
+      - tier
+      - last_accessed
+    sort:
+      - property: last_accessed
+        direction: DESC
