@@ -7,6 +7,7 @@ English and Russian pages are maintained as mirrored documentation sets.
 | Installation | [Getting started](en/getting-started.md) | [Начало работы](ru/getting-started.md) |
 | Settings | [Configuration](en/configuration.md) | [Конфигурация](ru/configuration.md) |
 | Commands | [CLI reference](en/cli.md) | [Справочник CLI](ru/cli.md) |
+| Knowledge and retrieval | [Memory, notes, and search](en/memory-and-search.md) | [Память, заметки и поиск](ru/memory-and-search.md) |
 | Production use | [Operations](en/operations.md) | [Эксплуатация](ru/operations.md) |
 | External services | [Integrations](en/integrations.md) | [Интеграции](ru/integrations.md) |
 | Data recovery | [Backup and restore](en/backup-and-restore.md) | [Резервное копирование и восстановление](ru/backup-and-restore.md) |

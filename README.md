@@ -2,19 +2,133 @@
 
 [Русская версия](README.ru.md)
 
-A self-hosted, voice-first personal assistant for Telegram. It captures text
-and forwarded messages, voice messages, photos, documents, web pages, and
-YouTube links in a private Obsidian-compatible vault. It can import transcripts
-and summaries from optional PLAUD recordings, answer questions from the vault,
-and create Todoist tasks.
+A self-hosted, voice-first personal assistant for Telegram. Send it a thought,
+a question, a voice message, a photo, a document, or a link. It keeps the
+source material in a private Obsidian-compatible vault, turns useful input into
+notes and tasks, and can answer later from what you saved.
 
 [Full documentation](docs/index.md) covers installation, configuration,
-operations, integrations, backups, troubleshooting, architecture, and
-development in English and Russian.
+memory and search, operations, integrations, backups, troubleshooting,
+architecture, and development in English and Russian.
 
 The repository contains application code and an anonymized starter-vault
 template. Your real `vault/`, `.env`, backups, logs, and runtime state are
 ignored by Git and must remain private.
+
+## Why it exists
+
+Capturing a thought is easy. Keeping notes organized enough to find that
+thought next month is the hard part. A Second Brain reduces the maintenance:
+Telegram is the inbox, Markdown is the durable record, and the agent handles
+classification, retrieval, linking, and scheduled review.
+
+The system does not hide your knowledge in a proprietary database. The source
+of truth is a directory of readable Markdown files and attachments that can be
+opened in Obsidian or managed with ordinary filesystem tools.
+
+## What it does
+
+- Captures text, forwarded messages, voice, photos, albums, and documents from
+  one authorized Telegram account.
+- Transcribes voice with Deepgram and preserves raw daily entries before later
+  processing.
+- Archives supported web pages, YouTube material, uploaded documents, and
+  optional PLAUD transcripts with their source context.
+- Distinguishes likely questions from notes. Questions are answered immediately;
+  notes are kept for the daily processing cycle.
+- Turns classified entries into knowledge cards, business or project updates,
+  and optional Todoist tasks during the full processing cycle.
+- Builds daily, weekly, monthly, and yearly reviews and maintains searchable
+  briefings derived from the underlying notes.
+- Ages memory metadata over time, promotes notes when they are used, and keeps
+  old material available for deep recall instead of deleting it.
+- Checks the note graph for broken links, weak metadata, and isolated notes, and
+  maintains Maps of Content where the vault structure needs them.
+
+## What you send and what happens
+
+| Input | Immediate result | Later use |
+|---|---|---|
+| Voice message | Deepgram transcript saved to the daily note | Classified during processing and available to search |
+| Text thought | Original text saved to the daily note | May become a task, knowledge card, or context update |
+| Text question | Answer built from goals, memory, briefings, and retrieved notes | A longer reusable answer may be filed back into the searchable vault |
+| Forwarded message or link | Source information and extracted content are preserved when available | Included in recall and daily review |
+| Photo or album | Image saved under attachments with its caption and best-effort AI description | Can be linked to related daily or project context |
+| Document | Original upload is staged first, then text is extracted and archived | Searchable import plus a daily reference |
+| PLAUD recording | Optional sync imports transcript and summary | Recent actions assigned to the owner can become Todoist tasks |
+
+## From inbox to organized notes
+
+New captures are written first, so a later model or integration failure does
+not discard the original input. There are then three ways the system uses it:
+
+1. A direct question is routed to the most useful context: current goals and
+   long-term memory, compiled briefings, note retrieval, or exact lookup.
+2. `/process` runs a quick preview of today's entries without executing the
+   write-heavy steps.
+3. The scheduled cycle at 21:00, or `/process_full`, runs three isolated phases:
+   capture and classification, execution, then reflection and maintenance.
+
+Periodic cycles add weekly, monthly, and yearly reviews. Optional timers refresh
+the local search index and synchronize PLAUD independently of the bot process.
+
+## Memory and search at a glance
+
+The assistant does not load the whole vault for every request. It combines four
+layers:
+
+- a small, bounded core context with long-term memory, current goals, recent
+  daily notes, and the previous handoff;
+- compiled briefings, which are derived summaries for fast status and history
+  questions;
+- QMD semantic search, meaning search by idea rather than exact wording;
+- exact text search for identifiers, paths, dates, and other literal strings.
+
+Each note can carry a memory tier and a relevance score. Recent or repeatedly
+used notes rank higher in normal recall. When QMD is installed and indexed,
+deep recall includes cold and archived notes; an exceptionally strong match can
+still appear in normal recall. Opening a note through `qmd get`, or explicitly
+touching a directly read file, promotes it one tier at a time. Decay never
+deletes it.
+
+The complete model, including note organization, retrieval order, tier
+thresholds, daily-entry tracking, correction history, QMD commands, and what is
+or is not automatic, is in [Memory, notes, and search](docs/en/memory-and-search.md).
+
+## Vault layout
+
+```text
+vault/
+├── MEMORY.md          # Curated durable context
+├── daily/             # Raw chronological inbox
+├── goals/             # Vision, yearly, monthly, and weekly focus
+├── thoughts/          # Reusable knowledge cards and reflections
+├── business/          # CRM, network, and event context
+├── projects/          # Clients, leads, and active projects
+├── imports/           # Archived documents, web pages, YouTube, and PLAUD
+├── compiled/          # Derived briefings; rebuildable from source notes
+├── summaries/         # Periodic reports
+├── MOC/               # Maps of Content for navigation
+└── attachments/       # Uploaded images and other binary files
+```
+
+The private vault also contains rebuildable indexes, session state, rules, and
+Obsidian settings. `vault-manifest.json` defines which paths are user content
+and which paths are runtime infrastructure.
+
+## Everyday Telegram commands
+
+| Command | Action |
+|---|---|
+| `/do` | Run a free-form request against the vault and optional Todoist access |
+| `/process` | Preview today's classification without write-heavy execution |
+| `/process_full` | Run the full daily cycle now |
+| `/menu` | Open the persistent dashboard |
+| `/stats` | Show capture statistics |
+| `/files` | Browse and download allowed vault files |
+
+See the [CLI reference](docs/en/cli.md) for installation and maintenance
+commands and the bot help screen for the complete Telegram command list.
 
 ## Requirements
 
@@ -32,11 +146,10 @@ have additional requirements. See [Integrations](docs/en/integrations.md) and
 
 ## Install from a clone
 
-Until a public remote exists, there is no canonical clone URL. This snippet
-prompts for the HTTPS or SSH URL shown by the Git host:
+Clone the public repository, or set `REPOSITORY_URL` to your own fork:
 
 ```bash
-read -r -p "Repository URL: " REPOSITORY_URL
+REPOSITORY_URL="${REPOSITORY_URL:-https://github.com/LKosoj/a-second-brain.git}"
 git clone "$REPOSITORY_URL" a-second-brain
 cd a-second-brain
 ./install.sh
