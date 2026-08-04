@@ -35,6 +35,7 @@ module-name = "d_brain"
 [tool.ruff]
 line-length = 88
 target-version = "py312"
+extend-exclude = ["src/d_brain/resources/project_template/skills/"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
