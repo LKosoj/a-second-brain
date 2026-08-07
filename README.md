@@ -7,6 +7,11 @@ a question, a voice message, a photo, a document, or a link. It keeps the
 source material in a private Obsidian-compatible vault, turns useful input into
 notes and tasks, and can answer later from what you saved.
 
+It also synthesizes. A nightly pass compiles scattered notes into maintained
+pages about your projects, people, and decisions, keeps every claim tied to the
+note it came from, and brings genuine contradictions to you instead of quietly
+picking one.
+
 [Full documentation](docs/index.md) covers installation, configuration,
 memory and search, operations, integrations, backups, troubleshooting,
 architecture, and development in English and Russian.
@@ -21,6 +26,12 @@ Capturing a thought is easy. Keeping notes organized enough to find that
 thought next month is the hard part. A Second Brain reduces the maintenance:
 Telegram is the inbox, Markdown is the durable record, and the agent handles
 classification, retrieval, linking, and scheduled review.
+
+Finding the note is only half of it. What you know about a project is usually
+spread across a dozen entries written months apart, some of which contradict
+each other. So the system maintains a synthesized layer above the raw notes: a
+question is answered from one current page, with the sources behind each claim
+still attached.
 
 The system does not hide your knowledge in a proprietary database. The source
 of truth is a directory of readable Markdown files and attachments that can be
@@ -38,8 +49,15 @@ opened in Obsidian or managed with ordinary filesystem tools.
   notes are kept for the daily processing cycle.
 - Turns classified entries into knowledge cards, business or project updates,
   and optional Todoist tasks during the full processing cycle.
-- Builds daily, weekly, monthly, and yearly reviews and maintains searchable
-  briefings derived from the underlying notes.
+- Builds daily, weekly, monthly, and yearly reviews.
+- Compiles scattered notes into maintained pages for projects, people, topics,
+  decisions, meetings, and concepts, keeping each claim tied to its source note.
+- Re-checks those pages as they age. A contradiction settled by date, or one
+  that only looks like a contradiction because the two claims describe
+  different situations, is resolved without asking; a real factual conflict
+  waits for you in a decisions queue.
+- Sends a daily digest of what needs your decision, what changed, and which
+  long-forgotten page is worth another look.
 - Ages memory metadata over time, promotes notes when they are used, and keeps
   old material available for deep recall instead of deleting it.
 - Checks the note graph for broken links, weak metadata, and isolated notes, and
@@ -79,8 +97,8 @@ layers:
 
 - a small, bounded core context with long-term memory, current goals, recent
   daily notes, and the previous handoff;
-- compiled briefings, which are derived summaries for fast status and history
-  questions;
+- compiled pages, which are synthesized from many notes for fast status and
+  history questions and keep the sources behind each claim;
 - QMD semantic search, meaning search by idea rather than exact wording;
 - exact text search for identifiers, paths, dates, and other literal strings.
 
@@ -106,7 +124,7 @@ vault/
 ├── business/          # CRM, network, and event context
 ├── projects/          # Clients, leads, and active projects
 ├── imports/           # Archived documents, web pages, YouTube, and PLAUD
-├── compiled/          # Derived briefings; rebuildable from source notes
+├── compiled/          # Synthesized pages with sources; rebuildable from notes
 ├── summaries/         # Periodic reports
 ├── MOC/               # Maps of Content for navigation
 └── attachments/       # Uploaded images and other binary files
@@ -124,7 +142,7 @@ and which paths are runtime infrastructure.
 | `/why` | Explain why a compiled page states a claim, with its sources |
 | `/process` | Preview today's classification without write-heavy execution |
 | `/process_full` | Run the full daily cycle now |
-| `/menu` | Open the persistent dashboard |
+| `/menu` | Open the dashboard: digest, decisions queue, brief builder, weekly summary |
 | `/stats` | Show capture statistics |
 | `/files` | Browse and download allowed vault files |
 

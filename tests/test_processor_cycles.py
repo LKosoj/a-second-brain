@@ -1113,7 +1113,9 @@ def test_run_scheduled_cycle_triggers_due_periodic_reviews_and_audits(
         "maintenance.compiled-fact-check",
         "maintenance.compiled-digest",
     ]
-    assert result["processed_entries"] == 5
+    # daily 2 + weekly/monthly/yearly 1 each + digest 1; the same digest write
+    # that used to fail with "vault Markdown parent does not exist" now lands.
+    assert result["processed_entries"] == 6
     assert result["audit_task_candidates"] == [
         "todo:weekly_digest",
         "todo:monthly",
@@ -1413,7 +1415,12 @@ def test_run_scheduled_cycle_runs_compiled_nightly_maintenance(
     ]
     assert "## 🧩 Compiled Maintenance" in result["report"]
     assert "## 🩺 Vault Health" in result["report"]
-    assert result["processed_entries"] == 2
+    # daily 1 + compiled-nightly 1 + vault-health 0 + fact-check 0 + digest 1.
+    # This asserted 2 while the digest was contributing 0 with the error "vault
+    # Markdown parent does not exist" -- the vault writer needed
+    # CAP_DAC_READ_SEARCH, so the digest never got to write anything. The
+    # expectation recorded that failure instead of the cycle's real output.
+    assert result["processed_entries"] == 3
     assert refresh_calls["count"] == 1
 
 

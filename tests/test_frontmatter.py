@@ -892,18 +892,29 @@ def test_validated_write_rejects_closed_existing_lock(tmp_path: Path) -> None:
     assert not (vault / "note.md").exists()
 
 
-def test_validated_write_uses_verified_unnamed_source_at_publication(
+def test_validated_write_publishes_only_the_verified_candidate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Publication must move the candidate it verified, nothing else staged.
+
+    This used to be stated as "the source is unnamed": the candidate was an
+    ``O_TMPFILE`` file, so no staged name could be confused with it. The
+    candidate is now staged under a random ``candidate-`` name and published by
+    rename, so the guarantee is carried by the name the writer chose itself --
+    an extra file dropped into the staging directory must still be ignored.
+    """
     vault = tmp_path / "vault"
     vault.mkdir()
     note = vault / "note.md"
     content = b"---\ntype: note\n---\n# Sensitive candidate\n"
-    original_link = frontmatter_module._link_descriptor_noreplace
+    original_rename = frontmatter_module._rename_noreplace
     attacked = False
 
-    def inject_old_visible_source(
-        source_fd: int, destination_fd: int, destination_name: str
+    def inject_visible_staging_file(
+        source_fd: int,
+        source_name: str,
+        destination_fd: int,
+        destination_name: str,
     ) -> None:
         nonlocal attacked
         stage = next(
@@ -914,12 +925,12 @@ def test_validated_write_uses_verified_unnamed_source_at_publication(
         assert stat.S_IMODE(os.stat(stage).st_mode) == 0o700
         (stage / "content").write_bytes(b"attacker-controlled")
         attacked = True
-        original_link(source_fd, destination_fd, destination_name)
+        original_rename(source_fd, source_name, destination_fd, destination_name)
 
     monkeypatch.setattr(
         frontmatter_module,
-        "_link_descriptor_noreplace",
-        inject_old_visible_source,
+        "_rename_noreplace",
+        inject_visible_staging_file,
     )
 
     write_validated_vault_markdown(vault, note, content)
@@ -927,6 +938,32 @@ def test_validated_write_uses_verified_unnamed_source_at_publication(
     assert attacked is True
     assert note.read_bytes() == content
     assert not any(child.name.startswith(".dbrain-write-") for child in vault.iterdir())
+
+
+def test_link_name_noreplace_never_dereferences_a_symlink(tmp_path: Path) -> None:
+    """The helper links the name it was handed, not what a symlink points at.
+
+    Publication moved from linking a descriptor to linking a name, so this flag
+    is what keeps a swapped entry from pulling a file outside the vault into
+    staging. Every call site also compares the resulting inode against the
+    descriptor it verified, which masks the flag from the writer's own tests --
+    so pin it directly here.
+    """
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"outside")
+    (tmp_path / "link").symlink_to(outside)
+
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        frontmatter_module._link_name_noreplace(
+            directory_fd, "link", directory_fd, "copy"
+        )
+    finally:
+        os.close(directory_fd)
+
+    copy = tmp_path / "copy"
+    assert copy.is_symlink()
+    assert os.lstat(copy).st_ino != os.stat(outside).st_ino
 
 
 def test_validated_write_checks_expected_full_hash_inside_commit(
@@ -987,16 +1024,19 @@ def test_validated_move_refuses_target_appearing_before_publication(
     source_bytes = b"---\ntype: note\n---\n# Source\n"
     target_bytes = b"---\ntype: note\n---\n# Racer\n"
     source.write_bytes(source_bytes)
-    original_link = frontmatter_module._link_descriptor_noreplace
+    original_link = frontmatter_module._link_name_noreplace
 
     def create_target(
-        source_fd: int, destination_fd: int, destination_name: str
+        source_fd: int,
+        source_name: str,
+        destination_fd: int,
+        destination_name: str,
     ) -> None:
         if destination_name == target.name:
             target.write_bytes(target_bytes)
-        original_link(source_fd, destination_fd, destination_name)
+        original_link(source_fd, source_name, destination_fd, destination_name)
 
-    monkeypatch.setattr(frontmatter_module, "_link_descriptor_noreplace", create_target)
+    monkeypatch.setattr(frontmatter_module, "_link_name_noreplace", create_target)
 
     with pytest.raises(FrontmatterError, match="target appeared"):
         move_validated_vault_markdown(vault, source, target, manifest=_manifest())
@@ -1018,18 +1058,21 @@ def test_validated_write_creates_new_markdown_without_following_symlink(
     assert note.read_bytes() == content
 
     swapped = vault / "swapped.md"
-    original_link = frontmatter_module._link_descriptor_noreplace
+    original_rename = frontmatter_module._rename_noreplace
 
     def create_racer_before_publication(
-        source_fd: int, destination_fd: int, destination_name: str
+        source_fd: int,
+        source_name: str,
+        destination_fd: int,
+        destination_name: str,
     ) -> None:
         if destination_name == "swapped.md":
             swapped.write_bytes(b"RACER")
-        original_link(source_fd, destination_fd, destination_name)
+        original_rename(source_fd, source_name, destination_fd, destination_name)
 
     monkeypatch.setattr(
         frontmatter_module,
-        "_link_descriptor_noreplace",
+        "_rename_noreplace",
         create_racer_before_publication,
     )
     with pytest.raises(UnsafeVaultPathError, match="no-replace publication"):
@@ -1105,38 +1148,40 @@ def test_subprocess_candidate_mutation_rolls_back_publication(
     candidate = b"---\ntype: note\n---\n# Candidate\n"
     if replace_existing:
         note.write_bytes(original)
-    original_link = frontmatter_module._link_descriptor_noreplace
+    original_rename = frontmatter_module._rename_noreplace
     original_exchange = frontmatter_module._rename_exchange
-    candidate_fd: int | None = None
 
-    def mutate_from_child(descriptor: int) -> None:
+    def mutate_staged_candidate_from_child() -> None:
+        # The candidate used to be an ``O_TMPFILE`` file with no name, so the
+        # only way in was ``/proc/<pid>/fd/<n>``. It is now staged under a name,
+        # which is how a same-UID attacker would actually reach it -- and the
+        # invariant under test is unchanged: a candidate mutated after
+        # verification must be caught and rolled back, never published.
+        stage = next(
+            child
+            for child in vault.iterdir()
+            if child.name.startswith(".dbrain-write-")
+        )
+        staged = next(
+            child for child in stage.iterdir() if child.name.startswith("candidate-")
+        )
         script = (
             "import os,sys\n"
-            "fd=os.open(f'/proc/{sys.argv[1]}/fd/{sys.argv[2]}',os.O_WRONLY)\n"
+            "fd=os.open(sys.argv[1],os.O_WRONLY)\n"
             "os.ftruncate(fd,0)\n"
             "os.write(fd,b'ATTACKER')\n"
             "os.close(fd)\n"
         )
-        subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                script,
-                str(os.getpid()),
-                str(descriptor),
-            ],
-            check=True,
-        )
+        subprocess.run([sys.executable, "-c", script, str(staged)], check=True)
 
-    def remember_or_mutate_candidate(
-        source_fd: int, destination_fd: int, destination_name: str
+    def mutate_before_publication(
+        source_fd: int,
+        source_name: str,
+        destination_fd: int,
+        destination_name: str,
     ) -> None:
-        nonlocal candidate_fd
-        if replace_existing and destination_name.startswith("candidate-"):
-            candidate_fd = source_fd
-        elif not replace_existing and destination_name == "note.md":
-            mutate_from_child(source_fd)
-        original_link(source_fd, destination_fd, destination_name)
+        mutate_staged_candidate_from_child()
+        original_rename(source_fd, source_name, destination_fd, destination_name)
 
     def mutate_after_verify_before_exchange(
         source_fd: int,
@@ -1144,8 +1189,7 @@ def test_subprocess_candidate_mutation_rolls_back_publication(
         destination_fd: int,
         destination_name: str,
     ) -> None:
-        assert candidate_fd is not None
-        mutate_from_child(candidate_fd)
+        mutate_staged_candidate_from_child()
         original_exchange(
             source_fd,
             source_name,
@@ -1153,16 +1197,17 @@ def test_subprocess_candidate_mutation_rolls_back_publication(
             destination_name,
         )
 
-    monkeypatch.setattr(
-        frontmatter_module,
-        "_link_descriptor_noreplace",
-        remember_or_mutate_candidate,
-    )
     if replace_existing:
         monkeypatch.setattr(
             frontmatter_module,
             "_rename_exchange",
             mutate_after_verify_before_exchange,
+        )
+    else:
+        monkeypatch.setattr(
+            frontmatter_module,
+            "_rename_noreplace",
+            mutate_before_publication,
         )
 
     with pytest.raises(UnsafeVaultPathError, match="source changed"):
@@ -1466,9 +1511,12 @@ def test_cleanup_never_touches_swapped_stage_directory(
     swapped_stage: Path | None = None
 
     def swap_stage_and_fail(
-        source_fd: int, destination_fd: int, destination_name: str
+        source_fd: int,
+        source_name: str,
+        destination_fd: int,
+        destination_name: str,
     ) -> None:
-        del source_fd, destination_fd, destination_name
+        del source_fd, source_name, destination_fd, destination_name
         nonlocal swapped_stage
         stage = next(
             child
@@ -1480,9 +1528,7 @@ def test_cleanup_never_touches_swapped_stage_directory(
         swapped_stage = stage
         raise UnsafeVaultPathError("injected publication failure")
 
-    monkeypatch.setattr(
-        frontmatter_module, "_link_descriptor_noreplace", swap_stage_and_fail
-    )
+    monkeypatch.setattr(frontmatter_module, "_rename_noreplace", swap_stage_and_fail)
 
     with pytest.raises(UnsafeVaultPathError, match="injected"):
         write_validated_vault_markdown(vault, note, content)

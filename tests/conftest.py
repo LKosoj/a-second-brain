@@ -9,6 +9,31 @@ import pytest
 from _paths import SKILLS_TEMPLATE_ROOT
 
 
+@pytest.fixture(autouse=True)
+def _block_real_telegram_delivery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the suite from delivering Telegram messages to the real owner.
+
+    ``Settings`` reads ``env_file=".env"`` relative to the working directory,
+    so a suite run from the repository root loads the live bot token and owner
+    chat id. Cycles that deliver their own message -- currently
+    ``processor._run_compiled_digest_cycle`` -- then reach a real send whenever
+    their vault write succeeds, and five such messages left this repository
+    per full run. ``_send_telegram_text_to_target`` is the single point where
+    an ``aiogram.Bot`` is built, so blocking it closes every delivery path at
+    once. It raises rather than silently passing, so an unmocked send is
+    visible in the logs instead of looking like success; tests that exercise
+    delivery on purpose install their own patch, which wins over this one.
+    """
+
+    async def _blocked(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("real Telegram delivery attempted in tests")
+
+    monkeypatch.setattr(
+        "d_brain.services.telegram_delivery._send_telegram_text_to_target",
+        _blocked,
+    )
+
+
 def _write_vault_manifest(
     vault_path: Path,
     *,

@@ -48,7 +48,7 @@ _EPISTEMIC_SEMANTIC_FIELDS = frozenset(
 _ALLOWED_STATUSES = frozenset({"active", "draft", "pending", "done", "inactive"})
 _ALLOWED_TIERS = frozenset({"core", "active", "warm", "cold", "archive"})
 _DATE_FIELDS = frozenset({"date", "created", "updated", "last_accessed"})
-_AT_EMPTY_PATH = 0x1000
+_RENAME_NOREPLACE = 1
 _RENAME_EXCHANGE = 2
 _LIBC = ctypes.CDLL(None, use_errno=True)
 
@@ -538,19 +538,44 @@ def _verify_candidate_descriptor(
     )
 
 
-def _link_descriptor_noreplace(
-    source_fd: int, destination_fd: int, destination_name: str
+def _link_name_noreplace(
+    source_fd: int, source_name: str, destination_fd: int, destination_name: str
 ) -> None:
-    linkat = getattr(_LIBC, "linkat", None)
-    if linkat is None:
-        raise UnsafeVaultPathError("linkat is unavailable on this platform")
+    """Hard-link one existing name into another directory without replacing.
+
+    Publication used to link the open descriptor itself through
+    ``linkat(..., AT_EMPTY_PATH)``. That form needs ``CAP_DAC_READ_SEARCH``, so
+    every vault write raised ``ENOENT`` for an unprivileged process -- including
+    the systemd *user* unit this project ships and documents. Linking by name
+    needs no capability. It reopens a name the caller already resolved, so each
+    call site closes that window by comparing the published inode against the
+    identity it verified through its own descriptor.
+    """
+    os.link(
+        source_name,
+        destination_name,
+        src_dir_fd=source_fd,
+        dst_dir_fd=destination_fd,
+        follow_symlinks=False,
+    )
+
+
+def _rename_noreplace(
+    source_fd: int,
+    source_name: str,
+    destination_fd: int,
+    destination_name: str,
+) -> None:
+    renameat2 = getattr(_LIBC, "renameat2", None)
+    if renameat2 is None:
+        raise UnsafeVaultPathError("renameat2 is unavailable on this platform")
     ctypes.set_errno(0)
-    result = linkat(
+    result = renameat2(
         source_fd,
-        ctypes.c_char_p(b""),
+        ctypes.c_char_p(os.fsencode(source_name)),
         destination_fd,
         ctypes.c_char_p(os.fsencode(destination_name)),
-        _AT_EMPTY_PATH,
+        _RENAME_NOREPLACE,
     )
     if result != 0:
         error = ctypes.get_errno()
@@ -653,23 +678,43 @@ def _rollback_publication(
         return False, True
     guard_inode = _inode_identity(os.fstat(guard_fd)) if guard_fd is not None else None
     preserve_stage = False
+    restore_name: str | None = None
     if guard_inode is not None:
         preserve_stage = any(
             name is None or _name_inode(stage_fd, name) != guard_inode
             for name in (candidate_name, recovery_name)
         )
+        restore_name = next(
+            (
+                name
+                for name in (recovery_name, candidate_name)
+                if name is not None and _name_inode(stage_fd, name) == guard_inode
+            ),
+            None,
+        )
+        if restore_name is None:
+            # Restoring now means linking a name, not a bare descriptor, and
+            # the guard is reachable by name only from staging. Both staging
+            # names losing the guard inode means the staging directory was
+            # rewritten mid-transaction, so leave the published file in place
+            # and report IN_DOUBT rather than unlinking with nothing to put
+            # back. ``recovery_name`` is created before publication and removed
+            # only after ``durable_commit``, so an untampered rollback always
+            # finds it.
+            return False, True
     try:
         os.unlink(target_name, dir_fd=parent_fd)
         if guard_fd is not None:
             assert guard_identity is not None
             assert guard_hash is not None
+            assert restore_name is not None
             _verify_open_descriptor(
                 guard_fd,
                 guard_identity,
                 guard_hash,
                 label="write guard",
             )
-            _link_descriptor_noreplace(guard_fd, parent_fd, target_name)
+            _link_name_noreplace(stage_fd, restore_name, parent_fd, target_name)
             _verify_regular_at(parent_fd, target_name, guard_identity, guard_hash)
         os.fsync(stage_fd)
         os.fsync(parent_fd)
@@ -796,9 +841,16 @@ def _atomic_write_at(
         os.fchmod(stage_fd, 0o700)
         if stat.S_IMODE(os.fstat(stage_fd).st_mode) != 0o700:
             raise UnsafeVaultPathError("write staging directory is not private")
+        # Staged under a name from the start, rather than as an ``O_TMPFILE``
+        # anonymous file linked in later. The anonymous form bought invisibility
+        # that this writer never had anyway -- the ``.dbrain-write-*`` staging
+        # directory below is a real directory entry -- and it could only be
+        # published through the privileged ``AT_EMPTY_PATH`` link. The staging
+        # directory is private (0700) and checked for that on every commit.
+        candidate_name = f"candidate-{os.urandom(8).hex()}"
         candidate_fd = os.open(
-            ".",
-            os.O_RDWR | os.O_TMPFILE | os.O_CLOEXEC,
+            candidate_name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
             mode,
             dir_fd=stage_fd,
         )
@@ -821,10 +873,12 @@ def _atomic_write_at(
         if source_identity is not None:
             assert source_fd is not None
             assert source_hash is not None
-            candidate_name = f"candidate-{os.urandom(8).hex()}"
             recovery_name = f"recovery-{os.urandom(8).hex()}"
-            _link_descriptor_noreplace(candidate_fd, stage_fd, candidate_name)
-            _link_descriptor_noreplace(source_fd, stage_fd, recovery_name)
+            _link_name_noreplace(parent_fd, target_name, stage_fd, recovery_name)
+            # The guard was linked by name, so prove the name still pointed at
+            # the descriptor this call already read and hashed.
+            if _name_inode(stage_fd, recovery_name) != source_identity[:2]:
+                raise UnsafeVaultPathError("write guard link does not match the target")
             os.fsync(stage_fd)
             _verify_candidate_descriptor(
                 candidate_fd, candidate_identity, candidate_hash
@@ -879,7 +933,7 @@ def _atomic_write_at(
                 candidate_fd, candidate_identity, candidate_hash
             )
             try:
-                _link_descriptor_noreplace(candidate_fd, parent_fd, target_name)
+                _rename_noreplace(stage_fd, candidate_name, parent_fd, target_name)
             except FileExistsError as exc:
                 raise UnsafeVaultPathError(
                     "target appeared before no-replace publication"
@@ -939,9 +993,9 @@ def _atomic_write_at(
 def atomic_write_bytes(path: Path, content: bytes) -> None:
     """Publish one regular file through descriptor-based fail-closed writes.
 
-    New targets use atomic no-replace publication. Existing targets use
-    ``RENAME_EXCHANGE`` with a descriptor-backed recovery link, and retain that
-    guard until candidate verification plus directory fsyncs complete.
+    New targets use ``RENAME_NOREPLACE`` publication. Existing targets use
+    ``RENAME_EXCHANGE`` with a staged recovery link, and retain that guard
+    until candidate verification plus directory fsyncs complete.
 
     This protects cooperative writers and accidental namespace races. It is not
     a security boundary against arbitrary same-UID/root processes, which can
@@ -1470,13 +1524,26 @@ def move_validated_vault_markdown(
                                 label="move source",
                             )
                             try:
-                                _link_descriptor_noreplace(
-                                    source_fd, target_parent_fd, target_name
+                                _link_name_noreplace(
+                                    source_parent_fd,
+                                    source_name,
+                                    target_parent_fd,
+                                    target_name,
                                 )
                             except FileExistsError as exc:
                                 raise FrontmatterError(
                                     "Markdown move target appeared before publication"
                                 ) from exc
+                            # Linked by name, so prove the name still pointed at
+                            # the descriptor verified just above before the
+                            # source entry is unlinked below.
+                            if (
+                                _name_inode(target_parent_fd, target_name)
+                                != source_identity[:2]
+                            ):
+                                raise UnsafeVaultPathError(
+                                    "Markdown move source changed before publication"
+                                )
                         finally:
                             os.close(source_fd)
                         os.fsync(target_parent_fd)

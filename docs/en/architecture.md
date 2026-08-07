@@ -77,8 +77,11 @@ add backup, quiescence, proof, and write-ahead checks for high-risk changes.
 - Telegram rejects users other than the configured owner.
 - Control-plane hooks prevent runtime mutation of managed prompt assets.
 - Systemd user units run without root and enable `NoNewPrivileges`.
-- `PrivateTmp` is intentionally omitted because the vault's descriptor-based
-  atomic writer cannot publish its temporary file from that mount namespace.
+- `PrivateTmp` is intentionally omitted, and `tests/test_systemd_templates.py`
+  pins that. The original reason no longer applies: the writer used to publish
+  an `O_TMPFILE` descriptor and could not do so from that mount namespace,
+  while publication is now a `renameat2` between two directories inside the
+  vault and never touches `/tmp`. Enabling it is a separate decision.
 - Backups are encrypted to a public GPG recipient.
 - The vault is not exposed as a generic MCP server.
 
