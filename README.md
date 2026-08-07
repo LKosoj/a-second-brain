@@ -30,8 +30,10 @@ classification, retrieval, linking, and scheduled review.
 Finding the note is only half of it. What you know about a project is usually
 spread across a dozen entries written months apart, some of which contradict
 each other. So the system maintains a synthesized layer above the raw notes: a
-question is answered from one current page, with the sources behind each claim
-still attached.
+status or history question starts from one current page instead of a dozen
+fragments, with the sources behind each claim still attached. The notes stay
+underneath, and a question about an exact date, name, or identifier still goes
+to them first.
 
 The system does not hide your knowledge in a proprietary database. The source
 of truth is a directory of readable Markdown files and attachments that can be
