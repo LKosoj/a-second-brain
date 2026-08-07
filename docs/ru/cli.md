@@ -90,8 +90,14 @@ a-second-brain qmd [АРГУМЕНТЫ_QMD...]
 ```bash
 a-second-brain qmd status
 a-second-brain qmd update
+a-second-brain qmd query "фокус недели"
 a-second-brain qmd recall "фокус недели"
 ```
+
+Если задан `EMB_MODEL`, команда `query` сохраняет стандартное ранжирование
+QMD, но использует удалённые адаптеры векторизации (embedding) и повторной
+сортировки (rerank). Команда `recall` дополнительно учитывает важность,
+свежесть и состояние памяти vault.
 
 Без аргументов команда показывает состояние индекса.
 

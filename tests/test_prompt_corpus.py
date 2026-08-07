@@ -1,5 +1,7 @@
+import types
 from pathlib import Path
 
+import pytest
 from _paths import PROJECT_ROOT, SKILLS_TEMPLATE_ROOT, TEMPLATE_ROOT
 
 
@@ -58,6 +60,8 @@ def test_vault_retrieval_skill_is_the_single_retrieval_and_touch_contract() -> N
 
     assert 'a-second-brain qmd recall "<query>"' in retrieval_skill
     assert 'a-second-brain qmd deep-recall "<query>"' in retrieval_skill
+    assert 'a-second-brain qmd query "<query>"' in retrieval_skill
+    assert "It does not apply `tier`, `relevance`" in retrieval_skill
     assert "a-second-brain qmd get <vault-relative-path>" in retrieval_skill
     assert "qmd-local" not in retrieval_skill
     assert "memory-engine.py touch vault/<file>" in retrieval_skill
@@ -68,6 +72,18 @@ def test_vault_retrieval_skill_is_the_single_retrieval_and_touch_contract() -> N
     assert "## Retrieval Rules" not in question_answer
     assert "Search for related notes in the vault" not in execute
     assert "semantic recall when the relationship" not in links
+
+
+def test_agent_memory_skill_explains_query_and_recall_ranking() -> None:
+    skill = (SKILLS_TEMPLATE_ROOT / "agent-memory/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'a-second-brain qmd query "<query>"' in skill
+    assert 'a-second-brain qmd recall "<query>"' in skill
+    assert "`tier` controls visibility and adds a ranking bonus" in skill
+    assert "Card `status`" in skill
+    assert "is not a memory-ranking signal" in skill
 
 
 def test_repo_agents_do_not_use_direct_todoist_mcp_tool_names() -> None:
@@ -321,6 +337,101 @@ def test_control_plane_registry_is_valid_and_entrypoints_resolve() -> None:
     assert validate_control_plane_registry() == []
 
 
+def test_resolve_entrypoint_surfaces_missing_dependency_when_no_module_ever_imports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If every module-path guess fails to import (getattr is never
+    reached), the real root cause (e.g. a missing third-party dependency
+    deep in the import chain) must survive -- not a generic "X is not a
+    package" error produced by guessing the split point wrong.
+
+    The mocked failures are deliberately ordered weak / real-cause / weak
+    so this fails under both a naive "always keep the first error" (picks
+    the longest prefix's misleading guess) and a naive "always keep the
+    last error" (picks the shortest prefix's misleading guess); it only
+    passes when the implementation tells an informative ImportError (whose
+    failing module differs from the one requested) apart from a
+    self-referential "not a package" guess."""
+    from d_brain.control_plane import registry
+
+    real_import_module = registry.importlib.import_module
+    root_cause = ModuleNotFoundError("No module named 'acp'", name="acp")
+    weak_long = ModuleNotFoundError(
+        "No module named 'fake_dep_pkg.fake_mid.fake_sub'; "
+        "'fake_dep_pkg.fake_mid' is not a package",
+        name="fake_dep_pkg.fake_mid.fake_sub",
+    )
+    weak_short = ModuleNotFoundError(
+        "No module named 'fake_dep_pkg.fake_mid'; 'fake_dep_pkg' is not a package",
+        name="fake_dep_pkg",
+    )
+
+    def fake_import_module(name: str) -> object:
+        if name == "fake_dep_pkg.fake_mid.fake_sub":
+            raise weak_long
+        if name == "fake_dep_pkg.fake_mid":
+            raise root_cause
+        if name == "fake_dep_pkg":
+            raise weak_short
+        return real_import_module(name)
+
+    monkeypatch.setattr(registry.importlib, "import_module", fake_import_module)
+
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        registry.resolve_entrypoint("fake_dep_pkg.fake_mid.fake_sub.fake_attr")
+
+    assert excinfo.value is root_cause
+
+
+def test_resolve_entrypoint_surfaces_attribute_typo_when_module_imports_fine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If a middle-length module prefix imports successfully and only the
+    getattr chain fails, that AttributeError names the real missing
+    attribute (e.g. a typo in a method name) and must survive.
+
+    The mocked failures are deliberately ordered weak / real-cause / weak
+    so this fails under both a naive "always keep the first error" (picks
+    the longest prefix's misleading "not a package" guess) and a naive
+    "always keep the last error" (picks the shortest prefix's unrelated
+    misleading guess)."""
+    from d_brain.control_plane import registry
+
+    real_import_module = registry.importlib.import_module
+
+    class FakeClass:
+        pass
+
+    fake_module = types.ModuleType("fake_typo_pkg.fake_mod")
+    fake_module.FakeClass = FakeClass  # type: ignore[attr-defined]
+
+    weak_long = ModuleNotFoundError(
+        "No module named 'fake_typo_pkg.fake_mod.FakeClass'; "
+        "'fake_typo_pkg.fake_mod' is not a package",
+        name="fake_typo_pkg.fake_mod.FakeClass",
+    )
+    weak_short = ModuleNotFoundError(
+        "No module named 'fake_typo_pkg.fake_mod'; 'fake_typo_pkg' is not a package",
+        name="fake_typo_pkg",
+    )
+
+    def fake_import_module(name: str) -> object:
+        if name == "fake_typo_pkg.fake_mod.FakeClass":
+            raise weak_long
+        if name == "fake_typo_pkg.fake_mod":
+            return fake_module
+        if name == "fake_typo_pkg":
+            raise weak_short
+        return real_import_module(name)
+
+    monkeypatch.setattr(registry.importlib, "import_module", fake_import_module)
+
+    with pytest.raises(AttributeError) as excinfo:
+        registry.resolve_entrypoint("fake_typo_pkg.fake_mod.FakeClass.typo_attr")
+
+    assert "typo_attr" in str(excinfo.value)
+
+
 def test_control_plane_registry_exposes_scheduled_post_maintenance_workflows() -> None:
     from d_brain.control_plane.registry import iter_workflows
 
@@ -329,11 +440,69 @@ def test_control_plane_registry_exposes_scheduled_post_maintenance_workflows() -
     assert [workflow.name for workflow in workflows] == [
         "maintenance.compiled-nightly",
         "maintenance.vault-health",
+        "maintenance.compiled-fact-check",
+        "maintenance.compiled-digest",
     ]
     assert [workflow.display_name for workflow in workflows] == [
         "Compiled Maintenance",
         "Vault Health",
+        "Compiled Fact Check",
+        "Compiled Digest",
     ]
+
+
+def test_scheduled_cycle_declares_every_write_its_children_declare() -> None:
+    """``run_scheduled_cycle`` runs each ``scheduled-post`` maintenance
+    workflow in-process, so anything a child declares it writes, the parent
+    writes too. Walked rather than hardcoded: three separate gaps of exactly
+    this kind (``summaries`` twice, then ``graph``/``moc``/``links``) had
+    already opened up between the entries by the time this was written, and
+    each one made the registry -- the catalog the docs and reviews treat as
+    the source of truth -- understate what a nightly run touches."""
+    from d_brain.control_plane.registry import get_workflow, iter_workflows
+
+    parent = get_workflow("maintenance.scheduled-cycle")
+
+    for child in iter_workflows(kind="maintenance", trigger="scheduled-post"):
+        missing = set(child.allowed_writes) - set(parent.allowed_writes)
+        assert not missing, f"{child.name} writes {sorted(missing)}, parent does not"
+
+
+def test_scheduled_cycle_declares_the_goals_write_it_makes_directly() -> None:
+    """The walk above only compares the parent against its children, so a
+    write the parent makes *itself* is invisible to it. ``goals`` was exactly
+    that: ``_run_scheduled_cycle_locked`` calls ``rollover_weekly_goals``,
+    which rewrites ``goals/3-weekly.md``, and no workflow -- parent or child
+    -- declared it."""
+    import inspect
+
+    from d_brain.control_plane.registry import get_workflow
+    from d_brain.services.processor import CliProcessor
+
+    source = inspect.getsource(CliProcessor._run_scheduled_cycle_locked)
+    assert "rollover_weekly_goals" in source
+    assert "goals" in get_workflow("maintenance.scheduled-cycle").allowed_writes
+
+
+def test_control_plane_doc_lists_every_maintenance_workflow_name() -> None:
+    """Walk the registry instead of hardcoding names: a newly added
+    maintenance workflow (e.g. the compile-enrich fact-check/digest pair)
+    must be caught here if it drifts out of `docs/control-plane.md`."""
+    from d_brain.control_plane.registry import iter_workflows
+
+    control_plane = (PROJECT_ROOT / "docs/control-plane.md").read_text(
+        encoding="utf-8"
+    )
+
+    for workflow in iter_workflows(kind="maintenance"):
+        assert f"`{workflow.name}`" in control_plane
+
+
+def test_why_command_is_documented_in_repo_facing_docs() -> None:
+    for relative_path in ("AGENTS.md", "README.md", "README.ru.md"):
+        text = (PROJECT_ROOT / relative_path).read_text(encoding="utf-8")
+
+        assert "/why" in text
 
 
 def test_control_plane_registry_exposes_integration_workflows() -> None:

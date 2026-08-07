@@ -990,6 +990,45 @@ def test_clear_session_phase_artifacts_removes_stale_audit_raw_outputs(
     assert keep_path.exists()
 
 
+def test_a_crashing_audit_never_takes_the_whole_night_down(tmp_path: Path) -> None:
+    """``audit_cycle_result`` protects only its own model phase -- Todoist
+    project routing runs another CLI afterwards and can raise. The nightly
+    cycle calls the audit outside every try/except it has, so that raise used
+    to escape ``run_scheduled_cycle`` entirely: the owner got no report for
+    daily work that had already succeeded, and none of the maintenance
+    workflows ran. The audit is a helper; its failure is recorded, not fatal.
+    """
+    vault_path = tmp_path / "vault"
+    processor = CliProcessor(vault_path)
+    processor.process_daily = lambda day, mode=SCHEDULED_MODE: {  # type: ignore[method-assign]
+        "report": "📊 **Daily**",
+        "processed_entries": 2,
+        "mode": mode,
+    }
+
+    def crashing_audit(*, cycle_name: str, day: date, result: dict[str, Any]) -> Any:
+        del day, result
+        raise RuntimeError(
+            f"Todoist routing output: no JSON object found ({cycle_name})"
+        )
+
+    processor.audit_cycle_result = crashing_audit  # type: ignore[method-assign]
+    maintenance_ran: list[str] = []
+
+    def fake_maintenance(name: str) -> dict[str, Any]:
+        maintenance_ran.append(name)
+        return {"report": "", "processed_entries": 0, "searchable_write": False}
+
+    processor._run_control_plane_maintenance_workflow = fake_maintenance  # type: ignore[method-assign]
+    processor._refresh_qmd_index = lambda: None  # type: ignore[method-assign]
+
+    result = processor.run_scheduled_cycle(date(2026, 8, 5))
+
+    assert "📊 **Daily**" in result["report"]
+    assert maintenance_ran, "maintenance workflows must still run"
+    assert result["audit_task_candidates"] == []
+
+
 def test_run_scheduled_cycle_triggers_due_periodic_reviews_and_audits(
     tmp_path: Path,
 ) -> None:
@@ -1071,6 +1110,8 @@ def test_run_scheduled_cycle_triggers_due_periodic_reviews_and_audits(
         "yearly",
         "maintenance.compiled-nightly",
         "maintenance.vault-health",
+        "maintenance.compiled-fact-check",
+        "maintenance.compiled-digest",
     ]
     assert result["processed_entries"] == 5
     assert result["audit_task_candidates"] == [
@@ -1079,6 +1120,8 @@ def test_run_scheduled_cycle_triggers_due_periodic_reviews_and_audits(
         "todo:yearly",
         "todo:maintenance.compiled-nightly",
         "todo:maintenance.vault-health",
+        "todo:maintenance.compiled-fact-check",
+        "todo:maintenance.compiled-digest",
     ]
     assert "📊 **Daily**" in result["report"]
     assert "🧭 **Yearly**" in result["report"]
@@ -1365,11 +1408,70 @@ def test_run_scheduled_cycle_runs_compiled_nightly_maintenance(
     assert [cycle["name"] for cycle in result["periodic_cycles"]] == [
         "maintenance.compiled-nightly",
         "maintenance.vault-health",
+        "maintenance.compiled-fact-check",
+        "maintenance.compiled-digest",
     ]
     assert "## 🧩 Compiled Maintenance" in result["report"]
     assert "## 🩺 Vault Health" in result["report"]
     assert result["processed_entries"] == 2
     assert refresh_calls["count"] == 1
+
+
+def test_run_scheduled_cycle_survives_one_maintenance_workflow_raising(
+    tmp_path: Path,
+) -> None:
+    """Задача N дефект 3: an unhandled exception from one maintenance
+    workflow (kind=maintenance, trigger=scheduled-post) must not take down
+    the rest of that loop -- mirrors the neighboring periodic-cycle loop's
+    own try/except (~4535-4559). Before the fix, ``maintenance.vault-health``
+    raising here would propagate straight out of ``run_scheduled_cycle`` and
+    ``maintenance.compiled-fact-check``/``maintenance.compiled-digest``
+    (in particular the digest, whose whole job is to report on what the
+    prior steps did) would never run at all."""
+    vault_path = tmp_path / "vault"
+    processor = CliProcessor(vault_path)
+
+    processor.process_daily = lambda day, mode=SCHEDULED_MODE: {  # type: ignore[method-assign]
+        "report": "📊 **Daily**",
+        "processed_entries": 1,
+    }
+    processor._scheduled_cycle_names_for_day = lambda day: []  # type: ignore[method-assign]
+    processor.audit_cycle_result = lambda cycle_name, day, result: {  # type: ignore[method-assign]
+        "cycle_name": cycle_name,
+        "task_candidates": [],
+        "tasks_created": [],
+    }
+    processor._refresh_qmd_index = lambda: None  # type: ignore[method-assign]
+
+    def _fake_workflow(name: str) -> dict[str, Any]:
+        if name == "maintenance.vault-health":
+            raise RuntimeError("boom")
+        return {"report": "", "processed_entries": 0, "searchable_write": False}
+
+    processor._run_control_plane_maintenance_workflow = _fake_workflow  # type: ignore[method-assign]
+
+    result = processor.run_scheduled_cycle(date(2026, 4, 4))
+
+    names = [cycle["name"] for cycle in result["periodic_cycles"]]
+    assert names == [
+        "maintenance.compiled-nightly",
+        "maintenance.vault-health",
+        "maintenance.compiled-fact-check",
+        "maintenance.compiled-digest",
+    ]
+    results_by_name = {
+        cycle["name"]: cycle["result"] for cycle in result["periodic_cycles"]
+    }
+    assert results_by_name["maintenance.vault-health"]["error"] == "boom"
+    assert "error" not in results_by_name["maintenance.compiled-fact-check"]
+    assert "error" not in results_by_name["maintenance.compiled-digest"]
+    # Surviving the crash is only half of it (code review): the combined
+    # report is what actually reaches the owner at 21:00, and a workflow
+    # that raised has no ``report`` of its own, so it used to contribute an
+    # empty string and the night read as a clean run. The traceback lands
+    # in the service log, which nobody opens.
+    assert "❌ **Здоровье vault**" in result["report"]
+    assert "boom" in result["report"]
 
 
 def test_run_scheduled_cycle_uses_control_plane_labels_for_maintenance(
@@ -1398,6 +1500,8 @@ def test_run_scheduled_cycle_uses_control_plane_labels_for_maintenance(
     assert [cycle["label"] for cycle in result["periodic_cycles"]] == [
         "Поддержка compiled-слоя",
         "Здоровье vault",
+        "Проверка фактов compiled",
+        "Дайджест обогащения compiled",
     ]
 
 
@@ -1475,6 +1579,337 @@ def test_compiled_nightly_report_separates_lint_from_freshness_backlog(
 
     assert "- Проблемы проверки: 2" in result["report"]
     assert "- Карточки к переоценке: 7" in result["report"]
+
+
+def test_compiled_nightly_report_surfaces_budget_exhaustion(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Дефект 1 (задача N, ТЗ 5.5 инв 7): the combined nightly report must
+    surface a budget-exhausted pass too, not just the dedicated compile
+    digest -- ``run_nightly_maintenance``'s own return value has no
+    ``budget_exhausted`` key, only the pass journal
+    (``.session/compile-enrich.json``) does, and this report must read it
+    back rather than staying silent. The technical name must be translated,
+    not shown raw."""
+    vault_path = tmp_path / "vault"
+    _write_vault_manifest(vault_path)
+    session_dir = vault_path / ".session"
+    session_dir.mkdir(parents=True)
+    (session_dir / "compile-enrich.json").write_text(
+        '{"status": "ok", "error": "", "budget_exhausted": ["pages-per-pass"]}',
+        encoding="utf-8",
+    )
+    processor = CliProcessor(vault_path)
+
+    def fake_run_nightly(self):  # noqa: ANN001, ANN202
+        del self
+        return {
+            "queued_drained": 0,
+            "consolidations": [],
+            "backfilled": [],
+            "lint_issues": [],
+            "freshness_issues": [],
+            "queue_errors": [],
+        }
+
+    monkeypatch.setattr(
+        "d_brain.services.processor.CompiledBriefingService.run_nightly_maintenance",
+        fake_run_nightly,
+    )
+
+    result = processor._run_compiled_nightly_maintenance()
+
+    assert "Бюджет прохода исчерпан" in result["report"]
+    assert "pages-per-pass" not in result["report"]
+
+
+def test_run_compiled_fact_check_cycle_reports_in_russian_by_default(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    processor = CliProcessor(vault_path)
+    monkeypatch.setattr(
+        "d_brain.services.processor.run_monthly_fact_check",
+        lambda vault_path, **kwargs: {
+            "status": "ok",
+            "pages_checked": 3,
+            "pages_patched": 2,
+            "pages_flagged": 1,
+            "claims_checked": 5,
+            "claims_failed": 1,
+            "claims_unverifiable": 0,
+            "errors": [],
+        },
+    )
+
+    result = processor._run_compiled_fact_check_cycle()
+
+    assert "## 🔎 Проверка фактов compiled" in result["report"]
+    assert "- Страниц проверено: 3" in result["report"]
+    assert "- Дата подтверждена: 2" in result["report"]
+    assert "- Отправлено на решение владельца: 1" in result["report"]
+    assert "- Утверждений проверено: 5, не подтвердилось: 1, непроверяемых: 0" in (
+        result["report"]
+    )
+
+
+def test_run_compiled_fact_check_cycle_reports_in_english_for_english_setting(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Sibling cycles (compiled nightly maintenance, vault health) branch on
+    ``content_language``; this cycle must too instead of always reporting in
+    Russian (code-review defect 3)."""
+    vault_path = tmp_path / "vault"
+    processor = CliProcessor(vault_path, content_language="en")
+    monkeypatch.setattr(
+        "d_brain.services.processor.run_monthly_fact_check",
+        lambda vault_path, **kwargs: {
+            "status": "ok",
+            "pages_checked": 3,
+            "pages_patched": 2,
+            "pages_flagged": 1,
+            "claims_checked": 5,
+            "claims_failed": 1,
+            "claims_unverifiable": 0,
+            "errors": ["compiled/topics/aurora.md: boom"],
+        },
+    )
+
+    result = processor._run_compiled_fact_check_cycle()
+
+    assert "## 🔎 Compiled Fact-Check" in result["report"]
+    assert "- Pages checked: 3" in result["report"]
+    assert "- Date confirmed: 2" in result["report"]
+    assert "- Sent to owner for a decision: 1" in result["report"]
+    assert "- Claims checked: 5, failed: 1, unverifiable: 0" in result["report"]
+    assert "- Write errors: 1" in result["report"]
+    assert "Проверка фактов" not in result["report"]
+
+
+@pytest.mark.parametrize(
+    ("language", "expected", "unexpected"),
+    [
+        ("ru", "- Вытеснено из очереди решений: 2", "очереди решений: 0"),
+        ("en", "- Evicted from the decisions queue: 2", "queue: 0"),
+    ],
+)
+def test_run_compiled_fact_check_cycle_reports_queue_evictions(
+    tmp_path: Path,
+    monkeypatch,
+    language: str,
+    expected: str,
+    unexpected: str,
+) -> None:
+    """A bulk fact-check run can push the decisions queue past its cap, and
+    whatever gets evicted is work the owner asked for and will never see
+    again. ``run_monthly_fact_check`` counts it, but this cycle used to drop
+    the number on the floor, so the nightly report stayed silent about it."""
+    vault_path = tmp_path / "vault"
+    processor = CliProcessor(vault_path, content_language=language)
+    payload = {
+        "status": "ok",
+        "pages_checked": 32,
+        "pages_patched": 0,
+        "pages_flagged": 32,
+        "claims_checked": 32,
+        "claims_failed": 32,
+        "claims_unverifiable": 0,
+        "errors": [],
+        "queue_evictions": 2,
+    }
+    monkeypatch.setattr(
+        "d_brain.services.processor.run_monthly_fact_check",
+        lambda vault_path, **kwargs: dict(payload),
+    )
+
+    result = processor._run_compiled_fact_check_cycle()
+
+    assert expected in result["report"]
+
+    payload["queue_evictions"] = 0
+    quiet = processor._run_compiled_fact_check_cycle()
+
+    assert unexpected not in quiet["report"]
+
+
+def _write_digest_journal(vault_path: Path, status: str) -> None:
+    journal = vault_path / ".session" / "compile-enrich.json"
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    journal.write_text('{"status": "' + status + '"}', encoding="utf-8")
+
+
+def _write_digest_topic_page(vault_path: Path, day: date) -> None:
+    page_path = vault_path / "compiled" / "topics" / "aurora.md"
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    page_path.write_text(
+        "---\n"
+        "type: compiled-briefing\n"
+        "domain: topics\n"
+        'description: "Проект Аврора"\n'
+        "status: active\n"
+        f"created: {day.isoformat()}\n"
+        f"updated: {day.isoformat()}\n"
+        "freshness_state: fresh\n"
+        "confidence: high\n"
+        f"last_accessed: {day.isoformat()}\n"
+        "relevance: 0.80\n"
+        "tier: active\n"
+        "---\n\n"
+        "# Проект Аврора\n\n"
+        "## Sources That Shaped This Page\n\n"
+        "| Date | Source | What Added |\n"
+        "| --- | --- | --- |\n"
+        f"| {day.isoformat()} | [[daily/{day.isoformat()}.md]] | обновление |\n",
+        encoding="utf-8",
+    )
+
+
+def test_run_compiled_digest_cycle_skips_without_manifest(tmp_path: Path) -> None:
+    """A vault with no project manifest yet (a fresh vault before its first
+    compiled-nightly pass, or -- as here -- a vault whose parent directory
+    the autouse ``_cycle_manifest`` fixture never wrote a manifest for) must
+    be treated exactly like a quiet night: skipped, no exception, and no
+    write attempt. Verified by running, per the task's explicit requirement
+    for this guarantee, not by reasoning about it."""
+    vault_path = tmp_path / "no-manifest" / "vault"
+    processor = CliProcessor(vault_path)
+
+    result = processor._run_compiled_digest_cycle()
+
+    assert result == {
+        "report": "",
+        "processed_entries": 0,
+        "skipped": True,
+        "searchable_write": False,
+    }
+    assert not vault_path.exists()
+
+
+def test_run_compiled_digest_cycle_skips_quiet_day(tmp_path: Path) -> None:
+    """With a manifest present (autouse fixture) but a real "no-work"
+    journal and nothing else in ``compiled/``, ``build_daily_digest`` itself
+    returns ``None`` -- a second, distinct skip path from the no-manifest
+    case above, reached only after the manifest check passes."""
+    vault_path = tmp_path / "vault"
+    (vault_path / "compiled").mkdir(parents=True)
+    _write_digest_journal(vault_path, "no-work")
+    processor = CliProcessor(vault_path)
+
+    result = processor._run_compiled_digest_cycle()
+
+    assert result == {
+        "report": "",
+        "processed_entries": 0,
+        "skipped": True,
+        "searchable_write": False,
+    }
+    assert not (vault_path / "summaries").exists()
+
+
+def test_run_compiled_digest_cycle_writes_and_sends_on_changed_day(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """On a day with a real compiled-page change, the cycle writes the
+    digest file (path surfaced via ``summary_path`` for the existing
+    periodic-cycle line renderer) and also sends the digest text directly
+    over Telegram, as a separate message from the combined scheduled
+    report -- see this method's docstring for why that's deliberate.
+    ``write_validated_vault_markdown`` is monkeypatched because the real one
+    cannot run in this sandbox (see ``test_compiled_enrich_report.py``'s
+    module docstring for the confirmed environment limitation)."""
+    vault_path = tmp_path / "vault"
+    today = date.today()
+    _write_digest_topic_page(vault_path, today)
+    processor = CliProcessor(vault_path)
+
+    write_calls: list[Path] = []
+    send_calls: list[str] = []
+    monkeypatch.setattr(
+        "d_brain.services.processor.write_validated_vault_markdown",
+        lambda vault_path, path, content, **kwargs: write_calls.append(path),
+    )
+    monkeypatch.setattr(
+        "d_brain.services.processor.send_telegram_text_sync",
+        lambda text, **kwargs: send_calls.append(text),
+    )
+
+    result = processor._run_compiled_digest_cycle()
+
+    assert result["processed_entries"] == 1
+    assert result["searchable_write"] is True
+    assert result["summary_path"] == f"summaries/compile/{today.isoformat()}.md"
+    assert write_calls == [
+        vault_path / "summaries" / "compile" / f"{today.isoformat()}.md"
+    ]
+    assert len(send_calls) == 1
+    assert "compiled/topics/aurora.md" in send_calls[0]
+
+
+def test_run_compiled_digest_cycle_regenerates_queue_document_same_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Задача N: the nightly safety net regenerates the human-readable
+    decisions-queue mirror file even on a day when no response handler ran,
+    inside the same lock as the digest write -- not a second, independent
+    lock acquisition (``vault_write_lock`` is not reentrant)."""
+    vault_path = tmp_path / "vault"
+    today = date.today()
+    _write_digest_topic_page(vault_path, today)
+    processor = CliProcessor(vault_path)
+
+    write_calls: list[tuple[Path, object]] = []
+    monkeypatch.setattr(
+        "d_brain.services.processor.write_validated_vault_markdown",
+        lambda vault_path, path, content, **kwargs: write_calls.append(
+            (path, kwargs.get("existing_lock"))
+        ),
+    )
+    monkeypatch.setattr(
+        "d_brain.services.processor.send_telegram_text_sync",
+        lambda text, **kwargs: None,
+    )
+    queue_doc_calls: list[tuple[Path, object]] = []
+    monkeypatch.setattr(
+        "d_brain.services.processor.write_queue_document",
+        lambda vault_path, *, manifest, existing_lock: queue_doc_calls.append(
+            (vault_path, existing_lock)
+        ),
+    )
+
+    result = processor._run_compiled_digest_cycle()
+
+    assert result["searchable_write"] is True
+    assert len(queue_doc_calls) == 1
+    assert queue_doc_calls[0][0] == vault_path
+    assert len(write_calls) == 1
+    assert queue_doc_calls[0][1] is write_calls[0][1]
+
+
+def test_run_compiled_digest_cycle_skips_queue_document_regen_on_quiet_day(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """On a quiet day (``build_daily_digest`` returns ``None``), the cycle
+    returns before the digest write's lock is even opened -- the nightly
+    queue-document regen must not run either, since it only ever happens
+    inside that lock."""
+    vault_path = tmp_path / "vault"
+    (vault_path / "compiled").mkdir(parents=True)
+    _write_digest_journal(vault_path, "no-work")
+    processor = CliProcessor(vault_path)
+
+    queue_doc_calls: list[tuple] = []
+    monkeypatch.setattr(
+        "d_brain.services.processor.write_queue_document",
+        lambda *a, **k: queue_doc_calls.append((a, k)),
+    )
+
+    result = processor._run_compiled_digest_cycle()
+
+    assert result["skipped"] is True
+    assert queue_doc_calls == []
 
 
 def test_run_scheduled_cycle_refreshes_qmd_even_when_no_periodic_write(

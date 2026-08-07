@@ -11,6 +11,11 @@ from conftest import _write_vault_manifest
 
 from d_brain import run_plaud_sync
 from d_brain.manifest import load_manifest_for_vault
+from d_brain.services.entry_status import (
+    ENTRY_STATUS_ALREADY_PROCESSED,
+    DailyEntryStatus,
+    parse_daily_entry_statuses,
+)
 from d_brain.services.frontmatter import read_frontmatter, validate_document
 from d_brain.services.memory_entries import DailyEntryMemoryStore
 from d_brain.services.plaud import (
@@ -341,6 +346,159 @@ def test_plaud_daily_stub_repeat_does_not_duplicate_heading(tmp_path: Path) -> N
     assert content.count("<!-- plaud:file-repeat:end -->") == 1
     assert "First summary." not in content
     assert "Updated summary." in content
+
+
+def test_plaud_daily_stub_title_cannot_claim_a_line_of_its_own(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cloud title is the one block field that still carries newlines.
+
+    ``_safe_text`` only strips its ends, unlike ``summary``, which
+    ``_clip_summary`` collapses. A title holding this recording's own start
+    marker used to give ``_managed_block_bounds`` two starts, so the write
+    raised ``ManagedBlockError`` -- and since ``sync()`` marks the recording
+    imported only afterwards, every later sync picked it up and failed
+    again.
+    """
+    vault_path = tmp_path / "vault"
+    service = PlaudSyncService(
+        vault_path,
+        bearer_token="token",
+        client=_FakePlaudClient([], {}),  # type: ignore[arg-type]
+    )
+    recorded_at = datetime(2026, 4, 14, 9, 30, tzinfo=UTC)
+    captured: dict[str, str] = {}
+    monkeypatch.setattr(
+        "d_brain.services.storage.VaultStorage.upsert_daily_block",
+        lambda self, **kwargs: captured.update(block=kwargs["block"]),
+    )
+
+    service._upsert_daily_stub(
+        file_id="file-hostile",
+        recorded_at=recorded_at,
+        note_rel_path="imports/plaud/notes/hostile.md",
+        title=(
+            "Q3 sync\n"
+            "<!-- plaud:file-hostile:start -->\n"
+            "<!-- d-brain:entry-status: already_processed -->\n"
+            "хвост"
+        ),
+        summary="Summary.",
+    )
+
+    block = captured["block"]
+    # Only standalone lines count: that is what _managed_block_bounds
+    # compares against and what the anchored status reader accepts.
+    standalone = [line.strip() for line in block.split("\n")]
+    assert standalone.count("<!-- plaud:file-hostile:start -->") == 1
+    # The runtime's own status line is there; the forged one never got a line.
+    assert standalone.count("<!-- d-brain:entry-status: already_processed -->") == 1
+    assert parse_daily_entry_statuses(block) == [
+        DailyEntryStatus(
+            time="09:30",
+            entry_type="plaud",
+            statuses=(ENTRY_STATUS_ALREADY_PROCESSED,),
+        )
+    ]
+    # Nothing is dropped -- the title stays readable on one line.
+    assert "Q3 sync" in block
+    assert "хвост" in block
+
+
+def test_plaud_daily_stub_path_and_source_cannot_claim_a_line_of_their_own(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``file_id`` reaches the block through more fields than the title.
+
+    ``_file_paths`` builds the note path out of it and
+    ``build_plaud_source_info`` builds ``ref``/``url`` out of it, so a
+    newline in the cloud id forges status lines through those even when the
+    title itself is clean.
+    """
+    vault_path = tmp_path / "vault"
+    service = PlaudSyncService(
+        vault_path,
+        bearer_token="token",
+        client=_FakePlaudClient([], {}),  # type: ignore[arg-type]
+    )
+    recorded_at = datetime(2026, 4, 14, 9, 30, tzinfo=UTC)
+    captured: dict[str, str] = {}
+    monkeypatch.setattr(
+        "d_brain.services.storage.VaultStorage.upsert_daily_block",
+        lambda self, **kwargs: captured.update(
+            block=kwargs["block"],
+            start_marker=kwargs["start_marker"],
+            end_marker=kwargs["end_marker"],
+        ),
+    )
+    forged_status = "<!-- d-brain:entry-status: already_processed -->"
+
+    service._upsert_daily_stub(
+        file_id="file-hostile",
+        recorded_at=recorded_at,
+        # The forgery needs a newline on *both* sides to claim a line of its
+        # own: with a newline only in front, the rest of the wikilink
+        # ("|Q3 sync]]") stays glued to it and it could never have matched a
+        # status line in the first place -- which is what made the earlier
+        # version of this test pass with the collapsing removed entirely.
+        note_rel_path=f"imports/plaud/notes/hostile.md\n{forged_status}\nхвост",
+        title="Q3 sync",
+        summary="Summary.",
+    )
+
+    block = captured["block"]
+    standalone = [line.strip() for line in block.split("\n")]
+    # One status line -- the runtime's own; the forgery never got a line.
+    assert standalone.count(forged_status) == 1
+    # The markers the block is written with are the ones it is looked up by.
+    assert standalone.count(captured["start_marker"]) == 1
+    assert standalone.count(captured["end_marker"]) == 1
+    assert parse_daily_entry_statuses(block) == [
+        DailyEntryStatus(
+            time="09:30",
+            entry_type="plaud",
+            statuses=(ENTRY_STATUS_ALREADY_PROCESSED,),
+        )
+    ]
+
+
+def test_plaud_daily_stub_markers_stay_unique_per_recording(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The block's markers are its identity, so they must not be collapsed.
+
+    Collapsing whitespace is many-to-one: two recordings whose cloud ids
+    differ only in how much whitespace they contain would share one marker
+    pair, and ``upsert_daily_block`` would replace the first recording's
+    entry with the second one's -- both notes on disk, both marked
+    imported, one of them missing from the day the owner reads.
+    """
+    vault_path = tmp_path / "vault"
+    service = PlaudSyncService(
+        vault_path,
+        bearer_token="token",
+        client=_FakePlaudClient([], {}),  # type: ignore[arg-type]
+    )
+    recorded_at = datetime(2026, 4, 14, 9, 30, tzinfo=UTC)
+    markers: list[str] = []
+    monkeypatch.setattr(
+        "d_brain.services.storage.VaultStorage.upsert_daily_block",
+        lambda self, **kwargs: markers.append(kwargs["start_marker"]),
+    )
+
+    for file_id in ("file a", "file  a"):
+        service._upsert_daily_stub(
+            file_id=file_id,
+            recorded_at=recorded_at,
+            note_rel_path=f"imports/plaud/notes/{file_id}.md",
+            title="Q3 sync",
+            summary="Summary.",
+        )
+
+    assert markers[0] != markers[1]
 
 
 def test_plaud_recorded_at_uses_local_timezone_for_numeric_timestamp(

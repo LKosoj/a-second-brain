@@ -39,6 +39,21 @@ These files define actual behavior and should be edited first when product behav
 - `src/d_brain/services/reflection_digest.py`
 - `src/d_brain/services/recall_planner.py`
 
+### Deterministic Owner-Facing Renderers (Not Prompt Builders)
+
+- `src/d_brain/services/compiled_enrich_report.py`
+- `src/d_brain/services/compiled_briefs.py`
+- `src/d_brain/services/compiled_why.py`
+- `src/d_brain/services/compiled_question_provenance.py`
+- `src/d_brain/services/decisions_queue.py`
+- `src/d_brain/services/compiled_fact_check.py`
+
+These read the `compiled/` layer that `compiled_briefings.py` maintains and
+render Markdown for the owner (`/why`, on-demand briefs, the daily digest,
+the decisions queue). None of them ever call a model, so they stay out of
+the "Inline Prompt Builders" list above even though they live in the same
+directory. See `skills/compile-enrich/SKILL.md`.
+
 ### Runtime-Provided Context
 
 - `src/d_brain/services/context_pack.py` builds UTF-8 byte-budget-aware eager context for the
@@ -126,6 +141,7 @@ These files may explain the system, but should not redefine runtime behavior ind
 - `skills/todoist-ai/SKILL.md`
 - `skills/agent-memory/SKILL.md`
 - `skills/vault-health/SKILL.md`
+- `skills/compile-enrich/SKILL.md`
 
 ## Bundled Utility Skills Outside Product Runtime
 
@@ -155,7 +171,8 @@ Do not recreate them as alternate specs. If new behavior is needed, add it to th
 1. Edit the canonical runtime prompt builder and/or canonical phase/reference file.
 2. Update or add tests.
 3. Then update navigation docs:
-   - `skills/dbrain-processor/SKILL.md`
+   - `skills/dbrain-processor/SKILL.md` (or `skills/compile-enrich/SKILL.md`
+     for the compile-enrich pass and its satellites)
    - `vault/.claude/CLAUDE.md`
    - relevant rules/agents
 

@@ -98,17 +98,28 @@ async def _run_process_command(
         if report.get("empty_daily")
         else format_process_report(report)
     )
+    # Both sends below are nested so their *fallbacks* are covered too (code
+    # review). The run is over by the time either one is reached -- for
+    # /process_full the vault and Todoist writes have already committed --
+    # and nothing outside this function catches anything, so a fallback that
+    # raised escaped into the dispatcher: the owner was left staring at the
+    # "⏳" status forever, with a finished report that never arrived and not
+    # even a log line saying delivery was what failed.
     if "error" in report:
         try:
-            await edit_text(status_msg, formatted, parse_mode=None)
+            try:
+                await edit_text(status_msg, formatted, parse_mode=None)
+            except Exception:
+                await answer_text(message, formatted, parse_mode=None)
         except Exception:
-            await answer_text(message, formatted, parse_mode=None)
+            logger.exception("Failed to deliver process error report")
         return
 
     try:
-        await edit_rich_text(status_msg, formatted)
-    except TelegramBadRequest:
-        await answer_rich_text(message, formatted)
+        try:
+            await edit_rich_text(status_msg, formatted)
+        except TelegramBadRequest:
+            await answer_rich_text(message, formatted)
     except Exception:
         logger.exception("Failed to deliver rich process report")
 

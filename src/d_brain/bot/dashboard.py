@@ -1,5 +1,6 @@
 """Inline dashboard rendering and state for the Telegram bot."""
 
+import hashlib
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -9,6 +10,16 @@ from aiogram import Bot
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 
 from d_brain.bot.replies import send_text
+from d_brain.services.compiled_briefs import BRIEF_TYPES
+from d_brain.services.compiled_enrich_report import WeeklyReview, collect_weekly_review
+from d_brain.services.decisions_queue import (
+    QueueItem,
+    action_button_specs,
+    format_queue_item_line,
+    list_queue_items,
+    queue_item_fingerprint,
+    queue_kind_label,
+)
 from d_brain.services.file_browser import (
     TELEGRAM_MAX_DOCUMENT_BYTES,
     BrowserEntry,
@@ -21,7 +32,16 @@ from d_brain.services.telegram_markup import (
     normalize_markdown_input,
 )
 
-DashboardScreen = Literal["home", "stats", "file_roots", "files"]
+DashboardScreen = Literal[
+    "home",
+    "stats",
+    "file_roots",
+    "files",
+    "queue",
+    "queue_item",
+    "brief_type",
+    "weekly",
+]
 CAPTURE_TYPES: tuple[str, ...] = ("voice", "text", "photo", "document", "forward")
 TYPE_META: tuple[tuple[str, str, str], ...] = (
     ("voice", "🎤", "Голосовые"),
@@ -31,6 +51,14 @@ TYPE_META: tuple[tuple[str, str, str], ...] = (
     ("forward", "↩️", "Пересланные"),
 )
 FILES_PAGE_SIZE = 8
+QUEUE_PAGE_SIZE = 8
+WEEKLY_QUEUE_PREVIEW_SIZE = 5
+
+_BRIEF_TYPE_BUTTON_LABELS = {
+    "decision": "Решение",
+    "topic": "Тема",
+    "project": "Проект",
+}
 
 
 class _UsageStats(TypedDict):
@@ -51,6 +79,9 @@ class DashboardSession:
     file_current_dir: str = ""
     file_page: int = 0
     file_entries: list[BrowserEntry] = field(default_factory=list)
+    queue_page: int = 0
+    queue_items: list[QueueItem] = field(default_factory=list)
+    weekly_review: WeeklyReview | None = None
 
 
 _SESSIONS: dict[int, DashboardSession] = {}
@@ -80,6 +111,7 @@ def build_help_text() -> str:
         "/start — показать эту справку\n"
         "/menu — открыть или пересоздать рабочее меню\n"
         "/do — выполнить произвольный запрос\n"
+        "/why — почему компилированная страница так говорит\n"
         "/help — эта справка\n"
         "/stats — статистика по записям\n"
         "/files — файловый браузер vault\n"
@@ -155,6 +187,14 @@ def build_home_keyboard() -> InlineKeyboardMarkup:
             [
                 ("✨ Запрос", "menu:do"),
                 ("❌ Закрыть меню", "menu:close"),
+            ],
+            [
+                ("📰 Дайджест", "menu:digest"),
+                ("🗂 Очередь", "menu:queue"),
+            ],
+            [
+                ("📝 Бриф", "menu:brief"),
+                ("📅 Сводка недели", "menu:weekly"),
             ],
         ]
     )
@@ -272,6 +312,138 @@ def build_file_directory_keyboard(
             ],
         ]
     )
+    return _keyboard(rows)
+
+
+def build_queue_text(
+    *,
+    items: list[QueueItem],
+    page: int,
+    total_pages: int,
+    total_items: int,
+) -> str:
+    """Build one page of the decisions queue list (задача L, ТЗ 7.2)."""
+    lines = ["**Очередь решений**", ""]
+    if total_items == 0:
+        lines.append("Очередь пуста — открытых пунктов нет.")
+        return "\n".join(lines)
+    if total_pages > 1:
+        lines.append(
+            f"_Страница {page + 1} из {total_pages}, всего пунктов: {total_items}_"
+        )
+        lines.append("")
+    lines.extend(format_queue_item_line(entry) for entry in items)
+    return "\n".join(lines)
+
+
+def build_queue_keyboard(
+    *,
+    items: list[QueueItem],
+    page: int,
+    total_items: int,
+) -> InlineKeyboardMarkup:
+    """Build the paginated queue keyboard -- one button per item, encoding
+    its index within the current page plus ``queue_item_fingerprint`` (the
+    path itself never fits Telegram's 64-byte ``callback_data`` limit; worst
+    case here is prefix (15) + a 2-digit index + ":" + 8 hex chars = 26).
+
+    The fingerprint is on the *open* button for the same reason the action
+    buttons below carry one (code review): an index alone can resolve to a
+    different but still-valid item. That happens whenever an older queue
+    message keeps live buttons -- ``render_dashboard`` falls back to
+    *sending* a new message when its edit fails for anything other than
+    "message is not modified" -- while ``session.queue_items`` has since
+    moved on to another page.
+    """
+    rows: list[list[tuple[str, str]]] = []
+    for index, entry in enumerate(items):
+        label = f"{queue_kind_label(entry.kind)}: {entry.page}"
+        fingerprint = queue_item_fingerprint(entry)
+        rows.append([(label[:60], f"menu:queueitem:{index}:{fingerprint}")])
+
+    total_pages = max(1, (total_items + QUEUE_PAGE_SIZE - 1) // QUEUE_PAGE_SIZE)
+    if total_pages > 1:
+        start = page * QUEUE_PAGE_SIZE + 1
+        end = start + len(items) - 1
+        pagination_row: list[tuple[str, str]] = []
+        if page > 0:
+            pagination_row.append(("⬅️", f"menu:queuepage:{page - 1}"))
+        pagination_row.append((f"{start}-{end}/{total_items}", "menu:noop"))
+        if page + 1 < total_pages:
+            pagination_row.append(("➡️", f"menu:queuepage:{page + 1}"))
+        rows.append(pagination_row)
+
+    # "Обновить" redraws the page the owner is on, so it reuses the
+    # pagination callback rather than the bare ``menu:queue`` the *entry
+    # points* (home, weekly review) use -- that one always opens at page 0,
+    # which silently threw an owner working through page 3 back to the top
+    # (code review).
+    rows.append([("🔄 Обновить", f"menu:queuepage:{page}"), ("🏠 Домой", "menu:home")])
+    return _keyboard(rows)
+
+
+def build_queue_item_text(item: QueueItem) -> str:
+    """Build one queue item's detail view (задача L, ТЗ 7.2)."""
+    lines = [
+        "**Пункт очереди решений**",
+        "",
+        f"**Тип:** {queue_kind_label(item.kind)}",
+        f"**Страница:** {item.page}",
+        f"**Суть:** {item.summary}",
+    ]
+    if item.since:
+        lines.append(f"**С какого момента:** {item.since}")
+    return "\n".join(lines)
+
+
+def build_queue_item_keyboard(
+    *, index: int, item: QueueItem, page: int
+) -> InlineKeyboardMarkup:
+    """Build the action keyboard for one queue item -- labels come straight
+    from ``action_button_specs`` (real claim wording for a conflict, never
+    abstract labels; only reject/defer for an unsupported kind).
+
+    Each button also carries ``queue_item_fingerprint(item)`` (задача L code
+    review, defect 4) alongside the index, so the handler can detect a
+    stale/reused index -- e.g. a duplicated tap arriving after a previous
+    response already shortened ``session.queue_items`` -- before applying an
+    action to the wrong item. Worst case for ``callback_data`` length: prefix
+    (14) + a 2-digit index (2) + ":" + an 8-char fingerprint (8) + ":" + the
+    longest action id across every kind = 39 bytes, well under Telegram's
+    64-byte ``callback_data`` limit. Recomputed (задача N), not assumed,
+    after adding ``duplicate-candidate``'s "link"/"distinct" ids: both are
+    shorter than ``conflict``'s ``"keep_existing"`` (13 chars), which stays
+    the longest action id and the worst case above.
+    """
+    fingerprint = queue_item_fingerprint(item)
+    rows: list[list[tuple[str, str]]] = [
+        [(label, f"menu:queueact:{index}:{fingerprint}:{action_id}")]
+        for action_id, label in action_button_specs(item)
+    ]
+    # Back to the page this item was opened from, not to page 0 -- same
+    # reason as the "Обновить" button above.
+    rows.append(
+        [("⬅️ К очереди", f"menu:queuepage:{page}"), ("🏠 Домой", "menu:home")]
+    )
+    return _keyboard(rows)
+
+
+def build_brief_type_text() -> str:
+    """Build the brief type-picker screen text (задача L, ТЗ 7.6)."""
+    return (
+        "**Собрать бриф**\n\n"
+        "Выбери тип брифа, затем отправь текстом запрос "
+        "(название решения, темы или проекта)."
+    )
+
+
+def build_brief_type_keyboard() -> InlineKeyboardMarkup:
+    """Build the 3 brief-type buttons (decision/topic/project, ТЗ 7.6)."""
+    rows: list[list[tuple[str, str]]] = [
+        [(_BRIEF_TYPE_BUTTON_LABELS[brief_type], f"menu:brieftype:{brief_type}")]
+        for brief_type in BRIEF_TYPES
+    ]
+    rows.append([("🏠 Домой", "menu:home")])
     return _keyboard(rows)
 
 
@@ -439,6 +611,224 @@ async def render_file_directory(
             page=safe_page,
             total_entries=len(entries),
         ),
+        preferred_message_id=preferred_message_id,
+        notice=notice,
+    )
+
+
+async def render_queue(
+    bot: Bot,
+    *,
+    chat_id: int,
+    vault_path: Path | str,
+    page: int = 0,
+    preferred_message_id: int | None = None,
+    notice: str | None = None,
+) -> None:
+    """Render one page of the decisions queue (задача L, ТЗ 7.2).
+
+    Re-reads ``list_queue_items`` fresh on every render (same approach the
+    file browser takes for a directory listing): cheap enough, and it means
+    a response applied to one item is reflected the moment the list is
+    reopened, with no separate cache to invalidate.
+    """
+    all_items = list_queue_items(Path(vault_path))
+    total_items = len(all_items)
+    total_pages = max(1, (total_items + QUEUE_PAGE_SIZE - 1) // QUEUE_PAGE_SIZE)
+    safe_page = min(max(page, 0), total_pages - 1)
+    start = safe_page * QUEUE_PAGE_SIZE
+    end = start + QUEUE_PAGE_SIZE
+    page_items = all_items[start:end]
+
+    session = get_dashboard_session(chat_id)
+    session.current_screen = "queue"
+    session.queue_page = safe_page
+    session.queue_items = page_items
+
+    await render_dashboard(
+        bot,
+        chat_id=chat_id,
+        session=session,
+        text=build_queue_text(
+            items=page_items,
+            page=safe_page,
+            total_pages=total_pages,
+            total_items=total_items,
+        ),
+        keyboard=build_queue_keyboard(
+            items=page_items, page=safe_page, total_items=total_items
+        ),
+        preferred_message_id=preferred_message_id,
+        notice=notice,
+    )
+
+
+async def render_queue_item(
+    bot: Bot,
+    *,
+    chat_id: int,
+    index: int,
+    preferred_message_id: int | None = None,
+    notice: str | None = None,
+) -> QueueItem | None:
+    """Render one queue item's detail + action view.
+
+    ``index`` refers to ``session.queue_items`` (the *current page's* slice,
+    same convention as ``send_browser_file``'s ``entry_index``) -- returns
+    the resolved item for the caller to act on, or ``None`` if the index no
+    longer resolves (the queue changed since the list was last rendered).
+    """
+    session = get_dashboard_session(chat_id)
+    if index < 0 or index >= len(session.queue_items):
+        return None
+    item = session.queue_items[index]
+    session.current_screen = "queue_item"
+    await render_dashboard(
+        bot,
+        chat_id=chat_id,
+        session=session,
+        text=build_queue_item_text(item),
+        keyboard=build_queue_item_keyboard(
+            index=index, item=item, page=session.queue_page
+        ),
+        preferred_message_id=preferred_message_id,
+        notice=notice,
+    )
+    return item
+
+
+# --- Weekly review (задача N, missed acceptance criterion) ----------------
+#
+# On-demand "Сводка недели" screen: the half-hour ritual (ТЗ) -- work
+# through the queue, see the week's changes, confirm one page as reviewed,
+# see one forgotten page. Kept within budget by design: compact, no
+# pagination, one action button, a link to the full "Очередь" screen for
+# the rest.
+
+
+def page_fingerprint(rel_path: str) -> str:
+    """8-hex-char identity fingerprint of one page path (задача N) -- same
+    principle as ``queue_item_fingerprint`` above, applied to a page that is
+    not selected from an indexed list (the weekly screen's single "confirm
+    reviewed" pick, ``WeeklyReview.review_pick``). The handler must refuse
+    to act if the page currently held in session state does not match what
+    was fingerprinted when the button was rendered (e.g. the screen was
+    refreshed and the picked page changed between render and tap)."""
+    return hashlib.sha256(rel_path.encode()).hexdigest()[:8]
+
+
+def build_weekly_review_text(review: WeeklyReview) -> str:
+    """Build the "Сводка недели" screen text (задача N).
+
+    The queue section reuses ``format_queue_item_line`` (the same line the
+    "Очередь" screen and the human-readable queue file render) and is
+    capped at ``WEEKLY_QUEUE_PREVIEW_SIZE`` with a pointer to the full queue
+    screen -- no separate pagination here.
+    """
+    lines = [
+        "**Сводка недели**",
+        "",
+        f"**Период:** {review.start.isoformat()} — {review.end.isoformat()}",
+        "",
+        f"**Изменения за неделю ({len(review.changes)}):**",
+    ]
+    if not review.changes:
+        lines.append("Изменений за неделю не было.")
+    else:
+        lines.extend(
+            f"- [[{change.rel_path}]] — {change.what_added}"
+            for change in review.changes
+        )
+
+    lines.append("")
+    lines.append(f"**Очередь решений ({len(review.queue_items)}):**")
+    if not review.queue_items:
+        lines.append("Очередь пуста.")
+    else:
+        preview = review.queue_items[:WEEKLY_QUEUE_PREVIEW_SIZE]
+        lines.extend(format_queue_item_line(item) for item in preview)
+        remaining = len(review.queue_items) - len(preview)
+        if remaining > 0:
+            lines.append(f"…и ещё {remaining} — см. «Очередь» в меню.")
+
+    lines.append("")
+    if review.revisit:
+        rel_path, title = review.revisit[0]
+        lines.append(f"**Забытая страница:** [[{rel_path}]] ({title})")
+    else:
+        lines.append("**Забытая страница:** предложений на этой неделе нет.")
+
+    lines.append("")
+    if review.review_pick:
+        rel_path, title = review.review_pick
+        lines.append(f"**Подтвердить как просмотренную:** [[{rel_path}]] ({title})")
+    else:
+        lines.append(
+            "**Подтвердить как просмотренную:** кандидатов на этой неделе нет."
+        )
+    return "\n".join(lines)
+
+
+def build_weekly_review_keyboard(review: WeeklyReview) -> InlineKeyboardMarkup:
+    """Build the weekly-review keyboard -- one action button (confirm
+    reviewed, only when there is a pick), a link to the full queue screen,
+    refresh/home (задача N)."""
+    rows: list[list[tuple[str, str]]] = []
+    if review.review_pick is not None:
+        rel_path, _title = review.review_pick
+        fingerprint = page_fingerprint(rel_path)
+        rows.append(
+            [("✅ Подтвердить просмотр", f"menu:weeklyreview:{fingerprint}")]
+        )
+    rows.append([("🗂 Очередь целиком", "menu:queue")])
+    rows.append([("🔄 Обновить", "menu:weekly"), ("🏠 Домой", "menu:home")])
+    return _keyboard(rows)
+
+
+async def render_weekly_review(
+    bot: Bot,
+    *,
+    chat_id: int,
+    vault_path: Path | str,
+    preferred_message_id: int | None = None,
+    notice: str | None = None,
+) -> None:
+    """Render the "Сводка недели" screen (задача N, missed acceptance
+    criterion). Collected fresh from ``collect_weekly_review`` on every
+    render, same convention as ``render_queue``."""
+    review = collect_weekly_review(Path(vault_path), date.today())
+
+    session = get_dashboard_session(chat_id)
+    session.current_screen = "weekly"
+    session.weekly_review = review
+
+    await render_dashboard(
+        bot,
+        chat_id=chat_id,
+        session=session,
+        text=build_weekly_review_text(review),
+        keyboard=build_weekly_review_keyboard(review),
+        preferred_message_id=preferred_message_id,
+        notice=notice,
+    )
+
+
+async def render_brief_type(
+    bot: Bot,
+    *,
+    chat_id: int,
+    preferred_message_id: int | None = None,
+    notice: str | None = None,
+) -> None:
+    """Render the brief type-picker screen (задача L, ТЗ 7.6)."""
+    session = get_dashboard_session(chat_id)
+    session.current_screen = "brief_type"
+    await render_dashboard(
+        bot,
+        chat_id=chat_id,
+        session=session,
+        text=build_brief_type_text(),
+        keyboard=build_brief_type_keyboard(),
         preferred_message_id=preferred_message_id,
         notice=notice,
     )

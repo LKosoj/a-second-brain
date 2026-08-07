@@ -7,11 +7,11 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=@PROJECT_DIR@
 EnvironmentFile=@PROJECT_DIR@/.env
+Environment=UV_BIN=@UV_BIN@
 ExecStart=@UV_BIN@ run --frozen --no-dev a-second-brain run
 Restart=on-failure
 RestartSec=10
 NoNewPrivileges=true
-PrivateTmp=true
 
 [Install]
 WantedBy=default.target

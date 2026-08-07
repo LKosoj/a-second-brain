@@ -241,12 +241,14 @@ Use `vault/.claude/docs/prompt-source-map.md` for the full source-of-truth map.
 | `vault-health` | Health scoring, MOC generation, link repair |
 | `agent-memory` | Card template, decay engine, tiered search |
 | `todoist-ai` | Todoist task management via MCP |
+| `compile-enrich` | Compiled-page enrichment: domains, trust, conflicts, aging |
 
 - **Processing:** `skills/dbrain-processor/SKILL.md`
 - **Graph Builder:** `skills/graph-builder/SKILL.md`
 - **Vault Health:** `skills/vault-health/SKILL.md`
 - **Agent Memory:** `skills/agent-memory/SKILL.md`
 - **Todoist:** `skills/todoist-ai/SKILL.md`
+- **Compile Enrich:** `skills/compile-enrich/SKILL.md`
 - **Rules:** `vault/.claude/rules/` (daily, thoughts, goals, obsidian-markdown, weekly-reflection)
 - **Docs:** `vault/.claude/docs/`
 - **Control Plane:** `docs/control-plane.md`, `scripts/setup_control_plane.sh`, `scripts/update_control_plane.sh`
@@ -312,6 +314,7 @@ Reports use Telegram MarkdownV2 at delivery time:
 | `/stats` | Show entry statistics |
 | `/files` | Browse vault files |
 | `/menu` | Open the persistent dashboard menu |
+| `/why` | Explain why a compiled page states a claim, with sources |
 
 ## Customization
 

@@ -56,7 +56,23 @@ def _note_key(vault_path: Path, note_path: Path) -> str:
 
 
 def _domain_for(note_path: Path) -> str:
+    """Vault-domain bucket for one note's relative path.
+
+    The ``compiled/`` layer holds six domains (projects, people, topics,
+    decisions, meetings, concepts) plus an archive folder that mirrors those
+    same six domains one level deeper (``compiled/archive/<domain>/``, see
+    ``CompiledBriefingService._archive_candidate``). Bucketing all of them
+    under a single ``compiled`` domain would collapse six unrelated stats
+    rows into one and would hide the archive from
+    ``_domain_for``-derived reporting, so both are split by subdirectory
+    instead: ``compiled/<domain>`` and ``compiled/archive/<domain>``.
+    """
     rel_parts = note_path.parts
+    if rel_parts[:1] == ("compiled",):
+        if rel_parts[1:2] == ("archive",) and len(rel_parts) > 3:
+            return f"compiled/archive/{rel_parts[2]}"
+        if len(rel_parts) > 1:
+            return f"compiled/{rel_parts[1]}"
     return rel_parts[0] if len(rel_parts) > 1 else "root"
 
 
@@ -237,6 +253,7 @@ def analyze_vault(vault_path: Path) -> dict[str, Any]:
 
     orphans: list[str] = []
     weakly_connected: list[str] = []
+    archived_isolated: list[str] = []
     malformed_daily: list[dict[str, str]] = []
     description_candidates = 0
     described_notes = 0
@@ -246,9 +263,19 @@ def analyze_vault(vault_path: Path) -> dict[str, Any]:
         info["incoming"] = incoming
         info["outgoing"] = outgoing
         info["total_links"] = incoming + outgoing
-        if incoming == 0 and outgoing == 0 and info["domain"] not in {"MOC", "root"}:
+        domain = str(info["domain"])
+        is_archived = domain.startswith("compiled/archive")
+        if is_archived:
+            # No incoming links is the archival trigger itself (ТЗ 6.4: a
+            # page moves to compiled/archive/ once it has no incoming
+            # links), not a graph defect -- counting it as an orphan would
+            # make every correctly archived page shout forever in the
+            # report. Tracked separately so the fact still shows up.
+            if incoming == 0 and outgoing == 0:
+                archived_isolated.append(note_key)
+        elif incoming == 0 and outgoing == 0 and domain not in {"MOC", "root"}:
             orphans.append(note_key)
-        elif info["total_links"] < 2 and info["domain"] not in {"MOC", "root", "daily"}:
+        elif info["total_links"] < 2 and domain not in {"MOC", "root", "daily"}:
             weakly_connected.append(note_key)
         if info["domain"] == "daily":
             note_path = vault_path / str(info["path"])
@@ -326,6 +353,8 @@ def analyze_vault(vault_path: Path) -> dict[str, Any]:
         "orphan_count": len(orphans),
         "weakly_connected": sorted(weakly_connected),
         "weakly_connected_count": len(weakly_connected),
+        "archived_isolated": sorted(archived_isolated),
+        "archived_isolated_count": len(archived_isolated),
         "malformed_daily_notes": malformed_daily,
         "malformed_daily_count": len(malformed_daily),
         "daily_structure_penalty": round(daily_structure_penalty, 1),
@@ -360,6 +389,7 @@ def format_report(stats: dict[str, Any]) -> str:
         f"- **Broken links:** {stats['broken_link_count']}",
         f"- **Ignored non-note refs:** {stats['ignored_link_count']}",
         f"- **Orphan notes:** {stats['orphan_count']}",
+        f"- **Archived notes with no links (expected):** {stats['archived_isolated_count']}",
         f"- **Malformed daily notes:** {stats['malformed_daily_count']}",
         (
             f"- **Description coverage:** {stats['description_count']}/"
@@ -431,6 +461,23 @@ def format_report(stats: dict[str, Any]) -> str:
         if len(stats["weakly_connected"]) > 20:
             lines.append(
                 f"- ... and {len(stats['weakly_connected']) - 20} more"
+            )
+        lines.append("")
+
+    if stats["archived_isolated"]:
+        lines.append("## Archived Notes With No Links (Expected, Not A Defect)")
+        lines.append("")
+        lines.append(
+            "A `compiled/archive/` page with no incoming links is the "
+            "archival trigger, not a graph problem -- listed here for "
+            "visibility only."
+        )
+        lines.append("")
+        for note_key in stats["archived_isolated"][:20]:
+            lines.append(f"- {_display_link(note_key, stats['notes'])}")
+        if len(stats["archived_isolated"]) > 20:
+            lines.append(
+                f"- ... and {len(stats['archived_isolated']) - 20} more"
             )
         lines.append("")
 

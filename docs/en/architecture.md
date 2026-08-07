@@ -56,6 +56,14 @@ Question routing combines:
 Derived summaries and search indexes are aids, not ground truth. Durable
 claims belong in curated vault Markdown.
 
+Compiled pages are also enriched over time, not just read: a nightly pass
+adds verified claims, tracks source trust, and classifies conflicts before
+writing back to `compiled/` — temporal and contextual conflicts resolve
+automatically (temporal: the newer source wins; contextual: both claims are
+kept, each in its own scope); only a factual conflict waits for the owner in
+the decisions queue. See `skills/compile-enrich/SKILL.md` for the full
+pipeline.
+
 ## Storage and consistency
 
 `vault-manifest.json` declares the memory root, authorized content roots,
@@ -68,8 +76,9 @@ add backup, quiescence, proof, and write-ahead checks for high-risk changes.
 - `.env` stores secrets and is mode `0600`.
 - Telegram rejects users other than the configured owner.
 - Control-plane hooks prevent runtime mutation of managed prompt assets.
-- Systemd user units run without root and enable `NoNewPrivileges` and
-  `PrivateTmp`.
+- Systemd user units run without root and enable `NoNewPrivileges`.
+- `PrivateTmp` is intentionally omitted because the vault's descriptor-based
+  atomic writer cannot publish its temporary file from that mount namespace.
 - Backups are encrypted to a public GPG recipient.
 - The vault is not exposed as a generic MCP server.
 

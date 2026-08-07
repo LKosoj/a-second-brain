@@ -1,6 +1,7 @@
 import fcntl
 import inspect
 import json
+import subprocess
 import threading
 from datetime import date
 from hashlib import sha256
@@ -16,10 +17,12 @@ from conftest import (
 
 from d_brain.services import frontmatter as frontmatter_service
 from d_brain.services.compiled_briefings import (
+    CompiledBriefingCandidate,
     CompiledBriefingService,
 )
 from d_brain.services.entry_status import (
     ENTRY_STATUS_ALREADY_PROCESSED,
+    extract_entry_statuses,
 )
 from d_brain.services.frontmatter import parse_frontmatter_bytes
 from d_brain.services.processor import (
@@ -46,6 +49,41 @@ def test_process_daily_facade_signature_and_timeout_mapping(tmp_path: Path) -> N
         "error": "Processing timed out",
         "processed_entries": 0,
     }
+
+
+def test_process_daily_reports_missing_helper_instead_of_missing_ai_cli(
+    tmp_path: Path,
+) -> None:
+    processor = CliProcessor(tmp_path / "vault", ai_cli="codex")
+    processor._daily_workflow.run = lambda *args, **kwargs: (  # type: ignore[method-assign]
+        (_ for _ in ()).throw(FileNotFoundError("missing helper: uv"))
+    )
+
+    assert processor.process_daily(mode=INTERACTIVE_MODE) == {
+        "error": "missing helper: uv",
+        "processed_entries": 0,
+    }
+
+
+def test_run_uv_script_uses_configured_absolute_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = CliProcessor(tmp_path / "vault")
+    calls: list[list[str]] = []
+
+    def fake_run(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setenv("UV_BIN", "/opt/uv/bin/uv")
+    monkeypatch.setattr("d_brain.services.processor.subprocess.run", fake_run)
+
+    processor._run_uv_script("--version")
+
+    assert calls == [["/opt/uv/bin/uv", "run", "--version"]]
 
 
 def test_do_processor_uses_vault_scoped_runner(tmp_path: Path) -> None:
@@ -742,6 +780,37 @@ tier: active
     assert observations.count("- [pattern] 2026-04-12: keep-12") == 1
 
 
+def test_normalized_handoff_sections_tolerates_leading_bom(tmp_path: Path) -> None:
+    """A leading UTF-8 BOM must not hide handoff frontmatter (see frontmatter.py).
+
+    Without BOM tolerance, ``_split_frontmatter`` fails to match, so the real
+    frontmatter (tier/relevance/last_accessed) would be silently replaced by
+    fresh defaults instead of being preserved across compaction.
+    """
+    text = (
+        "\ufeff---\n"
+        "type: note\n"
+        "last_accessed: 2026-04-05\n"
+        "relevance: 0.3\n"
+        "tier: archive\n"
+        "---\n"
+        "# Передача сессии\n\n"
+        "## Last Session\nблок\n\n"
+        "## Key Decisions\n- (none)\n\n"
+        "## In Progress\n- (none)\n\n"
+        "## Next Steps\n- (none)\n\n"
+        "## Observations\n- (none)\n"
+    )
+
+    processor = CliProcessor(tmp_path / "vault")
+    frontmatter, sections = processor._normalized_handoff_sections(text)
+
+    assert "tier: archive" in frontmatter
+    assert "last_accessed: 2026-04-05" in frontmatter
+    assert "relevance: 0.3" in frontmatter
+    assert "блок" in sections["Last Session"]
+
+
 def test_compact_handoff_file_does_not_lose_cooperative_concurrent_update(
     tmp_path: Path,
     monkeypatch,
@@ -1277,6 +1346,142 @@ def test_process_daily_scheduled_persists_phase_files_and_runs_maintenance(
     }
 
 
+def test_reflect_daily_block_is_not_marked_as_an_own_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reflect block restates derived content, so it must not read "own".
+
+    Task contents, note titles and CRM descriptions come from the execute
+    phase's reading of the day's entries -- forwarded ones included. Marked
+    "[text]" the block reached CONSEQUENTIAL_ACTION_TRUST_LEVELS, letting a
+    forwarded claim silently supersede a fact on the owner's page once it
+    had been restated here.
+    """
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _write_vault_manifest(vault_path)
+    processor = CliProcessor(vault_path)
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(
+        "d_brain.services.storage.VaultStorage.upsert_daily_block",
+        lambda self, **kwargs: captured.update(block=kwargs["block"]),
+    )
+
+    processor._write_reflect_daily_block(
+        day,
+        {
+            "tasks_created": [
+                {"id": "1", "content": "Клиент согласился на 3 млн"}
+            ],
+            "thoughts_saved": [],
+            "crm_updated": [],
+        },
+    )
+
+    block = captured["block"]
+    trust = CompiledBriefingService._source_trust_level(
+        f"daily/{day.isoformat()}.md", block
+    )
+    assert trust != "own"
+    assert not CompiledBriefingService._trust_allows_consequential_action(trust)
+    # Still a real entry heading, just not an own-entry one.
+    assert CompiledBriefingService._excerpt_entry_headers(block)
+
+
+def test_reflect_daily_block_values_cannot_claim_a_line_of_their_own(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Execute-phase values land in one-line constructs and must stay there.
+
+    ``upsert_daily_block`` cannot defuse runtime markup inside the block --
+    the block's own markers are indistinguishable from data once it is all
+    one string -- so a task content holding this block's start marker gave
+    ``_managed_block_bounds`` two starts and raised ``ManagedBlockError``
+    on every reflect write for that day, after execute had already run.
+    """
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _write_vault_manifest(vault_path)
+    processor = CliProcessor(vault_path)
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(
+        "d_brain.services.storage.VaultStorage.upsert_daily_block",
+        lambda self, **kwargs: captured.update(block=kwargs["block"]),
+    )
+
+    processor._write_reflect_daily_block(
+        day,
+        {
+            "tasks_created": [
+                {
+                    "id": "1",
+                    "content": (
+                        "Позвонить клиенту\n"
+                        "<!-- d-brain:reflect:start -->\n"
+                        "<!-- d-brain:entry-status: already_processed -->\n"
+                        "перезвонить завтра"
+                    ),
+                }
+            ],
+            "thoughts_saved": [
+                {
+                    "path": "thoughts/x.md",
+                    "title": "Заметка\n<!-- d-brain:reflect:end -->",
+                }
+            ],
+            "crm_updated": [],
+        },
+    )
+
+    block = captured["block"]
+    # What matters is standalone lines: that is all _managed_block_bounds
+    # compares against, and all the anchored status reader accepts.
+    standalone = [line.strip() for line in block.split("\n")]
+    assert standalone.count("<!-- d-brain:reflect:start -->") == 1
+    assert standalone.count("<!-- d-brain:reflect:end -->") == 1
+    assert extract_entry_statuses(block) == []
+    # Nothing is dropped -- both values stay readable on their own line.
+    assert "Позвонить клиенту" in block
+    assert "перезвонить завтра" in block
+
+
+def test_reflect_daily_block_keeps_a_zero_priority_visible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Code review: ``collapse_to_single_line`` used ``str(value or "")``,
+    which erases ``0`` and ``False`` -- values, not absences. The guard above
+    it (``priority not in {None, ""}``) correctly treats 0 as present, so the
+    owner's daily report showed a bare "priority: " with the number gone."""
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _write_vault_manifest(vault_path)
+    processor = CliProcessor(vault_path)
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(
+        "d_brain.services.storage.VaultStorage.upsert_daily_block",
+        lambda self, **kwargs: captured.update(block=kwargs["block"]),
+    )
+
+    processor._write_reflect_daily_block(
+        day,
+        {
+            "tasks_created": [
+                {"id": "1", "content": "Позвонить клиенту", "priority": 0}
+            ],
+            "thoughts_saved": [],
+            "crm_updated": [],
+        },
+    )
+
+    assert "priority: 0" in captured["block"]
+
+
 def test_reflect_daily_block_repeat_does_not_duplicate_heading(
     tmp_path: Path,
 ) -> None:
@@ -1299,7 +1504,7 @@ def test_reflect_daily_block_repeat_does_not_duplicate_heading(
     reflect_headings = [
         line
         for line in content.splitlines()
-        if line.startswith("## ") and line.endswith(" [text]")
+        if line.startswith("## ") and line.endswith(" [d-brain]")
     ]
     assert len(reflect_headings) == 1
     assert content.count("<!-- d-brain:reflect:start -->") == 1
@@ -1811,6 +2016,63 @@ def test_answer_question_injects_compiled_briefings_block(
     ].index("USER QUESTION:")
 
 
+def test_compiled_briefings_block_ranks_once_so_prompt_and_footnote_agree(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """The prompt and the owner's "Источники ответа" footnote must name the
+    same pages.
+
+    Ranking re-reads every ``compiled/**`` page from disk, so ranking twice
+    in a row is two independent live scans. A background enrichment landing
+    between them used to put one page into the model's prompt while the
+    footnote credited another -- the answer would then be sourced from a
+    page the owner is never shown, and blamed on a page it never read.
+    ``_build_compiled_briefings_block`` therefore ranks once and hands the
+    frozen list to ``build_question_context``.
+    """
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _setup_daily_processing_vault(vault_path, day)
+
+    def _candidate(rel_path: str) -> CompiledBriefingCandidate:
+        return CompiledBriefingCandidate(
+            rel_path=rel_path,
+            domain="decisions",
+            slug=rel_path.rsplit("/", 1)[-1].removesuffix(".md"),
+            title=rel_path,
+            description="Решение по прайсингу",
+            freshness_state="fresh",
+            confidence="high",
+            relevance=0.9,
+            tier="active",
+            text="---\nsources_trust: high\n---\nТело страницы",
+        )
+
+    # Second scan sees a different page: exactly what a nightly enrichment
+    # landing between two scans would look like from here.
+    scans = [
+        [_candidate("compiled/decisions/pricing-v1.md")],
+        [_candidate("compiled/decisions/pricing-v2.md")],
+    ]
+    calls: list[str] = []
+
+    def fake_rank(self, question, *, limit=3):  # noqa: ANN001, ANN202
+        calls.append(question)
+        return scans[min(len(calls) - 1, len(scans) - 1)]
+
+    monkeypatch.setattr(CompiledBriefingService, "_rank_candidates", fake_rank)
+
+    processor = CliProcessor(vault_path)
+    block = processor._build_compiled_briefings_block("Что по прайсингу?")
+
+    assert len(calls) == 1
+    frozen = [c.rel_path for c in processor._question_provenance_candidates]
+    assert frozen == ["compiled/decisions/pricing-v1.md"]
+    assert "compiled/decisions/pricing-v1.md" in block
+    assert "compiled/decisions/pricing-v2.md" not in block
+
+
 def test_question_route_classifier_covers_planning_and_fact_lookup(
     tmp_path: Path,
 ) -> None:
@@ -1958,6 +2220,319 @@ def test_answer_question_files_useful_output_artifact(
             "question-answer",
         )
     ]
+
+
+def _write_compiled_topic_page(
+    vault_path: Path,
+    rel_path: str,
+    *,
+    title: str,
+    sources_trust: str | None = None,
+    conflicts_open: int | None = None,
+) -> None:
+    """Minimal ``compiled/topics/**`` fixture page for provenance tests
+    (ТЗ 7.4): enough frontmatter/body shape for ``_iter_candidates`` and
+    ``_frontmatter_fields`` to parse it like a real compiled page.
+    """
+    frontmatter = [
+        "---",
+        "type: compiled-briefing",
+        "domain: topics",
+        f'description: "{title}"',
+        "status: active",
+        "freshness_state: fresh",
+        "confidence: high",
+        "last_accessed: 2026-04-01",
+        "relevance: 0.80",
+        "tier: active",
+    ]
+    if sources_trust is not None:
+        frontmatter.append(f"sources_trust: {sources_trust}")
+    if conflicts_open is not None:
+        frontmatter.append(f"conflicts_open: {conflicts_open}")
+    frontmatter += ["---", ""]
+    body = [f"# {title}", "", "## Current State", f"State for {title}.", ""]
+    page_path = vault_path / rel_path
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    page_path.write_text(
+        "\n".join(frontmatter) + "\n".join(body) + "\n", encoding="utf-8"
+    )
+
+
+def test_answer_question_appends_deterministic_provenance(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _setup_daily_processing_vault(vault_path, day)
+    _write_compiled_topic_page(
+        vault_path,
+        "compiled/topics/example-topic.md",
+        title="Example Topic",
+        sources_trust="forwarded",
+        conflicts_open=1,
+    )
+
+    processor = CliProcessor(vault_path)
+    processor._capture_creative_recall = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    processor._build_auto_recall_block = lambda *args, **kwargs: ""  # type: ignore[method-assign]
+    touch_calls: list[tuple[str, ...]] = []
+    processor._touch_memory_paths = (  # type: ignore[method-assign]
+        lambda *paths: touch_calls.append(paths)
+    )
+    processor._run_assistant_prompt = (  # type: ignore[method-assign]
+        lambda prompt: "Ответ по Example Topic.\n\nВторой абзац с деталями."
+    )
+
+    result = processor.answer_question("Что нового по Example Topic?", user_id=7)
+
+    report = result["report"]
+    assert "**Источники ответа**" in report
+    assert "[[compiled/topics/example-topic.md|Example Topic]]" in report
+    assert "доверие: forwarded" in report
+    assert "открытых конфликтов: 1" in report
+    assert "**Внимание" in report
+    # The warning must land right after the first paragraph, never before it
+    # (the model is separately instructed to open with the actual answer).
+    assert report.index("Ответ по Example Topic.") < report.index("**Внимание")
+    assert report.index("**Внимание") < report.index("Второй абзац")
+    assert ("compiled/topics/example-topic.md",) in touch_calls
+
+
+def test_answer_question_omits_provenance_block_when_no_pages_rank(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _setup_daily_processing_vault(vault_path, day)
+
+    processor = CliProcessor(vault_path)
+    processor._capture_creative_recall = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    processor._build_auto_recall_block = lambda *args, **kwargs: ""  # type: ignore[method-assign]
+    processor._touch_memory_paths = lambda *paths: None  # type: ignore[method-assign]
+    processor._run_assistant_prompt = (  # type: ignore[method-assign]
+        lambda prompt: "Ответ без компилированных источников."
+    )
+
+    result = processor.answer_question("Что нового по Example Topic?", user_id=7)
+
+    assert result["report"] == "Ответ без компилированных источников."
+    assert "Источники ответа" not in result["report"]
+
+
+def test_answer_question_provenance_failure_does_not_break_answer(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _setup_daily_processing_vault(vault_path, day)
+    _write_compiled_topic_page(
+        vault_path,
+        "compiled/topics/example-topic.md",
+        title="Example Topic",
+        sources_trust="own",
+    )
+
+    processor = CliProcessor(vault_path)
+    processor._capture_creative_recall = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    processor._build_auto_recall_block = lambda *args, **kwargs: ""  # type: ignore[method-assign]
+    processor._touch_memory_paths = lambda *paths: None  # type: ignore[method-assign]
+    processor._run_assistant_prompt = lambda prompt: "Ответ."  # type: ignore[method-assign]
+
+    def boom(vault_path, question, **kwargs):  # noqa: ANN001, ANN003
+        raise RuntimeError("boom")
+
+    import d_brain.services.processor as processor_module
+
+    monkeypatch.setattr(processor_module, "build_question_provenance", boom)
+
+    result = processor.answer_question("Что нового по Example Topic?", user_id=7)
+
+    assert result["report"] == "Ответ."
+
+
+def _make_provenance_processor(vault_path: Path, run_assistant_prompt) -> CliProcessor:
+    """Shared scaffolding for the provenance-placement/state tests below."""
+    processor = CliProcessor(vault_path)
+    processor._capture_creative_recall = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    processor._build_auto_recall_block = lambda *args, **kwargs: ""  # type: ignore[method-assign]
+    processor._touch_memory_paths = lambda *paths: None  # type: ignore[method-assign]
+    processor._run_assistant_prompt = run_assistant_prompt  # type: ignore[method-assign]
+    return processor
+
+
+@pytest.mark.parametrize(
+    "opening_block",
+    [
+        "# Заголовок ответа",
+        "| Колонка | Значение |\n| --- | --- |\n| A | 1 |",
+        "```\nprint('code')\n```",
+    ],
+    ids=["heading", "table", "code-fence"],
+)
+def test_answer_question_provenance_warning_skips_non_paragraph_opening(
+    tmp_path: Path, opening_block: str
+) -> None:
+    """Code-review defect 1: a heading/table/code-fence opening the answer
+    must not end up between itself and the real first sentence."""
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _setup_daily_processing_vault(vault_path, day)
+    _write_compiled_topic_page(
+        vault_path,
+        "compiled/topics/example-topic.md",
+        title="Example Topic",
+        sources_trust="forwarded",
+    )
+    answer = f"{opening_block}\n\nПервый абзац ответа.\n\nВторой абзац с деталями."
+    processor = _make_provenance_processor(vault_path, lambda prompt: answer)
+
+    result = processor.answer_question("Что нового по Example Topic?", user_id=7)
+
+    report = result["report"]
+    assert "**Внимание" in report
+    opening_first_line = opening_block.splitlines()[0]
+    assert report.index(opening_first_line) < report.index("Первый абзац")
+    assert report.index("Первый абзац") < report.index("**Внимание")
+    assert report.index("**Внимание") < report.index("Второй абзац")
+
+
+def test_answer_question_provenance_warning_on_empty_answer_starts_the_report(
+    tmp_path: Path,
+) -> None:
+    """Code-review defect 1: with no real paragraph at all (empty model
+    response), the warning has nothing safe to follow, so it starts the
+    report -- this must stay true, not become a regression target."""
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _setup_daily_processing_vault(vault_path, day)
+    _write_compiled_topic_page(
+        vault_path,
+        "compiled/topics/example-topic.md",
+        title="Example Topic",
+        sources_trust="forwarded",
+    )
+    processor = _make_provenance_processor(vault_path, lambda prompt: "")
+
+    result = processor.answer_question("Что нового по Example Topic?", user_id=7)
+
+    report = result["report"]
+    assert report.startswith("**Внимание")
+    assert "**Источники ответа**" in report
+
+
+def test_answer_question_provenance_uses_candidates_ranked_before_the_model_ran(
+    tmp_path: Path,
+) -> None:
+    """Code-review defect 2: the compiled page is rewritten while the model
+    is "working" (simulated inside the fake ``_run_assistant_prompt``) --
+    the provenance shown must reflect what the context block actually had
+    at prompt-build time, not a fresh re-read of the mutated file."""
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _setup_daily_processing_vault(vault_path, day)
+    _write_compiled_topic_page(
+        vault_path,
+        "compiled/topics/example-topic.md",
+        title="Example Topic",
+        sources_trust="own",
+        conflicts_open=0,
+    )
+
+    def fake_run(prompt: str) -> str:
+        # Background enrichment / a model write landing mid-flight.
+        _write_compiled_topic_page(
+            vault_path,
+            "compiled/topics/example-topic.md",
+            title="Example Topic",
+            sources_trust="inferred",
+            conflicts_open=3,
+        )
+        return "Ответ по Example Topic."
+
+    processor = _make_provenance_processor(vault_path, fake_run)
+
+    result = processor.answer_question("Что нового по Example Topic?", user_id=7)
+
+    report = result["report"]
+    assert "доверие: own" in report
+    assert "inferred" not in report
+    assert "открытых конфликтов" not in report
+
+
+def test_answer_question_provenance_absent_when_compiled_block_not_in_route(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Code-review defect 3: if the question's route never puts the
+    compiled-pages block into the prompt, provenance must not appear even
+    though a compiled page would otherwise rank for the question."""
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _setup_daily_processing_vault(vault_path, day)
+    _write_compiled_topic_page(
+        vault_path,
+        "compiled/topics/example-topic.md",
+        title="Example Topic",
+        sources_trust="forwarded",
+    )
+    processor = _make_provenance_processor(
+        vault_path, lambda prompt: "Ответ по Example Topic."
+    )
+
+    import d_brain.services.processor as processor_module
+
+    monkeypatch.setattr(
+        processor_module,
+        "iter_question_context_blocks",
+        lambda question: ("recall",),
+    )
+
+    result = processor.answer_question("Что нового по Example Topic?", user_id=7)
+
+    report = result["report"]
+    assert report == "Ответ по Example Topic."
+    assert "Источники ответа" not in report
+    assert "**Внимание" not in report
+
+
+def test_answer_question_provenance_state_does_not_leak_between_questions(
+    tmp_path: Path,
+) -> None:
+    """State stored on the processor for provenance must be correct for
+    each question in turn, not left over from the previous one. Two
+    compiled pages, each dominating a different question's ranking, make a
+    stale carry-over from question 1 visible in question 2's report.
+    """
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _setup_daily_processing_vault(vault_path, day)
+    # Distinct vocabularies (not just distinct suffixes) so each question's
+    # lexical ranking cleanly favors one page over the other -- see the
+    # scoring formula in ``_rank_candidates``, which folds in every page's
+    # baseline freshness/confidence/relevance regardless of query overlap.
+    _write_compiled_topic_page(
+        vault_path,
+        "compiled/topics/widget-rollout.md",
+        title="Widget Rollout Status",
+        sources_trust="forwarded",
+    )
+    _write_compiled_topic_page(
+        vault_path,
+        "compiled/topics/harbor-contact.md",
+        title="Harbor Contact List",
+        sources_trust="own",
+    )
+    answers = iter(["Ответ по Widget Rollout.", "Ответ по Harbor Contact."])
+    processor = _make_provenance_processor(vault_path, lambda prompt: next(answers))
+
+    first = processor.answer_question("Что нового по Widget Rollout Status?", user_id=7)
+    assert "compiled/topics/widget-rollout.md" in first["report"]
+    assert "compiled/topics/harbor-contact.md" not in first["report"]
+    assert "**Внимание" in first["report"]
+
+    second = processor.answer_question("Что нового по Harbor Contact List?", user_id=7)
+    assert "compiled/topics/harbor-contact.md" in second["report"]
+    assert "compiled/topics/widget-rollout.md" not in second["report"]
+    assert "**Внимание" not in second["report"]
 
 
 def test_execute_prompt_injects_auto_recall_block(

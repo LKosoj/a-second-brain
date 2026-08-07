@@ -7,8 +7,20 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 ENTRY_STATUS_ALREADY_PROCESSED = "already_processed"
+# Anchored to one single line, like every other reader of the runtime's own
+# markup: format_entry_status_comments always writes one comment per line,
+# while a forged one arrives inside someone else's forwarded text, where
+# storage.append_to_daily has indented it by a space
+# (escape_embedded_runtime_markup). Without the anchor that one space would
+# not defuse anything, since this pattern is used with findall. The inner
+# gaps are "[ \t]", not "\s": "\s" spans newlines, so a marker split across
+# two lines ("<!--\nd-brain:entry-status: ... -->") still matched here while
+# neither of its lines matched the line-by-line escaping. The trailing
+# "\r?" keeps CRLF daily files readable, since MULTILINE "$" stops before
+# the "\n" but not before the "\r".
 ENTRY_STATUS_RE = re.compile(
-    r"<!--\s*d-brain:entry-status:\s*([a-z][a-z0-9_-]*)\s*-->"
+    r"^<!--[ \t]*d-brain:entry-status:[ \t]*([a-z][a-z0-9_-]*)[ \t]*-->[ \t]*\r?$",
+    re.MULTILINE,
 )
 DAILY_ENTRY_RE = re.compile(
     r"^##\s+(?P<time>\d{2}:\d{2})\s+(?P<type>\[[^\]]+\])\s*$",
@@ -60,15 +72,30 @@ def format_entry_status_comments(statuses: Iterable[str]) -> str:
     )
 
 
+def _normalize_newlines(text: str) -> str:
+    """Make every line ending a "\\n", the only one MULTILINE "^" reacts to.
+
+    Both patterns here are anchored, and Python anchors them on "\\n" alone --
+    a daily file written with bare "\\r" line endings (frontmatter._detect_newline
+    keeps that variant alive) would otherwise read as one single line, hiding
+    every entry and every status in it. Callers normally arrive via
+    Path.read_text, which already does this; doing it here too means the
+    anchors do not silently depend on how the caller opened the file.
+    """
+
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def extract_entry_statuses(text: str) -> list[str]:
     """Extract all entry statuses from one markdown block."""
 
-    return normalize_entry_statuses(ENTRY_STATUS_RE.findall(text))
+    return normalize_entry_statuses(ENTRY_STATUS_RE.findall(_normalize_newlines(text)))
 
 
 def parse_daily_entry_statuses(content: str) -> list[DailyEntryStatus]:
     """Parse raw daily markdown and return statuses for each entry in order."""
 
+    content = _normalize_newlines(content)
     matches = list(DAILY_ENTRY_RE.finditer(content))
     parsed: list[DailyEntryStatus] = []
     for index, match in enumerate(matches):

@@ -120,6 +120,23 @@ def test_kimi_backend_is_documented_in_both_languages() -> None:
         assert "`kimi`" in configuration
 
 
+def test_compiled_page_aging_terms_are_documented_in_both_languages() -> None:
+    for language in ("en", "ru"):
+        page = (
+            PROJECT_ROOT / f"docs/{language}/memory-and-search.md"
+        ).read_text(encoding="utf-8")
+
+        assert "`concepts`" in page
+        assert "/why" in page
+        assert "`own`" in page
+        assert "`forwarded`" in page
+        assert "`integration`" in page
+        assert "`inferred`" in page
+        assert "`sources_trust`" in page
+        assert "`last_verified`" in page
+        assert ".session/decisions-queue.json" in page
+
+
 def test_bilingual_documentation_links_resolve() -> None:
     pages = [
         PROJECT_ROOT / "README.md",

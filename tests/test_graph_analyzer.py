@@ -119,6 +119,43 @@ def test_graph_artifact_writer_requires_manifest_before_creating_artifacts(
     assert not (vault_path / ".graph").exists()
 
 
+def test_graph_analyzer_splits_compiled_domains_and_tracks_archived_isolation(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    (vault_path / "compiled" / "projects").mkdir(parents=True)
+    (vault_path / "compiled" / "people").mkdir(parents=True)
+    (vault_path / "compiled" / "archive" / "projects").mkdir(parents=True)
+
+    (vault_path / "compiled" / "projects" / "acme.md").write_text(
+        "# Acme\n\nNo links here.\n", encoding="utf-8"
+    )
+    (vault_path / "compiled" / "people" / "jane.md").write_text(
+        "# Jane\n\nAlso isolated.\n", encoding="utf-8"
+    )
+    (vault_path / "compiled" / "archive" / "projects" / "old-acme.md").write_text(
+        "# Old Acme\n\nArchived and isolated.\n", encoding="utf-8"
+    )
+
+    analyzer = _load_graph_analyzer()
+    stats = analyzer.analyze_vault(vault_path)
+
+    assert stats["domain_stats"]["compiled/projects"]["count"] == 1
+    assert stats["domain_stats"]["compiled/people"]["count"] == 1
+    assert stats["domain_stats"]["compiled/archive/projects"]["count"] == 1
+
+    assert "compiled/projects/acme" in stats["orphans"]
+    assert "compiled/people/jane" in stats["orphans"]
+    assert "compiled/archive/projects/old-acme" not in stats["orphans"]
+    assert "compiled/archive/projects/old-acme" not in stats["weakly_connected"]
+    assert stats["archived_isolated"] == ["compiled/archive/projects/old-acme"]
+    assert stats["archived_isolated_count"] == 1
+
+    report = analyzer.format_report(stats)
+    assert "Archived Notes With No Links" in report
+    assert "compiled/archive/projects/old-acme" in report
+
+
 def test_graph_link_builder_routes_thought_categories_to_matching_mocs(
     tmp_path: Path,
 ) -> None:
@@ -171,3 +208,167 @@ def test_graph_link_builder_uses_note_keys_for_duplicate_stem_sources(
     assert "business/_index" in suggestions
     assert "projects/_index" in suggestions
     assert "_index" not in suggestions
+
+
+def _compiled_page_with_human_related(tmp_path: Path) -> Path:
+    """A compiled page whose only "## Related" heading sits inside the
+    owner's human zone -- the case a blind insert would corrupt."""
+    page = tmp_path / "aurora.md"
+    page.write_text(
+        "# Aurora\n\n"
+        "## Current State\n\nIdle.\n\n"
+        "<!-- human:start -->\n"
+        "## Owner Notes\n\n"
+        "## Related\n\n- [[projects/borealis]]\n"
+        "<!-- human:end -->\n",
+        encoding="utf-8",
+    )
+    return page
+
+
+def test_graph_link_builder_never_writes_inside_the_human_zone(tmp_path: Path) -> None:
+    """The human zone survives every pass verbatim; appending under a
+    "## Related" heading that happens to live inside it would rewrite text
+    the owner typed by hand."""
+    builder = _load_graph_link_builder()
+    page = _compiled_page_with_human_related(tmp_path)
+
+    assert builder.apply_link(page, "topics/quantum-widgets", dry_run=False) is True
+
+    content = page.read_text(encoding="utf-8")
+    start = content.index("<!-- human:start -->")
+    end = content.index("<!-- human:end -->")
+    assert "[[topics/quantum-widgets]]" not in content[start:end]
+    assert "[[topics/quantum-widgets]]" in content[end:]
+
+
+def test_graph_link_builder_keeps_human_zone_bytes_including_line_endings(
+    tmp_path: Path,
+) -> None:
+    """"Verbatim" is about bytes, not about how the text looks.
+
+    ``apply_link`` rewrites the whole file, so reading it with translated
+    line endings quietly rewrote every CRLF the owner had typed inside
+    their own zone -- the note read the same and hashed differently.
+    """
+    builder = _load_graph_link_builder()
+    page = tmp_path / "aurora.md"
+    zone = (
+        b"<!-- human:start -->\r\n"
+        b"\xd0\x9c\xd0\xbe\xd1\x8f \xd0\xb7\xd0\xb0\xd0\xbc\xd0\xb5\xd1\x82\xd0\xba"
+        b"\xd0\xb0.\r\n"
+        b"<!-- human:end -->"
+    )
+    page.write_bytes(b"# Aurora\n\n## Owner Notes\n" + zone + b"\n")
+
+    assert builder.apply_link(page, "topics/quantum-widgets", dry_run=False) is True
+
+    after = page.read_bytes()
+    assert zone in after
+    assert b"[[topics/quantum-widgets]]" in after
+
+
+def test_graph_link_builder_skips_a_note_that_is_not_valid_utf8(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """One undecodable note must not take the whole run down with it.
+
+    ``analyze_and_suggest`` reads with ``errors="ignore"``, so such a note
+    still produces suggestions and reaches ``apply_link``. A strict decode
+    there raised out of ``main``'s loop, so every note queued behind it
+    silently never got its links -- on that run and on every rerun, until
+    someone found and fixed the bad note by hand. Decoding leniently would
+    be worse still: this function rewrites the whole file, so it would
+    write the replacement characters back over the real bytes.
+    """
+    builder = _load_graph_link_builder()
+    page = tmp_path / "aurora.md"
+    original = b"# Aurora\n\nOwner note: \xff\xfe\n"
+    page.write_bytes(original)
+
+    assert builder.apply_link(page, "topics/quantum-widgets", dry_run=False) is False
+
+    assert page.read_bytes() == original
+    assert "[SKIP]" in capsys.readouterr().out
+
+
+def test_graph_link_builder_leaves_ambiguous_human_zone_untouched(
+    tmp_path: Path,
+) -> None:
+    """Two zones mean no safe pairing of start/end markers -- fail closed
+    rather than guess, same as vault-health's fix_links.py."""
+    builder = _load_graph_link_builder()
+    page = tmp_path / "aurora.md"
+    original = (
+        "# Aurora\n\n"
+        "<!-- human:start -->\nfirst\n<!-- human:end -->\n\n"
+        "<!-- human:start -->\nsecond\n<!-- human:end -->\n"
+    )
+    page.write_text(original, encoding="utf-8")
+
+    assert builder.apply_link(page, "topics/quantum-widgets", dry_run=False) is False
+    assert page.read_text(encoding="utf-8") == original
+
+
+def test_graph_link_builder_leaves_unpaired_marker_human_zone_untouched(
+    tmp_path: Path,
+) -> None:
+    """A lone START with no matching END is exactly as ambiguous as two
+    zones -- there's no way to tell where the zone would have ended, so
+    fail closed rather than treat the "## Related" heading inside it as an
+    ordinary insertion point."""
+    builder = _load_graph_link_builder()
+    page = tmp_path / "aurora.md"
+    original = (
+        "# Aurora\n\n"
+        "<!-- human:start -->\n"
+        "## Owner Notes\n\n"
+        "## Related\n\n- [[projects/borealis]]\n"
+    )
+    page.write_text(original, encoding="utf-8")
+
+    assert builder.apply_link(page, "topics/quantum-widgets", dry_run=False) is False
+    assert page.read_text(encoding="utf-8") == original
+
+
+def test_graph_link_builder_human_zone_span_unpaired_marker_is_ambiguous() -> None:
+    builder = _load_graph_link_builder()
+
+    assert (
+        builder.human_zone_span(f"before {builder.HUMAN_ZONE_START} after")
+        == builder.AMBIGUOUS_HUMAN_ZONE
+    )
+    assert (
+        builder.human_zone_span(f"before {builder.HUMAN_ZONE_END} after")
+        == builder.AMBIGUOUS_HUMAN_ZONE
+    )
+    assert builder.human_zone_span("no markers here") is None
+
+
+def test_graph_link_builder_human_zone_span_reversed_pair_is_ambiguous() -> None:
+    """One START and one END, but the END comes first: the counts alone say
+    "well-formed pair", and taking the span at face value would hand back a
+    negative range -- the script would then treat the owner's notes as *not*
+    protected and could write straight into them."""
+    builder = _load_graph_link_builder()
+    reversed_pair = (
+        f"# Aurora\n\n{builder.HUMAN_ZONE_END}\n"
+        f"## Owner Notes\n\n{builder.HUMAN_ZONE_START}\n"
+    )
+
+    assert builder.human_zone_span(reversed_pair) == builder.AMBIGUOUS_HUMAN_ZONE
+
+
+def test_graph_link_builder_human_zone_span_zero_markers_with_owner_notes_heading() -> (
+    None
+):
+    """Zero exact markers is only "no zone yet" on a page that never had one.
+    A page still carrying the ``## Owner Notes`` heading that compiled
+    briefings always render together with the markers has lost them to some
+    external edit -- writing into that file would land inside what used to
+    be the owner's own text."""
+    builder = _load_graph_link_builder()
+    stripped = "# Aurora\n\n## Owner Notes\n\nМои заметки.\n"
+
+    assert builder.human_zone_span(stripped) == builder.AMBIGUOUS_HUMAN_ZONE

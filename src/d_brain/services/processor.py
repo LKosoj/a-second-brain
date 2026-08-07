@@ -36,8 +36,22 @@ from d_brain.manifest import (
     load_manifest_for_vault,
 )
 from d_brain.services.cli_runner import CliExecutionError, CliRunner
-from d_brain.services.compiled_briefings import CompiledBriefingService
+from d_brain.services.compiled_briefings import (
+    QUESTION_CONTEXT_LIMIT,
+    CompiledBriefingCandidate,
+    CompiledBriefingService,
+)
+from d_brain.services.compiled_enrich_report import (
+    build_daily_digest,
+    describe_budget_exhausted,
+    digest_path,
+    read_pass_status,
+    render_digest_note,
+)
+from d_brain.services.compiled_fact_check import run_monthly_fact_check
+from d_brain.services.compiled_question_provenance import build_question_provenance
 from d_brain.services.context_pack import ContextPackBuilder, select_yearly_goals_name
+from d_brain.services.decisions_queue import write_queue_document
 
 from d_brain.services.daily_workflow import (  # isort: skip
     INTERACTIVE_MODE as INTERACTIVE_MODE,
@@ -67,7 +81,9 @@ from d_brain.services.recall_planner import (
     build_qmd_recall_block,
 )
 from d_brain.services.session import SessionStore
+from d_brain.services.source_links import collapse_to_single_line
 from d_brain.services.storage import VaultStorage
+from d_brain.services.telegram_delivery import send_telegram_text_sync
 from d_brain.services.telegram_markup import normalize_markdown_input
 from d_brain.services.todoist_projects import (
     TodoistProjectCatalog,
@@ -110,9 +126,15 @@ HANDOFF_SECTION_RE = re.compile(
     r"^##\s+(Last Session|Key Decisions|In Progress|Next Steps|Observations)\s*$",
     re.MULTILINE,
 )
-HANDOFF_FRONTMATTER_RE = re.compile(r"\A---\n.*?\n---\n*", re.DOTALL)
+HANDOFF_FRONTMATTER_RE = re.compile(r"\A\ufeff?---\n.*?\n---\n*", re.DOTALL)
 THOUGHT_FRONTMATTER_KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*):(?:\s*(.*))?$")
 PROCESS_AUDIT_STATE_TTL_DAYS = 7
+# Block-boundary splitter for _insert_after_first_paragraph (ТЗ 7.4 code
+# review defect 1): keeps the blank-line separators so the text can be
+# reassembled byte-for-byte around the inserted warning.
+QUESTION_ANSWER_BLOCK_SPLIT_RE = re.compile(r"(\n[ \t]*\n+)")
+QUESTION_ANSWER_HEADING_RE = re.compile(r"^#{1,6}[ \t]+")
+QUESTION_ANSWER_TABLE_ROW_RE = re.compile(r"^[ \t]*\|")
 
 
 class ProcessAlreadyRunningError(RuntimeError):
@@ -161,6 +183,12 @@ class CliProcessor:
         )
         self._scheduled_cycle_lock_held = False
         self._daily_workflow = DailyWorkflow(self)
+        # Compiled-page candidates ranked for the question currently being
+        # answered (ТЗ 7.4 code-review defect 2): set fresh by
+        # `_build_compiled_briefings_block` before every model call, and
+        # consumed by `_append_question_provenance` after it -- never left
+        # over from a previous question (see `answer_question`).
+        self._question_provenance_candidates: tuple[CompiledBriefingCandidate, ...] = ()
 
     def _load_phase_content(self, phase_name: str) -> str:
         """Load phase instructions from the project skill tree."""
@@ -1757,20 +1785,23 @@ WORKFLOW:
     def _run_uv_script(self, *args: str) -> None:
         """Run a uv-managed helper script from the vault root."""
         command_args = self._project_skill_script_args(args)
+        uv_bin = os.environ.get("UV_BIN", "uv").strip() or "uv"
         try:
             result = subprocess.run(
-                ["uv", "run", *command_args],
+                [uv_bin, "run", *command_args],
                 cwd=self.vault_path,
                 capture_output=True,
                 text=True,
                 check=False,
                 timeout=self._UV_SCRIPT_TIMEOUT_SECONDS,
             )
+        except FileNotFoundError as exc:
+            raise CliExecutionError(f"uv executable not found: {uv_bin}") from exc
         except subprocess.TimeoutExpired:
             logger.warning(
                 "Command timed out after %ss: %s",
                 self._UV_SCRIPT_TIMEOUT_SECONDS,
-                " ".join(["uv", "run", *args]),
+                " ".join([uv_bin, "run", *args]),
             )
             return
         if result.returncode != 0:
@@ -1783,20 +1814,23 @@ WORKFLOW:
     def _run_uv_script_capture(self, *args: str) -> str:
         """Run a uv-managed helper script and return stdout on success."""
         command_args = self._project_skill_script_args(args)
+        uv_bin = os.environ.get("UV_BIN", "uv").strip() or "uv"
         try:
             result = subprocess.run(
-                ["uv", "run", *command_args],
+                [uv_bin, "run", *command_args],
                 cwd=self.vault_path,
                 capture_output=True,
                 text=True,
                 check=False,
                 timeout=self._UV_SCRIPT_TIMEOUT_SECONDS,
             )
+        except FileNotFoundError as exc:
+            raise CliExecutionError(f"uv executable not found: {uv_bin}") from exc
         except subprocess.TimeoutExpired:
             logger.warning(
                 "Command timed out after %ss: %s",
                 self._UV_SCRIPT_TIMEOUT_SECONDS,
-                " ".join(["uv", "run", *args]),
+                " ".join([uv_bin, "run", *args]),
             )
             return ""
         if result.returncode != 0:
@@ -2960,23 +2994,40 @@ or recent vault notes before answering instead of guessing.
         thoughts_saved = self._json_dict_list(execute_data, "thoughts_saved")
         crm_updated = self._json_dict_list(execute_data, "crm_updated")
 
+        # Not "[text]": that is an own-entry marker (OWN_ENTRY_MARK_RE in
+        # compiled_briefings.py), and this block is not the owner typing.
+        # Its task contents, note titles and CRM descriptions are what the
+        # execute phase derived from the day's entries -- forwarded ones
+        # included -- so marking it own let someone else's words reach
+        # CONSEQUENTIAL_ACTION_TRUST_LEVELS and silently supersede a fact on
+        # the owner's page. Nothing is lost by rating this summary lower:
+        # the entry it summarizes is still in the same file at full trust.
         lines = [
-            f"\n## {timestamp:%H:%M} [text]",
+            f"\n## {timestamp:%H:%M} [d-brain]",
             REFLECT_DAILY_START_MARKER,
             "d-brain processing",
             "",
             f"**Tasks created:** {len(tasks_created)}",
         ]
+        # Every value below is execute-phase output, i.e. what a model read
+        # off the day's entries -- forwarded ones included -- and each lands
+        # in a one-line construct here. collapse_to_single_line, not strip():
+        # a value that keeps a newline gets a line of its own inside the
+        # block, where upsert_daily_block cannot tell it from the block's own
+        # markers, and a forged or duplicated marker there wedges every
+        # later write for the day.
         for task in tasks_created:
-            content = str(task.get("content", "")).strip() or "Untitled task"
+            content = collapse_to_single_line(task.get("content")) or "Untitled task"
             details: list[str] = []
-            task_id = str(task.get("id", "")).strip()
+            task_id = collapse_to_single_line(task.get("id"))
             if task_id:
                 details.append(f"id: {task_id}")
             priority = task.get("priority")
             if priority not in {None, ""}:
-                details.append(f"priority: {priority}")
-            due_value = str(task.get("due") or task.get("due_hint") or "").strip()
+                details.append(f"priority: {collapse_to_single_line(priority)}")
+            due_value = collapse_to_single_line(
+                task.get("due") or task.get("due_hint")
+            )
             if due_value:
                 details.append(f"due: {due_value}")
             suffix = f" ({', '.join(details)})" if details else ""
@@ -2984,17 +3035,19 @@ or recent vault notes before answering instead of guessing.
 
         lines.extend(["", f"**Thoughts saved:** {len(thoughts_saved)}"])
         for thought in thoughts_saved:
-            path = str(thought.get("path", "")).strip()
-            title = str(thought.get("title", "")).strip() or path or "Untitled note"
-            category = str(thought.get("category", "")).strip()
+            path = collapse_to_single_line(thought.get("path"))
+            title = collapse_to_single_line(thought.get("title")) or path or (
+                "Untitled note"
+            )
+            category = collapse_to_single_line(thought.get("category"))
             link = f"[[{path}|{title}]]" if path else title
             suffix = f" — {category}" if category else ""
             lines.append(f"- {link}{suffix}")
 
         lines.extend(["", f"**CRM updated:** {len(crm_updated)}"])
         for change in crm_updated:
-            path = str(change.get("path", "")).strip() or "business/crm.md"
-            description = str(change.get("change", "")).strip()
+            path = collapse_to_single_line(change.get("path")) or "business/crm.md"
+            description = collapse_to_single_line(change.get("change"))
             line = f"- [[{path}]]"
             if description:
                 line += f" — {description}"
@@ -3066,12 +3119,19 @@ or recent vault notes before answering instead of guessing.
             "compiled": compiled_block,
             "recall": recall_block,
         }
-        blocks = [self._build_question_route_block(question)]
-        blocks.extend(
-            block_by_name[name]
+        block_names = tuple(
+            name
             for name in iter_question_context_blocks(question)
             if block_by_name.get(name, "")
         )
+        if "compiled" not in block_names:
+            # This route's block order dropped "compiled" (or ranking found
+            # nothing): no compiled page actually reached the prompt, so no
+            # candidates survive for provenance either (ТЗ 7.4 code-review
+            # defect 3).
+            self._question_provenance_candidates = ()
+        blocks = [self._build_question_route_block(question)]
+        blocks.extend(block_by_name[name] for name in block_names)
 
         for block in blocks:
             prompt = self._inject_prompt_block(prompt, "USER QUESTION:", block)
@@ -3088,6 +3148,7 @@ or recent vault notes before answering instead of guessing.
             prompt = self._inject_question_context_blocks(prompt, question)
             output = self._run_assistant_prompt(prompt)
             normalized = self._normalize_owner_report_markdown(output)
+            normalized = self._append_question_provenance(normalized, question)
             self._file_output_artifact_if_useful(
                 request=question,
                 output_markdown=normalized,
@@ -3111,12 +3172,143 @@ or recent vault notes before answering instead of guessing.
             return {"error": str(exc), "processed_entries": 0}
 
     def _build_compiled_briefings_block(self, question: str) -> str:
-        """Build a small compiled-briefing context block for direct answers."""
-        return CompiledBriefingService(
+        """Build a small compiled-briefing context block for direct answers.
+
+        Also freezes the exact ranked candidates behind this block onto
+        ``self`` (ТЗ 7.4 code-review defect 2): ``_append_question_provenance``
+        reuses them instead of re-ranking the vault after the model has
+        already run, when a background enrichment job or the model's own
+        write could have changed a page's frontmatter underneath it.
+        """
+        service = CompiledBriefingService(
             self.vault_path,
             content_language=self.content_language,
             ai_cli=self.ai_cli,
-        ).build_question_context(question)
+        )
+        self._question_provenance_candidates = tuple(
+            service._rank_candidates(question, limit=QUESTION_CONTEXT_LIMIT)
+        )
+        # Hand the frozen list straight through: ranking again inside
+        # ``build_question_context`` would be a second live scan of
+        # ``compiled/**``, so a background enrichment landing in between
+        # would put one set of pages into the prompt and cite another in the
+        # footnote -- the exact drift this freeze exists to prevent.
+        return service.build_question_context(
+            question, ranked=self._question_provenance_candidates
+        )
+
+    @staticmethod
+    def _is_real_answer_paragraph(block: str) -> bool:
+        """True when ``block`` is prose the provenance warning may follow --
+        not a heading, a table row, or a fenced code block (ТЗ 7.4
+        code-review defect 1: those must never get the warning wedged in
+        front of the answer's actual first sentence)."""
+        stripped = block.strip()
+        if not stripped:
+            return False
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            return False
+        first_line = stripped.splitlines()[0]
+        if QUESTION_ANSWER_HEADING_RE.match(first_line):
+            return False
+        if QUESTION_ANSWER_TABLE_ROW_RE.match(first_line):
+            return False
+        return True
+
+    @staticmethod
+    def _fence_state_after(block: str, in_fence: bool) -> bool:
+        """Whether a fenced code block is still open once ``block`` ends.
+
+        ``QUESTION_ANSWER_BLOCK_SPLIT_RE`` splits on blank lines, and a
+        fenced code block is free to contain them -- so
+        ``_is_real_answer_paragraph``'s "does this block start with a
+        fence" test only ever recognizes the block that *opens* the fence.
+        Every later block of the same fence looks like ordinary prose to
+        it, which is how the warning ended up wedged inside the code
+        (rendered literally, not as a callout). Toggling on each fence
+        delimiter line carries that state across the blank-line splits.
+        """
+        for line in block.splitlines():
+            if line.strip().startswith(("```", "~~~")):
+                in_fence = not in_fence
+        return in_fence
+
+    @staticmethod
+    def _split_at_first_fence(block: str) -> tuple[str, str]:
+        """Split ``block`` into the prose before its first fence delimiter
+        line and the rest, or ``(block, "")`` when it opens no fence."""
+        lines = block.splitlines(keepends=True)
+        for index, line in enumerate(lines):
+            if line.strip().startswith(("```", "~~~")):
+                return "".join(lines[:index]), "".join(lines[index:])
+        return block, ""
+
+    @classmethod
+    def _insert_after_first_paragraph(cls, markdown: str, warning: str) -> str:
+        """Insert ``warning`` right after the answer's first real paragraph
+        (ТЗ 7.4 code-review defect 1), skipping any opening heading, table,
+        or fenced code block. Falls back to putting ``warning`` first when
+        no real paragraph exists at all (e.g. an empty model response, or a
+        never-closed fence) -- there is nothing safe to follow in that case.
+        """
+        if not warning:
+            return markdown
+        parts = QUESTION_ANSWER_BLOCK_SPLIT_RE.split(markdown)
+        in_fence = False
+        for index in range(0, len(parts), 2):
+            block = parts[index]
+            if not in_fence and cls._is_real_answer_paragraph(block):
+                # A block may *start* as prose and open a fence further down
+                # with no blank line between them ("Вот пример:" immediately
+                # followed by ```python -- a very ordinary model answer).
+                # Appending to such a block drops the warning inside the code;
+                # skipping the block instead sends an answer that is nothing
+                # but prose+code to the warning-first fallback, i.e. straight
+                # back into the ТЗ 7.4 defect. Splitting the block is the only
+                # placement that is both outside the fence and after the
+                # answer's real first sentence.
+                prose, fenced = cls._split_at_first_fence(block)
+                parts[index] = (
+                    f"{prose.rstrip()}\n\n{warning}\n\n{fenced}"
+                    if fenced
+                    else f"{block}\n\n{warning}"
+                )
+                return "".join(parts)
+            in_fence = cls._fence_state_after(block, in_fence)
+        return f"{warning}\n\n{markdown}" if markdown else warning
+
+    def _append_question_provenance(self, markdown: str, question: str) -> str:
+        """Append code-determined provenance to a direct-question answer
+        (ТЗ 7.4, 4.4): trust level and open-conflict count for the compiled
+        pages ``_build_compiled_briefings_block`` actually ranked for this
+        question when it built the prompt (ТЗ 7.4 code-review defect 2) --
+        see ``compiled_question_provenance`` for the "ranked" vs "used"
+        caveat.
+
+        The warning callout is inserted right after the answer's first real
+        paragraph, never before it and never inside an opening heading,
+        table, or fenced code block (ТЗ 7.4 code-review defect 1): the
+        prompt separately instructs the model to open with the actual
+        answer, and a test locks that in. The full per-page block is
+        appended at the end. Best-effort, like the neighboring
+        ``_file_output_artifact_if_useful``: a failure here must never break
+        an answer already produced for the owner.
+        """
+        try:
+            provenance = build_question_provenance(
+                self.vault_path,
+                question,
+                candidates=self._question_provenance_candidates,
+            )
+            if not provenance.block:
+                return markdown
+            result = self._insert_after_first_paragraph(markdown, provenance.warning)
+            result = f"{result}\n\n{provenance.block}"
+            self._touch_memory_paths(*provenance.touched_paths)
+            return result
+        except Exception as exc:
+            logger.warning("Question provenance skipped: %s", exc)
+            return markdown
 
     def _file_output_artifact_if_useful(
         self,
@@ -3151,6 +3343,13 @@ or recent vault notes before answering instead of guessing.
         except Exception as exc:
             logger.warning("Compiled nightly maintenance failed: %s", exc)
             return {"error": str(exc), "processed_entries": 0}
+        # ТЗ 5.5 inv 7: "факт исчерпания бюджета попадает в дайджест" --
+        # ``run_nightly_maintenance``'s own return value has no
+        # ``budget_exhausted`` key (only the pass journal
+        # ``_write_pass_journal`` writes does), so read it back the same way
+        # the compile digest itself does (``compiled_enrich_report``) rather
+        # than leaving this combined report silent about it.
+        budget_exhausted = read_pass_status(self.vault_path).budget_exhausted
         if self.content_language == "ru":
             report_lines = [
                 "## 🧩 Поддержка compiled-слоя",
@@ -3204,8 +3403,87 @@ or recent vault notes before answering instead of guessing.
                 report_lines.append(
                     f"- Queue errors: {len(result.get('queue_errors', []))}"
                 )
+        if budget_exhausted:
+            if self.content_language == "ru":
+                report_lines.append(
+                    "- Бюджет прохода исчерпан: "
+                    + "; ".join(describe_budget_exhausted(budget_exhausted))
+                )
+            else:
+                report_lines.append(
+                    "- Pass budget exhausted: " + ", ".join(budget_exhausted)
+                )
         result["report"] = "\n".join(report_lines)
         result["processed_entries"] = len(result.get("archived", []))
+        return result
+
+    def _run_compiled_fact_check_cycle(self) -> dict[str, Any]:
+        """Monthly-cadence deterministic re-check of stale compiled pages (ТЗ 6.6).
+
+        Zero model calls; only patches ``last_verified``/``confidence``.
+        Separate from ``_run_compiled_nightly_maintenance`` -- see
+        ``compiled_fact_check.run_monthly_fact_check`` for why this is its
+        own process with its own budget and journal.
+        """
+        try:
+            result = run_monthly_fact_check(self.vault_path)
+        except Exception as exc:
+            logger.warning("Compiled fact-check failed: %s", exc)
+            return {"error": str(exc), "processed_entries": 0}
+        if self.content_language == "ru":
+            report_lines = [
+                "## 🔎 Проверка фактов compiled",
+                "",
+                f"- Страниц проверено: {int(result.get('pages_checked') or 0)}",
+                f"- Дата подтверждена: {int(result.get('pages_patched') or 0)}",
+                (
+                    "- Отправлено на решение владельца: "
+                    f"{int(result.get('pages_flagged') or 0)}"
+                ),
+                (
+                    "- Утверждений проверено: "
+                    f"{int(result.get('claims_checked') or 0)}, "
+                    f"не подтвердилось: {int(result.get('claims_failed') or 0)}, "
+                    f"непроверяемых: {int(result.get('claims_unverifiable') or 0)}"
+                ),
+            ]
+            if result.get("queue_evictions"):
+                report_lines.append(
+                    "- Вытеснено из очереди решений: "
+                    f"{int(result.get('queue_evictions') or 0)}"
+                )
+            if result.get("errors"):
+                report_lines.append(
+                    f"- Ошибки записи: {len(result.get('errors', []))}"
+                )
+        else:
+            report_lines = [
+                "## 🔎 Compiled Fact-Check",
+                "",
+                f"- Pages checked: {int(result.get('pages_checked') or 0)}",
+                f"- Date confirmed: {int(result.get('pages_patched') or 0)}",
+                (
+                    "- Sent to owner for a decision: "
+                    f"{int(result.get('pages_flagged') or 0)}"
+                ),
+                (
+                    "- Claims checked: "
+                    f"{int(result.get('claims_checked') or 0)}, "
+                    f"failed: {int(result.get('claims_failed') or 0)}, "
+                    f"unverifiable: {int(result.get('claims_unverifiable') or 0)}"
+                ),
+            ]
+            if result.get("queue_evictions"):
+                report_lines.append(
+                    "- Evicted from the decisions queue: "
+                    f"{int(result.get('queue_evictions') or 0)}"
+                )
+            if result.get("errors"):
+                report_lines.append(
+                    f"- Write errors: {len(result.get('errors', []))}"
+                )
+        result["report"] = "\n".join(report_lines)
+        result["processed_entries"] = int(result.get("pages_patched") or 0)
         return result
 
     def _run_vault_health_cycle(self) -> dict[str, Any]:
@@ -3293,6 +3571,93 @@ or recent vault notes before answering instead of guessing.
             "searchable_write": repair_applied,
         }
 
+    def _run_compiled_digest_cycle(self) -> dict[str, Any]:
+        """Build, write, and deliver the ТЗ 7.1 owner digest for the
+        compiled-enrichment layer as the last of the ``scheduled-post``
+        maintenance workflows (registry.py: it reads the pass journal
+        ``maintenance.compiled-nightly`` just wrote and the decisions queue
+        ``maintenance.compiled-fact-check`` may have just added to, so it
+        must run after both).
+
+        Unlike this cycle's siblings, the digest text itself is delivered
+        to the owner as its own Telegram message (``send_telegram_text_sync``)
+        instead of being folded into the combined scheduled report -- it is
+        a decision-focused artifact, not routine cycle status, so ``report``
+        is left empty here (nothing to add to the combined report) and the
+        written file's path is surfaced via ``summary_path`` instead, which
+        ``run_daily_process.py``'s periodic-cycle line renderer already
+        picks up. This means the owner receives two Telegram messages at
+        21:00 on a day with something to report -- accepted deliberately so
+        the digest stays a distinct message instead of being buried inside
+        the general summary.
+
+        A vault with no project manifest yet (e.g. a fresh vault before its
+        first nightly pass, or a temp vault in a test that does not build
+        one) has nothing safe to write to; that is treated exactly like a
+        quiet night -- skipped, no exception, no write attempt.
+        """
+        try:
+            manifest = load_manifest_for_vault(self.vault_path)
+        except Exception:
+            return {
+                "report": "",
+                "processed_entries": 0,
+                "skipped": True,
+                "searchable_write": False,
+            }
+
+        today = date.today()
+        try:
+            pass_status = read_pass_status(self.vault_path)
+            digest = build_daily_digest(self.vault_path, today, pass_status=pass_status)
+        except Exception as exc:
+            logger.warning("Compiled digest cycle failed: %s", exc)
+            return {"error": str(exc), "processed_entries": 0}
+
+        if digest is None:
+            return {
+                "report": "",
+                "processed_entries": 0,
+                "skipped": True,
+                "searchable_write": False,
+            }
+
+        path = digest_path(self.vault_path, today)
+        try:
+            with vault_write_lock(self.vault_path) as lock:
+                write_validated_vault_markdown(
+                    self.vault_path,
+                    path,
+                    render_digest_note(today, digest),
+                    manifest=manifest,
+                    existing_lock=lock,
+                )
+                # Nightly safety net (задача N): regenerates the
+                # human-readable decisions-queue mirror file even if no
+                # response handler ran today. Only reached past the
+                # ``digest is None`` quiet-day return above, and
+                # ``write_queue_document`` is itself best-effort (catches
+                # and logs), so it cannot turn a successful digest write
+                # into a reported failure.
+                write_queue_document(
+                    self.vault_path, manifest=manifest, existing_lock=lock
+                )
+        except Exception as exc:
+            logger.warning("Failed to write compiled digest: %s", exc)
+            return {"error": str(exc), "processed_entries": 0}
+
+        try:
+            send_telegram_text_sync(digest, rich=True)
+        except Exception as exc:  # pragma: no cover - notification boundary
+            logger.warning("Failed to send compiled digest: %s", exc)
+
+        return {
+            "report": "",
+            "processed_entries": 1,
+            "summary_path": path.relative_to(self.vault_path).as_posix(),
+            "searchable_write": True,
+        }
+
     def process_daily(
         self,
         day: date | None = None,
@@ -3314,10 +3679,13 @@ or recent vault notes before answering instead of guessing.
                 "error": "Processing timed out",
                 "processed_entries": 0,
             }
-        except FileNotFoundError:
-            logger.error("%s CLI not found", self.ai_cli)
+        except FileNotFoundError as exc:
+            logger.error(
+                "Required file or command not found during processing: %s",
+                exc,
+            )
             return {
-                "error": f"{self.ai_cli} CLI not installed",
+                "error": str(exc) or "Required file or command not found",
                 "processed_entries": 0,
             }
         except CliExecutionError as exc:
@@ -3431,6 +3799,8 @@ EXECUTION:
             "yearly": copy["yearly_review_title"],
             "maintenance.compiled-nightly": "Поддержка compiled-слоя",
             "maintenance.vault-health": "Здоровье vault",
+            "maintenance.compiled-fact-check": "Проверка фактов compiled",
+            "maintenance.compiled-digest": "Дайджест обогащения compiled",
         }
         labels_en = {
             "daily": "Daily Processing",
@@ -3441,6 +3811,8 @@ EXECUTION:
             "yearly": copy["yearly_review_title"],
             "maintenance.compiled-nightly": "Compiled Maintenance",
             "maintenance.vault-health": "Vault Health",
+            "maintenance.compiled-fact-check": "Compiled Fact Check",
+            "maintenance.compiled-digest": "Compiled Digest",
         }
         labels = labels_ru if self.content_language == "ru" else labels_en
         return labels.get(cycle_name, cycle_name)
@@ -3728,6 +4100,42 @@ EXECUTION:
             "tasks_created": created_tasks,
             **({"fallback": True} if fallback_payload is not None else {}),
         }
+
+    def _safe_audit_cycle_result(
+        self,
+        *,
+        cycle_name: str,
+        day: date,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """``audit_cycle_result`` for the scheduled stack, degraded on error.
+
+        The audit guards only its own model phase; everything after it --
+        Todoist project routing (another CLI call) and task creation -- can
+        still raise. ``_run_scheduled_cycle_locked`` calls the audit outside
+        the try/except that wraps each workflow, so such a raise used to
+        escape the whole nightly cycle: no owner report for work that had
+        already succeeded, and no maintenance workflow afterwards. An audit
+        is a helper, never the deliverable -- record the failure the same way
+        a failed audit phase does and let the cycle continue.
+        """
+        try:
+            return self.audit_cycle_result(
+                cycle_name=cycle_name,
+                day=day,
+                result=result,
+            )
+        except Exception as exc:
+            logger.exception("Post-run audit crashed for %s", cycle_name)
+            return {
+                "cycle_name": cycle_name,
+                "label": self._cycle_label(cycle_name),
+                "summary": "",
+                "issues": [],
+                "task_candidates": [],
+                "tasks_created": [],
+                "error": str(exc),
+            }
 
     def generate_weekly_digest(
         self,
@@ -4268,7 +4676,7 @@ YEARLY REVIEW RULES:
             )
         ]
         audits: list[dict[str, Any]] = [
-            self.audit_cycle_result(
+            self._safe_audit_cycle_result(
                 cycle_name="daily",
                 day=today,
                 result=daily_result,
@@ -4315,7 +4723,7 @@ YEARLY REVIEW RULES:
                     }
                 )
                 audits.append(
-                    self.audit_cycle_result(
+                    self._safe_audit_cycle_result(
                         cycle_name=cycle_name,
                         day=today,
                         result=cycle_result,
@@ -4353,7 +4761,7 @@ YEARLY REVIEW RULES:
                 }
             )
             audits.append(
-                self.audit_cycle_result(
+                self._safe_audit_cycle_result(
                     cycle_name=rollover_name,
                     day=today,
                     result=rollover_result,
@@ -4378,7 +4786,15 @@ YEARLY REVIEW RULES:
             kind="maintenance",
             trigger="scheduled-post",
         ):
-            cycle_result = self._run_control_plane_maintenance_workflow(workflow.name)
+            try:
+                cycle_result = self._run_control_plane_maintenance_workflow(
+                    workflow.name
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Scheduled maintenance workflow failed: %s", workflow.name
+                )
+                cycle_result = {"error": str(exc), "processed_entries": 0}
             periodic_cycles.append(
                 self._build_control_plane_cycle_record(
                     workflow.name,
@@ -4386,13 +4802,29 @@ YEARLY REVIEW RULES:
                 )
             )
             audits.append(
-                self.audit_cycle_result(
+                self._safe_audit_cycle_result(
                     cycle_name=workflow.name,
                     day=today,
                     result=cycle_result,
                 )
             )
-            reports.append(str(cycle_result.get("report", "")).strip())
+            cycle_report = str(cycle_result.get("report", "")).strip()
+            if not cycle_report and "error" in cycle_result:
+                # Same fallback as the two loops above (code review): a
+                # workflow that raised has no ``report`` of its own, so
+                # appending it verbatim contributed an empty string and the
+                # owner's nightly message came back looking like a clean
+                # run. The traceback goes to the service log, which nobody
+                # reads at 21:00 -- and these are exactly the workflows
+                # whose silence is indistinguishable from "nothing to say".
+                cycle_report = "\n".join(
+                    [
+                        f"❌ **{self._cycle_label(workflow.name)}**",
+                        "",
+                        f"`{str(cycle_result['error'])}`",
+                    ]
+                )
+            reports.append(cycle_report)
 
         self._refresh_qmd_index()
 

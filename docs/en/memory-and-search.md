@@ -98,6 +98,52 @@ Compiled briefings are concise operational summaries across projects, people,
 meetings, topics, and decisions. They are useful for questions such as “What is
 the current status?” or “What changed since the last review?”
 
+Compiled pages live under `compiled/<domain>/`, one page per project, person,
+topic, decision, meeting, or concept — six domains in total. `concepts` holds
+durable, portable ideas, methods, or approaches; a candidate that is really
+about one project or person — because its title carries a date, or fully
+names an existing project or people page — is routed to `topics` instead,
+since a dated or project-bound note is a snapshot, not a portable concept.
+
+Every compiled page ends with an `## Owner Notes` section that wraps a human
+zone marked by `<!-- human:start -->` / `<!-- human:end -->` comments.
+Anything written inside those markers belongs to the owner, not the pipeline,
+and survives every recompilation, compression, archival, and link-repair pass
+untouched.
+
+Beyond the frontmatter fields other notes use, a compiled page also carries
+fields that only code writes, never the model: `sources_trust`,
+`last_verified`, `enrichment_count`, `conflicts_open`, and `human_reviewed`.
+`last_verified` records when the page's claims were last confirmed — by a
+fresh claim landing, or by the fact-check pass described below. That is a
+different signal from the ordinary `last_accessed` field, which only tracks
+when the page was last opened: a frequently opened page is not automatically
+a frequently checked one.
+
+Every source that lands on a page is scored into one of four trust levels,
+from weakest to strongest: `inferred`, `forwarded`, `integration`, `own`. A
+page's `sources_trust` is the weakest level among its sources. Only `own` and
+`integration` are strong enough, alone, to justify an automatic action with
+real consequences, such as creating a task or superseding an existing claim;
+`forwarded` and `inferred` alone never are.
+
+A new claim that contradicts an existing one is classified as `temporal`,
+`factual`, or `contextual`. A temporal conflict — an opinion that changed
+over time, or two claims with different known source dates — resolves
+itself: the newer source wins. A factual conflict does not resolve on its
+own: both claims stay on the page, and the disagreement becomes one row the
+owner must resolve through the decisions queue described below. A
+contextual conflict resolves itself too: both claims are valid in their own
+scope, so the new claim is simply recorded on the page, with the model's
+explanation of how the scopes differ, when it gave one, appended to that
+claim's own row. Code forces the `temporal` type for an opinion-kind claim
+or when both source dates are known and differ; otherwise it accepts the
+model's own label as given, and only falls back to `factual` when that label
+is missing or invalid.
+
+See `skills/compile-enrich/SKILL.md` for the full domain table, trust and
+conflict rules, and page schema.
+
 Each briefing links back to its sources and records freshness and confidence.
 It is still derived data. When an answer depends on a precise fact, the runtime
 can verify the briefing against curated context or the source note.
@@ -283,6 +329,160 @@ useful history. Create a successor note and use `supersede`. The command marks
 the old note and writes reciprocal `superseded_by` and `supersedes` links. Search
 then penalizes the old version while preserving the chain.
 
+## Compiled-page aging and re-verification
+
+Compiled pages age through the same memory tiers used elsewhere in this
+document, but for a compiled page the tier also controls how much enrichment
+attention it gets, not only how visible it is in search:
+
+- `core` and `active` pages are fully compiled and checked whenever a
+  relevant source lands.
+- `warm` pages are enriched only on a real signal — several sources arriving
+  in a short window, or a claim that turns out to be a decision, commitment,
+  or conflict. A quiet source is only acknowledged with a marked row, not
+  enriched.
+- `cold` pages are never enriched. A new source only adds a marked row to the
+  page's sources table, with no model call and no effect on the page's
+  enrichment budget.
+- `archive` pages are not read at all. A new source only promotes the page
+  one tier, to `warm`; real enrichment happens on a later pass, once the page
+  is active again.
+
+When a page cools into `warm`, `cold`, or `archive`, its `Recent Changes` and
+`Open Loops` sections are compressed: only the most recent entries stay in
+place, and open loops left open long enough move into a `History` section
+marked abandoned. The sources table (“Sources That Shaped This Page”), the
+claim history, open conflicts, and the human zone are never compressed by
+this pass — they only grow, or shrink through an explicit owner decision in
+the decisions queue.
+
+A page that has stayed at the `archive` tier long enough, with no incoming
+links, is moved into `compiled/archive/<domain>/` instead of being deleted.
+Nothing under `compiled/` is ever deleted by this pipeline.
+
+Fact-checking itself runs every night, not on a monthly schedule — but each
+run only processes a small, bounded batch of the stalest `core`/`active`/
+`warm` pages, so with a normal vault size any single page is actually
+rechecked roughly once a month. It calls no model: it re-derives each
+claim's category from its recorded source and re-checks the wikilinks it
+references. A page whose checked claims mostly still hold has its
+`last_verified` date moved to today. A page that fails instead keeps its
+previous `last_verified` date, has its `confidence` stepped down one level,
+and is queued for the owner as a `fact-check-rejected` decision instead of
+being silently patched or archived on its own; a page with even one
+unverifiable claim also has its `confidence` capped at `medium` either way.
+
+## Owner tools for the compiled layer
+
+The dashboard (`/menu`) adds four buttons on top of the compiled layer:
+**📰 Дайджест** (digest), **🗂 Очередь** (queue), **📝 Бриф** (brief), and
+**📅 Сводка недели** (weekly review).
+
+**Daily digest.** The digest button, and the same step in nightly
+maintenance, builds a short report: what needs a decision, what changed
+today, and one or two long-forgotten pages worth another look. A "needs a
+decision" item that first appeared today is shown in full; an item that was
+already on the queue is folded into one summary line with a count and a
+pointer to the "Очередь" screen, so an old conflict is never restated in
+full every day, but it never silently drops out of view either. It is
+written to `summaries/compile/YYYY-MM-DD.md` and, during the nightly cycle,
+sent to the owner as its own Telegram message. The digest stays silent only
+on a genuinely quiet day: the pass took no work, reported no error, the
+merged decisions list — the internal queue file's entries plus every open
+page conflict — is empty, no compiled page changed today, no pass budget
+was exhausted, no queue entries were evicted by the 30-item cap, no page's
+human-owned zone markers were left ambiguous, the background queue worker
+did not crash, and the refresh queue did not permanently run out of attempts
+on any source. So a single open conflict still forces a digest, even when
+the pass otherwise did nothing — and so do the other six cases, each for its
+own reason: pages are also enriched during the day by the background queue
+drain, so a night that honestly finds nothing left to do can still sit on
+top of real changes; silent truncation from an exhausted budget is
+explicitly forbidden; an evicted queue entry is a fact the owner must learn;
+a page stuck on an ambiguous human-zone marker cannot resolve itself on a
+later pass the way the other cases eventually can; a crashed background
+worker means no new write reaches a compiled page at all until it is
+restarted (the reason comes from `.session/compile-queue-worker.json`); and
+a source the queue gave up on will never re-enter it on its own — until the owner opens and saves the note again, no compiled
+page for it will exist at all. That give-up list lives in
+`.session/compile-dropped-sources.json`, is not keyed by date (so it repeats
+in the digest every day until the source finally compiles), and is rendered
+as the first five names plus a count of the rest, so a backend outage across
+a hundred notes cannot bury the digest under itself.
+
+**Decisions queue.** The queue button opens a paginated list, 8 items per
+screen; there is no overall limit on how many items the list can hold. The
+list is available in two places at once: the interactive `/menu` screen and
+a human-readable file, `summaries/compile/decisions-queue.md`, regenerated
+on every queue change. Both are built from the same data — a small internal
+file (`.session/decisions-queue.json`) plus every compiled page's own “Open
+Conflicts” table — so they cannot drift apart. Eight kinds of items exist
+today; four have their own dedicated actions:
+
+- a page that failed its fact-check offers “confirm the page is current,”
+  “archive the page,” or “defer”;
+- an open conflict shows the two competing claims themselves as button
+  labels, so the owner picks between the actual wording, plus “defer”;
+- a page whose Verify step rejected most of its proposed claims several
+  times in a row against the same source snapshot offers “retry the
+  check” — this clears the page's rejection counter so the next pass gives
+  Verify another attempt instead of skipping the page as still exhausted —
+  or “stop retrying,” which just drops the queue entry and leaves the
+  page's counter as it was, plus “defer”;
+- a possible duplicate — a new page that turned out too close to an
+  existing page in the same domain — offers “link as similar” or “mark as
+  distinct,” plus “defer.” The two pages are never merged: “link” only sets
+  a mutual `duplicate_of` frontmatter marker on both pages; any actual
+  merge stays the owner's call.
+
+The other four — a page that outgrew its monthly enrichment budget
+(“drift”), a claim replacement blocked by a low-trust source
+(“blocked-action”), a page file saved in an unreadable encoding
+(“page-encoding-broken”), and a page whose `<!-- human:start -->` /
+`<!-- human:end -->` markers do not resolve to a single span
+(“human-zone-ambiguous”) — plus any other, truly unrecognized kind found in
+the queue file all fall back to just “reject” and “defer”; nothing here
+guesses what an unfamiliar kind should do. For the last two the remedy is
+outside the queue entirely: re-save the file as UTF-8, or fix the markers by
+hand — until then the page is neither enriched nor compressed. Only the small
+internal queue file has a size limit, 30 entries: past that, the oldest
+entries are dropped first, except entries whose *kind* is `conflict` or
+`blocked-action`. Open conflicts, however, never actually land in that
+file — they are read live from each page's own table and are not capped or
+evicted at all — so today that protection has nothing to protect, and it is
+not based on the page's memory tier; the code has no such check.
+
+**Weekly review.** The "Сводка недели" button opens the half-hour weekly
+ritual screen: the 7-day window ending today; the week's changes; a
+5-item preview of the decisions queue with a count of what is left and a
+pointer to the full "Очередь" screen; one long-forgotten page related to the
+week's changes (the same selection rule the digest uses, but at most one
+here); and one page from this week's changes suggested for a "confirm
+reviewed" tap, which stamps its `human_reviewed` field with today's date.
+Both the forgotten-page and the confirm-review pick are deterministic for a
+given day but are not pinned to the same page forever. There is no separate
+schedule behind this screen — it is rebuilt from already-compiled data every
+time it is opened.
+
+**`/why`.** `/why <query>` answers “why does this page say that” for one
+compiled page: its sources by date, trust level, claim-history replacements,
+open conflicts, when it was last fully verified, and whether/when the owner
+confirmed it. When the candidate pages are close enough that guessing would
+be unsafe, `/why` asks the owner to pick between them instead of guessing —
+two of them on a close lexical near-tie, and one per domain (up to six) when
+the same slug exists in several of them.
+
+**Provenance on answers.** A direct-question answer that drew on compiled
+pages is followed by an “Источники ответа” (answer sources) block naming
+those pages with their trust level and open-conflict count, plus a warning
+when the combined trust is weak or a shown page carries an open conflict.
+
+**Briefs.** The brief button offers three kinds — **Решение** (decision),
+**Тема** (topic), **Проект** (project) — then asks for a free-text query. A
+brief is assembled purely from an already-compiled page: it never triggers a
+new compile pass, so a topic with nothing compiled yet has no brief to
+offer. The result is filed under `summaries/briefs/`.
+
 ## Search and memory commands
 
 Run these from the project or wheel-created instance directory:
@@ -344,6 +544,8 @@ not the routine retrieval path.
 | Full daily processing | At 21:00 in the host's local time when the supplied timer is enabled, or manually with `/process_full` |
 | Memory decay and creative recall | During the full reflection phase |
 | Vault-health and compiled-briefing maintenance | During the full reflection phase and scheduled post-cycle maintenance |
+| Compiled fact-check | Nightly, during scheduled post-cycle maintenance, after compiled maintenance and vault health, on a bounded batch of the stalest pages |
+| Compiled digest delivery | Nightly, during scheduled post-cycle maintenance, after compiled maintenance, vault health, and fact-check; skipped on a quiet night |
 | QMD refresh after searchable writes | Best effort; the separate QMD timer can also refresh the index |
 | Weekly, monthly, and yearly reviews | During the scheduled cycle when the relevant boundary is due |
 | PLAUD import | Only when configured and its timer or manual sync is used |

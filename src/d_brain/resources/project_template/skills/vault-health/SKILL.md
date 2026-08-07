@@ -39,6 +39,7 @@ Supported top-level work areas today:
 - `business/_index.md`, `business/crm.md`, `business/network.md`, `business/events.md`
 - `projects/_index.md`, `projects/clients.md`, `projects/leads.md`, `projects/projects.md`
 - `MOC/MOC-ideas.md`, `MOC/MOC-learnings.md`, `MOC/MOC-plaud.md`, `MOC/MOC-projects.md`, `MOC/MOC-reflections.md`, `MOC/MOC-weekly.md`, `MOC/index.md`
+- `compiled/projects/`, `compiled/people/`, `compiled/topics/`, `compiled/decisions/`, `compiled/meetings/`, `compiled/concepts/` -- the six compile-enrich domains, plus `compiled/archive/<domain>/` for archived pages. See [[skills/compile-enrich/SKILL|compile-enrich]] for what maintains this layer.
 
 Do not describe old nested business/project trees as if they were current truth.
 
@@ -48,6 +49,19 @@ Do not describe old nested business/project trees as if they were current truth.
 - broken links should trend down
 - orphan count should trend down outside expected areas like `daily/`
 - description coverage should trend up on durable cards
+- a `compiled/archive/<domain>/` page with zero incoming links is
+  **expected**, not a defect: no incoming links is the archival trigger
+  itself (see `compile-enrich/SKILL.md`), so `analyze.py` reports it
+  separately from real orphans instead of counting it as one
+
+## Compiled Layer Frontmatter
+
+Five `compiled/` frontmatter fields -- `sources_trust`, `last_verified`,
+`enrichment_count`, `conflicts_open`, `human_reviewed` -- are set only by
+code inside `CompiledBriefingService`, never by heuristics. `add_descriptions.py`
+and any similar description-generation tooling must never guess at or
+overwrite these five fields on a compiled page; see
+[[skills/compile-enrich/SKILL|compile-enrich]] for what each one means.
 
 ## Usage Notes
 
@@ -65,8 +79,16 @@ Do not describe old nested business/project trees as if they were current truth.
 - running repair scripts blindly without reading their output
 - inventing nested CRM/lead paths that do not exist in the current vault
 - using health score as vanity metric instead of a maintenance signal
+- collapsing the six nested `compiled/<domain>/` paths (or
+  `compiled/archive/<domain>/`) the way legacy nested business/project paths
+  get collapsed -- these subdirectories are current truth, not legacy debt
+- editing the content of a compiled page's human zone (between
+  `<!-- human:start -->` and `<!-- human:end -->`, inside `## Owner Notes`)
+  -- that zone is owner-written and every maintenance script must leave it
+  byte-for-byte untouched
 
 ## Relevant Skills
 
 - [[skills/graph-builder/SKILL|graph-builder]] — core graph analysis
 - [[skills/dbrain-processor/SKILL|dbrain-processor]] — daily processing pipeline
+- [[skills/compile-enrich/SKILL|compile-enrich]] — compiled/ layer this skill's scripts now recognize

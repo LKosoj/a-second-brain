@@ -9,7 +9,7 @@ from d_brain.services.cli_runner import CliRunner
 from d_brain.services.json_normalizer import extract_first_json_dict
 from d_brain.services.localization import normalize_language, prompt_language_name
 
-IMAGE_ANALYSIS_TIMEOUT = 120
+IMAGE_ANALYSIS_TIMEOUT = 600
 
 
 def _safe_text(value: Any) -> str:

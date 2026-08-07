@@ -7,7 +7,10 @@ import json
 import sys
 
 from d_brain.config import get_settings
-from d_brain.services.compiled_briefings import CompiledBriefingService
+from d_brain.services.compiled_briefings import (
+    CompiledBriefingService,
+    CompiledSourceStateError,
+)
 
 
 def main() -> int:
@@ -47,19 +50,31 @@ def main() -> int:
         content_language=settings.content_language,
         ai_cli=settings.ai_cli,
     )
-    if args.initialize_source_state:
-        result = service.initialize_source_state()
-        result["lint_issues"] = service.lint_notes()
-        result["freshness_issues"] = service.freshness_issues()
-        if result["lint_issues"] or result["freshness_issues"]:
-            result["errors"] = ["source-state-validation-failed"]
-    elif args.nightly:
-        result = service.run_nightly_maintenance()
-    else:
-        result = service.run_queue_worker(
-            force=args.force,
-            max_events=args.max_events,
-        )
+    try:
+        if args.initialize_source_state:
+            result = service.initialize_source_state()
+            result["lint_issues"] = service.lint_notes()
+            result["freshness_issues"] = service.freshness_issues()
+            if result["lint_issues"] or result["freshness_issues"]:
+                result["errors"] = ["source-state-validation-failed"]
+        elif args.nightly:
+            result = service.run_nightly_maintenance()
+        else:
+            result = service.run_queue_worker(
+                force=args.force,
+                max_events=args.max_events,
+            )
+    except CompiledSourceStateError as exc:
+        # Code review Finding 2: this is a real failure (unlike the
+        # queue-only drain, which now degrades instead of raising -- see
+        # ``CompiledBriefingService._source_tier_ranks``), so it must still
+        # end the run non-zero. It just deserves a message the owner can
+        # read instead of a raw traceback -- ``run_nightly_maintenance``
+        # already recorded this as a failed pass in its journal before
+        # re-raising, so nothing about that strictness changes here.
+        result = {
+            "errors": [f"повреждено состояние источников компиляции: {exc}"],
+        }
     sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
     return 0 if not result.get("errors") else 1
 

@@ -152,14 +152,34 @@ class ProfileRoute:
     required_fields: tuple[str, ...]
 
 
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+
+def _strip_bom(content: bytes) -> bytes:
+    """Drop a leading UTF-8 BOM so '---' delimiter checks still match it.
+
+    A BOM is a harmless marker some editors (e.g. Notepad "Save As UTF-8")
+    prepend to a file. It carries no meaning for our Markdown/YAML content, so
+    once a header is being rewritten wholesale we simply do not reproduce it.
+    """
+    if content.startswith(_UTF8_BOM):
+        return content[len(_UTF8_BOM) :]
+    return content
+
+
 def _detect_newline(content: bytes) -> bytes:
+    content = _strip_bom(content)
     if content.startswith(b"---\r\n"):
         return b"\r\n"
     if content.startswith(b"---\n"):
         return b"\n"
+    if content.startswith(b"---\r"):
+        return b"\r"
     first_newline = content.find(b"\n")
     if first_newline > 0 and content[first_newline - 1 : first_newline] == b"\r":
         return b"\r\n"
+    if first_newline == -1 and b"\r" in content:
+        return b"\r"
     return b"\n"
 
 
@@ -187,27 +207,31 @@ def split_frontmatter_bytes(content: bytes) -> tuple[bytes | None, bytes, bytes]
     """Split Markdown into raw header/body bytes before YAML validation.
 
     A document without a leading delimiter is valid Markdown with no header.
-    A leading delimiter without a matching close delimiter is an error.
+    A leading delimiter without a matching close delimiter is an error. A
+    leading UTF-8 BOM is skipped when looking for the delimiter and is not
+    carried into the parsed header or body; a document with no delimiter at
+    all keeps its BOM as part of the returned body, unchanged.
     """
     newline = _detect_newline(content)
+    unmarked = _strip_bom(content)
     opening = b"---" + newline
-    if not content.startswith(opening):
+    if not unmarked.startswith(opening):
         return None, content, newline
 
     offset = len(opening)
     closing = newline + b"---" + newline
-    closing_index = content.find(closing, offset)
+    closing_index = unmarked.find(closing, offset)
     if closing_index == -1:
         trailing = newline + b"---"
-        if content.endswith(trailing):
-            closing_index = len(content) - len(trailing)
-            header = content[offset:closing_index]
+        if unmarked.endswith(trailing):
+            closing_index = len(unmarked) - len(trailing)
+            header = unmarked[offset:closing_index]
             body = b""
         else:
             raise FrontmatterError("frontmatter is missing a closing '---'")
     else:
-        header = content[offset:closing_index]
-        body = content[closing_index + len(closing) :]
+        header = unmarked[offset:closing_index]
+        body = unmarked[closing_index + len(closing) :]
     return header, body, newline
 
 
@@ -361,7 +385,18 @@ def patch_frontmatter_bytes(content: bytes, updates: Mapping[str, Any]) -> bytes
     }
     if document.header is None:
         header = b"".join(rendered[field] + newline for field in sorted(rendered))
-        return b"---" + newline + header + b"---" + newline + document.body
+        # ``split_frontmatter_bytes`` deliberately leaves a BOM in the body
+        # of a document that has no delimiter at all -- it is a lossless
+        # split, and there is no header for the BOM to sit in front of.
+        # Here there is one, and prepending it in front of a body that still
+        # carries the marker moved that marker into the middle of the file,
+        # right behind the closing ``---``, where it shows up as a stray
+        # character on the note's first line. ``_strip_bom``'s own docstring
+        # already states the rule this branch was missing: once a header is
+        # being written wholesale, the marker is simply not reproduced.
+        return (
+            b"---" + newline + header + b"---" + newline + _strip_bom(document.body)
+        )
 
     spans = _field_spans(document.header)
     header = document.header

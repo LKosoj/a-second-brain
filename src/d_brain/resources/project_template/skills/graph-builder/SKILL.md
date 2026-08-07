@@ -54,6 +54,19 @@ Routing doc for vault graph analysis and targeted link-building.
 - `projects/projects.md`
 - Hub: `projects/_index.md`
 
+### Compiled
+
+- `compiled/projects/`, `compiled/people/`, `compiled/topics/`,
+  `compiled/decisions/`, `compiled/meetings/`, `compiled/concepts/`, and
+  `compiled/archive/<domain>/` for archived pages -- `analyze.py` buckets
+  each of these as its own domain (`compiled/<domain>`,
+  `compiled/archive/<domain>`) instead of collapsing them under one
+  `compiled` row.
+- Hub: none. Unlike Business/Projects, the compiled domains have no single
+  index note to link back to -- see
+  [[skills/compile-enrich/SKILL|compile-enrich]] for how these pages are
+  actually maintained.
+
 ## Link Quality Rules
 
 - link from meaning, not from name similarity alone
@@ -62,6 +75,11 @@ Routing doc for vault graph analysis and targeted link-building.
 - keep 2-5 strong links instead of 10 weak ones
 - daily files are low-priority for manual graph cleanup
 - prefer one targeted cleanup pass over bulk relinking
+- the "Sources That Shaped This Page", "Claim History", and "Open
+  Conflicts" tables on a compiled page already carry their reason in an
+  adjacent cell -- do not run mention-based "link by meaning" logic over
+  those rows; they are a generated ledger, not links to curate (see
+  [[skills/compile-enrich/SKILL|compile-enrich]])
 
 ## Do Not
 
@@ -69,8 +87,22 @@ Routing doc for vault graph analysis and targeted link-building.
 - do not add links to non-existent files
 - do not invent old nested paths such as `business/crm/*` or `projects/leads/*`
 - do not create new files without a strong retrieval reason
+- do not treat a `compiled/archive/<domain>/` page with no incoming links as
+  a graph defect -- no incoming links is the archival trigger itself, not a
+  broken-graph symptom (`analyze.py` already reports it separately)
+- do not edit the content of a compiled page's human zone (between
+  `<!-- human:start -->` and `<!-- human:end -->`) -- that text is
+  owner-written and out of scope for graph maintenance. `add_links.py`
+  enforces this in code (`human_zone_span`): it skips a `## Related`
+  heading inside the zone and leaves a file with ambiguous markers
+  untouched, the same way `vault-health/scripts/fix_links.py` does
+- do not carry the "collapse nested legacy paths" habit from
+  `business/*`/`projects/*` over to `compiled/*` -- the nested
+  `compiled/<domain>/` and `compiled/archive/<domain>/` paths are current
+  truth, not legacy debt to flatten
 
 ## Relevant Skills
 
 - [[skills/vault-health/SKILL|vault-health]] — health scoring, MOC generation, link repair
 - [[skills/dbrain-processor/SKILL|dbrain-processor]] — daily processing pipeline
+- [[skills/compile-enrich/SKILL|compile-enrich]] — the compiled/ layer this skill's `analyze.py` now recognizes

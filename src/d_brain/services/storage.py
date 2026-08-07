@@ -24,7 +24,12 @@ from d_brain.services.frontmatter import (
 from d_brain.services.localization import normalize_language
 from d_brain.services.memory_entries import DailyEntryMemoryStore
 from d_brain.services.qmd import QmdService
-from d_brain.services.source_links import SourceInfo, format_source_markdown
+from d_brain.services.source_links import (
+    SourceInfo,
+    escape_embedded_daily_headers,
+    escape_embedded_runtime_markup,
+    format_source_markdown,
+)
 from d_brain.services.vault_lock import VaultWriteLock, vault_write_lock
 
 logger = logging.getLogger(__name__)
@@ -210,12 +215,32 @@ class VaultStorage:
         refresh_compiled: bool,
         source_excerpt: str = "",
     ) -> None:
-        """Keep secondary indexes in sync after one markdown write."""
-        DailyEntryMemoryStore(self.vault_path).sync_daily_file(file_path)
+        """Keep secondary indexes in sync after one markdown write.
+
+        Every step here is a *secondary* index: the daily write itself has
+        already committed to disk by the time this runs. A failure while
+        re-indexing therefore deserves a log line, never an exception thrown
+        back at the caller -- the document handler, for one, wraps its whole
+        pipeline in a single try/except and would answer "❌ Не удалось
+        обработать документ" about a document it had in fact saved, sending
+        the owner looking for a file that is already there.
+        """
+        try:
+            DailyEntryMemoryStore(self.vault_path).sync_daily_file(file_path)
+        except Exception:
+            logger.exception("Daily entry memory sync failed: %s", file_path)
         if refresh_compiled:
-            self._refresh_compiled_briefings(file_path, source_excerpt=source_excerpt)
+            try:
+                self._refresh_compiled_briefings(
+                    file_path, source_excerpt=source_excerpt
+                )
+            except Exception:
+                logger.exception("Compiled briefing refresh failed: %s", file_path)
         if refresh_qmd:
-            self._refresh_qmd_index()
+            try:
+                self._refresh_qmd_index()
+            except Exception:
+                logger.exception("qmd refresh failed after writing %s", file_path)
 
     def _manifest(self) -> VaultManifest:
         """Load the required project manifest before every daily write."""
@@ -364,9 +389,27 @@ class VaultStorage:
             source,
             language=self.content_language,
         )
-        body = text.strip()
+        # A body line shaped like "## HH:MM [...]" would be read back as a
+        # second, independent daily entry -- with its own, possibly
+        # stronger, trust rating -- once this file is split back into
+        # entries (see escape_embedded_daily_headers for why this runs for
+        # every entry, not only forwarded ones).
+        # Runtime markup gets the same treatment as a header lookalike: this
+        # body is someone else's words often enough (a forwarded message,
+        # extracted document text, image OCR) and the runtime's marker
+        # strings are public, so a body line can otherwise host the reflect
+        # block, wedge every later write for the day, or forge a status.
+        body = escape_embedded_runtime_markup(
+            escape_embedded_daily_headers(text.strip())
+        )
         entry_parts = [part for part in (status_block, source_block, body) if part]
         entry_body = "\n\n".join(entry_parts)
+        # Keep the "## HH:MM [type]" header attached to the body: the
+        # compiled-briefings pipeline reads the entry marker off the first
+        # line of the excerpt to tell an own entry from a forwarded one, and
+        # a body-only excerpt makes every immediate refresh fall back to the
+        # weakest provenance level.
+        entry_markdown = f"## {time_str} {msg_type}\n{entry_body}"
 
         with vault_write_lock(self.vault_path) as lock:
             with self._daily_lock(day):
@@ -378,7 +421,7 @@ class VaultStorage:
                 content_bytes = content.encode("utf-8")
                 document = parse_frontmatter_bytes(content_bytes)
                 entry = self._render_with_newline(
-                    f"## {time_str} {msg_type}\n{entry_body}\n",
+                    f"{entry_markdown}\n",
                     document.newline,
                 )
                 updated = (
@@ -394,7 +437,7 @@ class VaultStorage:
             file_path,
             refresh_qmd=refresh_qmd,
             refresh_compiled=True,
-            source_excerpt=entry_body,
+            source_excerpt=entry_markdown,
         )
 
     def upsert_daily_block(
@@ -408,6 +451,15 @@ class VaultStorage:
     ) -> None:
         """Insert a full block, or replace only its exact marker-owned range."""
         self._ensure_dirs()
+        # Same reason as in append_to_daily: a block line shaped like
+        # "## HH:MM [...]" reads back as its own daily entry, and this path
+        # carries other people's words too -- PLAUD meeting summaries and
+        # the reflect block's AI-written task and note titles come through
+        # here. The reflect block is the one that needs it: it heads itself
+        # "[text]", so _daily_source_chunks' floor rates a forged header
+        # below it "own". Callers pass heading and payload as one string,
+        # so keep_leading_header spares the heading they built themselves.
+        block = escape_embedded_daily_headers(block, keep_leading_header=True)
         file_path = self.get_daily_file(day)
 
         with vault_write_lock(self.vault_path) as lock:

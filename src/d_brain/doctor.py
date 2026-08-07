@@ -15,6 +15,7 @@ from typing import Literal, TextIO
 
 from dotenv import dotenv_values
 
+from d_brain.control_plane.registry import validate_control_plane_registry
 from d_brain.manifest import ManifestValidationError, VaultManifest, load_manifest
 
 CheckLevel = Literal["OK", "INFO", "WARN", "ERR"]
@@ -86,6 +87,7 @@ class ProjectDoctor:
         self._load_environment()
         self._check_environment()
         self._check_project_files()
+        self._check_control_plane_registry()
         self._check_commands()
         self._check_integrations()
         self._check_backup()
@@ -198,6 +200,18 @@ class ProjectDoctor:
                 self.report.add("OK", "mcp-config.json is valid")
             else:
                 self.report.add("ERR", "mcp-config.json must define mcpServers")
+
+    def _check_control_plane_registry(self) -> None:
+        try:
+            errors = validate_control_plane_registry()
+        except Exception as exc:
+            self.report.add("ERR", f"Control-plane registry: {exc}")
+            return
+        if errors:
+            for error in errors:
+                self.report.add("ERR", f"Control-plane registry: {error}")
+        else:
+            self.report.add("OK", "Control-plane workflow registry is valid")
 
     def _check_commands(self) -> None:
         for command in ("uv", "jq"):

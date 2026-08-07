@@ -60,6 +60,8 @@ Typical examples:
 - `question.fact-lookup`
 - `maintenance.compiled-nightly`
 - `maintenance.vault-health`
+- `maintenance.compiled-fact-check`
+- `maintenance.compiled-digest`
 - `integration.documents.archive`
 - `integration.web.archive`
 - `integration.youtube.archive`
@@ -134,6 +136,10 @@ Current deterministic guardrails:
   mutations that lexically reference repo-managed `.claude` assets; ordinary
   commands, read-only inspection, `a-second-brain qmd`, and memory-engine remain usable
 - `validate-frontmatter.sh` flags obvious malformed frontmatter after markdown writes
+- `a-second-brain doctor` also validates the control-plane registry itself
+  (`validate_control_plane_registry()`), catching a duplicate workflow name,
+  an unresolved entrypoint, or a malformed question-routing strategy before
+  it reaches the router
 
 The vault is not exposed as an MCP server. External integration authority is
 declared by the control-plane registry, not by a generic vault tool.
@@ -162,7 +168,7 @@ Every risky integration must define:
 The control plane registry is the canonical source of truth for all workflow definitions. It drives:
 - question routing (5 route strategies: planning, relationship, status-history, fact-lookup, general)
 - capture workflow metadata (`capture.daily-entry`)
-- scheduled maintenance orchestration (`maintenance.scheduled-cycle`, `maintenance.compiled-nightly`, `maintenance.vault-health`)
+- scheduled maintenance orchestration (`maintenance.scheduled-cycle`, `maintenance.compiled-nightly`, `maintenance.vault-health`, `maintenance.compiled-fact-check`, `maintenance.compiled-digest`)
 - integration workflow contracts (`integration.documents.archive`, `integration.web.archive`, `integration.youtube.archive`, `integration.plaud.sync`)
 - top-level text workflow resolution via `router.resolve_text_workflow()`
 

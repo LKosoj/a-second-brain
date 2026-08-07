@@ -90,8 +90,13 @@ Examples:
 ```bash
 a-second-brain qmd status
 a-second-brain qmd update
+a-second-brain qmd query "weekly focus"
 a-second-brain qmd recall "weekly focus"
 ```
+
+When `EMB_MODEL` is configured, `query` keeps the standard QMD ranking but
+uses the project's remote embedding and rerank adapters. `recall` adds the
+vault's memory relevance, recency, and lifecycle signals on top.
 
 With no QMD arguments, the command shows index status.
 

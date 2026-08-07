@@ -142,8 +142,6 @@ async def handle_text(message: Message) -> None:
         getattr(settings, "openai_base_url", ""),
         getattr(settings, "openai_model", ""),
     )
-    session = SessionStore(settings.vault_path)
-
     status_message = await _upsert_status_message(
         message,
         None,
@@ -151,38 +149,125 @@ async def handle_text(message: Message) -> None:
         step="запускаю роутинг",
     )
 
-    intent, status_message = await _run_to_thread_with_status(
-        message,
-        status_message,
-        processor.classify_text_intent,
-        branch="определяю ветку",
-        step="анализирую сообщение",
-        args=(message.text,),
-    )
-    branch = _text_branch_label(
-        intent["intent"],
-        str(intent.get("workflow") or ""),
-    )
-    if intent["intent"] == TEXT_INTENT_QUESTION:
-        report, status_message = await _run_to_thread_with_status(
+    # Wrapped like photo/voice/document (code review): this handler used to
+    # catch nothing at all, so a failed routing call, enrichment or daily
+    # write escaped into aiogram's dispatcher, which logs and returns. The
+    # "⏳" status put up above is never taken down in that case, so the owner
+    # was left watching a progress indicator for work that had already died,
+    # with no error and no way to tell it apart from a slow run.
+    try:
+        # Constructed inside the guard, unlike ``processor`` above it (code
+        # review): ``SessionStore.__init__`` calls ``mkdir(exist_ok=True)``
+        # without ``parents=True``, so a missing vault directory raises here.
+        # Left outside, that raise escaped the guard this whole round exists
+        # to close. photo.py and document.py already build theirs inside
+        # their own guards, via _log_photo_session and the upload task.
+        session = SessionStore(settings.vault_path)
+
+        intent, status_message = await _run_to_thread_with_status(
             message,
             status_message,
-            processor.answer_question,
-            branch=branch,
-            step="готовлю прямой ответ",
-            args=(message.text, message.from_user.id),
+            processor.classify_text_intent,
+            branch="определяю ветку",
+            step="анализирую сообщение",
+            args=(message.text,),
         )
+        branch = _text_branch_label(
+            intent["intent"],
+            str(intent.get("workflow") or ""),
+        )
+        if intent["intent"] == TEXT_INTENT_QUESTION:
+            report, status_message = await _run_to_thread_with_status(
+                message,
+                status_message,
+                processor.answer_question,
+                branch=branch,
+                step="готовлю прямой ответ",
+                args=(message.text, message.from_user.id),
+            )
+            session.append(
+                message.from_user.id,
+                "question",
+                text=message.text,
+                intent_confidence=intent.get("confidence", ""),
+                intent_reason=intent.get("reason", ""),
+                workflow_name=intent.get("workflow", ""),
+                workflow_kind=intent.get("workflow_kind", ""),
+                msg_id=message.message_id,
+            )
+            formatted = format_process_report(report)
+            status_message = await _upsert_status_message(
+                message,
+                status_message,
+                branch=branch,
+                step="отправляю ответ",
+            )
+            await _safe_delete_status(status_message)
+            final_sender = answer_text if "error" in report else answer_rich_text
+            try:
+                await final_sender(message, formatted)
+            except Exception:
+                logger.exception("Failed to send direct answer")
+            logger.info("Text message routed to direct answer")
+            return
+
+        storage = VaultStorage(settings.vault_path, settings.content_language)
+        link_summary = LinkSummaryService(
+            str(settings.vault_path),
+            settings.ai_cli,
+            settings.content_language,
+            tavily_api_key=getattr(settings, "tavily_api_key", ""),
+            jina_api_key=getattr(settings, "jina_api_key", ""),
+            zai_api_key=getattr(settings, "zai_api_key", ""),
+            proxy_url=getattr(settings, "proxy_url", ""),
+        )
+        timestamp = message.date.astimezone()
+        source = build_telegram_source_info(
+            message, language=settings.content_language
+        )
+        result, status_message = await _run_to_thread_with_status(
+            message,
+            status_message,
+            link_summary.enrich_text,
+            branch=branch,
+            step="обогащаю текст",
+            args=(message.text,),
+            kwargs={
+                "timestamp": timestamp,
+                "source": source,
+                "refresh_qmd": False,
+            },
+        )
+        _, status_message = await _run_to_thread_with_status(
+            message,
+            status_message,
+            storage.append_to_daily,
+            branch=branch,
+            step="сохраняю запись в daily",
+            args=(result.content, timestamp, "[text]"),
+            kwargs={"source": source},
+        )
+
+        # Log to session
         session.append(
             message.from_user.id,
-            "question",
-            text=message.text,
-            intent_confidence=intent.get("confidence", ""),
-            intent_reason=intent.get("reason", ""),
-            workflow_name=intent.get("workflow", ""),
-            workflow_kind=intent.get("workflow_kind", ""),
+            "text",
+            text=result.content,
+            youtube_urls=[item.url for item in result.transcripts],
             msg_id=message.message_id,
+            source_ref=source.ref,
+            source_url=source.url,
         )
-        formatted = format_process_report(report)
+
+        reply = "✓ Сохранено"
+        link_summary_message = format_link_summary_message(
+            result.summaries,
+            language=settings.content_language,
+            youtube_urls={item.url for item in result.youtube_summaries},
+        )
+        if link_summary_message:
+            reply += "\n\n" + link_summary_message
+
         status_message = await _upsert_status_message(
             message,
             status_message,
@@ -190,75 +275,20 @@ async def handle_text(message: Message) -> None:
             step="отправляю ответ",
         )
         await _safe_delete_status(status_message)
-        final_sender = answer_text if "error" in report else answer_rich_text
+        # Guarded separately from the handler below (code review): the status
+        # message has just been deleted and the entry is already saved, so an
+        # unguarded failure here would be reported as a failed capture, and
+        # told the owner an entry that is on disk had been lost.
         try:
-            await final_sender(message, formatted)
+            await answer_text(message, reply, parse_mode=None)
         except Exception:
-            logger.exception("Failed to send direct answer")
-        logger.info("Text message routed to direct answer")
-        return
+            logger.exception("Failed to deliver text capture confirmation")
+        logger.info("Text message saved: %d chars", len(result.content))
 
-    storage = VaultStorage(settings.vault_path, settings.content_language)
-    link_summary = LinkSummaryService(
-        str(settings.vault_path),
-        settings.ai_cli,
-        settings.content_language,
-        tavily_api_key=getattr(settings, "tavily_api_key", ""),
-        jina_api_key=getattr(settings, "jina_api_key", ""),
-        zai_api_key=getattr(settings, "zai_api_key", ""),
-        proxy_url=getattr(settings, "proxy_url", ""),
-    )
-    timestamp = message.date.astimezone()
-    source = build_telegram_source_info(message, language=settings.content_language)
-    result, status_message = await _run_to_thread_with_status(
-        message,
-        status_message,
-        link_summary.enrich_text,
-        branch=branch,
-        step="обогащаю текст",
-        args=(message.text,),
-        kwargs={
-            "timestamp": timestamp,
-            "source": source,
-            "refresh_qmd": False,
-        },
-    )
-    _, status_message = await _run_to_thread_with_status(
-        message,
-        status_message,
-        storage.append_to_daily,
-        branch=branch,
-        step="сохраняю запись в daily",
-        args=(result.content, timestamp, "[text]"),
-        kwargs={"source": source},
-    )
-
-    # Log to session
-    session.append(
-        message.from_user.id,
-        "text",
-        text=result.content,
-        youtube_urls=[item.url for item in result.transcripts],
-        msg_id=message.message_id,
-        source_ref=source.ref,
-        source_url=source.url,
-    )
-
-    reply = "✓ Сохранено"
-    link_summary_message = format_link_summary_message(
-        result.summaries,
-        language=settings.content_language,
-        youtube_urls={item.url for item in result.youtube_summaries},
-    )
-    if link_summary_message:
-        reply += "\n\n" + link_summary_message
-
-    status_message = await _upsert_status_message(
-        message,
-        status_message,
-        branch=branch,
-        step="отправляю ответ",
-    )
-    await _safe_delete_status(status_message)
-    await answer_text(message, reply, parse_mode=None)
-    logger.info("Text message saved: %d chars", len(result.content))
+    except Exception as exc:
+        logger.exception("Error processing text message")
+        await _safe_delete_status(status_message)
+        try:
+            await answer_text(message, f"Ошибка: {exc}", parse_mode=None)
+        except Exception:
+            logger.exception("Failed to deliver text failure report")

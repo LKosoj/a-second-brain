@@ -26,6 +26,7 @@ def create_bot(settings: Settings) -> Bot:
 def create_dispatcher() -> Dispatcher:
     """Create and configure the dispatcher with routers."""
     from d_brain.bot.handlers import (
+        brief,
         commands,
         do,
         document,
@@ -35,6 +36,7 @@ def create_dispatcher() -> Dispatcher:
         process,
         text,
         voice,
+        why,
     )
 
     # Use memory storage for FSM (required for /do command state)
@@ -45,6 +47,8 @@ def create_dispatcher() -> Dispatcher:
     dp.include_router(menu.router)
     dp.include_router(process.router)
     dp.include_router(do.router)  # Before voice/text to catch FSM state
+    dp.include_router(why.router)  # Before voice/text to catch FSM state
+    dp.include_router(brief.router)  # Before voice/text to catch FSM state
     dp.include_router(voice.router)
     dp.include_router(photo.router)
     dp.include_router(document.router)
@@ -114,6 +118,7 @@ async def configure_bot_commands(bot: Bot) -> None:
             BotCommand(command="start", description="показать справку"),
             BotCommand(command="menu", description="открыть меню"),
             BotCommand(command="do", description="произвольный запрос"),
+            BotCommand(command="why", description="почему страница так говорит"),
             BotCommand(command="help", description="справка"),
             BotCommand(command="stats", description="статистика"),
             BotCommand(command="files", description="файлы vault"),

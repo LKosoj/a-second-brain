@@ -118,6 +118,15 @@ def test_parse_epistemic_metadata_ignores_compiled_confidence() -> None:
     )
 
 
+def test_parse_epistemic_note_tolerates_leading_bom() -> None:
+    """A leading UTF-8 BOM must not hide a note's frontmatter (see frontmatter.py)."""
+    content = b"\xef\xbb\xbf" + _note()
+    metadata = parse_epistemic_note(content)
+    assert metadata.confidence == "verified"
+    assert metadata.scope == "project:test"
+    assert metadata.state == "active"
+
+
 def test_supersede_is_bidirectional_idempotent_and_preserves_bodies(
     tmp_path: Path,
 ) -> None:
@@ -594,6 +603,27 @@ def test_final_descriptor_replace_rejects_symlink_swap(
     assert (vault_path / ".locks/epistemic-supersession.json").exists()
 
 
+def test_memory_engine_parse_frontmatter_tolerates_leading_bom() -> None:
+    """A leading UTF-8 BOM must not hide fields from decay/tier calculations.
+
+    Without BOM tolerance, ``cmd_decay`` would see an empty ``fields`` dict and
+    overwrite an explicit ``type``/``tier`` with a freshly inferred guess.
+    """
+    memory_engine = _load_memory_engine()
+    without_bom = "---\ntier: archive\n---\nBody\n"
+    with_bom = "\ufeff" + without_bom
+
+    baseline_fields, baseline_body, baseline_had_yaml = (
+        memory_engine.parse_frontmatter(without_bom)
+    )
+    fields, body, had_yaml = memory_engine.parse_frontmatter(with_bom)
+
+    assert baseline_had_yaml is True
+    assert had_yaml is True
+    assert fields.get("tier") == baseline_fields.get("tier") == "archive"
+    assert body == baseline_body == "Body\n"
+
+
 def test_memory_engine_exposes_supersession_cli(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -703,3 +733,36 @@ def test_journal_contains_hashes_and_payloads_after_interruption(
         "before_sha256" in item and "after_payload_b64" in item
         for item in payload["notes"]
     )
+
+
+def test_parse_epistemic_document_accepts_every_shape_frontmatter_does():
+    """Code review: this module used to re-implement the delimiter rules of
+    ``frontmatter.split_frontmatter_bytes`` by hand, and the copy drifted --
+    it accepted only \\n and \\r\\n line endings and always demanded a
+    newline *after* the closing ---. Both shapes below are ordinary vault
+    files that module parses fine, and ``supersede_notes`` refused them."""
+    classic_mac = b"---\rtype: note\rdescription: x\r---\rbody\r"
+    header_only = b"---\ntype: note\ndescription: x\n---"
+
+    for content in (classic_mac, header_only):
+        reference = parse_frontmatter_bytes(content)
+        parsed = epistemic_memory._parse_epistemic_document(content)
+
+        assert parsed.fields == reference.fields
+        assert parsed.body == reference.body
+        assert parsed.newline == reference.newline
+
+
+def test_parse_epistemic_document_still_rejects_a_note_with_no_frontmatter():
+    """The delegation must not soften the module's own contract: a body-only
+    note is still an ``EpistemicValidationError``, not a silently empty
+    field set."""
+    with pytest.raises(EpistemicValidationError, match="require frontmatter"):
+        epistemic_memory._parse_epistemic_document(b"# Just a heading\n")
+
+
+def test_parse_epistemic_document_reports_frontmatter_errors_as_its_own_type():
+    """Every caller here catches ``EpistemicValidationError``; a raw
+    ``FrontmatterError`` leaking through the delegation would escape them."""
+    with pytest.raises(EpistemicValidationError, match="closing"):
+        epistemic_memory._parse_epistemic_document(b"---\ntype: note\nbody\n")

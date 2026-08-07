@@ -105,6 +105,109 @@ def test_doctor_rejects_invalid_owner_id(
     assert "[ERR] OWNER_TELEGRAM_ID must be a positive integer" in output.getvalue()
 
 
+def test_doctor_reports_valid_control_plane_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Doctor's own wiring/formatting for a clean registry result, not the
+    registry validator itself (see test_prompt_corpus.py for that) — the
+    validator is stubbed so this test and the validator test do not fail
+    in lockstep from the same underlying registry defect."""
+    initialize_project(tmp_path)
+    monkeypatch.setattr(doctor.shutil, "which", _installed_core_command)
+    monkeypatch.setattr(doctor, "validate_control_plane_registry", lambda: [])
+    output = io.StringIO()
+
+    status = doctor.run_doctor(
+        tmp_path,
+        environ=_valid_environment(),
+        stream=output,
+    )
+
+    assert status == 0
+    assert (
+        "[OK] Control-plane workflow registry is valid" in output.getvalue()
+    )
+
+
+def test_doctor_fails_when_control_plane_registry_is_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initialize_project(tmp_path)
+    monkeypatch.setattr(doctor.shutil, "which", _installed_core_command)
+    monkeypatch.setattr(
+        doctor, "validate_control_plane_registry", lambda: ["broken thing"]
+    )
+    output = io.StringIO()
+
+    status = doctor.run_doctor(
+        tmp_path,
+        environ=_valid_environment(),
+        stream=output,
+    )
+
+    assert status == 1
+    assert (
+        "[ERR] Control-plane registry: broken thing" in output.getvalue()
+    )
+
+
+def test_doctor_reports_each_control_plane_registry_error_separately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initialize_project(tmp_path)
+    monkeypatch.setattr(doctor.shutil, "which", _installed_core_command)
+    monkeypatch.setattr(
+        doctor,
+        "validate_control_plane_registry",
+        lambda: ["first problem", "second problem"],
+    )
+    output = io.StringIO()
+
+    doctor.run_doctor(
+        tmp_path,
+        environ=_valid_environment(),
+        stream=output,
+    )
+
+    rendered = output.getvalue()
+    assert "[ERR] Control-plane registry: first problem" in rendered
+    assert "[ERR] Control-plane registry: second problem" in rendered
+
+
+def test_doctor_survives_unexpected_registry_validation_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """validate_control_plane_registry() only promises to catch
+    (AttributeError, ImportError) internally; any other exception raised
+    while importing a workflow module (e.g. a settings validation error
+    that fires at import time) must not crash doctor -- it should surface
+    as a diagnostic ERR instead, same as every other _check_* method."""
+    initialize_project(tmp_path)
+    monkeypatch.setattr(doctor.shutil, "which", _installed_core_command)
+
+    def _explode() -> list[str]:
+        raise RuntimeError("settings validation failed for workflow module")
+
+    monkeypatch.setattr(doctor, "validate_control_plane_registry", _explode)
+    output = io.StringIO()
+
+    status = doctor.run_doctor(
+        tmp_path,
+        environ=_valid_environment(),
+        stream=output,
+    )
+
+    assert status == 1
+    assert (
+        "[ERR] Control-plane registry: settings validation failed for workflow module"
+        in output.getvalue()
+    )
+
+
 def test_doctor_requires_todoist_commands_only_when_configured(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

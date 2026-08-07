@@ -23,6 +23,7 @@ from d_brain.services.frontmatter import (
     move_validated_vault_markdown,
     parse_frontmatter_bytes,
     patch_frontmatter_bytes,
+    read_frontmatter,
     read_vault_file_bytes,
     resolve_vault_markdown_path,
     route_profile,
@@ -265,6 +266,137 @@ def test_split_preserves_body_hash_material_when_yaml_is_invalid() -> None:
     assert body == b"# Body\n"
     with pytest.raises(DuplicateKeyError):
         parse_frontmatter_bytes(b"---\ntype: note\ntype: duplicate\n---\n# Body\n")
+
+
+def test_bom_prefixed_frontmatter_parses_same_fields_as_without_bom() -> None:
+    """A leading UTF-8 BOM (e.g. Notepad "Save As UTF-8") must not hide fields."""
+    without_bom = b"---\ntier: archive\ndescription: Kept note\n---\nBody text\n"
+    with_bom = b"\xef\xbb\xbf" + without_bom
+
+    baseline = parse_frontmatter_bytes(without_bom)
+    document = parse_frontmatter_bytes(with_bom)
+
+    assert document.fields == baseline.fields == {
+        "tier": "archive",
+        "description": "Kept note",
+    }
+    assert document.body == baseline.body == b"Body text\n"
+    assert document.has_frontmatter
+
+
+def test_patch_preserves_single_header_and_body_for_bom_prefixed_file() -> None:
+    """The most dangerous failure mode: patching a BOM must not double the header."""
+    content = (
+        b"\xef\xbb\xbf---\ntier: archive\ndescription: Kept note\n---\nBody text\n"
+    )
+
+    patched = patch_frontmatter_bytes(content, {"tier": "active"})
+
+    assert patched.count(b"---\n") == 2
+    assert b"\xef\xbb\xbf" not in patched
+    document = parse_frontmatter_bytes(patched)
+    assert document.fields == {"tier": "active", "description": "Kept note"}
+    assert document.body == b"Body text\n"
+
+
+def test_bom_prefixed_document_without_frontmatter_keeps_body_bytes_unchanged() -> None:
+    content = b"\xef\xbb\xbfJust a note, no frontmatter.\n"
+    document = parse_frontmatter_bytes(content)
+    assert document.header is None
+    assert document.fields == {}
+    assert document.body == content
+
+
+def test_patch_of_bom_prefixed_body_without_header_does_not_bury_the_marker() -> None:
+    """The split above keeps the BOM in the body on purpose -- with no header
+    there is nowhere else for it to live. Once a header is written in front of
+    that body the marker is no longer leading: it ends up right behind the
+    closing '---', where Obsidian renders it as a stray glyph on the note's
+    first line and every later parse sees it as ordinary text."""
+    content = b"\xef\xbb\xbf# Note\n"
+
+    patched = patch_frontmatter_bytes(content, {"tier": "active"})
+
+    assert b"\xef\xbb\xbf" not in patched
+    document = parse_frontmatter_bytes(patched)
+    assert document.fields == {"tier": "active"}
+    assert document.body == b"# Note\n"
+
+
+def test_cr_only_frontmatter_parses_same_fields_as_lf() -> None:
+    """Classic Mac line endings (lone '\\r', no '\\n') must not hide fields."""
+    with_lf = b"---\ntier: archive\ndescription: Kept note\n---\nBody text\n"
+    with_cr = b"---\rtier: archive\rdescription: Kept note\r---\rBody text\r"
+
+    baseline = parse_frontmatter_bytes(with_lf)
+    document = parse_frontmatter_bytes(with_cr)
+
+    assert document.fields == baseline.fields == {
+        "tier": "archive",
+        "description": "Kept note",
+    }
+    assert document.newline == b"\r"
+    assert document.body == b"Body text\r"
+    assert document.has_frontmatter
+
+
+def test_read_frontmatter_from_cr_only_file_on_disk(tmp_path: Path) -> None:
+    note = tmp_path / "note.md"
+    note.write_bytes(b"---\rtier: core\rdescription: Kept note\r---\rBody text\r")
+
+    document = read_frontmatter(note)
+
+    assert document.fields == {"tier": "core", "description": "Kept note"}
+    assert document.newline == b"\r"
+
+
+def test_patch_preserves_single_header_and_cr_delimiters_for_cr_only_file() -> None:
+    """The same dangerous failure mode as BOM: a lone-'\\r' header must not be
+    treated as absent, or the patch glues a duplicate header onto the whole
+    original file instead of patching the real one and updating no field."""
+    content = b"---\rtier: core\rdescription: Kept note\r---\rBody text\r"
+
+    patched = patch_frontmatter_bytes(content, {"tier": "active"})
+
+    assert patched.count(b"---\r") == 2
+    document = parse_frontmatter_bytes(patched)
+    assert document.fields == {"tier": "active", "description": "Kept note"}
+    assert document.body == b"Body text\r"
+
+
+@pytest.mark.parametrize(
+    ("opening", "newline"),
+    [(b"---\n", b"\n"), (b"---\r\n", b"\r\n"), (b"---\r", b"\r")],
+)
+def test_patch_round_trips_and_keeps_native_delimiter_across_newline_styles(
+    opening: bytes, newline: bytes
+) -> None:
+    content = opening + b"type: note" + newline + b"---" + newline + b"Body" + newline
+
+    patched = patch_frontmatter_bytes(content, {"type": "changed"})
+    document = parse_frontmatter_bytes(patched)
+
+    assert document.fields["type"] == "changed"
+    assert document.newline == newline
+    assert document.body == b"Body" + newline
+
+
+def test_cr_only_headerless_document_gets_cr_delimited_header_on_patch() -> None:
+    """A body with no '---' header, already using lone '\\r' line breaks, must
+    stay headerless on plain parse and get a newly added header in that same
+    '\\r' style once patched -- not a mismatched '\\n' header glued on top."""
+    content = b"Just a note, no frontmatter.\rSecond line.\r"
+
+    document = parse_frontmatter_bytes(content)
+    assert document.header is None
+    assert document.fields == {}
+    assert document.body == content
+
+    patched = patch_frontmatter_bytes(content, {"type": "note"})
+    patched_document = parse_frontmatter_bytes(patched)
+    assert patched_document.fields == {"type": "note"}
+    assert patched_document.newline == b"\r"
+    assert patched_document.body == content
 
 
 def test_router_and_profile_validation_use_manifest_contract() -> None:

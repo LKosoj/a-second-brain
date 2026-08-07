@@ -98,6 +98,29 @@ def test_services_use_absolute_mcp_config_path(tmp_path: Path) -> None:
     assert plaud._cli_extra_env()["MCP_CONFIG_PATH"] == expected
 
 
+def test_qmd_touch_uses_configured_absolute_uv_path(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    note = vault_path / "daily/example.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("# Example\n", encoding="utf-8")
+    service = _qmd_service(vault_path)
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setenv("UV_BIN", "/opt/uv/bin/uv")
+    monkeypatch.setattr("d_brain.services.qmd.subprocess.run", fake_run)
+
+    service.touch_notes(["daily/example.md"])
+
+    assert calls[0][:2] == ["/opt/uv/bin/uv", "run"]
+
+
 def test_run_qmd_get_touches_opened_notes(monkeypatch, tmp_path: Path) -> None:
     calls: list[tuple[str, object]] = []
 
@@ -132,6 +155,167 @@ def test_run_qmd_get_touches_opened_notes(monkeypatch, tmp_path: Path) -> None:
     ]
 
 
+def test_run_qmd_query_uses_remote_query_adapter(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    calls: list[tuple[str, object]] = []
+
+    class FakeQmdService:
+        def __init__(self, vault_path: Path) -> None:
+            assert vault_path == tmp_path
+
+        def uses_remote_embeddings(self) -> bool:
+            return True
+
+        def query(self, query: str, *, limit: int = 5) -> dict[str, object]:
+            calls.append(("query", (query, limit)))
+            return {
+                "query": query,
+                "backend": "query",
+                "mode": "query",
+                "results": [{"file": "qmd://daily/example.md", "score": 0.91}],
+            }
+
+        def run(self, *args: str) -> subprocess.CompletedProcess[str]:
+            raise AssertionError(f"unexpected raw qmd run: {args}")
+
+    monkeypatch.setattr(run_qmd, "QmdService", FakeQmdService)
+    monkeypatch.setattr(
+        run_qmd,
+        "get_settings",
+        lambda: SimpleNamespace(vault_path=tmp_path),
+    )
+
+    exit_code = run_qmd.main(
+        ["query", "remote semantic query", "--format", "json", "-n", "3"]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert calls == [("query", ("remote semantic query", 3))]
+    assert payload == [{"file": "qmd://daily/example.md", "score": 0.91}]
+
+
+def test_run_qmd_query_cli_format_renders_text_and_uses_the_cli_default_limit(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    """Code review: neither the text-output branch nor the two different
+    default limits (json wants 20 rows, a terminal wants 5) were covered --
+    swapping them broke nothing. Both are what the owner actually sees when
+    running ``qmd query`` without flags."""
+    calls: list[tuple[str, object]] = []
+
+    class FakeQmdService:
+        def __init__(self, vault_path: Path) -> None:
+            assert vault_path == tmp_path
+
+        def uses_remote_embeddings(self) -> bool:
+            return True
+
+        def query(self, query: str, *, limit: int = 5) -> dict[str, object]:
+            calls.append(("query", (query, limit)))
+            return {
+                "query": query,
+                "backend": "query",
+                "mode": "query",
+                "results": [{"file": "qmd://daily/example.md", "score": 0.91}],
+            }
+
+        def format_query(self, payload: dict[str, object]) -> str:
+            calls.append(("format_query", payload["query"]))
+            return "отрендеренный текст"
+
+        def run(self, *args: str) -> subprocess.CompletedProcess[str]:
+            raise AssertionError(f"unexpected raw qmd run: {args}")
+
+    monkeypatch.setattr(run_qmd, "QmdService", FakeQmdService)
+    monkeypatch.setattr(
+        run_qmd,
+        "get_settings",
+        lambda: SimpleNamespace(vault_path=tmp_path),
+    )
+
+    exit_code = run_qmd.main(["query", "запрос без флагов"])
+
+    assert exit_code == 0
+    assert calls == [
+        ("query", ("запрос без флагов", 5)),
+        ("format_query", "запрос без флагов"),
+    ]
+    assert capsys.readouterr().out == "отрендеренный текст\n"
+
+
+def test_run_qmd_query_json_format_defaults_to_a_wider_limit(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    """The json branch feeds another program, not a terminal, so it defaults
+    to more rows than the cli branch -- the pair only means something when
+    both halves are pinned."""
+    calls: list[tuple[str, object]] = []
+
+    class FakeQmdService:
+        def __init__(self, vault_path: Path) -> None:
+            assert vault_path == tmp_path
+
+        def uses_remote_embeddings(self) -> bool:
+            return True
+
+        def query(self, query: str, *, limit: int = 5) -> dict[str, object]:
+            calls.append(("query", (query, limit)))
+            return {"query": query, "results": []}
+
+        def run(self, *args: str) -> subprocess.CompletedProcess[str]:
+            raise AssertionError(f"unexpected raw qmd run: {args}")
+
+    monkeypatch.setattr(run_qmd, "QmdService", FakeQmdService)
+    monkeypatch.setattr(
+        run_qmd,
+        "get_settings",
+        lambda: SimpleNamespace(vault_path=tmp_path),
+    )
+
+    exit_code = run_qmd.main(["query", "запрос", "--json"])
+
+    assert exit_code == 0
+    assert calls == [("query", ("запрос", 20))]
+    assert json.loads(capsys.readouterr().out) == []
+
+
+def test_run_qmd_query_keeps_stock_qmd_for_local_models(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    class FakeQmdService:
+        def __init__(self, vault_path: Path) -> None:
+            assert vault_path == tmp_path
+
+        def uses_remote_embeddings(self) -> bool:
+            return False
+
+        def run(self, *args: str) -> subprocess.CompletedProcess[str]:
+            calls.append(args)
+            return subprocess.CompletedProcess(
+                args=["qmd", *args],
+                returncode=0,
+                stdout="stock query\n",
+                stderr="",
+            )
+
+    monkeypatch.setattr(run_qmd, "QmdService", FakeQmdService)
+    monkeypatch.setattr(
+        run_qmd,
+        "get_settings",
+        lambda: SimpleNamespace(vault_path=tmp_path),
+    )
+
+    exit_code = run_qmd.main(["query", "local query", "-n", "2"])
+
+    assert exit_code == 0
+    assert calls == [("query", "local query", "-n", "2")]
+    assert capsys.readouterr().out == "stock query\n"
+
+
 def test_qmd_config_includes_documents_collection_when_notes_exist(
     tmp_path: Path,
 ) -> None:
@@ -149,6 +333,26 @@ def test_qmd_config_includes_documents_collection_when_notes_exist(
     assert "imports/documents/notes" in config_text
     assert "youtube:" in config_text
     assert "imports/youtube/notes" in config_text
+
+
+def test_qmd_config_includes_forwarded_documents_collection_when_dir_exists(
+    tmp_path: Path,
+) -> None:
+    """Forwarded documents land under imports/documents/forwarded/ (kept out
+    of imports/documents/notes/ so they stay capped at "forwarded" trust,
+    see CompiledBriefingService._source_trust_level) -- they still need
+    their own qmd collection so those notes stay full-text searchable."""
+    vault_path = tmp_path / "vault"
+    (vault_path / "imports" / "documents" / "forwarded").mkdir(parents=True)
+    (vault_path / "daily").mkdir(parents=True)
+    (vault_path / "goals").mkdir()
+
+    service = _qmd_service(vault_path)
+    config_path = service.ensure_local_config()
+    config_text = config_path.read_text(encoding="utf-8")
+
+    assert "documents_forwarded:" in config_text
+    assert "imports/documents/forwarded" in config_text
 
 
 def test_qmd_service_writes_project_local_config(tmp_path: Path) -> None:
@@ -331,6 +535,48 @@ supersedes: [thoughts/old.md]
     assert "epistemic_confidence" not in compiled_signal
 
 
+def test_read_frontmatter_signal_survives_leading_utf8_bom(tmp_path: Path) -> None:
+    """Regression: the old ``content.startswith("---\\n")`` check anchors at
+    literal position 0, so a note saved with a leading UTF-8 BOM (e.g.
+    Notepad's "Save As UTF-8" on Windows) decodes to a ``\\ufeff`` character
+    in front of the ``---`` and the check failed, silently dropping
+    tier/relevance/last_accessed for the note and under-ranking it in
+    search.
+    """
+    note_path = tmp_path / "note.md"
+    text = "---\ntier: warm\nrelevance: 0.65\nlast_accessed: 2026-08-01\n---\n# Demo\n"
+    note_path.write_bytes(("\ufeff" + text).encode())
+
+    signal = QmdService._read_frontmatter_signal(note_path)
+
+    assert signal is not None
+    assert signal["tier"] == "warm"
+    assert signal["relevance"] == 0.65
+    assert signal["last_accessed"] == "2026-08-01"
+
+
+def test_read_frontmatter_signal_survives_crlf_line_endings(tmp_path: Path) -> None:
+    """Confirms CRLF (e.g. Windows' `git config core.autocrlf true`) doesn't
+    need the same explicit fix as the BOM case above: ``path.read_text()``
+    already applies universal-newline translation, normalizing ``\\r\\n`` to
+    ``\\n`` before ``_read_frontmatter_signal`` ever sees the string. This
+    guards against a future refactor swapping that call for raw
+    ``path.read_bytes().decode(...)`` (as ``compiled_briefings.py``'s
+    ``_frontmatter_fields`` does, which is why *that* method needs its own
+    explicit CRLF normalization) silently reintroducing the bug here too.
+    """
+    note_path = tmp_path / "note.md"
+    text = "---\ntier: warm\nrelevance: 0.65\nlast_accessed: 2026-08-01\n---\n# Demo\n"
+    note_path.write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
+
+    signal = QmdService._read_frontmatter_signal(note_path)
+
+    assert signal is not None
+    assert signal["tier"] == "warm"
+    assert signal["relevance"] == 0.65
+    assert signal["last_accessed"] == "2026-08-01"
+
+
 def test_qmd_recall_shallow_does_not_fallback_to_archive_only_results(
     tmp_path: Path,
 ) -> None:
@@ -411,6 +657,334 @@ def test_qmd_recall_prioritizes_recent_results_when_scores_are_similar(
         > payload["results"][1]["effective_score"]
     )
     assert payload["results"][1]["age_days"] > payload["results"][0]["age_days"]
+
+
+def test_qmd_recall_raw_returns_unadjusted_score(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    (vault_path / "thoughts").mkdir(parents=True)
+    (vault_path / "thoughts" / "fresh.md").write_text(
+        (
+            "---\n"
+            "tier: core\n"
+            "relevance: 0.90\n"
+            "created: 2026-08-01\n"
+            "---\n"
+            "# Fresh\n"
+        ),
+        encoding="utf-8",
+    )
+    (vault_path / "thoughts" / "cold.md").write_text(
+        (
+            "---\n"
+            "tier: cold\n"
+            "relevance: 0.10\n"
+            "created: 2020-01-01\n"
+            "---\n"
+            "# Cold\n"
+        ),
+        encoding="utf-8",
+    )
+
+    service = _qmd_service(vault_path)
+    service._recall_candidates = lambda query, limit: (  # type: ignore[method-assign]
+        "search",
+        [
+            {
+                "file": "qmd://thoughts/fresh.md",
+                "title": "Fresh",
+                "score": 0.55,
+                "snippet": "x",
+            },
+            {
+                "file": "qmd://thoughts/cold.md",
+                "title": "Cold",
+                "score": 0.42,
+                "snippet": "y",
+            },
+        ],
+    )
+
+    payload = service.recall("query", raw=True, limit=5)
+
+    assert len(payload["results"]) == 2
+    for item in payload["results"]:
+        assert item["age_adjustment"] == 0.0
+        assert item["supersession_adjustment"] == 0.0
+    by_path = {item["rel_path"]: item for item in payload["results"]}
+    assert by_path["thoughts/fresh.md"]["effective_score"] == round(0.55, 4)
+    assert by_path["thoughts/cold.md"]["effective_score"] == round(0.42, 4)
+
+
+def test_qmd_recall_raw_handles_out_of_range_scores_above_one(tmp_path: Path) -> None:
+    """External qmd backends do not guarantee scores in [0,1]. In raw mode,
+    effective_score must stay unclamped (ranking depends on it), while
+    confidence stays clamped into [0,1] and does not distort the order."""
+    vault_path = tmp_path / "vault"
+    (vault_path / "thoughts").mkdir(parents=True)
+    for name in ("a", "b", "c"):
+        (vault_path / "thoughts" / f"{name}.md").write_text(
+            "---\ntier: active\nrelevance: 0.5\ncreated: 2026-08-01\n---\n# X\n",
+            encoding="utf-8",
+        )
+
+    service = _qmd_service(vault_path)
+    service._recall_candidates = lambda query, limit: (  # type: ignore[method-assign]
+        "search",
+        [
+            {"file": "qmd://thoughts/b.md", "title": "B", "score": 0.9, "snippet": "x"},
+            {"file": "qmd://thoughts/a.md", "title": "A", "score": 1.3, "snippet": "y"},
+            {"file": "qmd://thoughts/c.md", "title": "C", "score": 1.1, "snippet": "z"},
+        ],
+    )
+
+    payload = service.recall("query", raw=True, limit=5)
+
+    assert [item["rel_path"] for item in payload["results"]] == [
+        "thoughts/a.md",
+        "thoughts/c.md",
+        "thoughts/b.md",
+    ]
+    by_path = {item["rel_path"]: item for item in payload["results"]}
+    assert by_path["thoughts/a.md"]["effective_score"] == 1.3
+    assert by_path["thoughts/c.md"]["effective_score"] == 1.1
+    assert by_path["thoughts/a.md"]["confidence"] == 1.0
+    assert by_path["thoughts/c.md"]["confidence"] == 1.0
+    assert by_path["thoughts/b.md"]["confidence"] == 0.9
+    assert payload["confidence"] == 1.0
+
+
+def test_qmd_recall_raw_keeps_cold_and_archive_at_shallow_depth(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    (vault_path / "thoughts").mkdir(parents=True)
+    (vault_path / "thoughts" / "archived.md").write_text(
+        (
+            "---\n"
+            "tier: archive\n"
+            "relevance: 0.10\n"
+            "last_accessed: 2020-01-01\n"
+            "---\n"
+            "# Archived\n"
+        ),
+        encoding="utf-8",
+    )
+
+    service = _qmd_service(vault_path)
+    service._recall_candidates = lambda query, limit: (  # type: ignore[method-assign]
+        "search",
+        [
+            {
+                "file": "qmd://thoughts/archived.md",
+                "title": "Archived",
+                "score": 0.5,
+                "snippet": "x",
+            },
+        ],
+    )
+
+    payload = service.recall("query", raw=True, deep=False, limit=5)
+
+    assert [item["rel_path"] for item in payload["results"]] == ["thoughts/archived.md"]
+
+
+def test_qmd_recall_raw_flips_ranking_versus_normal_recall(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    (vault_path / "thoughts").mkdir(parents=True)
+    (vault_path / "thoughts" / "a_core.md").write_text(
+        (
+            "---\n"
+            "tier: core\n"
+            "relevance: 0.0\n"
+            "created: 2026-08-01\n"
+            "---\n"
+            "# A\n"
+        ),
+        encoding="utf-8",
+    )
+    (vault_path / "thoughts" / "b_archive.md").write_text(
+        (
+            "---\n"
+            "tier: archive\n"
+            "relevance: 0.0\n"
+            "created: 2026-08-01\n"
+            "---\n"
+            "# B\n"
+        ),
+        encoding="utf-8",
+    )
+
+    service = _qmd_service(vault_path)
+    service._today = lambda: date(2026, 8, 5)  # type: ignore[method-assign]
+    service._recall_candidates = lambda query, limit: (  # type: ignore[method-assign]
+        "search",
+        [
+            {
+                "file": "qmd://thoughts/a_core.md",
+                "title": "A",
+                "score": 0.60,
+                "snippet": "x",
+            },
+            {
+                "file": "qmd://thoughts/b_archive.md",
+                "title": "B",
+                "score": 0.85,
+                "snippet": "y",
+            },
+        ],
+    )
+
+    normal = service.recall("query", deep=True, limit=5)
+    raw = service.recall("query", raw=True, limit=5)
+
+    assert [item["rel_path"] for item in normal["results"]] == [
+        "thoughts/a_core.md",
+        "thoughts/b_archive.md",
+    ]
+    assert [item["rel_path"] for item in raw["results"]] == [
+        "thoughts/b_archive.md",
+        "thoughts/a_core.md",
+    ]
+
+
+def test_qmd_recall_raw_preserves_diagnostic_fields_for_superseded_cold_note(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    (vault_path / "thoughts").mkdir(parents=True)
+    (vault_path / "thoughts" / "old.md").write_text(
+        """---
+tier: cold
+relevance: 0.20
+epistemic_confidence: verified
+epistemic_scope: project:test
+epistemic_state: superseded
+epistemic_verification: issue-1
+supersedes: []
+superseded_by: thoughts/new.md
+---
+# Old fact
+""",
+        encoding="utf-8",
+    )
+
+    service = _qmd_service(vault_path)
+    service._recall_candidates = lambda query, limit: (  # type: ignore[method-assign]
+        "search",
+        [
+            {
+                "file": "qmd://thoughts/old.md",
+                "title": "Old fact",
+                "score": 0.66,
+                "snippet": "x",
+            },
+        ],
+    )
+
+    payload = service.recall("query", raw=True, limit=5)
+
+    assert len(payload["results"]) == 1
+    item = payload["results"][0]
+    assert item["memory_tier"] == "cold"
+    assert item["epistemic_state"] == "superseded"
+    assert item["superseded_by"] == "thoughts/new.md"
+    assert item["effective_score"] == round(0.66, 4)
+    assert item["supersession_adjustment"] == 0.0
+    assert item["age_adjustment"] == 0.0
+
+
+def test_qmd_recall_raw_mode_label_and_deep_independence(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    (vault_path / "thoughts").mkdir(parents=True)
+    (vault_path / "thoughts" / "a.md").write_text(
+        "---\ntier: core\nrelevance: 0.5\ncreated: 2026-08-01\n---\n# A\n",
+        encoding="utf-8",
+    )
+    (vault_path / "thoughts" / "b.md").write_text(
+        "---\ntier: archive\nrelevance: 0.1\ncreated: 2020-01-01\n---\n# B\n",
+        encoding="utf-8",
+    )
+
+    service = _qmd_service(vault_path)
+    service._recall_candidates = lambda query, limit: (  # type: ignore[method-assign]
+        "search",
+        [
+            {"file": "qmd://thoughts/a.md", "title": "A", "score": 0.6, "snippet": "x"},
+            {"file": "qmd://thoughts/b.md", "title": "B", "score": 0.4, "snippet": "y"},
+        ],
+    )
+
+    shallow = service.recall("query", raw=True, deep=False, limit=5)
+    deep = service.recall("query", raw=True, deep=True, limit=5)
+
+    assert shallow["mode"] == "raw-recall"
+    assert deep["mode"] == "raw-recall"
+    assert shallow == deep
+
+
+def test_qmd_recall_normal_formula_exact_anchor(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    (vault_path / "thoughts").mkdir(parents=True)
+    (vault_path / "thoughts" / "active.md").write_text(
+        "---\ntier: active\nrelevance: 0.90\ncreated: 2026-08-03\n---\n# Active\n",
+        encoding="utf-8",
+    )
+
+    service = _qmd_service(vault_path)
+    service._today = lambda: date(2026, 8, 5)  # type: ignore[method-assign]
+    service._recall_candidates = lambda query, limit: (  # type: ignore[method-assign]
+        "search",
+        [
+            {
+                "file": "qmd://thoughts/active.md",
+                "title": "Active",
+                "score": 0.70,
+                "snippet": "x",
+            },
+        ],
+    )
+
+    payload = service.recall("query", limit=5)
+
+    assert payload["results"][0]["effective_score"] == 0.925
+
+
+def test_qmd_recall_default_applies_tier_bonus_instead_of_raw_score(
+    tmp_path: Path,
+) -> None:
+    """Guard against an accidental default flip to raw=True: a bare call
+    must still apply the tier bonus (and thus differ from raw score), and
+    must match an explicit raw=False call exactly."""
+    vault_path = tmp_path / "vault"
+    (vault_path / "thoughts").mkdir(parents=True)
+    (vault_path / "thoughts" / "note.md").write_text(
+        "---\ntier: active\nrelevance: 0.5\ncreated: 2026-08-01\n---\n# Note\n",
+        encoding="utf-8",
+    )
+
+    service = _qmd_service(vault_path)
+    service._today = lambda: date(2026, 8, 1)  # type: ignore[method-assign]
+    service._recall_candidates = lambda query, limit: (  # type: ignore[method-assign]
+        "search",
+        [
+            {
+                "file": "qmd://thoughts/note.md",
+                "title": "Note",
+                "score": 0.6,
+                "snippet": "x",
+            },
+        ],
+    )
+
+    default_payload = service.recall("query", limit=5)
+    explicit_false_payload = service.recall("query", raw=False, limit=5)
+    explicit_raw_payload = service.recall("query", raw=True, limit=5)
+
+    assert default_payload == explicit_false_payload
+    default_score = default_payload["results"][0]["effective_score"]
+    raw_score = explicit_raw_payload["results"][0]["effective_score"]
+    assert default_score != raw_score
+    # tier=active (+0.10) + relevance 0.5 * 0.05 (+0.025) + same-day
+    # recency bonus (+0.08, age_days=0) over the raw score.
+    assert default_score == round(raw_score + 0.10 + 0.025 + 0.08, 4)
 
 
 def test_qmd_recall_uses_remote_query_helper_for_remote_emb_model(

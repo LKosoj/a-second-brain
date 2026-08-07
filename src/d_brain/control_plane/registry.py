@@ -242,7 +242,12 @@ CONTROL_PLANE_REGISTRY: tuple[WorkflowSpec, ...] = (
         owner="processor",
         display_name="Compiled Maintenance",
         triggers=("scheduled-post",),
-        allowed_writes=("compiled", "qmd"),
+        # "summaries" because every decisions-queue producer on this path
+        # (conflict, drift, duplicate candidate, verify-rejected, ...) also
+        # regenerates the owner-readable mirror at
+        # ``summaries/compile/decisions-queue.md`` -- see
+        # ``decisions_queue._regenerate_queue_document_after_append``.
+        allowed_writes=("compiled", "qmd", ".session", "summaries"),
         fallback_behavior=(
             "Best-effort nightly drain, lint, and source-aware backfill for "
             "compiled briefings."
@@ -264,6 +269,53 @@ CONTROL_PLANE_REGISTRY: tuple[WorkflowSpec, ...] = (
         notes="Scheduled vault health check after compiled maintenance.",
     ),
     WorkflowSpec(
+        name="maintenance.compiled-fact-check",
+        kind=WORKFLOW_KIND_MAINTENANCE,
+        entrypoint=(
+            "d_brain.services.processor.CliProcessor."
+            "_run_compiled_fact_check_cycle"
+        ),
+        owner="processor",
+        display_name="Compiled Fact Check",
+        triggers=("scheduled-post",),
+        # "summaries" for the same reason as compiled-nightly above: queuing
+        # a failed page regenerates the owner-readable queue mirror under
+        # ``summaries/compile/``.
+        allowed_writes=("compiled", ".session", "summaries"),
+        fallback_behavior=(
+            "Best-effort monthly-cadence deterministic re-check of a bounded "
+            "batch of stale compiled pages; a page that fails is left "
+            "unadvanced and queued for the owner instead of being patched."
+        ),
+        notes=(
+            "Scheduled compiled fact-check (ТЗ 6.6) after compiled maintenance "
+            "and vault health."
+        ),
+    ),
+    WorkflowSpec(
+        name="maintenance.compiled-digest",
+        kind=WORKFLOW_KIND_MAINTENANCE,
+        entrypoint=(
+            "d_brain.services.processor.CliProcessor._run_compiled_digest_cycle"
+        ),
+        owner="processor",
+        display_name="Compiled Digest",
+        triggers=("scheduled-post",),
+        allowed_writes=("summaries",),
+        fallback_behavior=(
+            "Best-effort owner digest for the compiled-enrichment layer; a "
+            "quiet night (per the pass journal) or a vault without a "
+            "manifest yet is skipped without writing."
+        ),
+        notes=(
+            "Scheduled compiled digest (ТЗ 7.1) after compiled maintenance, "
+            "vault health, and compiled fact-check -- it reads the pass "
+            "journal compiled-nightly just wrote and the decisions queue "
+            "compiled-fact-check may have just added to, so it must run "
+            "last among them."
+        ),
+    ),
+    WorkflowSpec(
         name="maintenance.scheduled-cycle",
         kind=WORKFLOW_KIND_MAINTENANCE,
         entrypoint="d_brain.services.processor.CliProcessor.run_scheduled_cycle",
@@ -277,6 +329,28 @@ CONTROL_PLANE_REGISTRY: tuple[WorkflowSpec, ...] = (
             "summaries",
             "compiled",
             "qmd",
+            # This cycle runs every ``scheduled-post`` maintenance workflow
+            # in-process (see ``_run_scheduled_cycle_locked``), so the two
+            # that write the pass journal and the owner's decisions queue --
+            # ``maintenance.compiled-nightly`` and
+            # ``maintenance.compiled-fact-check`` -- make this cycle a
+            # ``.session`` writer too, exactly as they make it a
+            # ``compiled`` writer above.
+            ".session",
+            # Same inheritance, one workflow further down that list:
+            # ``maintenance.vault-health`` runs from the same loop and is the
+            # declared writer of all three.
+            "graph",
+            "moc",
+            "links",
+            # Not inherited from a child at all, unlike everything above it:
+            # ``_run_scheduled_cycle_locked`` calls ``rollover_weekly_goals``
+            # directly, which rewrites ``goals/3-weekly.md`` under the vault
+            # lock. No workflow declared ``goals``, so the catalog the docs and
+            # reviews treat as the source of truth understated what a nightly
+            # run touches -- and because no *child* declares it either, the
+            # parent/child walk in ``test_prompt_corpus.py`` could not see it.
+            "goals",
         ),
         fallback_behavior="Daily scheduled stack with mandatory final qmd refresh.",
         notes="Top-level scheduled processing workflow.",
@@ -375,23 +449,42 @@ def get_question_workflow(route: str) -> WorkflowSpec:
 def resolve_entrypoint(entrypoint: str) -> object:
     """Resolve a dotted entrypoint path to a live Python object."""
     parts = entrypoint.split(".")
-    last_error: Exception | None = None
+    # Prefer the most *informative* failure, not simply the first or the
+    # last one tried. An AttributeError from a getattr chain proves the
+    # module part imported successfully, so it names the real missing
+    # attribute (e.g. a typo in a method name) -- as useful as it gets. An
+    # ImportError is just as informative when it names a *different*
+    # module than the one we asked for (e.g. a missing third-party
+    # dependency deep in the import chain); but when its module name is
+    # exactly the module_name we tried, it only means this prefix guess
+    # was wrong (e.g. "X.Y is not a package" because Y is a class, not a
+    # module), and a shorter prefix will explain things far better. Keep
+    # that kind of error only as a last-resort fallback.
+    informative_error: Exception | None = None
+    fallback_error: Exception | None = None
     for index in range(len(parts) - 1, 0, -1):
         module_name = ".".join(parts[:index])
         try:
             obj: object = importlib.import_module(module_name)
         except ImportError as exc:
-            last_error = exc
+            if exc.name == module_name:
+                if fallback_error is None:
+                    fallback_error = exc
+            elif informative_error is None:
+                informative_error = exc
             continue
         try:
             for attr in parts[index:]:
                 obj = getattr(obj, attr)
         except AttributeError as exc:
-            last_error = exc
+            if informative_error is None:
+                informative_error = exc
             continue
         return obj
-    if last_error is not None:
-        raise last_error
+    if informative_error is not None:
+        raise informative_error
+    if fallback_error is not None:
+        raise fallback_error
     raise ImportError(f"Unable to resolve entrypoint: {entrypoint}")
 
 

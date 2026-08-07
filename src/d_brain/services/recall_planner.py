@@ -640,6 +640,8 @@ def _source_family(rel_path: str) -> str:
         return "plaud"
     if rel_path.startswith("imports/documents/notes/"):
         return "documents"
+    if rel_path.startswith("imports/documents/forwarded/"):
+        return "documents"
     if rel_path.startswith("imports/youtube/notes/"):
         return "youtube"
     if rel_path.startswith("summaries/"):

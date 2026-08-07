@@ -104,6 +104,7 @@ class DocumentArchiveService:
         self.raw_root = self.documents_root / "raw"
         self.text_root = self.documents_root / "text"
         self.notes_root = self.documents_root / "notes"
+        self.forwarded_notes_root = self.documents_root / "forwarded"
         self._workflow = self._load_control_plane_workflow()
 
     @classmethod
@@ -222,8 +223,18 @@ class DocumentArchiveService:
         name_hint: str | None = None,
         caption: str | None = None,
         refresh_qmd: bool = True,
+        forwarded: bool = False,
     ) -> DocumentArchiveResult:
-        """Finish extraction and note creation from an already persisted original."""
+        """Finish extraction and note creation from an already persisted original.
+
+        ``forwarded=True`` (the owner forwarded someone else's file rather
+        than uploading their own) routes the summary note under
+        ``imports/documents/forwarded/`` instead of the default
+        ``imports/documents/notes/`` so ``CompiledBriefingService.
+        _source_trust_level`` caps it at "forwarded" trust instead of the
+        general imports/ "integration" rule -- the same pattern
+        ``IMPORTS_PLAUD_PREFIX`` already applies to PLAUD recordings.
+        """
         self._manifest_for_writes()
 
         payload = self._extract_payload(
@@ -255,6 +266,7 @@ class DocumentArchiveService:
             summary=summary,
             source=source,
             caption=caption,
+            forwarded=forwarded,
         )
         daily_summary = self._daily_summary(extraction, summary=summary)
         daily_content = self._build_daily_content(
@@ -428,9 +440,10 @@ class DocumentArchiveService:
         summary: str,
         source: SourceInfo | None,
         caption: str | None,
+        forwarded: bool = False,
     ) -> str:
         path = self._build_path(
-            root=self.notes_root,
+            root=self.forwarded_notes_root if forwarded else self.notes_root,
             timestamp=timestamp,
             suffix=".md",
             stem=file_name,

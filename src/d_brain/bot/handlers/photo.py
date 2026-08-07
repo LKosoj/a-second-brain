@@ -24,6 +24,7 @@ from d_brain.services.source_links import (
     SourceInfo,
     build_telegram_source_info,
     format_source_markdown,
+    forward_source_name,
 )
 from d_brain.services.storage import VaultStorage
 
@@ -48,6 +49,8 @@ class PhotoEntry:
     content_language: str
     youtube_urls: tuple[str, ...] = ()
     link_summaries: tuple[LinkSummary, ...] = ()
+    entry_type: str = "[photo]"
+    forwarded: bool = False
 
 
 def _build_photo_daily_content(
@@ -187,6 +190,18 @@ async def _save_photo(
         youtube_urls = tuple(item.url for item in result.transcripts)
         link_summaries = tuple(result.summaries)
 
+    # A forwarded photo is someone else's picture, not the owner's own
+    # capture -- see TRUST_RANK / CONSEQUENTIAL_ACTION_TRUST_LEVELS in
+    # compiled_briefings.py. photo.router is registered before
+    # forward.router (bot/main.py), so it must make this check itself or a
+    # forwarded photo would inherit the "[photo]" marker and be rated "own"
+    # trust by _source_trust_level. Same fix already applied to document.py;
+    # see forward_source_name for the shared helper.
+    forwarded = message.forward_origin is not None
+    entry_type = (
+        f"[forward from: {forward_source_name(message)}]" if forwarded else "[photo]"
+    )
+
     return PhotoEntry(
         message_id=message.message_id,
         timestamp=timestamp,
@@ -197,6 +212,8 @@ async def _save_photo(
         content_language=settings.content_language,
         youtube_urls=youtube_urls,
         link_summaries=link_summaries,
+        entry_type=entry_type,
+        forwarded=forwarded,
     )
 
 
@@ -217,6 +234,7 @@ def _log_photo_session(message: Message, entry: PhotoEntry) -> None:
         media_group_id=message.media_group_id or "",
         source_ref=entry.source.ref,
         source_url=entry.source.url,
+        forwarded=entry.forwarded,
     )
 
 
@@ -242,11 +260,19 @@ async def _flush_album(
 
         try:
             content = _build_album_daily_content(items)
+            # Fail closed: if any photo in the album was forwarded, mark
+            # the whole grouped entry forwarded rather than letting one
+            # owned photo's marker vouch for the rest (see the "own"
+            # trust-bypass comment in _save_photo).
+            entry_type = next(
+                (item.entry_type for item in items if item.forwarded),
+                items[0].entry_type,
+            )
             await asyncio.to_thread(
                 storage.append_to_daily,
                 content,
                 items[0].timestamp,
-                "[photo]",
+                entry_type,
             )
             reply = f"📷 ✓ Сохранено {len(items)} фото"
             link_summaries = [
@@ -261,7 +287,17 @@ async def _flush_album(
             )
             if link_summary_message:
                 reply += "\n\n" + link_summary_message
-            await answer_text(reply_message, reply, parse_mode=None)
+            # Guarded like the single-photo path (code review): the grouped
+            # daily entry is already written, so a failure to *show* the
+            # confirmation is not a failure to save the album -- reported as
+            # "❌ Ошибка сохранения альбома", it told the owner an album that
+            # is on disk had been lost.
+            try:
+                await answer_text(reply_message, reply, parse_mode=None)
+            except Exception:
+                logger.exception(
+                    "Failed to deliver album confirmation for %s", media_group_id
+                )
         except Exception:
             logger.exception(
                 "Failed to flush album %s (%d photos)",
@@ -275,7 +311,14 @@ async def _flush_album(
                     parse_mode=None,
                 )
             except Exception:
-                pass
+                # Logged like the confirmation above and like the other
+                # capture handlers' last-resort sends (code review): there is
+                # nothing left to tell the owner with, but a bare ``pass``
+                # also erased the only trace that the failure report itself
+                # never arrived.
+                logger.exception(
+                    "Failed to deliver album failure report for %s", media_group_id
+                )
         finally:
             _album_tasks.pop(media_group_id, None)
 
@@ -321,7 +364,7 @@ async def handle_photo(message: Message, bot: Bot) -> None:
             storage.append_to_daily,
             content,
             entry.timestamp,
-            "[photo]",
+            entry.entry_type,
         )
 
         reply = "📷 ✓ Сохранено"
@@ -333,7 +376,15 @@ async def handle_photo(message: Message, bot: Bot) -> None:
         if link_summary_message:
             reply += "\n\n" + link_summary_message
 
-        await answer_text(message, reply, parse_mode=None)
+        # Guarded on its own so it cannot reach the handler below (code
+        # review): the attachment and the daily entry are already written, so
+        # a failure to *show* the confirmation is not a failure to save the
+        # photo -- reported as "Ошибка: ...", it told the owner an already
+        # archived photo had been lost.
+        try:
+            await answer_text(message, reply, parse_mode=None)
+        except Exception:
+            logger.exception("Failed to deliver photo confirmation")
         logger.info("Photo saved: %s", entry.relative_path)
 
     except Exception as e:

@@ -24,7 +24,11 @@ from d_brain.services.documents import (
     UnsupportedDocumentError,
 )
 from d_brain.services.session import SessionStore
-from d_brain.services.source_links import SourceInfo, build_telegram_source_info
+from d_brain.services.source_links import (
+    SourceInfo,
+    build_telegram_source_info,
+    forward_source_name,
+)
 from d_brain.services.storage import VaultStorage
 
 router = Router(name="document")
@@ -100,11 +104,32 @@ async def handle_document(message: Message, bot: Bot) -> None:
         )
         return
 
-    status_msg = await answer_text(
-        message,
-        f"📄 Файл сохранён: {file_name}. Извлечение текста запущено в фоне.",
-        parse_mode=None,
-    )
+    forwarded = message.forward_origin is not None
+    if forwarded:
+        # A forwarded document is someone else's file, not the owner's own
+        # integration -- see TRUST_RANK / CONSEQUENTIAL_ACTION_TRUST_LEVELS
+        # in compiled_briefings.py. Archiving it under the normal
+        # imports/documents/notes/ pipeline would unconditionally grant it
+        # "integration" trust (any imports/ path except imports/plaud/),
+        # letting a stranger's forwarded file silently supersede the
+        # owner's own facts. It still gets the full extraction/summary
+        # pipeline below, but archive_staged_document(forwarded=True)
+        # routes the note under imports/documents/forwarded/ instead, which
+        # _source_trust_level caps at "forwarded" -- the same treatment
+        # IMPORTS_PLAUD_PREFIX already gives PLAUD recordings.
+        source_name = forward_source_name(message)
+        status_text = (
+            f"📎 Файл сохранён (переслано от {source_name}): {file_name}. "
+            "Извлечение текста запущено в фоне."
+        )
+        entry_type = f"[forward from: {source_name}]"
+    else:
+        status_text = (
+            f"📄 Файл сохранён: {file_name}. Извлечение текста запущено в фоне."
+        )
+        entry_type = "[document]"
+
+    status_msg = await answer_text(message, status_text, parse_mode=None)
     source = build_telegram_source_info(message, language=service.content_language)
     task = asyncio.create_task(
         _process_document_upload(
@@ -115,6 +140,8 @@ async def handle_document(message: Message, bot: Bot) -> None:
             file_name=file_name,
             timestamp=timestamp,
             source=source,
+            forwarded=forwarded,
+            entry_type=entry_type,
         )
     )
     _track_background_task(task)
@@ -129,8 +156,17 @@ async def _process_document_upload(
     file_name: str,
     timestamp: datetime,
     source: SourceInfo,
+    forwarded: bool = False,
+    entry_type: str = "[document]",
 ) -> None:
-    """Finish extraction and persistence for a durably staged document."""
+    """Finish extraction and persistence for a durably staged document.
+
+    ``forwarded``/``entry_type`` carry a forwarded document's trust-relevant
+    provenance through the same pipeline as an owned upload: ``forwarded``
+    routes the note under imports/documents/forwarded/ (see
+    archive_staged_document), and ``entry_type`` is the daily-entry marker
+    ("[forward from: ...]") that _source_trust_level's daily/ branch reads.
+    """
 
     try:
         result = await asyncio.to_thread(
@@ -143,6 +179,7 @@ async def _process_document_upload(
             name_hint=str(message.message_id),
             caption=message.caption,
             refresh_qmd=False,
+            forwarded=forwarded,
         )
 
         storage = VaultStorage(service.vault_path, service.content_language)
@@ -150,7 +187,7 @@ async def _process_document_upload(
             storage.append_to_daily,
             result.daily_content,
             timestamp,
-            "[document]",
+            entry_type,
             source=source,
         )
 
@@ -167,20 +204,27 @@ async def _process_document_upload(
             note_path=result.note_path,
             summary=result.daily_summary,
             warnings=result.extraction.warnings,
+            forwarded=forwarded,
             msg_id=message.message_id,
             source_ref=source.ref,
             source_url=source.url,
         )
 
         final_text = service.build_result_message(result, file_name=file_name)
+        # Nested so the fallback send is covered too (code review): the
+        # archive, the daily entry and the session record above have all
+        # committed by now, so no failure of the *delivery* may reach the
+        # outer handler -- it reports "не удалось обработать документ", and
+        # the fallback was the one path here that could still get there.
         try:
-            await edit_rich_text(status_msg, final_text, parse_mode=None)
-        except TelegramBadRequest:
-            await answer_rich_text(
-                message,
-                final_text,
-                parse_mode=None,
-            )
+            try:
+                await edit_rich_text(status_msg, final_text, parse_mode=None)
+            except TelegramBadRequest:
+                await answer_rich_text(
+                    message,
+                    final_text,
+                    parse_mode=None,
+                )
         except Exception:
             logger.exception("Failed to deliver rich document result")
 
@@ -189,7 +233,15 @@ async def _process_document_upload(
     except Exception as exc:
         logger.exception("Document processing failed")
         error_text = f"❌ Не удалось обработать документ: {exc}"
+        # Nested for the same reason as the success path above (code review):
+        # this whole coroutine runs as a background task nobody awaits, so a
+        # fallback that raised here died in the task and took the error
+        # report with it, leaving the owner on "Извлечение текста запущено в
+        # фоне" with nothing ever arriving -- neither result nor failure.
         try:
-            await edit_text(status_msg, error_text, parse_mode=None)
+            try:
+                await edit_text(status_msg, error_text, parse_mode=None)
+            except Exception:
+                await answer_text(message, error_text, parse_mode=None)
         except Exception:
-            await answer_text(message, error_text, parse_mode=None)
+            logger.exception("Failed to deliver document failure report")

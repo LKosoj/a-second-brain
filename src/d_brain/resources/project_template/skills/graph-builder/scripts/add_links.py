@@ -13,6 +13,60 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+SCRIPT_DIR = Path(__file__).parent
+PROJECT_ROOT = SCRIPT_DIR.parents[2]
+PROJECT_SRC = PROJECT_ROOT / "src"
+if str(PROJECT_SRC) not in sys.path:
+    sys.path.insert(0, str(PROJECT_SRC))
+
+from d_brain.services.compiled_briefings import (  # noqa: E402
+    HUMAN_ZONE_END,
+    HUMAN_ZONE_START,
+    human_zone_markers_look_corrupted,
+)
+
+# Sentinel span meaning "this file's human-zone markers are ambiguous".
+AMBIGUOUS_HUMAN_ZONE = (-1, -1)
+
+
+def human_zone_span(content: str) -> tuple[int, int] | None:
+    """Span of the owner's human zone, or ``None`` when the file has none.
+
+    Compiled briefings keep one ``## Owner Notes`` section wrapped in
+    ``HUMAN_ZONE_START``/``HUMAN_ZONE_END``; that block survives every
+    recompilation verbatim, so this script must never write inside it.
+
+    Mirrors ``vault-health/scripts/fix_links.py::_protect_human_zone``: no
+    markers at all means there is nothing to protect and returns ``None``,
+    but anything else short of a single well-ordered pair -- two or more
+    markers of either kind, a single START with no matching END, a single
+    END with no matching START, a single pair in reversed order, or zero
+    exact markers alongside either of the two independent signals
+    ``human_zone_markers_look_corrupted`` checks (code review defect 1): the
+    ``## Owner Notes`` heading compiled briefings always render together
+    with the markers, or the page's ``human_zone_populated`` frontmatter
+    flag, set once the zone has ever held real text and never cleared --
+    either surviving without the markers means they were corrupted since,
+    however that corruption looks -- is ambiguous. Guessing which START
+    pairs with which END (or whether a real pair exists at all) is exactly
+    the silent corruption this guard exists to prevent, so all of those
+    cases fail closed via ``AMBIGUOUS_HUMAN_ZONE`` and the caller leaves the
+    file alone.
+    """
+    starts = content.count(HUMAN_ZONE_START)
+    ends = content.count(HUMAN_ZONE_END)
+    if starts == 0 and ends == 0:
+        if human_zone_markers_look_corrupted(content):
+            return AMBIGUOUS_HUMAN_ZONE
+        return None
+    if starts != 1 or ends != 1:
+        return AMBIGUOUS_HUMAN_ZONE
+    start_index = content.find(HUMAN_ZONE_START)
+    end_index = content.find(HUMAN_ZONE_END)
+    if end_index < start_index:
+        return AMBIGUOUS_HUMAN_ZONE
+    return (start_index, end_index + len(HUMAN_ZONE_END))
+
 
 def note_key(vault_path: Path, note_path: Path) -> str:
     """Normalize a note path to a vault-relative wikilink target."""
@@ -139,15 +193,45 @@ def analyze_and_suggest(vault_path: Path) -> dict:
 
 def apply_link(file_path: Path, target: str, dry_run: bool = True) -> bool:
     """Add a link to a note's related section."""
-    content = file_path.read_text(encoding="utf-8")
+    # Bytes, not read_text: this function rewrites the whole file, and
+    # read_text translates every "\r\n"/"\r" it reads into "\n". A note the
+    # owner wrote with CRLF endings inside the human zone would come back
+    # with different bytes there -- the one thing this script promises never
+    # to do (see human_zone_span). Mirrors fix_links.py::_write_repair.
+    try:
+        content = file_path.read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        # analyze_and_suggest reads with errors="ignore", so a note with one
+        # byte that is not valid UTF-8 still produces suggestions and lands
+        # here. Decoding it leniently is not an option -- this function
+        # rewrites the whole file, so the lenient decode would write the
+        # replacements back and destroy whatever was really there. Skipping
+        # just this note keeps main()'s loop alive: without it the first bad
+        # note aborts the run and every note queued after it silently never
+        # gets its links, on this run and on every rerun.
+        print(f"[SKIP] {file_path.name}: not valid UTF-8")
+        return False
 
     # Check if link already exists
     if f"[[{target}]]" in content:
         return False
 
-    # Find or create "Related" section
+    zone = human_zone_span(content)
+    if zone == AMBIGUOUS_HUMAN_ZONE:
+        print(f"[SKIP] {file_path.name}: ambiguous human-zone markers")
+        return False
+
+    # Find or create "Related" section, never one inside the human zone --
+    # appending at the end is safe either way, since the zone is closed.
     related_pattern = r'^## Related\s*$'
-    match = re.search(related_pattern, content, re.MULTILINE)
+    match = next(
+        (
+            found
+            for found in re.finditer(related_pattern, content, re.MULTILINE)
+            if zone is None or not (zone[0] <= found.end() < zone[1])
+        ),
+        None,
+    )
 
     if match:
         # Add to existing Related section
@@ -161,7 +245,7 @@ def apply_link(file_path: Path, target: str, dry_run: bool = True) -> bool:
         print(f"[DRY RUN] Would add [[{target}]] to {file_path.name}")
         return True
 
-    file_path.write_text(new_content, encoding="utf-8")
+    file_path.write_bytes(new_content.encode("utf-8"))
     print(f"Added [[{target}]] to {file_path.name}")
     return True
 

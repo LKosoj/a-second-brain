@@ -6,6 +6,7 @@ from pathlib import Path
 
 from d_brain import run_qmd
 from d_brain.cli import initialize_project, main
+from d_brain.services.qmd import QmdService
 
 
 def test_initialize_project_creates_private_vault(tmp_path: Path) -> None:
@@ -25,6 +26,7 @@ def test_initialize_project_creates_private_vault(tmp_path: Path) -> None:
         "architecture-diagram",
         "arxiv",
         "blogwatcher",
+        "compile-enrich",
         "content-research-writer",
         "datetime",
         "dbrain-processor",
@@ -70,6 +72,13 @@ def test_initialize_project_creates_private_vault(tmp_path: Path) -> None:
         assert alias.is_symlink()
         assert alias.readlink() == Path("../skills")
     assert stat.S_IMODE((tmp_path / ".env").stat().st_mode) == 0o600
+    assert QmdService(vault_path)._remote_query_script_path.is_file()
+    assert "## Query versus recall" in (
+        tmp_path / "skills/vault-retrieval/SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert "## Search and Memory Signals" in (
+        tmp_path / "skills/agent-memory/SKILL.md"
+    ).read_text(encoding="utf-8")
 
 
 def test_initialize_project_does_not_overwrite_vault(tmp_path: Path) -> None:

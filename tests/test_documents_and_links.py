@@ -256,6 +256,51 @@ def test_document_archive_service_persists_original_text_and_summary_note(
     _assert_valid_import_note(vault_path, result.note_path, "# Header")
 
 
+def test_document_archive_service_forwarded_note_lands_under_forwarded_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Restoring extraction for forwarded documents must not restore the
+    "integration" trust the trust-bypass fix removed: forwarded=True has to
+    route the note under imports/documents/forwarded/, not
+    imports/documents/notes/, so CompiledBriefingService._source_trust_level
+    keeps capping it at "forwarded" (see IMPORTS_PLAUD_PREFIX for the
+    analogous PLAUD case) while the document still gets full extraction and
+    a summary note."""
+    vault_path = tmp_path / "vault"
+    _reject_direct_markdown_write(monkeypatch)
+    service = DocumentArchiveService(vault_path)
+    source = SourceInfo(kind="telegram", ref="telegram:1:2", url="", label="")
+
+    staged = service.stage_document_upload(
+        data=b"# Header\n\nBody line one.\nBody line two.\n",
+        file_name="notes.md",
+        mime_type="text/markdown",
+        file_size=39,
+        timestamp=datetime(2026, 4, 4, 19, 50),
+        name_hint="42",
+    )
+    result = service.archive_staged_document(
+        original_path=staged.original_path,
+        file_name="notes.md",
+        file_format=staged.file_format,
+        timestamp=datetime(2026, 4, 4, 19, 50),
+        source=source,
+        name_hint="42",
+        caption="Важный файл",
+        refresh_qmd=False,
+        forwarded=True,
+    )
+
+    assert result.note_path.startswith("imports/documents/forwarded/2026/04/")
+    assert not result.note_path.startswith("imports/documents/notes/")
+    assert result.daily_summary.startswith("Header")
+
+    note_content = (vault_path / result.note_path).read_text(encoding="utf-8")
+    assert "# Header" in note_content
+    assert "Важный файл" in note_content
+    _assert_valid_import_note(vault_path, result.note_path, "# Header")
+
+
 def test_document_archive_service_handles_relative_vault_path_for_subprocess_extraction(
     tmp_path: Path,
     monkeypatch,

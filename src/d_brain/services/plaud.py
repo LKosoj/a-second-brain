@@ -40,7 +40,10 @@ from d_brain.services.frontmatter import (
 from d_brain.services.json_normalizer import extract_first_json_dict
 from d_brain.services.localization import normalize_language, translate
 from d_brain.services.qmd import QmdService
-from d_brain.services.source_links import build_plaud_source_info
+from d_brain.services.source_links import (
+    build_plaud_source_info,
+    collapse_to_single_line,
+)
 from d_brain.services.storage import VaultStorage
 from d_brain.services.todoist_projects import (
     TodoistProjectCatalog,
@@ -702,7 +705,27 @@ class PlaudSyncService:
         title: str,
         summary: str,
     ) -> None:
+        # Every value interpolated below has to stay on the single line this
+        # block gives it: a newline inside one of them would forge another
+        # <!-- d-brain:entry-status: ... --> line (skipping processing) or
+        # another marker line (ManagedBlockError on every later write). Only
+        # the summary is already collapsed, by _clip_summary. The title comes
+        # from the PLAUD cloud as-is (_safe_text only strips the ends), and
+        # note_rel_path / source.ref / source.url are all built from file_id
+        # (see _file_paths / build_plaud_source_info), which is cloud data
+        # too.
+        #
+        # file_id itself is deliberately NOT collapsed: it is this block's
+        # identity, and collapsing is many-to-one, so two recordings whose
+        # ids differ only in whitespace would share one marker pair and the
+        # second one would silently overwrite the first one's entry. A
+        # newline in an id would break the markers instead -- a failed write
+        # the sync reports, not a lost entry nobody sees.
+        note_rel_path = collapse_to_single_line(note_rel_path)
+        title = collapse_to_single_line(title)
         source = build_plaud_source_info(file_id, language=self.content_language)
+        source_url = collapse_to_single_line(source.url)
+        source_ref = collapse_to_single_line(source.ref)
         start_marker = f"<!-- plaud:{file_id}:start -->"
         end_marker = f"<!-- plaud:{file_id}:end -->"
         status_block = format_entry_status_comments((ENTRY_STATUS_ALREADY_PROCESSED,))
@@ -712,8 +735,8 @@ class PlaudSyncService:
             f"{start_marker}\n"
             f"PLAUD: [[{note_rel_path}|{title}]]\n"
             f"> {translate(self.content_language, 'source')}: "
-            f"[{source.label}]({source.url})\n"
-            f"> {translate(self.content_language, 'source_ref')}: `{source.ref}`\n"
+            f"[{source.label}]({source_url})\n"
+            f"> {translate(self.content_language, 'source_ref')}: `{source_ref}`\n"
             f"{translate(self.content_language, 'summary')}: "
             f"{_clip_summary(summary)}\n"
             f"{end_marker}\n"

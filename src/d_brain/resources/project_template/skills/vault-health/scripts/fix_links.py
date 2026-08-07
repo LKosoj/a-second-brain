@@ -27,6 +27,11 @@ if str(PROJECT_SRC) not in sys.path:
     sys.path.insert(0, str(PROJECT_SRC))
 
 from d_brain.manifest import VaultManifest, load_manifest_for_vault  # noqa: E402
+from d_brain.services.compiled_briefings import (  # noqa: E402
+    HUMAN_ZONE_END,
+    HUMAN_ZONE_START,
+    human_zone_markers_look_corrupted,
+)
 from d_brain.services.frontmatter import (  # noqa: E402
     FrontmatterError,
     parse_frontmatter_bytes,
@@ -130,6 +135,65 @@ def suggest_fix(
     return None, "none"
 
 
+def _protect_human_zone(content: str, transform) -> str:
+    """Apply `transform` everywhere except inside the owner's human zone.
+
+    Compiled briefings (see ``services/compiled_briefings.py``) keep one
+    ``## Owner Notes`` section wrapped in ``HUMAN_ZONE_START``/
+    ``HUMAN_ZONE_END`` HTML comments; that block survives every
+    recompilation, archival, and link-repair pass verbatim -- including
+    this one. A blind whole-file regex substitution here would silently
+    rewrite text the owner typed by hand, so the single well-ordered zone
+    (its one START through its matching END, inclusive) is carved out and
+    left byte-for-byte untouched; `transform` only ever sees the text
+    before and after it.
+
+    fix_links.py walks the whole vault, not just compiled/ pages, so most
+    files have no markers at all -- that case has nothing to protect, and
+    `transform` runs over the whole file.
+
+    Any other marker count is fail-closed rather than guessed at: two or
+    more of either marker, a single START with no matching END, a single
+    END with no matching START, a single pair in reversed order, or zero
+    exact markers alongside either of the two independent signals
+    ``human_zone_markers_look_corrupted`` checks (code review defect 1): the
+    ``## Owner Notes`` heading compiled briefings always render together
+    with the markers, or the page's ``human_zone_populated`` frontmatter
+    flag, set once the zone has ever held real text and never cleared --
+    either surviving without the markers means they were corrupted since,
+    however that corruption looks -- all mean which START pairs with which
+    END (or whether there is a real pair at all) can't be told apart from a
+    lone marker the owner left behind while editing. Guessing wrong is
+    exactly the silent-corruption bug this function exists to prevent, so
+    every one of these cases leaves the file completely untouched and the
+    caller's transform does not run at all -- mirroring
+    ``compiled_briefings._extract_human_zone``'s ``HumanZoneMarkerError``
+    and ``add_links.py::human_zone_span``'s ``AMBIGUOUS_HUMAN_ZONE`` for
+    the same ambiguity.
+    """
+    starts = content.count(HUMAN_ZONE_START)
+    ends = content.count(HUMAN_ZONE_END)
+
+    if starts == 0 and ends == 0:
+        if human_zone_markers_look_corrupted(content):
+            return content
+        return transform(content)
+
+    if starts != 1 or ends != 1:
+        return content
+
+    start_index = content.find(HUMAN_ZONE_START)
+    end_index = content.find(HUMAN_ZONE_END)
+    if end_index < start_index:
+        return content
+
+    end_index += len(HUMAN_ZONE_END)
+    before = transform(content[:start_index])
+    zone = content[start_index:end_index]
+    after = transform(content[end_index:])
+    return before + zone + after
+
+
 def _write_repair(
     vault_path: Path,
     file_path: Path,
@@ -139,7 +203,7 @@ def _write_repair(
 ) -> bool:
     source = read_vault_file_bytes(vault_path, file_path)
     content = source.decode("utf-8")
-    new_content = transform(content)
+    new_content = _protect_human_zone(content, transform)
     if new_content == content:
         return False
     candidate = new_content.encode("utf-8")

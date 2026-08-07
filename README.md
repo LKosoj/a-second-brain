@@ -121,6 +121,7 @@ and which paths are runtime infrastructure.
 | Command | Action |
 |---|---|
 | `/do` | Run a free-form request against the vault and optional Todoist access |
+| `/why` | Explain why a compiled page states a claim, with its sources |
 | `/process` | Preview today's classification without write-heavy execution |
 | `/process_full` | Run the full daily cycle now |
 | `/menu` | Open the persistent dashboard |

@@ -43,6 +43,25 @@ Minimum expectations:
 - automatic `last_accessed`, `relevance`, `tier`
 - no duplicate facts across multiple notes
 
+## Search and Memory Signals
+
+`a-second-brain qmd query "<query>"` uses QMD's content ranking and does not
+apply memory properties. Remote embedding (text converted to numeric meaning)
+and rerank (a second sorting pass) improve content retrieval, but they are not
+memory signals.
+
+`a-second-brain qmd recall "<query>"` starts from the same QMD candidates and
+adds the memory layer:
+
+- `tier` controls visibility and adds a ranking bonus;
+- `relevance` adds the stored importance signal;
+- record age adjusts the score for freshness;
+- `epistemic_state: superseded` lowers results replaced by newer knowledge.
+
+Normal `recall` can omit low-visibility `cold` and `archive` results.
+`deep-recall` keeps those tiers for old or exhaustive history. Card `status` is
+domain-specific business state and is not a memory-ranking signal.
+
 ## Operational Commands
 
 ```bash

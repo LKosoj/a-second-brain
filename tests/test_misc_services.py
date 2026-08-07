@@ -600,9 +600,12 @@ def test_image_analysis_service_parses_fenced_json(tmp_path: Path) -> None:
     image_path.write_bytes(b"png")
 
     service = ImageAnalysisService(tmp_path / "vault", "qwen")
-    service.runner.run = lambda prompt, timeout, extra_env=None: (  # type: ignore[method-assign]
-        '```json\n{"description":"Слайд с надписью","ocr_text":"HELLO 123"}\n```'
-    )
+
+    def fake_run(prompt, timeout, extra_env=None):  # noqa: ANN001, ANN202, ARG001
+        assert timeout == 600
+        return '```json\n{"description":"Слайд с надписью","ocr_text":"HELLO 123"}\n```'
+
+    service.runner.run = fake_run  # type: ignore[method-assign]
 
     result = service.analyze("attachments/2026-04-04/img-test.png")
 
@@ -698,6 +701,98 @@ def test_build_album_daily_content_keeps_one_caption_and_all_images() -> None:
     assert "Идентификатор источника: `telegram:1:11`" in content
     assert "Первая картинка" in content
     assert "Вторая картинка" in content
+
+
+async def test_flush_album_marks_the_whole_group_forwarded_if_any_photo_is(
+    monkeypatch,
+) -> None:
+    """Fail closed: one forwarded photo taints the grouped entry, so a
+    single owned photo's ``[photo]`` marker cannot vouch for the rest and
+    let a forwarded source inherit "own" trust. Previously unpinned -- the
+    whole album flush could fall back to ``items[0].entry_type`` and the
+    suite stayed green."""
+    from d_brain.bot.handlers import photo as photo_handler
+
+    monkeypatch.setattr(photo_handler, "ALBUM_SETTLE_SECONDS", 0)
+
+    def _entry(message_id: int, *, entry_type: str, forwarded: bool):
+        return photo_handler.PhotoEntry(
+            message_id=message_id,
+            timestamp=datetime(2026, 4, 4, 12, 0, 0),
+            relative_path=f"attachments/2026-04-04/img-{message_id}.jpg",
+            caption=None,
+            analysis=None,
+            source=SourceInfo(kind="telegram", ref=f"telegram:1:{message_id}"),
+            content_language="ru",
+            entry_type=entry_type,
+            forwarded=forwarded,
+        )
+
+    # The owned photo sorts first, so a naive ``items[0]`` picks "[photo]".
+    photo_handler._album_items["group-1"] = [
+        _entry(10, entry_type="[photo]", forwarded=False),
+        _entry(11, entry_type="[forward from: Bob]", forwarded=True),
+    ]
+    appended: list[tuple[str, str]] = []
+
+    class FakeStorage:
+        def append_to_daily(self, content: str, timestamp, entry_type: str) -> None:  # noqa: ANN001
+            appended.append((content, entry_type))
+
+    async def fake_answer_text(message, text: str, **kwargs) -> None:  # noqa: ANN001, ANN003
+        return None
+
+    monkeypatch.setattr(photo_handler, "answer_text", fake_answer_text)
+
+    await photo_handler._flush_album("group-1", object(), FakeStorage())
+
+    assert [entry_type for _content, entry_type in appended] == [
+        "[forward from: Bob]"
+    ]
+
+
+async def test_flush_album_failed_confirmation_is_not_reported_as_a_lost_album(
+    monkeypatch,
+) -> None:
+    """The grouped daily entry is written before the confirmation is sent,
+    and the two used to share one ``try``: a failed send landed in the
+    handler that answers "❌ Ошибка сохранения альбома", telling the owner an
+    album that is on disk had been lost. Same defect the single-photo path
+    and the other capture handlers were fixed for."""
+    from d_brain.bot.handlers import photo as photo_handler
+
+    monkeypatch.setattr(photo_handler, "ALBUM_SETTLE_SECONDS", 0)
+
+    photo_handler._album_items["group-2"] = [
+        photo_handler.PhotoEntry(
+            message_id=10,
+            timestamp=datetime(2026, 4, 4, 12, 0, 0),
+            relative_path="attachments/2026-04-04/img-10.jpg",
+            caption=None,
+            analysis=None,
+            source=SourceInfo(kind="telegram", ref="telegram:1:10"),
+            content_language="ru",
+            entry_type="[photo]",
+            forwarded=False,
+        )
+    ]
+    appended: list[str] = []
+    sent: list[str] = []
+
+    class FakeStorage:
+        def append_to_daily(self, content: str, timestamp, entry_type: str) -> None:  # noqa: ANN001
+            appended.append(entry_type)
+
+    async def fake_answer_text(message, text: str, **kwargs) -> None:  # noqa: ANN001, ANN003
+        sent.append(text)
+        raise RuntimeError("send failed")
+
+    monkeypatch.setattr(photo_handler, "answer_text", fake_answer_text)
+
+    await photo_handler._flush_album("group-2", object(), FakeStorage())
+
+    assert appended == ["[photo]"]
+    assert not [text for text in sent if text.startswith("❌")]
 
 
 def test_send_telegram_text_sync_uses_configured_owner_target(

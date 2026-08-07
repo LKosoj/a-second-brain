@@ -244,7 +244,12 @@ def parse_frontmatter(content: str) -> tuple[dict, str, bool]:
     Stores the raw YAML block on the returned dict under reserved key
     ``_raw_yaml`` so build_frontmatter can update scalars in place
     without losing multiline structures or block lists.
+
+    Tolerates a leading UTF-8 BOM (e.g. from a manual edit) so it does not
+    hide existing frontmatter from decay/tier calculations.
     """
+    if content.startswith("\ufeff"):
+        content = content[1:]
     if content.startswith("---\n"):
         end = content.find("\n---\n", 4)
         if end != -1:

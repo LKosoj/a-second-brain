@@ -80,6 +80,7 @@ assets.
 - `vault-health`
 - `vault-retrieval`
 - `todoist-ai`
+- `compile-enrich`
 
 ## Bundled optional skills
 

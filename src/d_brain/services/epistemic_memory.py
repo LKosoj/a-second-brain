@@ -26,7 +26,6 @@ from d_brain.manifest import (
 from d_brain.services.frontmatter import (
     FrontmatterError,
     UnsafeVaultPathError,
-    _parse_yaml,
     parse_frontmatter_bytes,
     patch_frontmatter_bytes,
     read_vault_file_bytes,
@@ -133,28 +132,31 @@ def _required_string(fields: Mapping[str, Any], key: str) -> str:
 
 
 def _parse_epistemic_document(content: bytes) -> _EpistemicDocument:
-    """Parse frontmatter with WP4's strict YAML loader and preserve body bytes."""
-    if content.startswith(b"---\r\n"):
-        newline = b"\r\n"
-    elif content.startswith(b"---\n"):
-        newline = b"\n"
-    else:
-        raise EpistemicValidationError("epistemic notes require frontmatter")
-    opening_end = len(b"---") + len(newline)
-    closing = newline + b"---" + newline
-    closing_start = content.find(closing, opening_end)
-    if closing_start < 0:
-        raise EpistemicValidationError("frontmatter is missing a closing '---'")
-    header = content[opening_end:closing_start]
+    """Parse frontmatter with WP4's strict YAML loader and preserve body bytes.
+
+    Delegates the split to ``frontmatter.parse_frontmatter_bytes`` rather
+    than repeating its delimiter rules here (code review): the hand-rolled
+    copy this replaces accepted only ``\\n`` and ``\\r\\n`` and always
+    demanded a newline *after* the closing ``---``, so two shapes that module
+    handles were rejected outright -- a note saved with classic-Mac ``\\r``
+    line endings, and a header-only note with no trailing newline. Both
+    reached this function through ``supersede_notes``, which then refused a
+    perfectly valid vault file.
+
+    Errors are still raised as ``EpistemicValidationError`` (the contract
+    every caller here catches), not as ``FrontmatterError``.
+    """
     try:
-        fields = _parse_yaml(header)
-    except Exception as exc:
+        document = parse_frontmatter_bytes(content)
+    except Exception as exc:  # FrontmatterError, or the strict YAML loader
         raise EpistemicValidationError(str(exc)) from exc
+    if document.header is None:
+        raise EpistemicValidationError("epistemic notes require frontmatter")
     return _EpistemicDocument(
-        fields=fields,
-        header=header,
-        body=content[closing_start + len(closing) :],
-        newline=newline,
+        fields=document.fields,
+        header=document.header,
+        body=document.body,
+        newline=document.newline,
     )
 
 

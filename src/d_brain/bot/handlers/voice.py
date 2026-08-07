@@ -10,7 +10,10 @@ from d_brain.bot.replies import answer_text
 from d_brain.config import get_settings
 from d_brain.services.qmd import QmdService
 from d_brain.services.session import SessionStore
-from d_brain.services.source_links import build_telegram_source_info
+from d_brain.services.source_links import (
+    build_telegram_source_info,
+    forward_source_name,
+)
 from d_brain.services.storage import VaultStorage
 from d_brain.services.transcription import DeepgramTranscriber
 
@@ -70,11 +73,24 @@ async def handle_voice(message: Message, bot: Bot) -> None:
 
         timestamp = message.date.astimezone()
         source = build_telegram_source_info(message, language=settings.content_language)
+        # A forwarded voice message is someone else's recording, not the
+        # owner's own capture -- see TRUST_RANK / CONSEQUENTIAL_ACTION_TRUST_LEVELS
+        # in compiled_briefings.py. voice.router is registered before
+        # forward.router (bot/main.py), so it must make this check itself or
+        # a forwarded voice note would inherit the "[voice]" marker and be
+        # rated "own" trust by _source_trust_level. Same fix already applied
+        # to document.py; see forward_source_name for the shared helper.
+        forwarded = message.forward_origin is not None
+        entry_type = (
+            f"[forward from: {forward_source_name(message)}]"
+            if forwarded
+            else "[voice]"
+        )
         await asyncio.to_thread(
             storage.append_to_daily,
             transcript,
             timestamp,
-            "[voice]",
+            entry_type,
             source=source,
             refresh_qmd=False,
         )
@@ -89,13 +105,23 @@ async def handle_voice(message: Message, bot: Bot) -> None:
             msg_id=message.message_id,
             source_ref=source.ref,
             source_url=source.url,
+            forwarded=forwarded,
         )
 
-        await answer_text(
-            message,
-            f"🎤 {transcript}\n\n✓ Сохранено",
-            parse_mode=None,
-        )
+        # Guarded on its own so it cannot reach the handler below (code
+        # review): the daily entry and the session record are already on
+        # disk, so a failure to *show* the transcript is not a failure to
+        # save it -- reported as "Ошибка: ...", it told the owner their voice
+        # note was lost when it was not, which is the one wrong answer here
+        # that invites re-recording over an entry that already exists.
+        try:
+            await answer_text(
+                message,
+                f"🎤 {transcript}\n\n✓ Сохранено",
+                parse_mode=None,
+            )
+        except Exception:
+            logger.exception("Failed to deliver voice transcript confirmation")
         _track_background_task(
             asyncio.create_task(_refresh_qmd_in_background(settings.vault_path))
         )

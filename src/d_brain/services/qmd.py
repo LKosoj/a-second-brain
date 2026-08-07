@@ -133,6 +133,12 @@ class QmdService:
                 "pptx, html и других поддержанных форматов.",
             ),
             (
+                "documents_forwarded",
+                self.vault_path / "imports" / "documents" / "forwarded",
+                "Саммари пересланных документов (файл не от владельца, доверие "
+                "ограничено уровнем forwarded): те же форматы, что и documents.",
+            ),
+            (
                 "youtube",
                 self.vault_path / "imports" / "youtube" / "notes",
                 "Саммари и метаданные YouTube-роликов с сохранёнными "
@@ -251,6 +257,10 @@ class QmdService:
         """Detect OpenAI-compatible embedding backends versus local GGUF models."""
         return bool(self._remote_embed_model(self._resolved_env(env)))
 
+    def uses_remote_embeddings(self) -> bool:
+        """Return whether this project routes qmd vectors through an API."""
+        return self._uses_remote_embeddings()
+
     def build_env(self) -> dict[str, str]:
         """Environment for qmd, scoped to the current project."""
         self.ensure_local_config()
@@ -297,9 +307,19 @@ class QmdService:
         if not path.exists():
             return None
         content = path.read_text(encoding="utf-8", errors="replace")
-        if not content.startswith("---\n"):
+        # Tolerate a leading BOM (e.g. Notepad's "Save As UTF-8"): it doesn't
+        # change the frontmatter's meaning, but the literal "---\n" check
+        # below would otherwise miss it and silently drop
+        # tier/relevance/last_accessed for the note. CRLF needs no separate
+        # handling here -- Path.read_text() already applies universal-newline
+        # translation, normalizing "\r\n" to "\n" before this method ever
+        # sees the string (unlike compiled_briefings.py's
+        # _frontmatter_fields, which decodes raw bytes with no such
+        # translation and needs its own CRLF fix instead).
+        normalized = content.lstrip("\ufeff")
+        if not normalized.startswith("---\n"):
             return None
-        match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
+        match = re.match(r"^---\n(.*?)\n---", normalized, re.DOTALL)
         if match is None:
             return None
         fields: dict[str, str] = {}
@@ -445,12 +465,14 @@ class QmdService:
         deep: bool,
         backend: str,
         ranked: list[dict[str, Any]],
+        raw: bool = False,
     ) -> None:
         """Write structured recall diagnostics to the runtime log."""
         logger.info(
-            "QMD recall query=%r deep=%s backend=%s results=%s",
+            "QMD recall query=%r deep=%s raw=%s backend=%s results=%s",
             query,
             deep,
+            raw,
             backend,
             len(ranked),
         )
@@ -564,10 +586,63 @@ class QmdService:
                 return backend, payload
         return "none", []
 
+    def query(self, query: str, *, limit: int = DEFAULT_RECALL_LIMIT) -> dict[str, Any]:
+        """Run qmd retrieval without applying memory-specific score adjustments."""
+        backend, candidates = self._recall_candidates(query, limit)
+        return {
+            "query": query,
+            "backend": backend,
+            "mode": "query",
+            "results": candidates[:limit],
+        }
+
+    @staticmethod
+    def format_query(payload: dict[str, Any]) -> str:
+        """Format project-routed qmd query results for the terminal."""
+        results = payload.get("results", [])
+        if not results:
+            return "No results found."
+        lines: list[str] = []
+        for item in results:
+            title = str(item.get("title", "") or item.get("file", ""))
+            file_ref = str(item.get("file", ""))
+            score = float(item.get("score", 0.0) or 0.0)
+            snippet = str(item.get("snippet", "")).strip()
+            lines.append(
+                f"{file_ref}\nTitle: {title}\nScore: {score:.0%}\n\n{snippet}"
+            )
+        return "\n\n".join(lines)
+
     def recall(
-        self, query: str, *, deep: bool = False, limit: int = DEFAULT_RECALL_LIMIT
+        self,
+        query: str,
+        *,
+        deep: bool = False,
+        limit: int = DEFAULT_RECALL_LIMIT,
+        raw: bool = False,
     ) -> dict[str, Any]:
-        """Run memory-aware archive recall on top of qmd candidates."""
+        """Run memory-aware archive recall on top of qmd candidates.
+
+        When ``raw`` is True, ``effective_score`` is the untouched qmd
+        score: no memory-tier bonus, relevance bonus, age adjustment, or
+        supersession penalty is applied, and the memory-tier filter is
+        skipped entirely (cold and archive candidates are kept). ``deep``
+        is ignored in this mode. Diagnostic fields (memory_tier,
+        memory_relevance, epistemic_state, superseded_by, record_date,
+        age_days) are still populated, but age_adjustment and
+        supersession_adjustment are reported as 0.0 because nothing was
+        added to the score.
+
+        Regardless of ``raw``, this method searches the entire qmd index —
+        daily, thoughts, imports, goals, business, projects, etc. — not
+        only the ``compiled`` collection. Callers that need compiled-only
+        results (e.g. matching against existing compiled pages before
+        creating a new one) must filter ``results`` by
+        ``rel_path.startswith("compiled/")`` themselves; otherwise a
+        top-ranked ``thoughts/...`` or ``daily/...`` hit can be mistaken
+        for "no matching compiled page exists" and cause a duplicate to be
+        created.
+        """
         backend, candidates = self._recall_candidates(query, limit)
         ranked: list[dict[str, Any]] = []
         for candidate in candidates:
@@ -586,26 +661,34 @@ class QmdService:
             )
             record_date = self._record_date_for_rel_path(rel_path or "", signal)
             age_days, age_adjustment = self._age_adjustment(rel_path or "", record_date)
-            allowed = (
-                deep
-                or not tier
-                or tier in {"core", "active", "warm"}
-                or base_score >= 0.9
-            )
-            if not allowed:
-                continue
-            effective_score = round(
-                base_score
-                + RECALL_TIER_BONUS.get(tier, 0.0)
-                + min(relevance, 1.0) * 0.05,
-                4,
-            )
-            effective_score = round(effective_score + age_adjustment, 4)
             epistemic_state = str(signal.get("epistemic_state", "")) if signal else ""
-            supersession_adjustment = (
-                SUPERSEDED_RESULT_PENALTY if epistemic_state == "superseded" else 0.0
-            )
-            effective_score = round(effective_score + supersession_adjustment, 4)
+
+            if raw:
+                effective_score = round(base_score, 4)
+                age_adjustment = 0.0
+                supersession_adjustment = 0.0
+            else:
+                allowed = (
+                    deep
+                    or not tier
+                    or tier in {"core", "active", "warm"}
+                    or base_score >= 0.9
+                )
+                if not allowed:
+                    continue
+                effective_score = round(
+                    base_score
+                    + RECALL_TIER_BONUS.get(tier, 0.0)
+                    + min(relevance, 1.0) * 0.05,
+                    4,
+                )
+                effective_score = round(effective_score + age_adjustment, 4)
+                supersession_adjustment = (
+                    SUPERSEDED_RESULT_PENALTY
+                    if epistemic_state == "superseded"
+                    else 0.0
+                )
+                effective_score = round(effective_score + supersession_adjustment, 4)
             confidence = self._clamp_confidence(effective_score)
             ranked.append(
                 {
@@ -643,11 +726,12 @@ class QmdService:
             deep=deep,
             backend=backend,
             ranked=ranked[: min(limit, RECALL_LOG_LIMIT)],
+            raw=raw,
         )
         return {
             "query": query,
             "backend": backend,
-            "mode": "deep-recall" if deep else "recall",
+            "mode": "raw-recall" if raw else ("deep-recall" if deep else "recall"),
             "confidence": float(ranked[0].get("confidence", 0.0)) if ranked else 0.0,
             "results": ranked[:limit],
         }
@@ -909,19 +993,28 @@ class QmdService:
             memory_engine = (
                 self.vault_path.parent / "skills/agent-memory/scripts/memory-engine.py"
             )
-            result = subprocess.run(
-                [
-                    "uv",
-                    "run",
-                    str(memory_engine),
-                    "touch",
-                    str(relative),
-                ],
-                cwd=self.vault_path,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            uv_bin = os.environ.get("UV_BIN", "uv").strip() or "uv"
+            try:
+                result = subprocess.run(
+                    [
+                        uv_bin,
+                        "run",
+                        str(memory_engine),
+                        "touch",
+                        str(relative),
+                    ],
+                    cwd=self.vault_path,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except FileNotFoundError:
+                logger.warning(
+                    "Failed to touch memory note %s: uv executable not found: %s",
+                    relative,
+                    uv_bin,
+                )
+                continue
             if result.returncode != 0:
                 logger.warning(
                     "Failed to touch memory note %s: %s",

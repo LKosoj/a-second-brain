@@ -56,7 +56,7 @@ SEMANTIC_DESCRIPTION_PROFILES = frozenset(
 )
 def parse_frontmatter(content: str) -> dict[str, str]:
     """Extract YAML frontmatter as simple key-value pairs."""
-    match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
+    match = re.match(r"^\ufeff?---\n(.*?)\n---", content, re.DOTALL)
     if not match:
         return {}
     fm = {}
@@ -80,7 +80,7 @@ def parse_frontmatter(content: str) -> dict[str, str]:
 
 def get_body_after_frontmatter(content: str) -> str:
     """Get content after frontmatter."""
-    match = re.match(r"^---\n.*?\n---\n?", content, re.DOTALL)
+    match = re.match(r"^\ufeff?---\n.*?\n---\n?", content, re.DOTALL)
     if match:
         return content[match.end():]
     return content
@@ -307,7 +307,7 @@ def main():
             continue
 
         # Also check raw frontmatter for description: field
-        fm_match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
+        fm_match = re.match(r"^\ufeff?---\n(.*?)\n---", content, re.DOTALL)
         if fm_match and "description:" in fm_match.group(1):
             already_has += 1
             continue

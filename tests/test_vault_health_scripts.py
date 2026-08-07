@@ -252,6 +252,250 @@ def test_fix_links_collapses_legacy_paths_and_removes_repo_links(
     ) == (None, "remove")
 
 
+def test_fix_links_leaves_human_zone_untouched(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    _write_vault_manifest(vault_path)
+    (vault_path / "business").mkdir(parents=True)
+    source_path = vault_path / "business" / "crm.md"
+    source_path.write_text(
+        _flat_context_note(
+            "CRM",
+            "See [[vault/obsolete]].\n\n"
+            "<!-- human:start -->\n"
+            "Keep [[legacy/manual-note]] exactly as I wrote it.\n"
+            "<!-- human:end -->\n",
+        ),
+        encoding="utf-8",
+    )
+
+    module = _load_vault_health_script("fix_links")
+    module.VAULT_PATH = vault_path
+
+    # Sandbox note: the real write_validated_vault_markdown needs a kernel
+    # privilege this test environment does not grant (same root cause as
+    # the many pre-existing sandboxed-write failures in this suite). Swap
+    # in a plain write so this test exercises the actual defect under
+    # test -- whether the human zone survives _write_repair's transform --
+    # without depending on that unrelated sandbox restriction.
+    def direct_write(vault_path, file_path, candidate, *, manifest, **kwargs):
+        del manifest, kwargs
+        (vault_path / file_path).write_bytes(candidate)
+
+    monkeypatch.setattr(module, "write_validated_vault_markdown", direct_write)
+
+    stats = module.fix_targets(
+        vault_path,
+        {
+            "broken_links": [
+                {"source": "business/crm", "target": "vault/obsolete"},
+                {"source": "business/crm", "target": "legacy/manual-note"},
+            ]
+        },
+        apply=True,
+        stem_index={},
+    )
+
+    content = source_path.read_text(encoding="utf-8")
+    assert "[[vault/obsolete]]" not in content
+    assert "Keep [[legacy/manual-note]] exactly as I wrote it." in content
+    assert stats["removed"] == 1
+
+
+def test_fix_links_leaves_every_human_zone_untouched_with_multiple_pairs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Reproduces the code-review report: a file with two human-zone marker
+    pairs used to have everything past the *first* pair processed by the
+    normal link-repair regex, silently turning the link inside the
+    *second* zone into bare text. With the fix, `_protect_human_zone`
+    cannot tell which START pairs with which END, so it fails closed and
+    leaves the whole file untouched -- both zones, and even the broken
+    link outside any zone.
+    """
+    vault_path = tmp_path / "vault"
+    _write_vault_manifest(vault_path)
+    (vault_path / "business").mkdir(parents=True)
+    source_path = vault_path / "business" / "crm.md"
+    original = _flat_context_note(
+        "CRM",
+        "See [[vault/obsolete]].\n\n"
+        "<!-- human:start -->\n"
+        "Keep [[legacy/manual-note-1]] exactly as I wrote it.\n"
+        "<!-- human:end -->\n\n"
+        "More context in between the two zones.\n\n"
+        "<!-- human:start -->\n"
+        "Keep [[legacy/manual-note-2]] exactly as I wrote it too.\n"
+        "<!-- human:end -->\n",
+    )
+    source_path.write_text(original, encoding="utf-8")
+
+    module = _load_vault_health_script("fix_links")
+    module.VAULT_PATH = vault_path
+
+    # Sandbox note: see test_fix_links_leaves_human_zone_untouched above.
+    def direct_write(vault_path, file_path, candidate, *, manifest, **kwargs):
+        del manifest, kwargs
+        (vault_path / file_path).write_bytes(candidate)
+
+    monkeypatch.setattr(module, "write_validated_vault_markdown", direct_write)
+
+    stats = module.fix_targets(
+        vault_path,
+        {
+            "broken_links": [
+                {"source": "business/crm", "target": "vault/obsolete"},
+                {"source": "business/crm", "target": "legacy/manual-note-1"},
+                {"source": "business/crm", "target": "legacy/manual-note-2"},
+            ]
+        },
+        apply=True,
+        stem_index={},
+    )
+
+    content = source_path.read_text(encoding="utf-8")
+    assert content == original
+    assert "Keep [[legacy/manual-note-2]] exactly as I wrote it too." in content
+    assert stats["removed"] == 0
+
+
+def test_protect_human_zone_multiple_pairs_leaves_content_untouched() -> None:
+    module = _load_vault_health_script("fix_links")
+    content = (
+        "See [[vault/obsolete]].\n\n"
+        f"{module.HUMAN_ZONE_START}\n"
+        "Keep [[legacy/manual-note-1]] exactly.\n"
+        f"{module.HUMAN_ZONE_END}\n\n"
+        "More text with [[vault/obsolete]] again.\n\n"
+        f"{module.HUMAN_ZONE_START}\n"
+        "Keep [[legacy/manual-note-2]] exactly too.\n"
+        f"{module.HUMAN_ZONE_END}\n"
+    )
+
+    result = module._protect_human_zone(
+        content, lambda text: text.replace("[[vault/obsolete]]", "REMOVED")
+    )
+
+    assert result == content
+
+
+def test_protect_human_zone_single_start_marker_fails_closed() -> None:
+    """A lone START with no matching END is exactly as ambiguous as two
+    pairs -- there's no way to tell where the zone would have ended, so
+    the file is left untouched rather than treating the marker as if it
+    were not there."""
+    module = _load_vault_health_script("fix_links")
+    content = f"before {module.HUMAN_ZONE_START} middle [[link]] end"
+
+    result = module._protect_human_zone(
+        content, lambda text: text.replace("[[link]]", "REMOVED")
+    )
+
+    assert result == content
+
+
+def test_protect_human_zone_single_end_marker_fails_closed() -> None:
+    module = _load_vault_health_script("fix_links")
+    content = f"before [[link]] middle {module.HUMAN_ZONE_END} end"
+
+    result = module._protect_human_zone(
+        content, lambda text: text.replace("[[link]]", "REMOVED")
+    )
+
+    assert result == content
+
+
+def test_protect_human_zone_reversed_single_pair_fails_closed() -> None:
+    module = _load_vault_health_script("fix_links")
+    content = (
+        f"before {module.HUMAN_ZONE_END} middle [[link]] middle2 "
+        f"{module.HUMAN_ZONE_START} end"
+    )
+
+    result = module._protect_human_zone(
+        content, lambda text: text.replace("[[link]]", "REMOVED")
+    )
+
+    assert result == content
+
+
+def test_protect_human_zone_no_markers_transforms_whole_file() -> None:
+    module = _load_vault_health_script("fix_links")
+    content = "before [[link]] end"
+
+    result = module._protect_human_zone(
+        content, lambda text: text.replace("[[link]]", "REMOVED")
+    )
+
+    assert result == content.replace("[[link]]", "REMOVED")
+
+
+def test_protect_human_zone_zero_markers_but_corrupted_evidence_fails_closed() -> None:
+    """Zero exact markers usually means "an ordinary vault file with no zone
+    to protect" -- but not on a page that still carries the ``## Owner
+    Notes`` heading compiled briefings always render together with the
+    markers. There the markers were lost to some external edit, and running
+    the transform over the whole file would rewrite the owner's own text.
+    """
+    module = _load_vault_health_script("fix_links")
+    content = "# Aurora\n\n## Owner Notes\n\nМои заметки про [[link]].\n"
+
+    result = module._protect_human_zone(
+        content, lambda text: text.replace("[[link]]", "REMOVED")
+    )
+
+    assert result == content
+
+
+def test_protect_human_zone_counts_markers_inside_code_blocks_too() -> None:
+    """`_protect_human_zone` does a plain byte-for-byte scan with no
+    markdown awareness, so example markers written inside a fenced code
+    block count exactly like real ones. Here that produces two START/END
+    pairs overall (one real zone plus one written as documentation inside
+    a code fence), which must be treated the same as any other
+    multiple-pair file: left untouched rather than guessed at.
+    """
+    module = _load_vault_health_script("fix_links")
+    content = (
+        "```\n"
+        f"{module.HUMAN_ZONE_START}\n"
+        f"{module.HUMAN_ZONE_END}\n"
+        "```\n\n"
+        f"{module.HUMAN_ZONE_START}\n"
+        "Keep [[legacy/manual-note]] as-is.\n"
+        f"{module.HUMAN_ZONE_END}\n"
+    )
+
+    result = module._protect_human_zone(
+        content, lambda text: text.replace("[[legacy/manual-note]]", "REMOVED")
+    )
+
+    assert result == content
+
+
+def test_protect_human_zone_pair_without_trailing_newline() -> None:
+    module = _load_vault_health_script("fix_links")
+    content = (
+        "See [[vault/obsolete]].\n\n"
+        f"{module.HUMAN_ZONE_START}\n"
+        "Keep [[legacy/manual-note]] exactly."
+        f"{module.HUMAN_ZONE_END}"
+    )
+    assert not content.endswith("\n")
+
+    result = module._protect_human_zone(
+        content, lambda text: text.replace("[[vault/obsolete]]", "REMOVED")
+    )
+
+    assert result.endswith(module.HUMAN_ZONE_END)
+    assert "Keep [[legacy/manual-note]] exactly." in result
+    assert "[[vault/obsolete]]" not in result
+    assert "REMOVED" in result
+
+
 def test_fix_links_rejects_cas_conflict_without_overwriting(
     tmp_path: Path,
     monkeypatch,
@@ -347,6 +591,27 @@ def test_add_descriptions_uses_current_flat_business_and_projects_layout() -> No
         {"type": "project"},
     )
     assert project_desc == "Сюда сводятся клиентские проекты и аккаунты."
+
+
+def test_add_descriptions_parse_frontmatter_tolerates_leading_bom() -> None:
+    """A leading UTF-8 BOM must not hide an existing description (see frontmatter.py).
+
+    Without BOM tolerance, ``parse_frontmatter``/``get_body_after_frontmatter``
+    would both report "no frontmatter", so main() would regenerate and
+    overwrite an already-present description for no reason.
+    """
+    module = _load_vault_health_script("add_descriptions")
+
+    without_bom = "---\ntype: note\ndescription: Kept\n---\nBody text.\n"
+    with_bom = "\ufeff" + without_bom
+
+    baseline_fm = module.parse_frontmatter(without_bom)
+    fm = module.parse_frontmatter(with_bom)
+    assert fm == baseline_fm == {"type": "note", "description": "Kept"}
+
+    baseline_body = module.get_body_after_frontmatter(without_bom)
+    body = module.get_body_after_frontmatter(with_bom)
+    assert body == baseline_body == "Body text.\n"
 
 
 def test_add_descriptions_skips_nonsemantic_routed_profiles(
