@@ -175,6 +175,8 @@ CORE_FRONTMATTER_FIELDS = frozenset(
         "conflicts_open",
         "human_reviewed",
         "human_zone_populated",
+        "quality_status",
+        "quality_reason",
         "record_kind",
         "decision_status",
         "decision_owner",
@@ -4093,6 +4095,20 @@ class CompiledBriefingService:
         )
         if confidence not in CONFIDENCE_VALUES:
             confidence = "medium"
+        quality_status = existing_meta.get("quality_status", "").strip()
+        quality_reason = existing_meta.get("quality_reason", "").strip()
+        if payload.get("_quality_verification_completed") is True:
+            quality_issues = payload.get("_quality_issues")
+            if isinstance(quality_issues, list) and quality_issues:
+                quality_status = "needs_review"
+                quality_reason = "; ".join(
+                    str(issue).strip()
+                    for issue in quality_issues
+                    if str(issue).strip()
+                )
+            else:
+                quality_status = ""
+                quality_reason = ""
 
         current_state = self._paragraph(payload.get("current_state"))
         def without_leading_date(items: list[str]) -> list[str]:
@@ -4444,7 +4460,7 @@ class CompiledBriefingService:
             field="last_verified",
             page_path=page_path,
         )
-        if claims:
+        if claims and quality_status != "needs_review":
             last_verified = today
         enrichment_count = (
             self._int_value(existing_meta.get("enrichment_count"), default=0) + 1
@@ -4496,6 +4512,13 @@ class CompiledBriefingService:
         ]
         if human_zone_populated:
             lines.append("human_zone_populated: true")
+        if quality_status == "needs_review" and quality_reason:
+            lines.extend(
+                [
+                    "quality_status: needs_review",
+                    f"quality_reason: {json.dumps(quality_reason, ensure_ascii=False)}",
+                ]
+            )
         if record_kind:
             lines.append(f"record_kind: {record_kind}")
         if record_kind == "decision":
@@ -7397,6 +7420,8 @@ class CompiledBriefingService:
                 f"JSON even after repair; treated as a full rejection ({exc})"
             ) from exc
         if candidate_payload is not None:
+            candidate_payload.pop("_quality_verification_completed", None)
+            candidate_payload.pop("_quality_issues", None)
             raw_page_checks = payload.get("page_checks")
             if not isinstance(raw_page_checks, dict) or any(
                 not isinstance(raw_page_checks.get(key), bool)
@@ -7411,11 +7436,6 @@ class CompiledBriefingService:
             failed_page_checks = [
                 key for key in VERIFY_PAGE_CHECK_KEYS if not raw_page_checks[key]
             ]
-            if failed_page_checks:
-                raise CompiledBriefingVerificationRejectedError(
-                    f"Verify rejected page for {source_rel_path}: failed checks "
-                    + ", ".join(failed_page_checks)
-                )
             raw_page_issues = payload.get("page_issues")
             if not isinstance(raw_page_issues, list) or any(
                 not isinstance(issue, str) for issue in raw_page_issues
@@ -7427,11 +7447,15 @@ class CompiledBriefingService:
                     "page_issues list; page write aborted"
                 )
             page_issues = [issue.strip() for issue in raw_page_issues if issue.strip()]
-            if page_issues:
-                raise CompiledBriefingVerificationRejectedError(
-                    f"Verify rejected page for {source_rel_path}: "
-                    + "; ".join(page_issues)
-                )
+            candidate_payload["_quality_verification_completed"] = True
+            candidate_payload["_quality_issues"] = [
+                *(
+                    ["failed checks: " + ", ".join(failed_page_checks)]
+                    if failed_page_checks
+                    else []
+                ),
+                *page_issues,
+            ]
 
         raw_verdicts = payload.get("verdicts")
         # Matched by position (the "index" each claim was given in the
@@ -7503,9 +7527,13 @@ class CompiledBriefingService:
                 )
 
         if rejected_count * 2 > len(sample):
-            raise CompiledBriefingVerificationRejectedError(
-                f"Verify rejected {rejected_count}/{len(sample)} sampled claims "
-                f"for {source_rel_path}; page write aborted"
+            if candidate_payload is None:
+                raise CompiledBriefingVerificationRejectedError(
+                    f"Verify rejected {rejected_count}/{len(sample)} sampled claims "
+                    f"for {source_rel_path}; page write aborted"
+                )
+            candidate_payload.setdefault("_quality_issues", []).append(
+                f"Verify rejected {rejected_count}/{len(sample)} sampled claims"
             )
 
         # Filtered by position in `claims`, not by claim text (code review

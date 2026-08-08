@@ -8027,12 +8027,11 @@ def test_compiled_briefings_verify_prompt_has_final_merged_page(
     assert "contradictory or ambiguous source statements" in verify_prompt
 
 
-def test_compiled_briefings_verify_majority_reject_aborts_page_write(
+def test_compiled_briefings_verify_majority_reject_writes_flagged_page(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ТЗ 5.2 step 4: rejecting a majority of the sampled claims aborts the
-    whole page write, not just the rejected claims."""
+    """A content-quality rejection preserves the page but flags it for review."""
     vault_path = tmp_path / "vault"
     service = _compiled_service(vault_path)
     _bypass_atomic_vault_write(monkeypatch)
@@ -8080,19 +8079,22 @@ def test_compiled_briefings_verify_majority_reject_aborts_page_write(
     monkeypatch.setattr(service.runner, "run", fake_run)
     note_path = vault_path / "compiled" / "projects" / "demo-project.md"
 
-    with pytest.raises(CompiledBriefingVerificationRejectedError):
-        service._upsert_briefing(
-            target=_demo_target(),
-            source_rel_path="daily/2026-08-05.md",
-            source_excerpt="## 09:00 [text]\nУтверждение А. Утверждение Б.",
-            signal=None,
-        )
+    service._upsert_briefing(
+        target=_demo_target(),
+        source_rel_path="daily/2026-08-05.md",
+        source_excerpt="## 09:00 [text]\nУтверждение А. Утверждение Б.",
+        signal=None,
+    )
 
     assert len(calls) == 2
-    assert not note_path.exists()
+    note_text = note_path.read_text(encoding="utf-8")
+    assert "quality_status: needs_review" in note_text
+    assert "Verify rejected 2/2 sampled claims" in note_text
+    assert "| Утверждение А. |" not in note_text
+    assert "| Утверждение Б. |" not in note_text
 
 
-def test_compiled_briefings_verify_page_issue_aborts_page_write(
+def test_compiled_briefings_verify_page_issue_writes_flagged_page(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -8133,16 +8135,82 @@ def test_compiled_briefings_verify_page_issue_aborts_page_write(
 
     monkeypatch.setattr(service.runner, "run", fake_run)
 
-    with pytest.raises(CompiledBriefingVerificationRejectedError):
+    service._upsert_briefing(
+        target=_demo_target(),
+        source_rel_path="daily/2026-08-05.md",
+        source_excerpt="Решение принято.",
+        signal=None,
+    )
+
+    assert len(calls) == 2
+    note_text = (vault_path / "compiled/projects/demo-project.md").read_text(
+        encoding="utf-8"
+    )
+    assert "quality_status: needs_review" in note_text
+    assert "target decision is missing from key_decisions" in note_text
+
+
+def test_compiled_briefings_successful_verify_clears_quality_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_atomic_vault_write(monkeypatch)
+    responses = [
+        json.dumps(
+            _minimal_compile_payload(
+                claims=[{"text": "Первый факт.", "kind": "fact"}]
+            )
+        ),
+        json.dumps(
+            {
+                "verdicts": [{"index": 0, "supported": True}],
+                "page_checks": {
+                    "source_coverage": False,
+                    "target_scope": True,
+                    "timeline_consistency": True,
+                },
+                "page_issues": [],
+            }
+        ),
+        json.dumps(
+            _minimal_compile_payload(
+                claims=[{"text": "Второй факт.", "kind": "fact"}]
+            )
+        ),
+        json.dumps(
+            {
+                "verdicts": [{"index": 0, "supported": True}],
+                "page_checks": {
+                    "source_coverage": True,
+                    "target_scope": True,
+                    "timeline_consistency": True,
+                },
+                "page_issues": [],
+            }
+        ),
+    ]
+    calls: list[str] = []
+
+    def fake_run(prompt: str, *, timeout: int) -> str:
+        calls.append(prompt)
+        return responses[len(calls) - 1]
+
+    monkeypatch.setattr(service.runner, "run", fake_run)
+    for source_rel_path in ("daily/2026-08-05.md", "daily/2026-08-06.md"):
         service._upsert_briefing(
             target=_demo_target(),
-            source_rel_path="daily/2026-08-05.md",
-            source_excerpt="Решение принято.",
+            source_rel_path=source_rel_path,
+            source_excerpt="Факт.",
             signal=None,
         )
 
-    assert len(calls) == 2
-    assert not (vault_path / "compiled/projects/demo-project.md").exists()
+    note_text = (vault_path / "compiled/projects/demo-project.md").read_text(
+        encoding="utf-8"
+    )
+    assert "quality_status:" not in note_text
+    assert "quality_reason:" not in note_text
 
 
 def test_compiled_briefings_verify_missing_page_issues_aborts_page_write(
@@ -8191,7 +8259,7 @@ def test_compiled_briefings_verify_missing_page_issues_aborts_page_write(
     "failed_check",
     ["source_coverage", "target_scope", "timeline_consistency"],
 )
-def test_compiled_briefings_verify_failed_systemic_check_aborts_page_write(
+def test_compiled_briefings_verify_failed_systemic_check_marks_candidate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     failed_check: str,
@@ -8217,21 +8285,28 @@ def test_compiled_briefings_verify_failed_systemic_check_aborts_page_write(
         ),
     )
 
-    with pytest.raises(CompiledBriefingVerificationRejectedError):
-        service._verify_claims_batch(
-            claims=[
-                {
-                    "text": "Факт.",
-                    "source": "daily/2026-08-05.md",
-                    "kind": "fact",
-                }
-            ],
-            source_rel_path="daily/2026-08-05.md",
-            source_excerpt="Факт.",
-            page_tier="active",
-            target_title="Факт",
-            candidate_payload={"current_state": "Факт."},
-        )
+    candidate_payload = {"current_state": "Факт."}
+    verified = service._verify_claims_batch(
+        claims=[
+            {
+                "text": "Факт.",
+                "source": "daily/2026-08-05.md",
+                "kind": "fact",
+            }
+        ],
+        source_rel_path="daily/2026-08-05.md",
+        source_excerpt="Факт.",
+        page_tier="active",
+        target_title="Факт",
+        candidate_payload=candidate_payload,
+    )
+
+    assert verified[0]["text"] == "Факт."
+    assert candidate_payload["_quality_verification_completed"] is True
+    assert candidate_payload["_quality_issues"] == [
+        f"failed checks: {failed_check}",
+        f"failed {failed_check}",
+    ]
 
 
 def test_compiled_briefings_verify_missing_systemic_checks_aborts_page_write(
