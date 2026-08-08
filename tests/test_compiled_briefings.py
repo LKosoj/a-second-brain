@@ -974,6 +974,39 @@ def test_compiled_briefings_run_queue_worker_drains_burst_until_queue_empty(
         )
         == []
     )
+    journal_paths = list((vault_path / ".compiled" / "queue-history").glob("*.json"))
+    assert len(journal_paths) == 1
+    journal = json.loads(journal_paths[0].read_text(encoding="utf-8"))
+    assert journal["status"] == "completed"
+    assert journal["initial_queue_size"] == 2
+    assert journal["remaining_queue_size"] == 0
+    assert [event["outcome"] for event in journal["events"]] == [
+        "updated",
+        "updated",
+    ]
+    assert [event["source_date"] for event in journal["events"]] == [
+        "2026-04-04",
+        "2026-04-05",
+    ]
+
+
+def test_compiled_briefings_queue_worker_keeps_ten_latest_journals(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    history_root = vault_path / ".compiled" / "queue-history"
+    history_root.mkdir(parents=True)
+    for index in range(11):
+        (history_root / f"2026-08-07-1200{index:02d}-{index}.json").write_text(
+            "{}\n", encoding="utf-8"
+        )
+
+    service._rotate_queue_worker_journals()
+
+    journals = sorted(path.name for path in history_root.glob("*.json"))
+    assert len(journals) == 10
+    assert "2026-08-07-120000-0.json" not in journals
 
 
 def test_compiled_briefings_drain_queue_once_requeues_requeueable_skip(
@@ -1115,6 +1148,51 @@ def test_compiled_briefings_drain_clears_the_give_up_trace_once_it_compiles(
         )
     )
     assert journal["sources"] == []
+
+
+def test_compiled_briefings_drain_moves_verify_rejection_to_decisions_queue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    service.enqueue_refresh(
+        source_path="daily/2026-04-04.md",
+        source_excerpt="source body",
+        max_updates=2,
+        debounce_seconds=0,
+    )
+    monkeypatch.setattr(service, "is_available", lambda: True)
+    monkeypatch.setattr(
+        service,
+        "refresh_after_write",
+        lambda **kwargs: {  # type: ignore[no-untyped-def]
+            "updated": [],
+            "errors": ["topics/new-page: Verify rejected page"],
+            "verify_rejected": ["compiled/topics/new-page.md"],
+        },
+    )
+
+    for _ in range(3):
+        service._drain_queue_once(force=True, max_events=50)
+
+    queued = json.loads(
+        (vault_path / ".session" / "decisions-queue.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert queued == [
+        {
+            "kind": "verify-rejected",
+            "page": "compiled/topics/new-page.md",
+            "summary": queued[0]["summary"],
+            "since": date.today().isoformat(),
+            "source_path": "daily/2026-04-04.md",
+            "source_excerpt": "source body",
+            "max_updates": "2",
+        }
+    ]
+    assert not (vault_path / "compiled/topics/new-page.md").exists()
 
 
 def _nightly_pass_with_stubbed_side_work(service, monkeypatch, *, lint_issues):  # noqa: ANN001, ANN202
@@ -2288,8 +2366,15 @@ def test_compiled_briefings_refresh_daily_fully_processes_all_entry_blocks(
     service = _compiled_service(vault_path)
     excerpts: list[str] = []
 
-    def fake_refresh(self, *, source_path, source_excerpt="", max_updates=3):  # noqa: ANN001
-        del self, source_path, max_updates
+    def fake_refresh(  # noqa: ANN001
+        self,
+        *,
+        source_path,
+        source_excerpt="",
+        max_updates=3,
+        force_recompile=False,
+    ):
+        del self, source_path, max_updates, force_recompile
         excerpts.append(source_excerpt)
         return {"available": True, "updated": [], "errors": []}
 
@@ -2332,8 +2417,15 @@ def test_compiled_briefings_refresh_daily_fully_header_injection_stays_capped(
     service = _compiled_service(vault_path)
     excerpts: list[str] = []
 
-    def fake_refresh(self, *, source_path, source_excerpt="", max_updates=3):  # noqa: ANN001
-        del self, source_path, max_updates
+    def fake_refresh(  # noqa: ANN001
+        self,
+        *,
+        source_path,
+        source_excerpt="",
+        max_updates=3,
+        force_recompile=False,
+    ):
+        del self, source_path, max_updates, force_recompile
         excerpts.append(source_excerpt)
         return {"available": True, "updated": [], "errors": []}
 
@@ -2364,8 +2456,15 @@ def test_compiled_briefings_refresh_daily_fully_keeps_middle_of_large_entry(
     service = _compiled_service(vault_path)
     excerpts: list[str] = []
 
-    def fake_refresh(self, *, source_path, source_excerpt="", max_updates=3):  # noqa: ANN001
-        del self, source_path, max_updates
+    def fake_refresh(  # noqa: ANN001
+        self,
+        *,
+        source_path,
+        source_excerpt="",
+        max_updates=3,
+        force_recompile=False,
+    ):
+        del self, source_path, max_updates, force_recompile
         excerpts.append(source_excerpt)
         return {"available": True, "updated": [], "errors": []}
 
@@ -2407,8 +2506,9 @@ def test_compiled_briefings_refresh_daily_fully_reports_chunk_progress(
         source_path,
         source_excerpt="",
         max_updates=3,
+        force_recompile=False,
     ):
-        del self, source_path, source_excerpt, max_updates
+        del self, source_path, source_excerpt, max_updates, force_recompile
         return {
             "available": True,
             "updated": ["compiled/projects/demo.md"],
@@ -2453,6 +2553,47 @@ def test_compiled_briefings_refresh_daily_fully_reports_chunk_progress(
             "errors": [],
         },
     ]
+
+
+def test_compiled_briefings_refresh_daily_fully_resumes_from_chunk(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    daily_path = vault_path / "daily" / "2025-05-02.md"
+    daily_path.parent.mkdir(parents=True)
+    daily_path.write_text(
+        "# Day\n\n## 09:00 [text]\nOne.\n\n## 10:00 [text]\nTwo.\n",
+        encoding="utf-8",
+    )
+    service = _compiled_service(vault_path)
+    seen: list[str] = []
+
+    def fake_refresh(  # noqa: ANN001
+        self,
+        *,
+        source_path,
+        source_excerpt="",
+        max_updates=3,
+        force_recompile=False,
+    ):
+        del self, source_path, max_updates, force_recompile
+        seen.append(source_excerpt)
+        return {"available": True, "updated": [], "errors": []}
+
+    monkeypatch.setattr(CompiledBriefingService, "refresh_after_write", fake_refresh)
+
+    result = service.refresh_daily_fully(
+        source_path="daily/2025-05-02.md",
+        start_chunk=2,
+        refresh_qmd=False,
+    )
+
+    assert result["chunks"] == 2
+    assert result["processed_chunks"] == 2
+    assert len(seen) == 1
+    assert "Two." in seen[0]
+    assert "One." not in seen[0]
 
 
 def test_compiled_briefings_resolve_targets_repairs_non_json_output(
@@ -2695,6 +2836,34 @@ def test_compiled_decision_renders_adr_fields(tmp_path: Path) -> None:
     assert "## Decision Evidence\n- [[daily/2026-04-04.md]]" in rendered
 
 
+def test_compiled_decision_accepted_record_keeps_headline_decision(
+    tmp_path: Path,
+) -> None:
+    service = _compiled_service(tmp_path / "vault")
+    target = CompiledBriefingTarget(
+        domain="decisions",
+        title="Run DBCC CHECK before the snapshot",
+        slug="dbcc-before-snapshot",
+        description="Cutover safety decision.",
+        reason="Durable decision.",
+    )
+
+    rendered = service._render_briefing(
+        target=target,
+        payload={
+            "record_kind": "decision",
+            "decision_status": "accepted",
+            "source_links": ["daily/2026-08-07.md"],
+        },
+        source_rel_path="daily/2026-08-07.md",
+        existing_text="",
+        existing_meta={},
+        signal=None,
+    )
+
+    assert "## Key Decisions\n- Run DBCC CHECK before the snapshot" in rendered
+
+
 def test_compiled_record_dates_and_severity_never_break_the_page_yaml(
     tmp_path: Path,
 ) -> None:
@@ -2923,20 +3092,7 @@ def test_compiled_briefings_upsert_briefing_frozen_tier_survives_utf8_bom(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """End-to-end regression for the same BOM hole: with the frontmatter
-    unreadable, the `tier == "cold"` gate in ``_upsert_briefing`` never
-    fired (``tier = existing_meta.get("tier", "")`` saw ``""``, not
-    ``"cold"``), so a frozen page fell through to the full enrichment path
-    -- one real model call, where a healthy `cold`-tier page makes zero
-    (see ``test_compiled_briefings_cold_tier_skips_model_and_adds_marked_row``).
-
-    Only asserts the model-call count, which is decided entirely by
-    ``_frontmatter_fields`` inside this module -- not the tier value on the
-    rewritten file, which also round-trips through
-    ``frontmatter.py``'s independent ``patch_frontmatter_bytes``/
-    ``split_frontmatter_bytes`` (out of scope here; see the write-up for
-    this fix for that separate BOM gap).
-    """
+    """A BOM does not prevent a cold page from receiving a real refresh."""
     vault_path = tmp_path / "vault"
     service = _compiled_service(vault_path)
     _bypass_atomic_vault_write(monkeypatch)
@@ -2962,7 +3118,7 @@ def test_compiled_briefings_upsert_briefing_frozen_tier_survives_utf8_bom(
         signal=None,
     )
 
-    assert calls == []
+    assert len(calls) == 1
     assert result.written is True
 
 
@@ -3103,17 +3259,7 @@ def test_compiled_briefings_upsert_briefing_frozen_tier_survives_crlf_line_endin
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """End-to-end regression for the same CRLF hole, sibling of
-    ``test_compiled_briefings_upsert_briefing_frozen_tier_survives_utf8_bom``:
-    with the frontmatter unreadable, the `tier == "archive"` gate in
-    ``_upsert_briefing`` never fired (``tier = existing_meta.get("tier",
-    "")`` saw ``""``, not ``"archive"``), so a frozen page fell through to
-    the full enrichment path -- one real model call, and ``_merged_tier``
-    (seeing no existing tier either) wrote back ``tier: active`` --
-    jumping the page from the most-frozen rank straight to the
-    highest-activity one instead of the ``_promote_archive_tier`` bump to
-    `warm` this branch is supposed to make.
-    """
+    """CRLF frontmatter does not prevent an archived page refresh."""
     vault_path = tmp_path / "vault"
     service = _compiled_service(vault_path)
     _bypass_atomic_vault_write(monkeypatch)
@@ -3138,7 +3284,7 @@ def test_compiled_briefings_upsert_briefing_frozen_tier_survives_crlf_line_endin
         signal=None,
     )
 
-    assert calls == []
+    assert len(calls) == 1
     assert result.written is True
     new_tier = service._frontmatter_fields(
         page_path.read_text(encoding="utf-8")
@@ -3277,8 +3423,15 @@ def test_compiled_briefings_refresh_daily_fully_stops_on_terminal_backend_error(
     service = _compiled_service(vault_path)
     seen_excerpts: list[str] = []
 
-    def fake_refresh(self, *, source_path, source_excerpt="", max_updates=3):  # noqa: ANN001
-        del self, source_path, max_updates
+    def fake_refresh(  # noqa: ANN001
+        self,
+        *,
+        source_path,
+        source_excerpt="",
+        max_updates=3,
+        force_recompile=False,
+    ):
+        del self, source_path, max_updates, force_recompile
         seen_excerpts.append(source_excerpt)
         if len(seen_excerpts) == 1:
             return {
@@ -4620,6 +4773,11 @@ def test_compiled_briefings_upsert_briefing_symmetric_marker_typo_leaves_file_un
     vault_path = tmp_path / "vault"
     service = _compiled_service(vault_path)
     service._active_pass = CompileEnrichPass(pass_id="p1", snapshot_enabled=False)
+    monkeypatch.setattr(
+        service.runner,
+        "run",
+        lambda prompt, **kwargs: json.dumps(_minimal_compile_payload()),
+    )
     compiled_projects = vault_path / "compiled" / "projects"
     compiled_projects.mkdir(parents=True)
     secret = "Владелец: конфиденциальный контекст сделки, не терять."
@@ -5557,9 +5715,8 @@ def test_compiled_briefings_render_keeps_short_bullet_that_echoes_human_zone(
     )
 
     recent_changes_section = service._section_text(rendered, "Recent Changes")
-    today = date.today().isoformat()
     assert recent_changes_section == (
-        f"- {today}: SLA (source: [[daily/2026-08-05.md]])"
+        "- 2026-08-05: SLA (source: [[daily/2026-08-05.md]])"
     )
 
 
@@ -5710,9 +5867,57 @@ def test_compiled_briefings_sources_table_escapes_pipe_in_both_columns(
     # Escaping must round-trip so a later compile pass recognizes this as
     # the same (date, source) pair instead of appending a duplicate row.
     rows = service._sources_shaped_rows(rendered)
-    assert rows == [
-        (date.today().isoformat(), source_rel_path, "Update | one.")
+    assert rows == [("2026-08-05", source_rel_path, "Update | one.")]
+
+
+def test_compiled_briefing_uses_source_date_without_duplicate_prefix(
+    tmp_path: Path,
+) -> None:
+    service = _compiled_service(tmp_path / "vault")
+
+    rendered = service._render_briefing(
+        target=_demo_target(),
+        payload=_minimal_compile_payload(
+            recent_changes=["2026-08-07: Создан обязательный снапшот."]
+        ),
+        source_rel_path="daily/2026-08-07.md",
+        existing_text="",
+        existing_meta={},
+        signal=None,
+    )
+
+    section = service._section_text(rendered, "Recent Changes")
+    assert "2026-08-07: Создан обязательный снапшот." in section
+    assert section.count("2026-08-07:") == 1
+    assert service._sources_shaped_rows(rendered) == [
+        (
+            "2026-08-07",
+            "daily/2026-08-07.md",
+            "Создан обязательный снапшот.",
+        )
     ]
+
+
+def test_compiled_briefing_hides_non_enrichment_from_claim_provenance(
+    tmp_path: Path,
+) -> None:
+    service = _compiled_service(tmp_path / "vault")
+    text = _full_compiled_page_text(
+        sources=["daily/used.md", "daily/inspected.md"],
+        shaped_rows=[
+            ("2026-08-01", "daily/used.md", "Подтверждено решение."),
+            (
+                "2026-08-02",
+                "daily/inspected.md",
+                NOT_ENRICHMENT_SOURCE_MARKER,
+            ),
+        ],
+    )
+
+    assert service._sources_shaped_rows(text) == [
+        ("2026-08-01", "daily/used.md", "Подтверждено решение.")
+    ]
+    assert "daily/inspected.md" not in service._existing_claims_catalog(text)
 
 
 # --- A4: frontmatter provenance fields ---------------------------------------
@@ -7703,7 +7908,13 @@ def test_compiled_briefings_verify_drops_rejected_claim_without_aborting_write(
                         "supported": False,
                         "reason": "not stated in source",
                     },
-                ]
+                ],
+                "page_checks": {
+                    "source_coverage": True,
+                    "target_scope": True,
+                    "timeline_consistency": True,
+                },
+                "page_issues": [],
             }
         ),
     ]
@@ -7732,22 +7943,17 @@ def test_compiled_briefings_verify_drops_rejected_claim_without_aborting_write(
     assert not any(row[2] == "Планируется рост на 20%." for row in rows)
 
 
-def test_compiled_briefings_verify_prompt_has_no_compile_context(
+def test_compiled_briefings_verify_prompt_has_final_merged_page(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ТЗ 5.2 step 4: Verify runs as a separate model call with a clean,
-    read-only context and must not see anything from the Compile step --
-    only the claims, the source path, and the source excerpt (see
-    ``_build_verify_prompt``). This regression-tests that boundary: a
-    unique marker placed on the existing page, the page's existing-claims
-    catalog, and the target's description all reach the first (Compile)
-    prompt, but none of them reach the second (Verify) prompt."""
+    """Verify sees the complete page after old and new content are merged."""
     vault_path = tmp_path / "vault"
     service = _compiled_service(vault_path)
     _bypass_atomic_vault_write(monkeypatch)
 
     marker = "UNIQUE-MARKER-9f3d2a77"
+    old_open_loop = "OLD-OPEN-LOOP-6d4f1b20"
     page_path = vault_path / "compiled" / "projects" / "demo-project.md"
     page_path.parent.mkdir(parents=True, exist_ok=True)
     page_path.write_text(
@@ -7755,7 +7961,8 @@ def test_compiled_briefings_verify_prompt_has_no_compile_context(
         "## Sources That Shaped This Page\n"
         "| Date | Source | What Added |\n"
         "| --- | --- | --- |\n"
-        f"| 2026-07-01 | [[thoughts/idea.md]] | {marker} |\n",
+        f"| 2026-07-01 | [[thoughts/idea.md]] | {marker} |\n\n"
+        f"## Open Loops\n- 2026-07-01: {old_open_loop}\n",
         encoding="utf-8",
     )
     target = _demo_target(description="UNIQUE-TARGET-DESCRIPTION-7ac1e5")
@@ -7775,7 +7982,13 @@ def test_compiled_briefings_verify_prompt_has_no_compile_context(
                         "supported": True,
                         "reason": "stated in source",
                     }
-                ]
+                ],
+                "page_checks": {
+                    "source_coverage": True,
+                    "target_scope": True,
+                    "timeline_consistency": True,
+                },
+                "page_issues": [],
             }
         ),
     ]
@@ -7800,13 +8013,18 @@ def test_compiled_briefings_verify_prompt_has_no_compile_context(
     assert marker in compile_prompt
     assert target.description in compile_prompt
     assert "thoughts/idea.md" in compile_prompt
-    # The regression itself: none of it leaks into the Verify prompt.
-    assert marker not in verify_prompt
-    assert target.description not in verify_prompt
-    assert "thoughts/idea.md" not in verify_prompt
-    assert "[EXISTING_CLAIMS]" not in verify_prompt
-    assert "[EXISTING_BRIEFING_MARKDOWN]" not in verify_prompt
-    assert "[TARGET]" not in verify_prompt
+    # Verify must inspect the actual merged page, including old sections
+    # that are absent from the current model payload.
+    assert marker in verify_prompt
+    assert old_open_loop in verify_prompt
+    assert "# Demo Project" in verify_prompt
+    assert "thoughts/idea.md" in verify_prompt
+    assert "[EXISTING_VERIFIED_CLAIMS]" in verify_prompt
+    assert "[CANDIDATE_PAGE_JSON]" in verify_prompt
+    assert "[CANDIDATE_PAGE_MARKDOWN]" in verify_prompt
+    assert target.title in verify_prompt
+    assert "Never invent a plausible alternative" in compile_prompt
+    assert "contradictory or ambiguous source statements" in verify_prompt
 
 
 def test_compiled_briefings_verify_majority_reject_aborts_page_write(
@@ -7843,7 +8061,13 @@ def test_compiled_briefings_verify_majority_reject_aborts_page_write(
                         "supported": False,
                         "reason": "not supported",
                     },
-                ]
+                ],
+                "page_checks": {
+                    "source_coverage": True,
+                    "target_scope": True,
+                    "timeline_consistency": True,
+                },
+                "page_issues": [],
             }
         ),
     ]
@@ -7866,6 +8090,186 @@ def test_compiled_briefings_verify_majority_reject_aborts_page_write(
 
     assert len(calls) == 2
     assert not note_path.exists()
+
+
+def test_compiled_briefings_verify_page_issue_aborts_page_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_atomic_vault_write(monkeypatch)
+    responses = [
+        json.dumps(
+            _minimal_compile_payload(
+                claims=[{"text": "Решение принято.", "kind": "commitment"}],
+                key_decisions=[],
+            )
+        ),
+        json.dumps(
+            {
+                "verdicts": [
+                    {
+                        "index": 0,
+                        "text": "Решение принято.",
+                        "supported": True,
+                        "reason": "stated",
+                    }
+                ],
+                "page_checks": {
+                    "source_coverage": True,
+                    "target_scope": True,
+                    "timeline_consistency": True,
+                },
+                "page_issues": ["target decision is missing from key_decisions"],
+            }
+        ),
+    ]
+    calls: list[str] = []
+
+    def fake_run(prompt: str, *, timeout: int) -> str:
+        calls.append(prompt)
+        return responses[len(calls) - 1]
+
+    monkeypatch.setattr(service.runner, "run", fake_run)
+
+    with pytest.raises(CompiledBriefingVerificationRejectedError):
+        service._upsert_briefing(
+            target=_demo_target(),
+            source_rel_path="daily/2026-08-05.md",
+            source_excerpt="Решение принято.",
+            signal=None,
+        )
+
+    assert len(calls) == 2
+    assert not (vault_path / "compiled/projects/demo-project.md").exists()
+
+
+def test_compiled_briefings_verify_missing_page_issues_aborts_page_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _compiled_service(tmp_path / "vault")
+    service._active_pass = CompileEnrichPass(pass_id="p1", snapshot_enabled=False)
+    monkeypatch.setattr(
+        service.runner,
+        "run",
+        lambda prompt, *, timeout: json.dumps(
+            {
+                "verdicts": [
+                    {"index": 0, "text": "Факт.", "supported": True}
+                ],
+                "page_checks": {
+                    "source_coverage": True,
+                    "target_scope": True,
+                    "timeline_consistency": True,
+                },
+            }
+        ),
+    )
+
+    with pytest.raises(CompiledBriefingVerificationRejectedError):
+        service._verify_claims_batch(
+            claims=[
+                {
+                    "text": "Факт.",
+                    "source": "daily/2026-08-05.md",
+                    "kind": "fact",
+                }
+            ],
+            source_rel_path="daily/2026-08-05.md",
+            source_excerpt="Факт.",
+            page_tier="active",
+            target_title="Факт",
+            candidate_payload={"current_state": "Факт."},
+        )
+
+    assert service._active_pass.verify_format_drift == 1
+
+
+@pytest.mark.parametrize(
+    "failed_check",
+    ["source_coverage", "target_scope", "timeline_consistency"],
+)
+def test_compiled_briefings_verify_failed_systemic_check_aborts_page_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_check: str,
+) -> None:
+    service = _compiled_service(tmp_path / "vault")
+    page_checks = {
+        "source_coverage": True,
+        "target_scope": True,
+        "timeline_consistency": True,
+    }
+    page_checks[failed_check] = False
+    monkeypatch.setattr(
+        service.runner,
+        "run",
+        lambda prompt, *, timeout: json.dumps(
+            {
+                "verdicts": [
+                    {"index": 0, "text": "Факт.", "supported": True}
+                ],
+                "page_checks": page_checks,
+                "page_issues": [f"failed {failed_check}"],
+            }
+        ),
+    )
+
+    with pytest.raises(CompiledBriefingVerificationRejectedError):
+        service._verify_claims_batch(
+            claims=[
+                {
+                    "text": "Факт.",
+                    "source": "daily/2026-08-05.md",
+                    "kind": "fact",
+                }
+            ],
+            source_rel_path="daily/2026-08-05.md",
+            source_excerpt="Факт.",
+            page_tier="active",
+            target_title="Факт",
+            candidate_payload={"current_state": "Факт."},
+        )
+
+
+def test_compiled_briefings_verify_missing_systemic_checks_aborts_page_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _compiled_service(tmp_path / "vault")
+    service._active_pass = CompileEnrichPass(pass_id="p1", snapshot_enabled=False)
+    monkeypatch.setattr(
+        service.runner,
+        "run",
+        lambda prompt, *, timeout: json.dumps(
+            {
+                "verdicts": [
+                    {"index": 0, "text": "Факт.", "supported": True}
+                ],
+                "page_issues": [],
+            }
+        ),
+    )
+
+    with pytest.raises(CompiledBriefingVerificationRejectedError):
+        service._verify_claims_batch(
+            claims=[
+                {
+                    "text": "Факт.",
+                    "source": "daily/2026-08-05.md",
+                    "kind": "fact",
+                }
+            ],
+            source_rel_path="daily/2026-08-05.md",
+            source_excerpt="Факт.",
+            page_tier="active",
+            target_title="Факт",
+            candidate_payload={"current_state": "Факт."},
+        )
+
+    assert service._active_pass.verify_format_drift == 1
 
 
 def test_compiled_briefings_verify_unparseable_response_raises_verification_rejected(
@@ -8646,6 +9050,11 @@ def test_compiled_briefings_cold_tier_write_counts_toward_touched_pages(
         encoding="utf-8",
     )
     service._active_pass = CompileEnrichPass(pass_id="p1", snapshot_enabled=False)
+    monkeypatch.setattr(
+        service.runner,
+        "run",
+        lambda prompt, **kwargs: json.dumps(_minimal_compile_payload()),
+    )
 
     result = service._upsert_briefing(
         target=_demo_target(),
@@ -8708,7 +9117,6 @@ def test_compiled_briefings_warm_tier_insignificant_write_counts_toward_touched_
 def test_compiled_briefings_cold_tier_skips_write_on_ambiguous_human_zone(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Defect 1 regression: a lone, unclosed human-zone marker makes both
     ``_replace_section`` calls in ``_record_non_enrichment_source`` silently
@@ -8737,26 +9145,25 @@ def test_compiled_briefings_cold_tier_skips_write_on_ambiguous_human_zone(
     ).replace(HUMAN_ZONE_END, "")  # lone, unclosed start marker
     page_path.write_text(original_text, encoding="utf-8")
     original_bytes = page_path.read_bytes()
+    monkeypatch.setattr(
+        service.runner,
+        "run",
+        lambda prompt, **kwargs: json.dumps(_minimal_compile_payload()),
+    )
 
-    with caplog.at_level(logging.WARNING):
-        result = service._upsert_briefing(
+    with pytest.raises(HumanZoneMarkerError):
+        service._upsert_briefing(
             target=_demo_target(),
             source_rel_path="daily/2026-08-05.md",
             source_excerpt="New material found while the owner's note was open.",
             signal=None,
         )
 
-    assert result.written is False
     assert page_path.read_bytes() == original_bytes
     assert service._frontmatter_fields(original_text).get("source_count") == "1"
     assert service._applied_source_chunk_hashes(
         rel_path, "daily/2026-08-05.md"
     ) == []
-    assert any(
-        "ambiguous" in record.message.lower() and rel_path in record.message
-        for record in caplog.records
-    )
-
     # Repair the marker (as the owner closing their draft would) and retry:
     # the chunk was never marked applied above, so the exact same call must
     # now succeed instead of being silently skipped by the chunk-idempotency
@@ -8816,15 +9223,20 @@ def test_compiled_briefings_cold_tier_ambiguous_human_zone_not_counted_as_touche
     ).replace(HUMAN_ZONE_END, "")  # lone, unclosed start marker
     page_path.write_text(original_text, encoding="utf-8")
     service._active_pass = CompileEnrichPass(pass_id="p1", snapshot_enabled=False)
-
-    result = service._upsert_briefing(
-        target=_demo_target(),
-        source_rel_path="daily/2026-08-05.md",
-        source_excerpt="New material found while the owner's note was open.",
-        signal=None,
+    monkeypatch.setattr(
+        service.runner,
+        "run",
+        lambda prompt, **kwargs: json.dumps(_minimal_compile_payload()),
     )
 
-    assert result.written is False
+    with pytest.raises(HumanZoneMarkerError):
+        service._upsert_briefing(
+            target=_demo_target(),
+            source_rel_path="daily/2026-08-05.md",
+            source_excerpt="New material found while the owner's note was open.",
+            signal=None,
+        )
+
     assert rel_path not in service._active_pass.touched_pages
 
 
@@ -8870,21 +9282,24 @@ def test_compiled_briefings_drain_queue_once_recovers_cold_tier_source_after_mar
     monkeypatch.setattr(
         service.qmd, "_memory_signal_for_rel_path", lambda _path: None
     )
+    monkeypatch.setattr(
+        service.runner,
+        "run",
+        lambda prompt, **kwargs: json.dumps(_minimal_compile_payload()),
+    )
 
     first = service._drain_queue_once(force=True, max_events=50)
 
-    assert first == {
-        "drained": 1,
-        "updated": [],
-        "errors": [],
-        "consolidations": [],
-    }
+    assert first["drained"] == 1
+    assert first["updated"] == []
+    assert first["consolidations"] == []
+    assert first["errors"]
     queue = json.loads(
         (vault_path / ".compiled" / "queue.json").read_text(encoding="utf-8")
     )
     assert len(queue) == 1
     assert queue[0]["state"] == "pending"
-    assert queue[0]["attempts"] == 0
+    assert queue[0]["attempts"] == 1
 
     # Owner fixes the marker.
     fixed_text = _full_compiled_page_text(
@@ -8909,22 +9324,11 @@ def test_compiled_briefings_drain_queue_once_recovers_cold_tier_source_after_mar
     )
 
 
-def test_compiled_briefings_warm_tier_ambiguous_human_zone_still_acks(
+def test_compiled_briefings_warm_tier_ambiguous_human_zone_retries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Defect 2 scope boundary (code review): a `warm`-tier page's
-    "insignificant" branch also calls ``_record_non_enrichment_source``,
-    but only *after* a model call already ran (compile). Unlike the
-    `cold`-tier branch, which never calls the model first, requeueing this
-    case for free would re-burn a model call on every retry until the
-    owner fixes the marker, silently draining ``MAX_MODEL_CALLS_PER_PASS``.
-    This path is deliberately left out of the defect-2 fix --
-    ``BriefingUpsertResult.requeueable`` stays ``False`` here, so the queue
-    event is still acked, exactly as before this fix. The owner still
-    learns about the stuck page via the digest
-    (``_record_human_zone_ambiguous``).
-    """
+    """A broken human zone leaves the source queued for a later retry."""
     vault_path = tmp_path / "vault"
     service = _compiled_service(vault_path)
     page_path = vault_path / "compiled" / "projects" / "demo-project.md"
@@ -8955,18 +9359,16 @@ def test_compiled_briefings_warm_tier_ambiguous_human_zone_still_acks(
 
     result = service._drain_queue_once(force=True, max_events=50)
 
-    assert result == {
-        "drained": 1,
-        "updated": [],
-        "errors": [],
-        "consolidations": [],
-    }
-    assert (
-        json.loads(
-            (vault_path / ".compiled" / "queue.json").read_text(encoding="utf-8")
-        )
-        == []
+    assert result["drained"] == 1
+    assert result["updated"] == []
+    assert result["consolidations"] == []
+    assert result["errors"]
+    queue = json.loads(
+        (vault_path / ".compiled" / "queue.json").read_text(encoding="utf-8")
     )
+    assert len(queue) == 1
+    assert queue[0]["state"] == "pending"
+    assert queue[0]["attempts"] == 1
 
 
 def test_compiled_briefings_cold_tier_records_new_chunk_with_no_visible_diff(
@@ -8996,6 +9398,11 @@ def test_compiled_briefings_cold_tier_records_new_chunk_with_no_visible_diff(
         shaped_rows=[(today, "daily/2026-08-05.md", NOT_ENRICHMENT_SOURCE_MARKER)],
     )
     page_path.write_text(original_text, encoding="utf-8")
+    monkeypatch.setattr(
+        service.runner,
+        "run",
+        lambda prompt, **kwargs: json.dumps(_minimal_compile_payload()),
+    )
 
     result = service._upsert_briefing(
         target=_demo_target(),
@@ -9029,6 +9436,11 @@ def test_compiled_briefings_archive_tier_write_counts_toward_touched_pages(
         encoding="utf-8",
     )
     service._active_pass = CompileEnrichPass(pass_id="p1", snapshot_enabled=False)
+    monkeypatch.setattr(
+        service.runner,
+        "run",
+        lambda prompt, **kwargs: json.dumps(_minimal_compile_payload()),
+    )
 
     result = service._upsert_briefing(
         target=_demo_target(),
@@ -9448,6 +9860,18 @@ def test_compiled_briefings_run_queue_worker_releases_claim_and_logs_crash(
     assert crash["error"]["type"] == "OSError"
     assert "No space left" in crash["error"]["message"]
     assert crash["pid"] == os.getpid()
+
+    history_paths = list(
+        (vault_path / ".compiled" / "queue-history").glob("*.json")
+    )
+    assert len(history_paths) == 1
+    history = json.loads(history_paths[0].read_text(encoding="utf-8"))
+    assert history["status"] == "crashed"
+    assert history["remaining_queue_size"] == 2
+    assert [event["outcome"] for event in history["events"]] == [
+        "released_after_crash",
+        "released_after_crash",
+    ]
 
     # The worker's own lock/state must not be left held after the crash --
     # a later spawn_background_drain() must be able to start a fresh worker.
@@ -9980,13 +10404,22 @@ def test_compiled_briefings_nightly_gate_rolls_back_ambiguous_zone_only_pass(
     monkeypatch.setattr(service, "lint_notes", lambda: [])
     monkeypatch.setattr(service, "freshness_issues", lambda: [])
     monkeypatch.setattr(service, "_refresh_qmd_index", lambda: None)
+    monkeypatch.setattr(
+        service.runner,
+        "run",
+        lambda prompt, **kwargs: json.dumps(_minimal_compile_payload()),
+    )
 
     result = service.run_nightly_maintenance()
 
-    assert result["errors"] == [
+    assert any(
+        "expected exactly one human zone marker pair" in error
+        for error in result["errors"]
+    )
+    assert result["errors"][-1] == (
         "compile-enrich pass took work but changed zero pages; "
         "rolled back (ТЗ 5.5 inv 5)"
-    ]
+    )
     journal = json.loads(
         (vault_path / ".session" / "compile-enrich.json").read_text(encoding="utf-8")
     )
@@ -10391,15 +10824,20 @@ def test_compiled_briefings_cold_tier_ambiguous_human_zone_records_pass_counter(
         human_note="Draft in progress, saved mid-edit.",
     ).replace(HUMAN_ZONE_END, "")  # lone, unclosed start marker
     page_path.write_text(broken_text, encoding="utf-8")
-
-    result = service._upsert_briefing(
-        target=_demo_target(),
-        source_rel_path="daily/2026-08-05.md",
-        source_excerpt="New material found while the owner's note was open.",
-        signal=None,
+    monkeypatch.setattr(
+        service.runner,
+        "run",
+        lambda prompt, **kwargs: json.dumps(_minimal_compile_payload()),
     )
 
-    assert result.written is False
+    with pytest.raises(HumanZoneMarkerError):
+        service._upsert_briefing(
+            target=_demo_target(),
+            source_rel_path="daily/2026-08-05.md",
+            source_excerpt="New material found while the owner's note was open.",
+            signal=None,
+        )
+
     assert service._active_pass.human_zone_ambiguous_pages == {rel_path}
 
 
@@ -11065,18 +11503,16 @@ def test_compiled_briefings_blocked_action_entry_does_not_duplicate_across_passe
     assert len(queue) == 1
 
 
-# --- H: memory tier controls enrichment (ТЗ 6, 5.6) -------------------------
+# --- H: memory tier controls attention without suppressing updates ----------
 #
-# Point 1/4: tier-gated enrichment budget + archive->warm promotion.
+# Relevant new sources enrich every tier; archive pages return to warm.
 
 
-def test_compiled_briefings_cold_tier_skips_model_and_adds_marked_row(
+def test_compiled_briefings_cold_tier_enriches_new_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ТЗ 6.1: `cold` is never enriched -- a new source only gets a marked,
-    non-enrichment row in "Sources That Shaped This Page", with no model
-    call and no ``enrichment_count`` bump."""
+    """A new source refreshes a cold page instead of leaving it stale."""
     vault_path = tmp_path / "vault"
     service = _compiled_service(vault_path)
     _bypass_atomic_vault_write(monkeypatch)
@@ -11089,7 +11525,15 @@ def test_compiled_briefings_cold_tier_skips_model_and_adds_marked_row(
 
     calls: list[str] = []
     monkeypatch.setattr(
-        service.runner, "run", lambda prompt, **k: calls.append(prompt) or "{}"
+        service.runner,
+        "run",
+        lambda prompt, **k: calls.append(prompt)
+        or json.dumps(
+            _minimal_compile_payload(
+                current_state="Updated cold-page state.",
+                recent_changes=["New material was incorporated."],
+            )
+        ),
     )
 
     result = service._upsert_briefing(
@@ -11099,16 +11543,21 @@ def test_compiled_briefings_cold_tier_skips_model_and_adds_marked_row(
         signal=None,
     )
 
-    assert calls == []
+    assert len(calls) == 1
     assert result.written is True
     rendered = page_path.read_text(encoding="utf-8")
-    rows = service._sources_shaped_rows(rendered)
-    assert rows[-1] == (
-        date.today().isoformat(),
-        "daily/2026-08-05.md",
-        NOT_ENRICHMENT_SOURCE_MARKER,
+    assert service._sources_shaped_rows(rendered) == [
+        (
+            "2026-08-05",
+            "daily/2026-08-05.md",
+            "New material was incorporated.",
+        )
+    ]
+    assert "daily/2026-08-05.md" in service._section_text(rendered, "Sources")
+    assert service._frontmatter_fields(rendered)["source_count"] == "1"
+    assert service._section_text(rendered, "Current State") == (
+        "Updated cold-page state."
     )
-    assert service._section_text(rendered, "Current State") == "Demo state."
 
 
 def test_compiled_briefings_cold_tier_marked_rows_do_not_block_later_real_enrichment(
@@ -11177,15 +11626,11 @@ def test_compiled_briefings_what_added_never_collides_with_not_enrichment_marker
     assert rows[-1][2] != NOT_ENRICHMENT_SOURCE_MARKER
 
 
-def test_compiled_briefings_warm_tier_skips_enrichment_when_insignificant(
+def test_compiled_briefings_warm_tier_enriches_new_source_without_claims(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ТЗ 5.6 "Значимый сигнал для уровня warm": without the cheap signal
-    (>=2 sources in 7 days), compile still runs so the expensive half (a
-    new commitment or conflict) can be classified from its verified output
-    -- but with neither in the result, the source is only acknowledged,
-    not enriched, and the compiled draft is discarded."""
+    """A relevant source refreshes a warm page even without a new claim."""
     vault_path = tmp_path / "vault"
     service = _compiled_service(vault_path)
     _bypass_atomic_vault_write(monkeypatch)
@@ -11211,9 +11656,9 @@ def test_compiled_briefings_warm_tier_skips_enrichment_when_insignificant(
     assert len(calls) == 1  # compile ran; Verify never reached (no claims)
     assert result.written is True
     rendered = page_path.read_text(encoding="utf-8")
-    assert service._section_text(rendered, "Current State") == "Demo state."
-    rows = service._sources_shaped_rows(rendered)
-    assert rows[-1][2] == NOT_ENRICHMENT_SOURCE_MARKER
+    assert service._section_text(rendered, "Current State") == "Demo current state."
+    assert service._sources_shaped_rows(rendered)
+    assert "daily/2026-08-05.md" in service._section_text(rendered, "Sources")
 
 
 def test_compiled_briefings_warm_tier_without_signal_enriches_when_claims_significant(
@@ -11245,14 +11690,20 @@ def test_compiled_briefings_warm_tier_without_signal_enriches_when_claims_signif
         json.dumps(
             {
                 "verdicts": [
-                    {
-                        "index": 0,
-                        "text": "Договорились о запуске 1 сентября.",
-                        "supported": True,
-                    }
-                ]
-            }
-        ),
+                        {
+                            "index": 0,
+                            "text": "Договорились о запуске 1 сентября.",
+                            "supported": True,
+                        }
+                    ],
+                    "page_checks": {
+                        "source_coverage": True,
+                        "target_scope": True,
+                        "timeline_consistency": True,
+                    },
+                    "page_issues": [],
+                }
+            ),
     ]
     calls: list[str] = []
 
@@ -11350,14 +11801,11 @@ def test_compiled_briefings_warm_recent_source_signal_boundary_is_the_window_edg
     assert service._warm_recent_source_signal(one_day_older) is False
 
 
-def test_compiled_briefings_archive_tier_promotes_to_warm_without_enrichment(
+def test_compiled_briefings_archive_tier_promotes_and_enriches(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ТЗ 6.1/6.4 plan point 4: a source landing on an `archive`-tier page
-    only bumps its tier to `warm` -- no model call, no Verify, no new
-    "Sources That Shaped This Page" row, so nothing here can cascade into
-    an enrichment for the same source in the same pass."""
+    """A relevant source revives and refreshes an archived page."""
     vault_path = tmp_path / "vault"
     service = _compiled_service(vault_path)
     _bypass_atomic_vault_write(monkeypatch)
@@ -11370,7 +11818,15 @@ def test_compiled_briefings_archive_tier_promotes_to_warm_without_enrichment(
 
     calls: list[str] = []
     monkeypatch.setattr(
-        service.runner, "run", lambda prompt, **k: calls.append(prompt) or "{}"
+        service.runner,
+        "run",
+        lambda prompt, **k: calls.append(prompt)
+        or json.dumps(
+            _minimal_compile_payload(
+                current_state="Updated archived-page state.",
+                recent_changes=["New archived-page material was incorporated."],
+            )
+        ),
     )
 
     result = service._upsert_briefing(
@@ -11380,12 +11836,14 @@ def test_compiled_briefings_archive_tier_promotes_to_warm_without_enrichment(
         signal=None,
     )
 
-    assert calls == []
+    assert len(calls) == 1
     assert result.written is True
     rendered = page_path.read_text(encoding="utf-8")
     assert service._frontmatter_fields(rendered)["tier"] == "warm"
-    assert service._sources_shaped_rows(rendered) == []
-    assert service._section_text(rendered, "Current State") == "Demo state."
+    assert service._sources_shaped_rows(rendered)
+    assert service._section_text(rendered, "Current State") == (
+        "Updated archived-page state."
+    )
 
 
 # Point 5: the compiled layer's tier edits (merge + promotion) never lower

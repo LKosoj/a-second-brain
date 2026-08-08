@@ -76,6 +76,10 @@ touching the existing claim's row.
 One batched, read-only, clean-context model call per page, checking whether
 each sampled claim actually follows from the source excerpt given (no
 network access, so it can only judge entailment, not look anything up).
+The same call must explicitly pass three page-wide checks before a write:
+every substantive statement has source coverage, all content belongs to the
+target topic, and dates/statuses/owners/outcomes are internally consistent or
+retain the source's uncertainty. A missing or failed check rejects the page.
 Sampling rate: 100% of new claims for `core`/`active` tier pages, 25%
 (minimum 1) for everything else -- `warm`, `cold`, `archive`, or an
 unset/unknown tier all fall back to the warm fraction (fail-closed rather
@@ -160,10 +164,11 @@ Eight kinds exist today (`services/decisions_queue.py`):
   has rejected a majority of its proposed claims
   `MAX_VERIFY_REJECTED_RETRIES` times in a row against the same source
   snapshot (both the incremental refresh path and the nightly freshness
-  backfill count toward the same retry counter). "Повторить проверку"
-  clears the page's retry counter so the next pass attempts Verify again;
-  the generic `reject` below just drops the queue entry and leaves the page
-  exhausted as-is.
+  backfill count toward the same retry counter). Incremental entries retain
+  the source event, including for a page that has not been created yet.
+  "Повторить проверку" clears the page's retry counter and returns that
+  source to the refresh queue; the generic `reject` below just drops the
+  queue entry and leaves the page exhausted as-is.
 - `page-encoding-broken` -- written by
   `CompiledBriefingService._queue_undecodable_page` when a compiled page's
   bytes on disk are not valid UTF-8. Every writer refuses such a page rather

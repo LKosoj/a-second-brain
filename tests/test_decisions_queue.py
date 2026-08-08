@@ -2566,6 +2566,12 @@ def test_apply_response_verify_rejected_retry_clears_counter_and_queue_entry(
     monkeypatch.setattr(
         decisions_queue, "write_validated_vault_markdown", lambda *a, **k: None
     )
+    spawned: list[bool] = []
+    monkeypatch.setattr(
+        CompiledBriefingService,
+        "spawn_background_drain",
+        lambda self: spawned.append(True) or True,
+    )
     _write_queue(
         vault,
         [
@@ -2574,6 +2580,9 @@ def test_apply_response_verify_rejected_retry_clears_counter_and_queue_entry(
                 "page": rel_path,
                 "summary": "Verify отклонил больше половины утверждений",
                 "since": "2026-08-01",
+                "source_path": "daily/2026-08-05.md",
+                "source_excerpt": "исходный фрагмент",
+                "max_updates": "2",
             }
         ],
     )
@@ -2591,6 +2600,14 @@ def test_apply_response_verify_rejected_retry_clears_counter_and_queue_entry(
         service.source_state_path.read_text(encoding="utf-8")
     )
     assert "verify_rejected" not in state_after["entries"][rel_path]
+    compile_queue = json.loads(
+        (vault / ".compiled" / "queue.json").read_text(encoding="utf-8")
+    )
+    assert len(compile_queue) == 1
+    assert compile_queue[0]["source_path"] == "daily/2026-08-05.md"
+    assert compile_queue[0]["source_excerpt"] == "исходный фрагмент"
+    assert compile_queue[0]["max_updates"] == 2
+    assert spawned == [True]
     journal_path = vault / ".session" / "decisions-queue-responses.jsonl"
     lines = journal_path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1

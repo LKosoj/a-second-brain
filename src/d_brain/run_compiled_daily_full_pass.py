@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -69,6 +70,7 @@ def main() -> int:
         return 1
 
     start_name = args.start_from
+    previous: dict[str, Any] = {}
     if args.resume and progress_path.exists():
         try:
             previous = json.loads(progress_path.read_text(encoding="utf-8"))
@@ -120,9 +122,42 @@ def main() -> int:
     try:
         for offset, path in enumerate(all_days[start_index:], start=1):
             rel_path = path.relative_to(vault).as_posix()
+            source_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+            start_chunk = 1
+            resuming_current_file = False
+            current_file_updated: list[str] = []
+            current_file_errors: list[str] = []
+            if (
+                args.resume
+                and str(previous.get("current_file") or "") == path.name
+                and str(previous.get("current_file_hash") or "") == source_hash
+            ):
+                resuming_current_file = True
+                previous_chunk = int(previous.get("current_chunk") or 0)
+                previous_status = str(previous.get("last_chunk_status") or "")
+                if previous_chunk > 0:
+                    start_chunk = previous_chunk + (
+                        1 if previous_status == "finished" else 0
+                    )
+                current_file_updated = [
+                    str(item)
+                    for item in previous.get("current_file_updated", [])
+                    if str(item)
+                ]
+                current_file_errors = [
+                    str(item)
+                    for item in previous.get("current_file_errors", [])
+                    if str(item)
+                ]
             state["current_file"] = path.name
-            state["current_chunk"] = 0
-            state["current_chunk_total"] = 0
+            state["current_file_hash"] = source_hash
+            state["current_chunk"] = start_chunk
+            state["current_chunk_total"] = int(
+                previous.get("current_chunk_total") or 0
+            ) if resuming_current_file else 0
+            state["last_chunk_status"] = "resuming" if start_chunk > 1 else ""
+            state["current_file_updated"] = current_file_updated
+            state["current_file_errors"] = current_file_errors
             state["last_activity_at"] = datetime.now().astimezone().isoformat()
             _write_json(progress_path, state)
             sys.stdout.write(f"==> {rel_path}\n")
@@ -141,18 +176,56 @@ def main() -> int:
                 state["last_chunk_status"] = str(event.get("status") or "")
                 state["last_chunk_updated"] = list(event.get("updated", []))
                 state["last_chunk_errors"] = list(event.get("errors", []))
+                if str(event.get("status") or "") == "finished":
+                    state["current_file_updated"] = list(
+                        dict.fromkeys(
+                            [
+                                *state.get("current_file_updated", []),
+                                *[
+                                    str(item)
+                                    for item in event.get("updated", [])
+                                    if str(item)
+                                ],
+                            ]
+                        )
+                    )
+                    state["current_file_errors"].extend(
+                        f"chunk {int(event.get('index') or 0)}: {error}"
+                        for error in event.get("errors", [])
+                        if str(error).strip()
+                    )
                 state["last_activity_at"] = datetime.now().astimezone().isoformat()
                 _write_json(progress_path, state)
 
-            result = service.refresh_daily_fully(
-                source_path=rel_path,
-                refresh_qmd=False,
-                on_chunk=on_chunk,
-            )
+            refresh_kwargs: dict[str, Any] = {
+                "source_path": rel_path,
+                "refresh_qmd": False,
+                "on_chunk": on_chunk,
+                "force_recompile": True,
+            }
+            if start_chunk > 1:
+                refresh_kwargs["start_chunk"] = start_chunk
+            result = service.refresh_daily_fully(**refresh_kwargs)
             updated = list(
-                dict.fromkeys(str(item) for item in result.get("updated", []))
+                dict.fromkeys(
+                    [
+                        *state.get("current_file_updated", []),
+                        *[str(item) for item in result.get("updated", [])],
+                    ]
+                )
             )
-            errors = [str(item) for item in result.get("errors", []) if str(item)]
+            errors = list(
+                dict.fromkeys(
+                    [
+                        *state.get("current_file_errors", []),
+                        *[
+                            str(item)
+                            for item in result.get("errors", [])
+                            if str(item)
+                        ],
+                    ]
+                )
+            )
             entry = {
                 "timestamp": datetime.now().astimezone().isoformat(),
                 "file": path.name,
@@ -168,6 +241,9 @@ def main() -> int:
             state["current_file"] = None
             state["current_chunk"] = 0
             state["current_chunk_total"] = 0
+            state["current_file_hash"] = None
+            state["current_file_updated"] = []
+            state["current_file_errors"] = []
             state["processed_from_start"] = offset
             state["next_file"] = (
                 all_days[start_index + offset].name

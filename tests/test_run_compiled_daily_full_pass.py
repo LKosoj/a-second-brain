@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -39,8 +40,11 @@ def test_main_stops_the_whole_pass_on_a_terminal_backend_error(
         def __init__(self, *_args, **_kwargs) -> None:  # noqa: ANN002, ANN003
             pass
 
-        def refresh_daily_fully(self, *, source_path, refresh_qmd, on_chunk):  # type: ignore[no-untyped-def]
+        def refresh_daily_fully(
+            self, *, source_path, refresh_qmd, on_chunk, force_recompile
+        ):  # type: ignore[no-untyped-def]
             del refresh_qmd, on_chunk
+            assert force_recompile is True
             seen.append(source_path)
             return {
                 "available": True,
@@ -100,8 +104,11 @@ def test_main_resume_continues_from_the_progress_file(
         def __init__(self, *_args, **_kwargs) -> None:  # noqa: ANN002, ANN003
             pass
 
-        def refresh_daily_fully(self, *, source_path, refresh_qmd, on_chunk):  # type: ignore[no-untyped-def]
+        def refresh_daily_fully(
+            self, *, source_path, refresh_qmd, on_chunk, force_recompile
+        ):  # type: ignore[no-untyped-def]
             del refresh_qmd, on_chunk
+            assert force_recompile is True
             seen.append(source_path)
             return {
                 "available": True,
@@ -126,6 +133,88 @@ def test_main_resume_continues_from_the_progress_file(
 
     assert exit_code == 0
     assert seen == ["daily/2025-05-02.md"]
+
+
+def test_main_resume_continues_from_the_interrupted_chunk(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    vault = tmp_path / "vault"
+    daily_path = vault / "daily" / "2025-05-02.md"
+    daily_path.parent.mkdir(parents=True)
+    daily_path.write_text("# Day\n", encoding="utf-8")
+    source_hash = hashlib.sha256(daily_path.read_bytes()).hexdigest()
+    progress_path = vault / ".compiled" / "daily-full-pass-progress.json"
+    progress_path.parent.mkdir(parents=True)
+    progress_path.write_text(
+        json.dumps(
+            {
+                "current_file": "2025-05-02.md",
+                "current_file_hash": source_hash,
+                "current_chunk": 62,
+                "current_chunk_total": 128,
+                "last_chunk_status": "started",
+                "current_file_updated": ["compiled/projects/already.md"],
+                "current_file_errors": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _patch_settings(monkeypatch, vault)
+    seen_start_chunks: list[int] = []
+
+    class FakeService:
+        def __init__(self, *_args, **_kwargs) -> None:  # noqa: ANN002, ANN003
+            pass
+
+        def refresh_daily_fully(
+            self,
+            *,
+            source_path,
+            refresh_qmd,
+            on_chunk,
+            force_recompile,
+            start_chunk=1,
+        ):  # type: ignore[no-untyped-def]
+            del source_path, refresh_qmd
+            assert force_recompile is True
+            seen_start_chunks.append(start_chunk)
+            on_chunk(
+                {
+                    "index": start_chunk,
+                    "total": 128,
+                    "status": "finished",
+                    "updated": ["compiled/topics/new.md"],
+                    "errors": [],
+                }
+            )
+            return {
+                "available": True,
+                "updated": ["compiled/topics/new.md"],
+                "errors": [],
+                "chunks": 128,
+                "processed_chunks": 128,
+            }
+
+        def _refresh_qmd_index(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        run_compiled_daily_full_pass, "CompiledBriefingService", FakeService
+    )
+    monkeypatch.setattr(sys, "argv", ["prog", "--resume"])
+
+    assert run_compiled_daily_full_pass.main() == 0
+    assert seen_start_chunks == [62]
+    history = json.loads(
+        (vault / ".compiled" / "daily-full-pass-history.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    assert history["updated"] == [
+        "compiled/projects/already.md",
+        "compiled/topics/new.md",
+    ]
 
 
 def test_main_updated_notes_counter_ignores_duplicate_skip_days(
@@ -158,8 +247,11 @@ def test_main_updated_notes_counter_ignores_duplicate_skip_days(
         def __init__(self, *_args, **_kwargs) -> None:  # noqa: ANN002, ANN003
             pass
 
-        def refresh_daily_fully(self, *, source_path, refresh_qmd, on_chunk):  # type: ignore[no-untyped-def]
+        def refresh_daily_fully(
+            self, *, source_path, refresh_qmd, on_chunk, force_recompile
+        ):  # type: ignore[no-untyped-def]
             del refresh_qmd, on_chunk
+            assert force_recompile is True
             # Every chunk of every day is a duplicate-chunk skip: no
             # updates, no errors.
             return {

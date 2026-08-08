@@ -279,6 +279,7 @@ DEFAULT_WORKER_IDLE_SECONDS = DEFAULT_DEBOUNCE_SECONDS + 15
 DEFAULT_WORKER_POLL_SECONDS = 5.0
 DEFAULT_WORKER_STALE_SECONDS = 90
 DEFAULT_QUEUE_CLAIM_STALE_SECONDS = 900
+QUEUE_WORKER_HISTORY_LIMIT = 10
 IMPACT_CATALOG_MAX_ITEMS = 48
 IMPACT_CATALOG_MAX_CHARS = 48000
 # Resolve stage thresholds (ТЗ 5.2 "Resolve", 5.6 "Параметры по умолчанию").
@@ -810,8 +811,19 @@ VERIFY_JSON_EXAMPLE = (
     '      "supported": true,\n'
     '      "reason": "short justification"\n'
     "    }\n"
-    "  ]\n"
+    "  ],\n"
+    '  "page_checks": {\n'
+    '    "source_coverage": true,\n'
+    '    "target_scope": true,\n'
+    '    "timeline_consistency": true\n'
+    "  },\n"
+    '  "page_issues": ["blocking issue", "..."]\n'
     "}"
+)
+VERIFY_PAGE_CHECK_KEYS = (
+    "source_coverage",
+    "target_scope",
+    "timeline_consistency",
 )
 BATCH_CONSOLIDATION_JSON_EXAMPLE = (
     "{\n"
@@ -998,6 +1010,9 @@ class CompiledBriefingService:
         self.launcher_lock_path = self.state_root / "launcher.lock"
         self.worker_lock_path = self.state_root / "worker.lock"
         self.worker_state_path = self.state_root / "worker-state.json"
+        self.queue_worker_history_root = self.state_root / "queue-history"
+        self._active_queue_worker_journal: dict[str, Any] | None = None
+        self._active_queue_worker_journal_path: Path | None = None
         self.answers_root = self.vault_path / "summaries" / "answers"
         self.content_language = normalize_language(content_language)
         self.ai_cli = self._resolve_ai_cli(ai_cli)
@@ -1196,6 +1211,15 @@ class CompiledBriefingService:
             loop_force = force
 
             try:
+                initial_queue_size = len(self._with_queue_lock(self._load_queue))
+                self._start_queue_worker_journal(
+                    pid=worker_pid,
+                    started_at=started_at,
+                    force=force,
+                    max_events=max_events,
+                    refresh_qmd=refresh_qmd,
+                    initial_queue_size=initial_queue_size,
+                )
                 self._write_worker_state(
                     pid=worker_pid,
                     status="running",
@@ -1272,7 +1296,33 @@ class CompiledBriefingService:
                     if remaining_idle <= 0:
                         break
                     time.sleep(min(max(0.1, poll_seconds), remaining_idle))
+
+                if updated_paths and refresh_qmd:
+                    self._refresh_qmd_index()
+                self._finish_queue_worker_journal(
+                    status="completed",
+                    remaining_queue_size=len(
+                        self._with_queue_lock(self._load_queue)
+                    ),
+                    totals={
+                        "drained": total_drained,
+                        "updated": len(updated_paths),
+                        "consolidations": len(consolidation_paths),
+                        "errors": len(errors),
+                    },
+                )
+                return {
+                    "drained": total_drained,
+                    "updated": updated_paths,
+                    "consolidations": consolidation_paths,
+                    "errors": errors,
+                }
             except Exception as exc:
+                self._finish_queue_worker_journal(
+                    status="crashed",
+                    remaining_queue_size=len(self._with_queue_lock(self._load_queue)),
+                    error={"type": type(exc).__name__, "message": str(exc)},
+                )
                 # Resilience review defect 1: this loop had no top-level
                 # handler at all. ``spawn_background_drain`` runs this worker
                 # as a detached subprocess with stdout/stderr sent to
@@ -1291,15 +1341,6 @@ class CompiledBriefingService:
                 raise
             finally:
                 self._clear_worker_state(pid=worker_pid)
-
-            if updated_paths and refresh_qmd:
-                self._refresh_qmd_index()
-            return {
-                "drained": total_drained,
-                "updated": updated_paths,
-                "consolidations": consolidation_paths,
-                "errors": errors,
-            }
 
     def _drain_queue_once(
         self,
@@ -1346,6 +1387,12 @@ class CompiledBriefingService:
                 # bookkeeping as the budget_exhausted branch below, then keep
                 # propagating so run_queue_worker's own handler can log it.
                 for remaining_event in selected[index:]:
+                    self._record_queue_worker_event(
+                        remaining_event,
+                        outcome="released_after_crash",
+                        updated=[],
+                        errors=[],
+                    )
                     self._release_claimed_queue_event(
                         remaining_event,
                         attempts=int(remaining_event.get("attempts") or 0),
@@ -1367,6 +1414,12 @@ class CompiledBriefingService:
                 # released events count toward ``processed`` below -- they
                 # were not actually handled this pass.
                 for remaining_event in selected[index:]:
+                    self._record_queue_worker_event(
+                        remaining_event,
+                        outcome="deferred_budget_exhausted",
+                        updated=[],
+                        errors=[],
+                    )
                     self._release_claimed_queue_event(
                         remaining_event,
                         attempts=int(remaining_event.get("attempts") or 0),
@@ -1417,6 +1470,12 @@ class CompiledBriefingService:
                     # for free (no model call spent -- see
                     # BriefingUpsertResult.requeueable), so this retry never
                     # burns the per-pass model-call budget.
+                    self._record_queue_worker_event(
+                        event,
+                        outcome="deferred_requeueable",
+                        updated=event_updated,
+                        errors=[],
+                    )
                     self._release_claimed_queue_event(
                         event,
                         attempts=int(event.get("attempts") or 0),
@@ -1424,6 +1483,12 @@ class CompiledBriefingService:
                         backoff=True,
                     )
                 else:
+                    self._record_queue_worker_event(
+                        event,
+                        outcome="updated" if event_updated else "no_changes",
+                        updated=event_updated,
+                        errors=[],
+                    )
                     self._ack_claimed_queue_event(event)
                     # This source made it all the way through, so any earlier
                     # "gave up on it" trace is stale -- see
@@ -1444,6 +1509,13 @@ class CompiledBriefingService:
             if retriable:
                 attempts = int(event.get("attempts") or 0) + 1
                 if attempts < 3:
+                    self._record_queue_worker_event(
+                        event,
+                        outcome="retry_scheduled",
+                        updated=event_updated,
+                        errors=event_errors,
+                        attempts=attempts,
+                    )
                     self._release_claimed_queue_event(
                         event,
                         attempts=attempts,
@@ -1451,6 +1523,20 @@ class CompiledBriefingService:
                         backoff=True,
                     )
                 else:
+                    self._record_queue_worker_event(
+                        event,
+                        outcome="dropped",
+                        updated=event_updated,
+                        errors=event_errors,
+                        attempts=attempts,
+                    )
+                    for page_rel_path in result.get("verify_rejected", []):
+                        self._queue_verify_rejected(
+                            page_rel_path=str(page_rel_path),
+                            source_rel_path=str(event.get("source_path") or ""),
+                            source_excerpt=str(event.get("source_excerpt") or ""),
+                            max_updates=int(event.get("max_updates") or 3),
+                        )
                     self._record_dropped_queue_source(
                         source_rel_path=str(event.get("source_path") or ""),
                         errors=event_errors,
@@ -1472,6 +1558,13 @@ class CompiledBriefingService:
                     errors=event_errors,
                     attempts=int(event.get("attempts") or 0) + 1,
                 )
+            self._record_queue_worker_event(
+                event,
+                outcome="rejected",
+                updated=event_updated,
+                errors=event_errors,
+                attempts=int(event.get("attempts") or 0) + 1,
+            )
             self._ack_claimed_queue_event(event)
 
         consolidation_paths: list[str] = []
@@ -2003,6 +2096,7 @@ class CompiledBriefingService:
         source_path: str | Path,
         source_excerpt: str = "",
         max_updates: int = 3,
+        force_recompile: bool = False,
     ) -> dict[str, Any]:
         """Refresh a small compiled-note budget after one raw/searchable write."""
 
@@ -2056,6 +2150,7 @@ class CompiledBriefingService:
 
         updated: list[str] = []
         errors: list[str] = []
+        verify_rejected: list[str] = []
         requeueable = False
         for target in targets:
             try:
@@ -2064,6 +2159,7 @@ class CompiledBriefingService:
                     source_rel_path=source_rel_path,
                     source_excerpt=excerpt,
                     signal=signal,
+                    force_recompile=force_recompile,
                 )
             except CompiledBriefingPassBudgetExceededError:
                 # Same rationale as above: stop trying further targets for
@@ -2091,7 +2187,18 @@ class CompiledBriefingService:
                 )
                 errors.append(f"{target.domain}/{target.slug}: {exc}")
                 if isinstance(exc, CompiledBriefingVerificationRejectedError):
-                    self._handle_incremental_verify_rejection(target)
+                    target_rel_path = (
+                        self._target_path(target)
+                        .relative_to(self.vault_path)
+                        .as_posix()
+                    )
+                    verify_rejected.append(target_rel_path)
+                    self._handle_incremental_verify_rejection(
+                        target,
+                        source_rel_path=source_rel_path,
+                        source_excerpt=excerpt,
+                        max_updates=max_updates,
+                    )
                 continue
             if upsert_result.written:
                 updated.append(upsert_result.path)
@@ -2103,15 +2210,23 @@ class CompiledBriefingService:
                 # event back instead of acking it away for good.
                 requeueable = True
 
-        return {
+        result: dict[str, Any] = {
             "available": True,
             "updated": updated,
             "errors": errors,
             "requeueable": requeueable,
         }
+        if verify_rejected:
+            result["verify_rejected"] = verify_rejected
+        return result
 
     def _handle_incremental_verify_rejection(
-        self, target: CompiledBriefingTarget
+        self,
+        target: CompiledBriefingTarget,
+        *,
+        source_rel_path: str,
+        source_excerpt: str,
+        max_updates: int,
     ) -> None:
         """Same ``MAX_VERIFY_REJECTED_RETRIES`` bookkeeping the nightly
         backfill loop (``_backfill_freshness_notes``) already does, applied
@@ -2132,7 +2247,12 @@ class CompiledBriefingService:
         rel_path = target_path.relative_to(self.vault_path).as_posix()
         rejection_count = self._record_verify_rejection(rel_path, note_text)
         if rejection_count >= MAX_VERIFY_REJECTED_RETRIES:
-            self._queue_verify_rejected(page_rel_path=rel_path)
+            self._queue_verify_rejected(
+                page_rel_path=rel_path,
+                source_rel_path=source_rel_path,
+                source_excerpt=source_excerpt,
+                max_updates=max_updates,
+            )
 
     def refresh_daily_fully(
         self,
@@ -2141,6 +2261,8 @@ class CompiledBriefingService:
         max_updates_per_chunk: int = 3,
         refresh_qmd: bool = True,
         on_chunk: Callable[[dict[str, Any]], None] | None = None,
+        start_chunk: int = 1,
+        force_recompile: bool = False,
     ) -> dict[str, Any]:
         (
             "Refresh one daily note chunk-by-chunk without silently dropping "
@@ -2168,8 +2290,11 @@ class CompiledBriefingService:
         updated: list[str] = []
         errors: list[str] = []
         total_chunks = len(chunks)
-        processed_chunks = 0
-        for index, chunk in enumerate(chunks, start=1):
+        first_chunk = min(max(1, start_chunk), total_chunks + 1)
+        processed_chunks = first_chunk - 1
+        for index, chunk in enumerate(
+            chunks[first_chunk - 1 :], start=first_chunk
+        ):
             if on_chunk is not None:
                 on_chunk(
                     {
@@ -2183,6 +2308,7 @@ class CompiledBriefingService:
                 source_path=source_rel_path,
                 source_excerpt=chunk,
                 max_updates=max_updates_per_chunk,
+                force_recompile=force_recompile,
             )
             chunk_updated = [
                 str(rel_path) for rel_path in result.get("updated", []) if str(rel_path)
@@ -2482,6 +2608,7 @@ class CompiledBriefingService:
         source_excerpt: str,
         signal: dict[str, Any] | None,
         record_source_state: bool = True,
+        force_recompile: bool = False,
     ) -> BriefingUpsertResult:
         self._ensure_dirs()
         note_path = self._target_path(target)
@@ -2528,7 +2655,10 @@ class CompiledBriefingService:
                 ) from exc
             existing_meta = self._frontmatter_fields(existing_text)
 
-        if self._duplicate_source_chunk(
+        if existing_meta.get("tier") == "archive":
+            signal = {**(signal or {}), "tier": "warm"}
+
+        if not force_recompile and self._duplicate_source_chunk(
             existing_text=existing_text,
             source_rel_path=source_rel_path,
             source_excerpt=source_excerpt,
@@ -2543,65 +2673,7 @@ class CompiledBriefingService:
         # though, so it goes through the same pages-per-pass accounting as
         # every other write in this method (ТЗ 5.6 "Максимум изменяемых
         # страниц за проход" bounds pass write volume, not "enrichment").
-        tier = existing_meta.get("tier", "")
         pass_obj = self._active_pass
-        if tier == "archive":
-            # Not read, not enriched: a new source only promotes the page
-            # (ТЗ 6.1/6.4) -- no compile, no Verify, no source-table row,
-            # so nothing here can cascade into enrichment this same pass.
-            self._check_pages_per_pass_budget(pass_obj, rel_path)
-            promoted = self._promote_archive_tier(
-                note_path=note_path, rel_path=rel_path
-            )
-            if promoted and pass_obj is not None:
-                pass_obj.touched_pages.add(rel_path)
-                # ТЗ 5.5 inv 5: this write never touches the sources table,
-                # so it must not be able to trip the "no source link at
-                # all" effectiveness-gate check on its own -- see
-                # ``run_nightly_maintenance``.
-                pass_obj.archive_promoted_pages.add(rel_path)
-            return BriefingUpsertResult(path=rel_path, written=promoted)
-        if tier == "cold":
-            # Never enriched: the source is only acknowledged with a marked,
-            # non-counting row (ТЗ 6.1).
-            self._check_pages_per_pass_budget(pass_obj, rel_path)
-            result = self._record_non_enrichment_source(
-                note_path=note_path,
-                rel_path=rel_path,
-                existing_text=existing_text,
-                original_fingerprint=original_fingerprint,
-                source_rel_path=source_rel_path,
-                source_excerpt=source_excerpt,
-                # Code review defect 2: this branch never calls the model
-                # before reaching the ambiguous-zone check inside
-                # _record_non_enrichment_source (ТЗ 6.1 "no model call" for
-                # `cold`), so a retry here is free -- unlike the `warm`
-                # "insignificant" call to the same helper further down,
-                # which only reaches it after compiling.
-                requeueable_if_ambiguous=True,
-            )
-            # Code review defect 1: `written=False` here means the page's
-            # human-zone markers are ambiguous and the write was skipped
-            # (see _record_non_enrichment_source) -- the page's bytes never
-            # changed, so it must not count as touched. Only a real write
-            # (written=True) belongs in touched_pages, same as every other
-            # branch in this method (see the archive-tier branch above).
-            if result.written and pass_obj is not None:
-                pass_obj.touched_pages.add(rel_path)
-            return result
-        # ТЗ 5.6 "Значимый сигнал для уровня warm": the cheap half (>=2
-        # sources in 7 days) is checked now, from the sources table alone.
-        # When it does not hold, compile+verify still run below and the
-        # *expensive* half (new commitment or conflict) is classified
-        # afterward from their verified output -- see
-        # ``_claims_are_significant`` below. This mirrors the ТЗ's own
-        # framing of the per-pass model-call cap as the safety net for this
-        # case, which would be pointless if a `warm` page without a cheap
-        # signal never called the model at all.
-        warm_needs_classification = tier == "warm" and not (
-            self._warm_recent_source_signal(existing_text)
-        )
-
         if pass_obj is not None:
             # ТЗ 5.6 "Максимум изменяемых страниц за проход": only a page
             # this pass has not already committed to (see the
@@ -2659,32 +2731,14 @@ class CompiledBriefingService:
         )
         claims, conflicts = self._extract_and_verify_claims(
             payload=payload,
+            target=target,
             source_rel_path=source_rel_path,
             source_excerpt=source_excerpt,
+            existing_claims=self._existing_claims_catalog(existing_text),
+            existing_text=existing_text,
             existing_meta=existing_meta,
             signal=signal,
         )
-        if warm_needs_classification and not self._claims_are_significant(
-            claims, conflicts
-        ):
-            # No decision/commitment/conflict came out of it either: not a
-            # significant signal, so this source is only acknowledged, not
-            # enriched (ТЗ 5.6/6.1) -- discard the compiled draft.
-            result = self._record_non_enrichment_source(
-                note_path=note_path,
-                rel_path=rel_path,
-                existing_text=existing_text,
-                original_fingerprint=original_fingerprint,
-                source_rel_path=source_rel_path,
-                source_excerpt=source_excerpt,
-            )
-            # Code review defect 2: same as the `cold`-tier branch above --
-            # only a real write (written=True) belongs in touched_pages,
-            # but this branch used to `return` before ever adding it, so
-            # MAX_PAGES_PER_PASS never counted these writes at all.
-            if result.written and pass_obj is not None:
-                pass_obj.touched_pages.add(rel_path)
-            return result
         try:
             rendered = self._render_briefing(
                 target=target,
@@ -2902,9 +2956,16 @@ class CompiledBriefingService:
             "Sources That Shaped This Page",
             self._render_sources_shaped_table(shaped_rows),
         )
+        shaped_source_count = len(
+            {
+                source
+                for _, source, what_added in shaped_rows
+                if what_added != NOT_ENRICHMENT_SOURCE_MARKER
+            }
+        )
         new_bytes = patch_frontmatter_bytes(
             new_text.encode("utf-8"),
-            {"updated": today, "source_count": len(all_sources)},
+            {"updated": today, "source_count": shaped_source_count},
         )
         with vault_write_lock(self.vault_path) as lock:
             try:
@@ -3470,7 +3531,14 @@ class CompiledBriefingService:
             )
         self._record_queue_eviction(evicted)
 
-    def _queue_verify_rejected(self, *, page_rel_path: str) -> None:
+    def _queue_verify_rejected(
+        self,
+        *,
+        page_rel_path: str,
+        source_rel_path: str = "",
+        source_excerpt: str = "",
+        max_updates: int = 3,
+    ) -> None:
         """Queue a page whose Verify step has rejected a majority of its
         proposed claims on ``MAX_VERIFY_REJECTED_RETRIES`` consecutive
         attempts against the same source snapshot, as an owner decision
@@ -3502,6 +3570,9 @@ class CompiledBriefingService:
                         "page": page_rel_path,
                         "summary": summary,
                         "since": date.today().isoformat(),
+                        "source_path": source_rel_path,
+                        "source_excerpt": source_excerpt,
+                        "max_updates": str(max_updates),
                     }
                 ],
                 existing_lock=lock,
@@ -3870,12 +3941,31 @@ class CompiledBriefingService:
             "- Be specific, short, and cumulative.\n"
             "- Do not claim certainty beyond the available evidence.\n"
             "- Preserve older still-valid context from the existing note.\n"
+            "- Rewrite current_state as the concise current truth; do not append "
+            "a second summary or repeat the same fact in several sections.\n"
+            "- recent_changes contains only real changes of state from the changed "
+            "source, not every extracted fact. Do not prefix bullets with a date; "
+            "the renderer adds the source date.\n"
             "- Prefer 2-5 bullets per list. Empty lists are allowed when truly "
             "absent.\n"
             "- source_links must contain only vault-relative paths.\n"
-            "- Include the current source path in source_links if it matters.\n"
+            "- Include only sources that materially support content kept on the "
+            "page. A merely inspected source does not belong in source_links.\n"
+            "- If sources or speakers give incompatible dates, owners, statuses, "
+            "or outcomes, do not silently choose one. Lower confidence, preserve "
+            "the uncertainty, and add a focused open loop or a conflict when the "
+            "conflict schema permits it. confidence=high is forbidden while such "
+            "uncertainty remains.\n"
             "- For the decisions domain, choose record_kind decision for an ADR "
             "or incident for an operational debrief and fill the matching fields.\n"
+            "- For a decision, key_decisions must state the decision named by the "
+            "target title; distinguish proposed, accepted, and completed. Keep an "
+            "owner unknown unless the source explicitly assigns that person for "
+            "this decision and scope.\n"
+            "- alternatives_considered contains only alternatives explicitly "
+            "discussed in the changed source or preserved from an accepted existing "
+            "decision. Never invent a plausible alternative.\n"
+            "- Keep open_loops focused on this target; omit adjacent project work.\n"
             "- Accepted decisions are immutable. Preserve their decision, owner, "
             "date, rationale, and alternatives unless a new decision explicitly "
             "supersedes them; then set decision_status=superseded and "
@@ -3885,8 +3975,11 @@ class CompiledBriefingService:
             "- claims are individual facts, opinions, or commitments taken from "
             "the changed source excerpt only -- never from the existing briefing "
             "or from other compiled/summary pages.\n"
-            "- Extract 0-5 claims. Return an empty claims list when the source "
-            "adds nothing beyond what current_state/recent_changes already say.\n"
+            f"- Extract 0-{MAX_CLAIMS_PER_PASS} claims. Every substantive new or "
+            "changed fact, decision, commitment, owner, date, status, outcome, "
+            "rationale, alternative, and open loop kept anywhere in the candidate "
+            "page must be represented in claims. Return an empty claims list only "
+            "when the source adds no substantive page content.\n"
             "- A conflict's new_claim must be copied verbatim from one entry in "
             "claims above; do not describe a conflict for text you did not also "
             "add to claims.\n"
@@ -3929,6 +4022,7 @@ class CompiledBriefingService:
         source_excerpt: str = "",
         claims: list[dict[str, str]] | None = None,
         conflicts: list[dict[str, str]] | None = None,
+        record_side_effects: bool = True,
     ) -> str:
         claims = claims or []
         conflicts = conflicts or []
@@ -4001,8 +4095,19 @@ class CompiledBriefingService:
             confidence = "medium"
 
         current_state = self._paragraph(payload.get("current_state"))
-        recent_changes = self._normalize_list(payload.get("recent_changes"))
-        open_loops = self._normalize_list(payload.get("open_loops"))
+        def without_leading_date(items: list[str]) -> list[str]:
+            cleaned = [
+                re.sub(r"^\d{4}-\d{2}-\d{2}:\s*", "", item).strip()
+                for item in items
+            ]
+            return [item for item in cleaned if item]
+
+        recent_changes = without_leading_date(
+            self._normalize_list(payload.get("recent_changes"))
+        )
+        open_loops = without_leading_date(
+            self._normalize_list(payload.get("open_loops"))
+        )
         # Filtered here, before any accepted-decision restoration below can
         # overwrite it with immutable existing-page content: the duplicate
         # filter must only ever see freshly generated model output, never
@@ -4113,6 +4218,8 @@ class CompiledBriefingService:
                         existing_text,
                         "Key Decisions",
                     ) or key_decisions
+                if decision_status == "accepted" and not key_decisions:
+                    key_decisions = [target.title]
             elif record_kind == "incident":
                 incident_date = self._validated_date_field(
                     payload.get("incident_date")
@@ -4168,6 +4275,12 @@ class CompiledBriefingService:
         # (``_compress_cooled_pages``), which only runs for warm/cold/
         # archive tiers -- a `core`/`active` page is expected to keep
         # growing while it stays hot.
+        source_date_value = self.qmd._record_date_for_rel_path(
+            source_rel_path, signal
+        )
+        source_date = (
+            source_date_value.isoformat() if source_date_value is not None else today
+        )
         recent_changes_rows = self._dated_rows(
             existing_text,
             "Recent Changes",
@@ -4179,7 +4292,7 @@ class CompiledBriefingService:
         for item in recent_changes:
             pair = (item, source_rel_path)
             if pair not in existing_recent_pairs:
-                recent_changes_rows.append((today, item, source_rel_path))
+                recent_changes_rows.append((source_date, item, source_rel_path))
                 existing_recent_pairs.add(pair)
 
         open_loops_rows = self._dated_rows(
@@ -4193,7 +4306,7 @@ class CompiledBriefingService:
         for item in open_loops:
             pair = (item, source_rel_path)
             if pair not in existing_open_pairs:
-                open_loops_rows.append((today, item, source_rel_path))
+                open_loops_rows.append((source_date, item, source_rel_path))
                 existing_open_pairs.add(pair)
 
         # History (ТЗ 6.3) is only ever written by ``_compress_candidate_text``
@@ -4255,6 +4368,7 @@ class CompiledBriefingService:
                     signal=signal,
                     today=today,
                     page_rel_path=page_rel_path,
+                    record_side_effects=record_side_effects,
                 )
             )
         else:
@@ -4273,8 +4387,11 @@ class CompiledBriefingService:
                 # monthly enrichment budget filter below.
                 what_added += "."
             existing_shaped_pairs = {(row[0], row[1]) for row in shaped_rows}
-            if (today, source_rel_path) not in existing_shaped_pairs:
-                shaped_rows = [*shaped_rows, (today, source_rel_path, what_added)]
+            if (source_date, source_rel_path) not in existing_shaped_pairs:
+                shaped_rows = [
+                    *shaped_rows,
+                    (source_date, source_rel_path, what_added),
+                ]
         new_open_conflicts = len(open_conflict_rows) - len(open_conflict_rows_before)
 
         # Provenance/trust frontmatter fields (profile `derived`, optional --
@@ -4341,6 +4458,15 @@ class CompiledBriefingService:
             self._int_value(existing_meta.get("conflicts_open"), default=0)
             + new_open_conflicts,
         )
+        if open_conflict_rows and confidence == "high":
+            confidence = "medium"
+        shaped_source_count = len(
+            {
+                source
+                for _, source, what_added in shaped_rows
+                if what_added != NOT_ENRICHMENT_SOURCE_MARKER
+            }
+        )
         human_reviewed = self._validated_date_field(
             existing_meta.get("human_reviewed"),
             field="human_reviewed",
@@ -4358,7 +4484,7 @@ class CompiledBriefingService:
             f"last_compiled_at: {compiled_at}",
             f"freshness_state: {freshness_state}",
             f"confidence: {confidence}",
-            f"source_count: {len(all_sources)}",
+            f"source_count: {shaped_source_count}",
             f"last_accessed: {today}",
             f"relevance: {relevance:.2f}",
             f"tier: {tier}",
@@ -4948,6 +5074,121 @@ class CompiledBriefingService:
 
         with self._launcher_lock(blocking=True):
             clear_state()
+
+    def _start_queue_worker_journal(
+        self,
+        *,
+        pid: int,
+        started_at: str,
+        force: bool,
+        max_events: int,
+        refresh_qmd: bool,
+        initial_queue_size: int,
+    ) -> None:
+        started = datetime.fromisoformat(started_at)
+        filename = f"{started.strftime('%Y-%m-%d-%H%M%S')}-{pid}.json"
+        self.queue_worker_history_root.mkdir(parents=True, exist_ok=True)
+        self._active_queue_worker_journal_path = (
+            self.queue_worker_history_root / filename
+        )
+        self._active_queue_worker_journal = {
+            "pid": pid,
+            "status": "running",
+            "started_at": started_at,
+            "parameters": {
+                "force": force,
+                "max_events": max_events,
+                "refresh_qmd": refresh_qmd,
+            },
+            "initial_queue_size": initial_queue_size,
+            "events": [],
+        }
+        self._write_active_queue_worker_journal()
+        self._rotate_queue_worker_journals()
+
+    def _write_active_queue_worker_journal(self) -> None:
+        if (
+            self._active_queue_worker_journal is None
+            or self._active_queue_worker_journal_path is None
+        ):
+            return
+        _atomic_write_text(
+            self._active_queue_worker_journal_path,
+            json.dumps(
+                self._active_queue_worker_journal,
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+        )
+
+    def _record_queue_worker_event(
+        self,
+        event: dict[str, Any],
+        *,
+        outcome: str,
+        updated: list[str],
+        errors: list[str],
+        attempts: int | None = None,
+    ) -> None:
+        if self._active_queue_worker_journal is None:
+            return
+        source_path = str(event.get("source_path") or "")
+        date_match = re.search(r"\d{4}-\d{2}-\d{2}", source_path)
+        self._active_queue_worker_journal["events"].append(
+            {
+                "source_path": source_path,
+                "source_date": date_match.group(0) if date_match else None,
+                "enqueued_at": event.get("enqueued_at"),
+                "last_enqueued_at": event.get("last_enqueued_at"),
+                "claimed_at": event.get("claimed_at"),
+                "finished_at": datetime.now().astimezone().isoformat(),
+                "attempts": (
+                    attempts
+                    if attempts is not None
+                    else int(event.get("attempts") or 0)
+                ),
+                "outcome": outcome,
+                "updated": list(updated),
+                "errors": list(errors),
+            }
+        )
+        self._write_active_queue_worker_journal()
+
+    def _finish_queue_worker_journal(
+        self,
+        *,
+        status: str,
+        remaining_queue_size: int,
+        totals: dict[str, int] | None = None,
+        error: dict[str, str] | None = None,
+    ) -> None:
+        if self._active_queue_worker_journal is None:
+            return
+        self._active_queue_worker_journal["status"] = status
+        self._active_queue_worker_journal["finished_at"] = (
+            datetime.now().astimezone().isoformat()
+        )
+        self._active_queue_worker_journal["remaining_queue_size"] = (
+            remaining_queue_size
+        )
+        if totals is not None:
+            self._active_queue_worker_journal["totals"] = totals
+        if error is not None:
+            self._active_queue_worker_journal["error"] = error
+        self._write_active_queue_worker_journal()
+        self._rotate_queue_worker_journals()
+        self._active_queue_worker_journal = None
+        self._active_queue_worker_journal_path = None
+
+    def _rotate_queue_worker_journals(self) -> None:
+        journals = sorted(
+            self.queue_worker_history_root.glob("*.json"),
+            key=lambda path: path.name,
+            reverse=True,
+        )
+        for path in journals[QUEUE_WORKER_HISTORY_LIMIT:]:
+            path.unlink()
 
     def _write_queue_worker_crash_journal(
         self, *, pid: int, started_at: str, exc: Exception
@@ -6124,6 +6365,8 @@ class CompiledBriefingService:
             date_value, source_value, what_value = match.groups()
             source_text = cls._unescape_table_cell(source_value)
             what_text = cls._unescape_table_cell(what_value)
+            if what_text == NOT_ENRICHMENT_SOURCE_MARKER:
+                continue
             rows.append((date_value, source_text, what_text))
         return rows
 
@@ -6132,6 +6375,7 @@ class CompiledBriefingService:
         cls,
         rows: list[tuple[str, str, str]],
     ) -> list[str]:
+        rows = [row for row in rows if row[2] != NOT_ENRICHMENT_SOURCE_MARKER]
         if not rows:
             return ["(no sources recorded yet)"]
         lines = ["| Date | Source | What Added |", "| --- | --- | --- |"]
@@ -7021,6 +7265,10 @@ class CompiledBriefingService:
         claims: list[dict[str, str]],
         source_rel_path: str,
         source_excerpt: str,
+        target_title: str = "",
+        candidate_payload: dict[str, Any] | None = None,
+        candidate_markdown: str = "",
+        existing_claims: str = "[]",
     ) -> str:
         claims_payload = [
             {"index": index, "text": claim["text"]}
@@ -7035,7 +7283,10 @@ class CompiledBriefingService:
             "excerpt alone. Do not use outside knowledge or assumptions, and do "
             "not fetch or reference anything outside the excerpt below.\n"
             "A claim is supported only if the source excerpt states it or "
-            "clearly implies it.\n\n"
+            "clearly implies it. Also inspect the complete candidate page Markdown "
+            "for blocking quality problems. The JSON describes the new model "
+            "proposal; the Markdown is the final page after it is merged with "
+            "existing content.\n\n"
             "Required JSON schema:\n"
             f"{VERIFY_JSON_EXAMPLE}\n\n"
             "Rules:\n"
@@ -7044,7 +7295,41 @@ class CompiledBriefingService:
             "your verdict is matched back to the claim, so it must be "
             "correct even if you paraphrase the claim text.\n"
             '- Echo the claim text back exactly as given in "text".\n'
+            "- Reject a claim that selects one side of contradictory or "
+            "ambiguous source statements without preserving that uncertainty.\n"
+            "- Reject a claim that upgrades proposed or planned work to accepted, "
+            "completed, or confirmed.\n"
+            "- Reject any owner, date, status, outcome, or alternative that is not "
+            "explicitly supported by the source excerpt.\n"
+            "- Set source_coverage=true only when every substantive new or changed "
+            "statement anywhere in the candidate is represented by a supported "
+            "claim, or is preserved from EXISTING_VERIFIED_CLAIMS.\n"
+            "- Set target_scope=true only when every candidate statement directly "
+            "belongs to TARGET_TITLE; adjacent projects, people, or topics fail "
+            "this check.\n"
+            "- Set timeline_consistency=true only when dates, owners, statuses, "
+            "outcomes, and confidence agree across the candidate and evidence, or "
+            "the uncertainty/conflict is explicitly preserved.\n"
+            "- page_issues must be an empty list when the candidate is coherent "
+            "and supported. Otherwise list each blocking issue briefly.\n"
+            "- A blocking page issue is: an internal contradiction; a substantive "
+            "statement not supported by the changed source or EXISTING_VERIFIED_"
+            "CLAIMS; a repeated claim in multiple sections; a decision named by "
+            "TARGET_TITLE missing from key_decisions; status inflation; an owner "
+            "whose assignment or scope is unsupported; an invented alternative; "
+            "or adjacent work unrelated to the target.\n"
+            "- EXISTING_VERIFIED_CLAIMS may support preserved older context, but "
+            "never use it to pretend the changed source supplied new evidence.\n"
+            "- Do not report wording preferences as page issues.\n"
             "- Keep \"reason\" short.\n\n"
+            "[TARGET_TITLE]\n"
+            f"{target_title}\n\n"
+            "[CANDIDATE_PAGE_JSON]\n"
+            f"{json.dumps(candidate_payload or {}, ensure_ascii=False, indent=2)}\n\n"
+            "[CANDIDATE_PAGE_MARKDOWN]\n"
+            f"{candidate_markdown}\n\n"
+            "[EXISTING_VERIFIED_CLAIMS]\n"
+            f"{existing_claims}\n\n"
             "[SOURCE_PATH]\n"
             f"{source_rel_path}\n\n"
             "[SOURCE_EXCERPT]\n"
@@ -7060,6 +7345,10 @@ class CompiledBriefingService:
         source_rel_path: str,
         source_excerpt: str,
         page_tier: str,
+        target_title: str = "",
+        candidate_payload: dict[str, Any] | None = None,
+        candidate_markdown: str = "",
+        existing_claims: str = "[]",
     ) -> list[dict[str, str]]:
         """Batched Verify (ТЗ 5.2 step 4): one model call per page, sampling
         per ``_verify_sample_size``. Claims outside the sample pass through
@@ -7078,6 +7367,10 @@ class CompiledBriefingService:
             claims=sample,
             source_rel_path=source_rel_path,
             source_excerpt=source_excerpt,
+            target_title=target_title,
+            candidate_payload=candidate_payload,
+            candidate_markdown=candidate_markdown,
+            existing_claims=existing_claims,
         )
         try:
             payload = self._run_json_dict_prompt(
@@ -7103,6 +7396,43 @@ class CompiledBriefingService:
                 f"Verify response for {source_rel_path} did not parse as "
                 f"JSON even after repair; treated as a full rejection ({exc})"
             ) from exc
+        if candidate_payload is not None:
+            raw_page_checks = payload.get("page_checks")
+            if not isinstance(raw_page_checks, dict) or any(
+                not isinstance(raw_page_checks.get(key), bool)
+                for key in VERIFY_PAGE_CHECK_KEYS
+            ):
+                if self._active_pass is not None:
+                    self._active_pass.verify_format_drift += 1
+                raise CompiledBriefingVerificationRejectedError(
+                    f"Verify response for {source_rel_path} omitted valid "
+                    "page_checks; page write aborted"
+                )
+            failed_page_checks = [
+                key for key in VERIFY_PAGE_CHECK_KEYS if not raw_page_checks[key]
+            ]
+            if failed_page_checks:
+                raise CompiledBriefingVerificationRejectedError(
+                    f"Verify rejected page for {source_rel_path}: failed checks "
+                    + ", ".join(failed_page_checks)
+                )
+            raw_page_issues = payload.get("page_issues")
+            if not isinstance(raw_page_issues, list) or any(
+                not isinstance(issue, str) for issue in raw_page_issues
+            ):
+                if self._active_pass is not None:
+                    self._active_pass.verify_format_drift += 1
+                raise CompiledBriefingVerificationRejectedError(
+                    f"Verify response for {source_rel_path} omitted a valid "
+                    "page_issues list; page write aborted"
+                )
+            page_issues = [issue.strip() for issue in raw_page_issues if issue.strip()]
+            if page_issues:
+                raise CompiledBriefingVerificationRejectedError(
+                    f"Verify rejected page for {source_rel_path}: "
+                    + "; ".join(page_issues)
+                )
+
         raw_verdicts = payload.get("verdicts")
         # Matched by position (the "index" each claim was given in the
         # prompt), not by echoed-back text: text matching is fragile to
@@ -7194,8 +7524,11 @@ class CompiledBriefingService:
         self,
         *,
         payload: dict[str, Any],
+        target: CompiledBriefingTarget,
         source_rel_path: str,
         source_excerpt: str,
+        existing_claims: str,
+        existing_text: str,
         existing_meta: dict[str, str],
         signal: dict[str, Any] | None,
     ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
@@ -7221,11 +7554,27 @@ class CompiledBriefingService:
             return [], []
         conflicts = self._normalize_conflicts(payload.get("conflicts"), claims=claims)
         page_tier = self._merged_tier(existing_meta, signal)
+        candidate_markdown = self._render_briefing(
+            target=target,
+            payload=payload,
+            source_rel_path=source_rel_path,
+            existing_text=existing_text,
+            existing_meta=existing_meta,
+            signal=signal,
+            source_excerpt=source_excerpt,
+            claims=claims,
+            conflicts=conflicts,
+            record_side_effects=False,
+        )
         verified_claims = self._verify_claims_batch(
             claims=claims,
             source_rel_path=source_rel_path,
             source_excerpt=source_excerpt,
             page_tier=page_tier,
+            target_title=target.title,
+            candidate_payload=payload,
+            candidate_markdown=candidate_markdown,
+            existing_claims=existing_claims,
         )
         verified_texts = {claim["text"] for claim in verified_claims}
         conflicts = [
@@ -7303,6 +7652,7 @@ class CompiledBriefingService:
         signal: dict[str, Any] | None,
         today: str,
         page_rel_path: str,
+        record_side_effects: bool = True,
     ) -> tuple[
         list[tuple[str, str, str]],
         list[tuple[str, str, str, str]],
@@ -7418,7 +7768,7 @@ class CompiledBriefingService:
                 # branch below instead, which keeps both sides and queues
                 # the conflict for the owner.
                 effective_type = "factual"
-                if self._active_pass is not None:
+                if record_side_effects and self._active_pass is not None:
                     # G7: count every temporal-to-factual downgrade caused
                     # by weak source trust for the pass journal. Only the
                     # counter belongs under this guard -- there is no pass
@@ -7436,14 +7786,15 @@ class CompiledBriefingService:
                 # explanation of *why* the normally-automatic date-based
                 # supersession did not just happen. The "factual" branch
                 # just below still adds that row either way.
-                self._queue_blocked_action(
-                    page_rel_path=page_rel_path,
-                    existing_claim=conflict["existing_claim"],
-                    existing_source=conflict["existing_source"],
-                    new_claim=conflict["new_claim"],
-                    new_source=source_rel_path,
-                    trust=current_trust,
-                )
+                if record_side_effects:
+                    self._queue_blocked_action(
+                        page_rel_path=page_rel_path,
+                        existing_claim=conflict["existing_claim"],
+                        existing_source=conflict["existing_source"],
+                        new_claim=conflict["new_claim"],
+                        new_source=source_rel_path,
+                        trust=current_trust,
+                    )
             if effective_type == "temporal":
                 if winner_is_new:
                     dropped_existing.add(key)

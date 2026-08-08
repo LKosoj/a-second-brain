@@ -315,6 +315,9 @@ class QueueItem:
     since: str
     conflict_row: tuple[str, str, str, str, str] | None = None
     candidate_page: str = ""
+    source_path: str = ""
+    source_excerpt: str = ""
+    max_updates: int = 3
 
 
 def queue_item_fingerprint(item: QueueItem) -> str:
@@ -368,7 +371,14 @@ def queue_item_fingerprint(item: QueueItem) -> str:
     ``"1:a2:bc"`` and ``"2:ab1:c"``, which differ.
     """
     row = item.conflict_row if item.conflict_row is not None else ("", "", "", "", "")
-    fields = (item.kind, item.page, item.since, item.candidate_page, *row)
+    fields = (
+        item.kind,
+        item.page,
+        item.since,
+        item.candidate_page,
+        item.source_path,
+        *row,
+    )
     encoded = "".join(f"{len(field)}:{field}" for field in fields)
     digest = hashlib.sha256(encoded.encode()).hexdigest()
     return digest[:8]
@@ -688,6 +698,12 @@ def _json_backed_items(vault_path: Path) -> list[QueueItem]:
         kind = str(entry.get("kind") or "").strip() or "queued"
         since = str(entry.get("since") or "").strip()
         candidate_page = str(entry.get("candidate_page") or "").strip()
+        source_path = str(entry.get("source_path") or "").strip()
+        source_excerpt = str(entry.get("source_excerpt") or "")
+        try:
+            max_updates = max(1, int(entry.get("max_updates") or 3))
+        except (TypeError, ValueError):
+            max_updates = 3
         items.append(
             QueueItem(
                 kind=kind,
@@ -695,6 +711,9 @@ def _json_backed_items(vault_path: Path) -> list[QueueItem]:
                 summary=summary,
                 since=since,
                 candidate_page=candidate_page,
+                source_path=source_path,
+                source_excerpt=source_excerpt,
+                max_updates=max_updates,
             )
         )
     return items
@@ -1179,6 +1198,21 @@ def _apply_verify_rejected_retry(vault_path: Path, item: QueueItem) -> ResponseO
     attempts Verify again on this source snapshot instead of immediately
     skipping it as still exhausted."""
     service = CompiledBriefingService(vault_path)
+    if item.source_path:
+        enqueue_result = service.enqueue_refresh(
+            source_path=item.source_path,
+            source_excerpt=item.source_excerpt,
+            max_updates=item.max_updates,
+            debounce_seconds=0,
+        )
+        if not enqueue_result.get("queued"):
+            return ResponseOutcome(
+                ok=False,
+                message=(
+                    f"Не удалось вернуть {item.source_path} в очередь: "
+                    + ", ".join(enqueue_result.get("errors", []))
+                ),
+            )
     manifest = load_manifest_for_vault(vault_path)
     with vault_write_lock(vault_path) as lock:
         service._clear_verify_rejection(item.page)
@@ -1192,6 +1226,15 @@ def _apply_verify_rejected_retry(vault_path: Path, item: QueueItem) -> ResponseO
             at=datetime.now().astimezone(),
         )
         write_queue_document(vault_path, manifest=manifest, existing_lock=lock)
+    if item.source_path:
+        service.spawn_background_drain()
+        return ResponseOutcome(
+            ok=True,
+            message=(
+                f"Источник {item.source_path} возвращён в очередь для повторной "
+                f"проверки страницы {item.page}."
+            ),
+        )
     return ResponseOutcome(
         ok=True,
         message=(

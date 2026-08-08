@@ -151,7 +151,9 @@ can verify the briefing against curated context or the source note.
 Relevant source writes enqueue a briefing refresh. Post-cycle maintenance drains
 that queue, checks required sections and source links, refreshes stale
 briefings, archives obsolete ones, and updates QMD when searchable content
-changed.
+changed. Each background queue run writes a separate journal under
+`.compiled/queue-history/` with its source events, outcomes, changed pages, and
+errors. The latest 10 journals are retained.
 
 A reusable direct answer can also be filed under `summaries/answers/`. The
 current filter rejects outputs shorter than 180 characters. Longer outputs are
@@ -332,21 +334,15 @@ then penalizes the old version while preserving the chain.
 ## Compiled-page aging and re-verification
 
 Compiled pages age through the same memory tiers used elsewhere in this
-document, but for a compiled page the tier also controls how much enrichment
-attention it gets, not only how visible it is in search:
+document. The tier controls queue priority, verification depth, compression,
+and search visibility, but it does not suppress a relevant new source:
 
 - `core` and `active` pages are fully compiled and checked whenever a
   relevant source lands.
-- `warm` pages are enriched only on a real signal — several sources arriving
-  in a short window, or a claim that turns out to be a decision, commitment,
-  or conflict. A quiet source is only acknowledged with a marked row, not
-  enriched.
-- `cold` pages are never enriched. A new source only adds a marked row to the
-  page's sources table, with no model call and no effect on the page's
-  enrichment budget.
-- `archive` pages are not read at all. A new source only promotes the page
-  one tier, to `warm`; real enrichment happens on a later pass, once the page
-  is active again.
+- `warm` and `cold` pages are compiled when a relevant new source lands, so
+  the derived page does not remain stale. Verify samples their new claims.
+- `archive` pages that receive a relevant new source are promoted to `warm`
+  and enriched in the same pass.
 
 When a page cools into `warm`, `cold`, or `archive`, its `Recent Changes` and
 `Open Loops` sections are compressed: only the most recent entries stay in
