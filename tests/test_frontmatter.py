@@ -1565,6 +1565,43 @@ def test_validated_writer_preserves_mode_and_does_not_leak_fds(
     assert not any(child.name.startswith(".dbrain-write-") for child in vault.iterdir())
 
 
+def test_validated_writer_keeps_the_group_a_shared_vault_hands_out(
+    tmp_path: Path,
+) -> None:
+    """A note published into a shared vault keeps that vault's group.
+
+    The candidate is staged inside a private ``.dbrain-write-*`` directory
+    whose setgid bit is cleared, so it is born with the writing process's
+    group rather than the one the target directory hands out. Without an
+    explicit hand-over, a service running as another user publishes notes the
+    vault's own group can no longer read.
+    """
+    shared_gid = next((gid for gid in os.getgroups() if gid != os.getgid()), None)
+    if shared_gid is None:
+        pytest.skip("needs a second group to tell inheritance from the default")
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    os.chown(vault, -1, shared_gid)
+    vault.chmod(0o2770)
+    content = b"---\ntype: note\n---\n# 0\n"
+
+    created = vault / "created.md"
+    write_validated_vault_markdown(vault, created, content)
+    assert created.stat().st_gid == shared_gid
+
+    replaced = vault / "replaced.md"
+    replaced.write_bytes(content)
+    os.chown(replaced, -1, shared_gid)
+    write_validated_vault_markdown(
+        vault,
+        replaced,
+        b"---\ntype: note\n---\n# 1\n",
+        expected_full_sha256=hashlib.sha256(content).hexdigest(),
+    )
+    assert replaced.stat().st_gid == shared_gid
+
+
 def test_validated_write_creates_missing_nested_parents(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     vault.mkdir()

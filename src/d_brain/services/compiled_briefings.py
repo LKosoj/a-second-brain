@@ -2697,11 +2697,20 @@ class CompiledBriefingService:
         # rows marked ``NOT_ENRICHMENT_SOURCE_MARKER`` (cold, or a `warm`
         # page that turned out insignificant) do not consume this budget.
         month_prefix = date.today().isoformat()[:7]
-        monthly_enrichments = sum(
-            1
-            for row_date, _, what in self._sources_shaped_rows(existing_text)
-            if row_date.startswith(month_prefix)
-            and what != NOT_ENRICHMENT_SOURCE_MARKER
+        # Counted by distinct (date, source) pair, not by row: ТЗ 5.6 budgets
+        # *enrichments*, and one enrichment appends one row per claim it
+        # contributed, so counting rows charged a single pass 3-4 times over.
+        # In practice that declared "drift" on pages enriched 1-3 times --
+        # 29 of them in one month here, each blocked until the month rolled
+        # over. A pass always writes its rows under one source and one date,
+        # so the pair is the enrichment.
+        monthly_enrichments = len(
+            {
+                (row_date, source)
+                for row_date, source, what in self._sources_shaped_rows(existing_text)
+                if row_date.startswith(month_prefix)
+                and what != NOT_ENRICHMENT_SOURCE_MARKER
+            }
         )
         if monthly_enrichments >= MAX_ENRICHMENTS_PER_PAGE_PER_MONTH:
             if pass_obj is not None:
@@ -7361,6 +7370,35 @@ class CompiledBriefingService:
             f"{json.dumps(claims_payload, ensure_ascii=False, indent=2)}\n"
         )
 
+    def _mark_verify_unavailable(
+        self,
+        candidate_payload: dict[str, Any],
+        *,
+        source_rel_path: str,
+        reason: str,
+    ) -> None:
+        """Record that Verify produced no usable verdict for this page.
+
+        Used only for a reply broken as a *format*, never for an honest
+        rejection: the model said nothing about the claims, so they are kept
+        and the page carries ``quality_status: needs_review`` with this
+        reason instead (``_render_briefing`` reads both ``_quality_*`` keys).
+        Because the mark is set, ``last_verified`` stays where it was -- the
+        page is written, but it is not claimed to be verified.
+        """
+        if self._active_pass is not None:
+            self._active_pass.verify_format_drift += 1
+        logger.warning(
+            "Compiled briefing Verify unusable for %s: %s; страница будет "
+            "сохранена с пометкой needs_review",
+            source_rel_path,
+            reason,
+        )
+        candidate_payload["_quality_verification_completed"] = True
+        candidate_payload["_quality_issues"] = [
+            f"{reason} — утверждения не проверены"
+        ]
+
     def _verify_claims_batch(
         self,
         *,
@@ -7376,10 +7414,18 @@ class CompiledBriefingService:
         """Batched Verify (ТЗ 5.2 step 4): one model call per page, sampling
         per ``_verify_sample_size``. Claims outside the sample pass through
         unchecked. A rejected sampled claim is dropped (ТЗ 5.2: "утверждение
-        не попадает на страницу"); if a majority of the *sample* is
-        rejected, the whole page write is aborted via
-        ``CompiledBriefingVerificationRejectedError`` (ТЗ 5.2: "страница не
-        применяется целиком").
+        не попадает на страницу"); a majority-rejected sample no longer
+        aborts the write, it marks the page ``quality_status: needs_review``
+        instead, so the owner gets a page with a stated reason rather than
+        nothing at all.
+
+        A Verify reply that is broken *as a format* -- unparseable JSON, or
+        missing ``page_checks``/``page_issues`` -- is a different case from
+        an honest rejection: the model said nothing about these claims, so
+        there is no ground to drop them. They pass through unverified and
+        the page is marked ``needs_review`` with that reason (see
+        ``_mark_verify_unavailable``), which also keeps ``last_verified``
+        from moving.
         """
         sample_size = self._verify_sample_size(len(claims), page_tier)
         sample = claims[:sample_size]
@@ -7403,22 +7449,25 @@ class CompiledBriefingService:
                 json_example=VERIFY_JSON_EXAMPLE,
             )
         except ValueError as exc:
-            # Code review (narrow gap left by the majority-rejection fix
-            # above): a Verify response that never parses as the required
-            # structure -- even after the JSON-repair retry inside
-            # ``_run_json_dict_prompt`` -- must escalate exactly like an
-            # explicit rejection, not surface as a plain ``ValueError``.
-            # Both call sites that catch escalation
-            # (``refresh_after_write``'s per-target loop and
-            # ``_backfill_freshness_notes``) only treat
-            # ``CompiledBriefingVerificationRejectedError`` as something
-            # the owner must eventually see; a bare ``ValueError`` there is
-            # just logged and skipped, so an unparseable Verify reply would
-            # otherwise leave the page silently unreviewed forever.
-            raise CompiledBriefingVerificationRejectedError(
-                f"Verify response for {source_rel_path} did not parse as "
-                f"JSON even after repair; treated as a full rejection ({exc})"
-            ) from exc
+            # A Verify reply that never parses as the required structure --
+            # even after the JSON-repair retry inside
+            # ``_run_json_dict_prompt`` -- says nothing about the claims,
+            # so it is not treated as a rejection of them. The page is
+            # written with ``quality_status: needs_review`` and this reason
+            # instead; without a candidate payload to carry that mark there
+            # is nowhere to record it, so that (today unreachable) path
+            # still escalates as before.
+            if candidate_payload is None:
+                raise CompiledBriefingVerificationRejectedError(
+                    f"Verify response for {source_rel_path} did not parse as "
+                    f"JSON even after repair; treated as a full rejection ({exc})"
+                ) from exc
+            self._mark_verify_unavailable(
+                candidate_payload,
+                source_rel_path=source_rel_path,
+                reason=f"Verify не вернул разбираемый JSON ({exc})",
+            )
+            return claims
         if candidate_payload is not None:
             candidate_payload.pop("_quality_verification_completed", None)
             candidate_payload.pop("_quality_issues", None)
@@ -7427,12 +7476,12 @@ class CompiledBriefingService:
                 not isinstance(raw_page_checks.get(key), bool)
                 for key in VERIFY_PAGE_CHECK_KEYS
             ):
-                if self._active_pass is not None:
-                    self._active_pass.verify_format_drift += 1
-                raise CompiledBriefingVerificationRejectedError(
-                    f"Verify response for {source_rel_path} omitted valid "
-                    "page_checks; page write aborted"
+                self._mark_verify_unavailable(
+                    candidate_payload,
+                    source_rel_path=source_rel_path,
+                    reason="Verify не вернул корректное поле page_checks",
                 )
+                return claims
             failed_page_checks = [
                 key for key in VERIFY_PAGE_CHECK_KEYS if not raw_page_checks[key]
             ]
@@ -7440,12 +7489,12 @@ class CompiledBriefingService:
             if not isinstance(raw_page_issues, list) or any(
                 not isinstance(issue, str) for issue in raw_page_issues
             ):
-                if self._active_pass is not None:
-                    self._active_pass.verify_format_drift += 1
-                raise CompiledBriefingVerificationRejectedError(
-                    f"Verify response for {source_rel_path} omitted a valid "
-                    "page_issues list; page write aborted"
+                self._mark_verify_unavailable(
+                    candidate_payload,
+                    source_rel_path=source_rel_path,
+                    reason="Verify не вернул корректный список page_issues",
                 )
+                return claims
             page_issues = [issue.strip() for issue in raw_page_issues if issue.strip()]
             candidate_payload["_quality_verification_completed"] = True
             candidate_payload["_quality_issues"] = [

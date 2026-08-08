@@ -69,9 +69,12 @@ sub-fields (`decision_status`, `decision_owner`, `decision_date`, `severity`, ..
 - `conflicts_open` -- number of unresolved factual conflicts.
 - `human_reviewed` -- `YYYY-MM-DD` or empty; when the owner last confirmed
   this page (a date, not a boolean).
-- `quality_status` -- `needs_review`; present only when Verify found a
-  content-quality problem in the version that was still saved.
-- `quality_reason` -- the failed checks or other content-quality reasons.
+- `quality_status` -- `needs_review`; present when Verify found a
+  content-quality problem in the version that was still saved, or when Verify
+  produced no usable reply at all (unparseable JSON, missing `page_checks` or
+  `page_issues`) so the claims went in unverified.
+- `quality_reason` -- the failed checks, other content-quality reasons, or the
+  reason Verify could not be used.
   Both quality fields disappear after the next successful Verify pass.
 
 Generation logic (`add_descriptions.py` and friends in `vault-health`) must

@@ -8213,10 +8213,13 @@ def test_compiled_briefings_successful_verify_clears_quality_flag(
     assert "quality_reason:" not in note_text
 
 
-def test_compiled_briefings_verify_missing_page_issues_aborts_page_write(
+def test_compiled_briefings_verify_missing_page_issues_flags_page(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A Verify reply with no ``page_issues`` key at all is the same format
+    breakage as one whose ``page_issues`` is the wrong type: claims kept,
+    page flagged."""
     service = _compiled_service(tmp_path / "vault")
     service._active_pass = CompileEnrichPass(pass_id="p1", snapshot_enabled=False)
     monkeypatch.setattr(
@@ -8236,21 +8239,27 @@ def test_compiled_briefings_verify_missing_page_issues_aborts_page_write(
         ),
     )
 
-    with pytest.raises(CompiledBriefingVerificationRejectedError):
-        service._verify_claims_batch(
-            claims=[
-                {
-                    "text": "Факт.",
-                    "source": "daily/2026-08-05.md",
-                    "kind": "fact",
-                }
-            ],
-            source_rel_path="daily/2026-08-05.md",
-            source_excerpt="Факт.",
-            page_tier="active",
-            target_title="Факт",
-            candidate_payload={"current_state": "Факт."},
-        )
+    candidate_payload = {"current_state": "Факт."}
+    verified = service._verify_claims_batch(
+        claims=[
+            {
+                "text": "Факт.",
+                "source": "daily/2026-08-05.md",
+                "kind": "fact",
+            }
+        ],
+        source_rel_path="daily/2026-08-05.md",
+        source_excerpt="Факт.",
+        page_tier="active",
+        target_title="Факт",
+        candidate_payload=candidate_payload,
+    )
+
+    assert [claim["text"] for claim in verified] == ["Факт."]
+    assert candidate_payload["_quality_issues"] == [
+        "Verify не вернул корректный список page_issues — утверждения не проверены"
+    ]
+    assert service._active_pass.verify_format_drift == 1
 
     assert service._active_pass.verify_format_drift == 1
 
@@ -8309,10 +8318,13 @@ def test_compiled_briefings_verify_failed_systemic_check_marks_candidate(
     ]
 
 
-def test_compiled_briefings_verify_missing_systemic_checks_aborts_page_write(
+def test_compiled_briefings_verify_missing_systemic_checks_flags_page(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A Verify reply with no ``page_checks`` says nothing about the claims,
+    so they are kept and the page is flagged for review instead of being
+    dropped entirely."""
     service = _compiled_service(tmp_path / "vault")
     service._active_pass = CompileEnrichPass(pass_id="p1", snapshot_enabled=False)
     monkeypatch.setattr(
@@ -8328,39 +8340,88 @@ def test_compiled_briefings_verify_missing_systemic_checks_aborts_page_write(
         ),
     )
 
-    with pytest.raises(CompiledBriefingVerificationRejectedError):
-        service._verify_claims_batch(
-            claims=[
-                {
-                    "text": "Факт.",
-                    "source": "daily/2026-08-05.md",
-                    "kind": "fact",
-                }
-            ],
-            source_rel_path="daily/2026-08-05.md",
-            source_excerpt="Факт.",
-            page_tier="active",
-            target_title="Факт",
-            candidate_payload={"current_state": "Факт."},
-        )
+    candidate_payload = {"current_state": "Факт."}
+    verified = service._verify_claims_batch(
+        claims=[
+            {
+                "text": "Факт.",
+                "source": "daily/2026-08-05.md",
+                "kind": "fact",
+            }
+        ],
+        source_rel_path="daily/2026-08-05.md",
+        source_excerpt="Факт.",
+        page_tier="active",
+        target_title="Факт",
+        candidate_payload=candidate_payload,
+    )
 
+    assert [claim["text"] for claim in verified] == ["Факт."]
+    assert candidate_payload["_quality_verification_completed"] is True
+    assert candidate_payload["_quality_issues"] == [
+        "Verify не вернул корректное поле page_checks — утверждения не проверены"
+    ]
     assert service._active_pass.verify_format_drift == 1
 
 
-def test_compiled_briefings_verify_unparseable_response_raises_verification_rejected(
+def test_compiled_briefings_verify_wrong_type_page_issues_flags_page(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Code review defect 1: when the Verify step's model response never
-    parses as JSON -- not even after ``_run_json_dict_prompt``'s own
-    repair-prompt retry -- ``_verify_claims_batch`` must raise
-    ``CompiledBriefingVerificationRejectedError``, the same as an explicit
-    rejection, not let the underlying ``ValueError`` escape. Both escalation
-    call sites (``refresh_after_write``, ``_backfill_freshness_notes``) only
-    treat that specific type as queue-worthy; a bare ``ValueError`` there
-    used to be logged and skipped, so an unparseable Verify reply left the
-    page silently unreviewed forever without ever incrementing the retry
-    counter that would eventually queue it for the owner."""
+    """Same for a reply whose ``page_issues`` is not a list of strings."""
+    service = _compiled_service(tmp_path / "vault")
+    service._active_pass = CompileEnrichPass(pass_id="p1", snapshot_enabled=False)
+    monkeypatch.setattr(
+        service.runner,
+        "run",
+        lambda prompt, *, timeout: json.dumps(
+            {
+                "verdicts": [
+                    {"index": 0, "text": "Факт.", "supported": True}
+                ],
+                "page_checks": {
+                    "source_coverage": True,
+                    "target_scope": True,
+                    "timeline_consistency": True,
+                },
+                "page_issues": "не список",
+            }
+        ),
+    )
+
+    candidate_payload = {"current_state": "Факт."}
+    verified = service._verify_claims_batch(
+        claims=[
+            {
+                "text": "Факт.",
+                "source": "daily/2026-08-05.md",
+                "kind": "fact",
+            }
+        ],
+        source_rel_path="daily/2026-08-05.md",
+        source_excerpt="Факт.",
+        page_tier="active",
+        target_title="Факт",
+        candidate_payload=candidate_payload,
+    )
+
+    assert [claim["text"] for claim in verified] == ["Факт."]
+    assert candidate_payload["_quality_issues"] == [
+        "Verify не вернул корректный список page_issues — утверждения не проверены"
+    ]
+    assert service._active_pass.verify_format_drift == 1
+
+
+def test_compiled_briefings_verify_unparseable_response_writes_flagged_page(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the Verify step's model response never parses as JSON -- not even
+    after ``_run_json_dict_prompt``'s own repair-prompt retry -- the model
+    has said nothing about the proposed claims. That is not a rejection of
+    them: the page is written with the claims intact and flagged
+    ``quality_status: needs_review`` with the reason, and ``last_verified``
+    is left unset so nothing claims the page was verified."""
     vault_path = tmp_path / "vault"
     service = _compiled_service(vault_path)
     _bypass_atomic_vault_write(monkeypatch)
@@ -8382,18 +8443,23 @@ def test_compiled_briefings_verify_unparseable_response_raises_verification_reje
 
     monkeypatch.setattr(service.runner, "run", fake_run)
 
-    with pytest.raises(CompiledBriefingVerificationRejectedError):
-        service._upsert_briefing(
-            target=_demo_target(),
-            source_rel_path="daily/2026-08-05.md",
-            source_excerpt="## 09:00 [text]\nУтверждение А.",
-            signal=None,
-        )
+    service._upsert_briefing(
+        target=_demo_target(),
+        source_rel_path="daily/2026-08-05.md",
+        source_excerpt="## 09:00 [text]\nУтверждение А.",
+        signal=None,
+    )
 
     # Compile, Verify, and the JSON-repair retry -- all three model calls
-    # happened, and the repair's own failure still surfaces the dedicated
-    # rejection type, not the raw ValueError extract_first_json_dict raises.
+    # happened.
     assert len(calls) == 3
+    note_text = (vault_path / "compiled/projects/demo-project.md").read_text(
+        encoding="utf-8"
+    )
+    assert "quality_status: needs_review" in note_text
+    assert "Verify не вернул разбираемый JSON" in note_text
+    assert "| Утверждение А. |" in note_text
+    assert f"last_verified: {date.today().isoformat()}" not in note_text
 
 
 def test_compiled_briefings_superseded_source_claims_are_never_extracted(
@@ -9569,6 +9635,55 @@ def test_compiled_briefings_monthly_enrichment_budget_blocks_page(
         )
     assert calls == []
     assert "monthly-enrichments-per-page" in service._active_pass.budget_exhausted
+
+
+def test_compiled_briefings_monthly_budget_counts_enrichments_not_claims(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One enrichment appends one "Sources That Shaped This Page" row per
+    claim it contributed, so a page enriched twice can already carry a dozen
+    rows. Charging the monthly budget per row declared drift on pages
+    enriched two or three times and froze them until the month rolled over;
+    the budget counts distinct (date, source) pairs instead."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_atomic_vault_write(monkeypatch)
+    month_prefix = date.today().isoformat()[:7]
+    page_path = vault_path / "compiled" / "projects" / "demo-project.md"
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    # Two enrichments, six claims each: well past the cap by row count.
+    page_path.write_text(
+        _full_compiled_page_text(
+            shaped_rows=[
+                (f"{month_prefix}-0{day}", "daily/day1.md", f"claim {index}")
+                for day in (1, 2)
+                for index in range(6)
+            ],
+            sources=["daily/day1.md"],
+        ),
+        encoding="utf-8",
+    )
+    service._active_pass = CompileEnrichPass(pass_id="p1", snapshot_enabled=False)
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        service.runner,
+        "run",
+        lambda prompt, **k: calls.append(prompt)
+        or json.dumps(_minimal_compile_payload()),
+    )
+
+    result = service._upsert_briefing(
+        target=_demo_target(),
+        source_rel_path="daily/2026-08-05.md",
+        source_excerpt="New fact this month.",
+        signal=None,
+    )
+
+    assert result.written is True
+    assert calls
+    assert "monthly-enrichments-per-page" not in service._active_pass.budget_exhausted
 
 
 def test_compiled_briefings_monthly_enrichment_budget_allows_the_last_slot(

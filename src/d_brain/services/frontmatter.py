@@ -788,6 +788,16 @@ def _atomic_write_at(
     durable_commit = False
     preserve_stage_contents = False
     mode = 0o600
+    # The candidate below is created inside a private staging directory whose
+    # setgid bit is deliberately cleared, so it is born with the *writing
+    # process's* group rather than the group the target directory hands out.
+    # A file created directly in the target directory would inherit that
+    # group, and on a shared vault (setgid directory, group-readable notes)
+    # losing it means a root-owned service publishes notes the vault's own
+    # group can no longer read. Carry the group across explicitly: from the
+    # file being replaced when there is one, from the target directory
+    # otherwise -- the same source ``mode`` comes from.
+    target_gid = os.fstat(parent_fd).st_gid
     try:
         try:
             source_stat = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
@@ -813,6 +823,7 @@ def _atomic_write_at(
                 raise UnsafeVaultPathError("atomic write target changed while reading")
             source_hash = hashlib.sha256(source_bytes).hexdigest()
             mode = opened_stat.st_mode & 0o7777
+            target_gid = opened_stat.st_gid
         if expected_source is not None and (
             source_identity != expected_source[0] or source_hash != expected_source[1]
         ):
@@ -857,6 +868,15 @@ def _atomic_write_at(
         view = memoryview(content)
         while view:
             view = view[os.write(candidate_fd, view) :]
+        if os.fstat(candidate_fd).st_gid != target_gid:
+            try:
+                os.fchown(candidate_fd, -1, target_gid)
+            except OSError:
+                # A writer that is not a member of that group cannot hand the
+                # file over; the write itself must not fail over a permission
+                # detail, so the candidate keeps its own group.
+                pass
+        # After ``fchown``, which clears setuid/setgid on the file.
         os.fchmod(candidate_fd, mode)
         os.fsync(candidate_fd)
         candidate_identity = _stat_identity(os.fstat(candidate_fd))

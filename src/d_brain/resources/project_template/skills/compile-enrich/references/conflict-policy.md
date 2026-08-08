@@ -85,13 +85,23 @@ Sampling rate: 100% of new claims for `core`/`active` tier pages, 25%
 unset/unknown tier all fall back to the warm fraction (fail-closed rather
 than skipping Verify for a tier the source ТЗ never named).
 
-If Verify rejects a majority of one page's newly proposed claims, the whole
-page write is skipped for this pass -- not partially applied. A single
-rejection does not queue anything by itself: only once
-`MAX_VERIFY_REJECTED_RETRIES` consecutive rejections land against the same
-source snapshot does the page reach the decisions queue as a
-`verify-rejected` item (`_queue_verify_rejected`) -- earlier rejections just
-retry on the next pass. See "Decisions Queue Item Kinds" below.
+A rejected claim never reaches the page. If Verify rejects a majority of one
+page's newly proposed claims, the page is still written -- with
+`quality_status: needs_review` and the reason in `quality_reason` -- rather
+than skipped entirely, and `last_verified` is left where it was.
+
+A Verify reply broken *as a format* (unparseable JSON, or a missing/mistyped
+`page_checks` or `page_issues`) is treated differently from a rejection: the
+model said nothing about these claims, so they are kept unverified and the
+page carries the same `needs_review` mark with the reason
+(`_mark_verify_unavailable`). Every such reply also counts toward the pass
+journal's `verify_format_drift`.
+
+Because both paths now write a page, a page no longer reaches the decisions
+queue as a `verify-rejected` item in practice; `_queue_verify_rejected` and
+`MAX_VERIFY_REJECTED_RETRIES` stay in place only for the escalation path that
+has no candidate payload to carry the mark. See "Decisions Queue Item Kinds"
+below.
 
 ## Pass Budgets (`run_nightly_maintenance`)
 
@@ -100,7 +110,10 @@ retry on the next pass. See "Decisions Queue Item Kinds" below.
   call shares this one budget.
 - `MAX_ENRICHMENTS_PER_PAGE_PER_MONTH` = 8 -- beyond this, further source
   material for that page waits for the decisions queue instead of
-  compounding unattended drift onto one page.
+  compounding unattended drift onto one page. Counted as distinct
+  (date, source) pairs in "Sources That Shaped This Page", not as rows: one
+  enrichment appends one row per claim, so counting rows charged a single
+  pass several times over and froze pages enriched two or three times.
 - `MAX_CLAIMS_PER_PASS` = 20 -- claims accepted from one model response.
 
 Exhausting a budget ends the pass normally: the remainder stays queued, and
@@ -168,7 +181,10 @@ Eight kinds exist today (`services/decisions_queue.py`):
   the source event, including for a page that has not been created yet.
   "Повторить проверку" clears the page's retry counter and returns that
   source to the refresh queue; the generic `reject` below just drops the
-  queue entry and leaves the page exhausted as-is.
+  queue entry and leaves the page exhausted as-is. No producer reaches this
+  in practice any more -- see the Verify section above: a page that fails
+  Verify is written with `quality_status: needs_review` instead of being
+  escalated here.
 - `page-encoding-broken` -- written by
   `CompiledBriefingService._queue_undecodable_page` when a compiled page's
   bytes on disk are not valid UTF-8. Every writer refuses such a page rather
