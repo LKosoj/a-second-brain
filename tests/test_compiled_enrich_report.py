@@ -1778,6 +1778,37 @@ def test_collect_changes_range_widens_window_to_multiple_days():
     assert "до недели" not in changes[0].what_added
 
 
+def test_collect_changes_does_not_glue_a_separator_onto_a_finished_sentence():
+    """Each source row's cell is already a full sentence, so the joined line
+    must not read "...ограничений.; LightLLM..." in the owner's digest."""
+    candidate = CompiledBriefingCandidate(
+        rel_path="compiled/topics/aurora.md",
+        domain="topics",
+        slug="aurora",
+        title="Проект Аврора",
+        description="",
+        freshness_state="",
+        confidence="",
+        relevance=0.0,
+        tier="active",
+        text=(
+            "---\ncreated: 2026-08-01\n---\n\n# Проект Аврора\n\n"
+            "## Sources That Shaped This Page\n\n"
+            "| Date | Source | What Added |\n| --- | --- | --- |\n"
+            "| 2026-08-05 | [[daily/a.md]] | Первый факт. |\n"
+            "| 2026-08-05 | [[daily/b.md]] | Второй факт. |\n"
+            "| 2026-08-05 | [[daily/c.md]] | Третий факт без точки |\n"
+            "| 2026-08-05 | [[daily/d.md]] | Четвёртый факт. |\n"
+        ),
+    )
+
+    changes = _collect_changes([candidate], DAY, DAY)
+
+    assert changes[0].what_added == (
+        "Первый факт. Второй факт. Третий факт без точки; Четвёртый факт."
+    )
+
+
 # --- _collect_revisit: limit parameter (задача N) -------------------------
 
 

@@ -358,6 +358,19 @@ def test_compiled_briefings_lint_resolves_project_root_relative_sources(
     )
     (tmp_path / "README.md").write_text("# Project\n", encoding="utf-8")
     (tmp_path / "README.ru.md").write_text("# Проект\n", encoding="utf-8")
+    (tmp_path / "AGENTS.md").write_text("# Agents\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir(parents=True)
+    (tmp_path / "tests" / "test_resolver.py").write_text("# stub\n", encoding="utf-8")
+    (tmp_path / ".claude" / "skills" / "demo").mkdir(parents=True)
+    (tmp_path / ".claude" / "skills" / "demo" / "SKILL.md").write_text(
+        "# Demo skill\n",
+        encoding="utf-8",
+    )
+    (vault_path / ".claude" / "rules").mkdir(parents=True)
+    (vault_path / ".claude" / "rules" / "daily-format.md").write_text(
+        "# Daily format\n",
+        encoding="utf-8",
+    )
 
     (compiled_root / "resolver-demo.md").write_text(
         (
@@ -395,6 +408,10 @@ def test_compiled_briefings_lint_resolves_project_root_relative_sources(
             "- [[src/d_brain/services/compiled_briefings.py]]\n"
             "- [[scripts/setup_control_plane.sh]]\n"
             "- [[docs/control-plane.md]]\n"
+            "- [[AGENTS.md]]\n"
+            "- [[tests/test_resolver.py]]\n"
+            "- [[.claude/skills/demo/SKILL.md]]\n"
+            "- [[.claude/rules/daily-format.md]]\n"
             "- [[src/missing.py]]\n"
         ),
         encoding="utf-8",

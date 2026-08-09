@@ -93,7 +93,7 @@ from d_brain.services.vault_lock import VaultWriteLock, vault_write_lock
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TIMEOUT = 1200  # 20 minutes
+DEFAULT_TIMEOUT = 2400  # 40 minutes
 DAILY_ENTRY_HEADER_RE = re.compile(r"^##\s+\d{2}:\d{2}\s+\[[^\]]+\]\s*$", re.MULTILINE)
 REFLECT_DAILY_START_MARKER = "<!-- d-brain:reflect:start -->"
 REFLECT_DAILY_END_MARKER = "<!-- d-brain:reflect:end -->"
@@ -518,17 +518,22 @@ class CliProcessor:
                 "carry_forward_title": "Наблюдения на перенос",
                 "no_system_signals": "Новых системных сигналов нет.",
                 "no_system_signals_daily": (
-                    "Weekly system reflection: новых системных сигналов нет."
+                    "Системная рефлексия: новых системных сигналов нет."
                 ),
                 "reflection_created": "Создана заметка:",
                 "retained_observations": (
                     "Новых сгруппированных выводов нет; наблюдения оставлены"
-                    " на следующий weekly pass."
+                    " на следующий недельный проход."
                 ),
                 "retained_daily_log": (
-                    "Weekly system reflection: unresolved observations "
+                    "Системная рефлексия: нерешённые наблюдения "
                     "оставлены на следующий проход."
                 ),
+                "reflection_daily_log": "Системная рефлексия:",
+                "processed_observations_label": "Обработано наблюдений",
+                "carry_forward_label": "Перенесено наблюдений",
+                "reflection_note_description": "Недельная системная рефлексия за",
+                "reflection_title_fallback": "Системная рефлексия",
             }
         return {
             "weekly_digest_title": "Weekly Digest",
@@ -552,6 +557,11 @@ class CliProcessor:
                 "Weekly system reflection: unresolved observations were kept "
                 "for the next pass."
             ),
+            "reflection_daily_log": "Weekly system reflection:",
+            "processed_observations_label": "Processed observations",
+            "carry_forward_label": "Carry forward",
+            "reflection_note_description": "Weekly system reflection for",
+            "reflection_title_fallback": "Weekly system reflection",
         }
 
     @staticmethod
@@ -565,6 +575,41 @@ class CliProcessor:
             if value:
                 items.append(value)
         return items
+
+    @staticmethod
+    def _graph_health_entry_day(entry: Any) -> date | None:
+        """Calendar day of one graph-health history entry, when it has one."""
+        if not isinstance(entry, dict):
+            return None
+        raw = str(entry.get("date") or "").strip()
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw).date()
+        except ValueError:
+            return None
+
+    @classmethod
+    def _graph_health_window(
+        cls,
+        graph_history: list[Any],
+        *,
+        start: date,
+        end: date,
+    ) -> list[Any]:
+        """Graph-health entries recorded inside one closed date window.
+
+        ``.graph/health-history.json`` keeps up to 90 runs, so the raw list
+        spans weeks. A weekly reflection must compare the week it reports on,
+        not the whole retained tail.
+        """
+        window: list[Any] = []
+        for entry in graph_history:
+            entry_day = cls._graph_health_entry_day(entry)
+            if entry_day is None or not (start <= entry_day <= end):
+                continue
+            window.append(entry)
+        return window
 
     def _graph_health_delta_line(self, graph_history: list[Any]) -> str:
         """Build one compact graph-health delta summary when enough history exists."""
@@ -586,14 +631,20 @@ class CliProcessor:
 
         delta_score = end_score - start_score
         delta_links = end_links - start_links
+        start_day = self._graph_health_entry_day(start)
+        end_day = self._graph_health_entry_day(end)
+        period = ""
+        if start_day is not None and end_day is not None:
+            period = f"{start_day.isoformat()} → {end_day.isoformat()}: "
         if self.content_language == "ru":
             return (
-                f"{start_score:.1f} → {end_score:.1f} ({delta_score:+.1f}); "
+                f"{period}{start_score:.1f} → {end_score:.1f} "
+                f"({delta_score:+.1f}); "
                 f"связи {delta_links:+d}, орфаны {start_orphans}→{end_orphans}, "
-                f"weakly-connected {start_weak}→{end_weak}"
+                f"слабосвязанные {start_weak}→{end_weak}"
             )
         return (
-            f"{start_score:.1f} → {end_score:.1f} ({delta_score:+.1f}); "
+            f"{period}{start_score:.1f} → {end_score:.1f} ({delta_score:+.1f}); "
             f"links {delta_links:+d}, orphans {start_orphans}→{end_orphans}, "
             f"weakly-connected {start_weak}→{end_weak}"
         )
@@ -1180,11 +1231,12 @@ WORKFLOW:
         year, week, _ = week_date.isocalendar()
         note_path = self._weekly_system_reflection_path(week_date)
         note_path.parent.mkdir(parents=True, exist_ok=True)
+        description = self._owner_report_defaults()["reflection_note_description"]
         content = (
             f"---\n"
             f"date: {week_date.isoformat()}\n"
             "type: reflection\n"
-            f"description: Weekly system reflection for {year}-W{week:02d}\n"
+            f"description: {description} {year}-W{week:02d}\n"
             f"week: {year}-W{week:02d}\n"
             "tags: [system, weekly-reflection]\n"
             f"created: {week_date.isoformat()}\n"
@@ -1232,23 +1284,21 @@ WORKFLOW:
     ) -> None:
         """Append one concise weekly system reflection entry to today's daily."""
         copy = self._owner_report_defaults()
+        carry_forward_line = (
+            f"- {copy['carry_forward_label']}: {carry_forward_observations}"
+        )
         if note_path is not None:
             note_rel_path = note_path.relative_to(self.vault_path).as_posix()
             body = (
-                f"Weekly system reflection: [[{note_rel_path}|{title}]]\n"
-                f"- Processed observations: {processed_observations}\n"
-                f"- Carry forward: {carry_forward_observations}"
+                f"{copy['reflection_daily_log']} [[{note_rel_path}|{title}]]\n"
+                f"- {copy['processed_observations_label']}:"
+                f" {processed_observations}\n"
+                f"{carry_forward_line}"
             )
         elif carry_forward_observations > 0:
-            body = (
-                f"{copy['retained_daily_log']}\n"
-                f"- Carry forward: {carry_forward_observations}"
-            )
+            body = f"{copy['retained_daily_log']}\n{carry_forward_line}"
         else:
-            body = (
-                f"{copy['no_system_signals_daily']}\n"
-                f"- Carry forward: {carry_forward_observations}"
-            )
+            body = f"{copy['no_system_signals_daily']}\n{carry_forward_line}"
         VaultStorage(
             self.vault_path,
             self.content_language,
@@ -4243,13 +4293,18 @@ EXECUTION:
 
         iso_year, iso_week, _ = today.isocalendar()
         week_label = f"{iso_year}-W{iso_week:02d}"
-        graph_history = self._load_graph_health_history()
+        week_start = today - timedelta(days=today.weekday())
+        graph_history = self._graph_health_window(
+            self._load_graph_health_history(),
+            start=week_start,
+            end=today,
+        )
         rule_text = self._load_weekly_reflection_rule()
         prompt = f"""Today is {today}. Generate the weekly system reflection.
 
 CONTEXT:
 - Working directory: vault root ({self.vault_path})
-- Current ISO week: {week_label}
+- Current ISO week: {week_label} ({week_start} .. {today})
 
 {self._language_instruction()}
 
@@ -4259,7 +4314,7 @@ WEEKLY SYSTEM REFLECTION RULE:
 CURRENT OBSERVATIONS (exact unresolved bullets):
 {json.dumps(observations, ensure_ascii=False, indent=2)}
 
-GRAPH HEALTH HISTORY:
+GRAPH HEALTH HISTORY (this ISO week only):
 {json.dumps(graph_history, ensure_ascii=False, indent=2)}
 
 WEEKLY SYSTEM REFLECTION RULES:
@@ -4303,7 +4358,7 @@ Return exactly one JSON object:
         create_reflection = bool(payload.get("create_reflection"))
         title = " ".join(str(payload.get("title") or "").split())
         if not title:
-            title = f"Weekly system reflection {week_label}"
+            title = f"{copy['reflection_title_fallback']} {week_label}"
         report_highlights = self._string_list(payload.get("report_highlights"))
         watch_next_week = self._string_list(payload.get("watch_next_week"))
         report_markdown = self._normalize_owner_report_markdown(

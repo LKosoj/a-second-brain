@@ -459,8 +459,8 @@ def test_generate_weekly_system_reflection_writes_note_and_updates_handoff(
     daily_content = (daily_path / f"{date.today().isoformat()}.md").read_text(
         encoding="utf-8"
     )
-    assert "Weekly system reflection:" in daily_content
-    assert "Processed observations: 1" in daily_content
+    assert "Системная рефлексия:" in daily_content
+    assert "Обработано наблюдений: 1" in daily_content
 
 
 def test_weekly_reflection_preserves_observation_added_during_llm(
@@ -707,11 +707,49 @@ def test_generate_weekly_system_reflection_retains_unresolved_observations(
 
     assert result["created_reflection"] is False
     assert result["carry_forward_observations"] == ["- [pattern] keep this"]
-    assert "оставлены на следующий weekly pass" in result["report"]
+    assert "оставлены на следующий недельный проход" in result["report"]
 
     daily_content = (daily_path / f"{today}.md").read_text(encoding="utf-8")
-    assert "unresolved observations" in daily_content
-    assert "Carry forward: 1" in daily_content
+    assert "нерешённые наблюдения" in daily_content
+    assert "Перенесено наблюдений: 1" in daily_content
+
+
+def test_graph_health_delta_covers_only_the_reported_week(tmp_path: Path) -> None:
+    processor = CliProcessor(tmp_path / "vault")
+    history = [
+        {
+            "date": "2026-07-13T18:10:37+00:00",
+            "health_score": 99.7,
+            "total_links": 3991,
+            "orphans": 9,
+            "weakly_connected": 2,
+        },
+        {
+            "date": "2026-08-03T21:04:07+03:00",
+            "health_score": 99.8,
+            "total_links": 4600,
+            "orphans": 1,
+            "weakly_connected": 4,
+        },
+        {
+            "date": "2026-08-09T21:09:23+03:00",
+            "health_score": 98.5,
+            "total_links": 4205,
+            "orphans": 3,
+            "weakly_connected": 163,
+        },
+    ]
+
+    window = processor._graph_health_window(
+        history,
+        start=date(2026, 8, 3),
+        end=date(2026, 8, 9),
+    )
+
+    assert len(window) == 2
+    line = processor._graph_health_delta_line(window)
+    assert line.startswith("2026-08-03 → 2026-08-09: ")
+    assert "связи -395" in line
 
 
 def test_build_weekly_system_report_markdown_is_deterministic(

@@ -44,6 +44,7 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from pathlib import Path
@@ -329,6 +330,26 @@ def _page_fields(text: str) -> dict[str, str]:
     return CompiledBriefingService._frontmatter_fields(text)
 
 
+# Sentence-final punctuation a page's "что добавилось" cell may already end
+# with. A page enriched from several sources contributes one such cell per
+# source, and they are rendered as one digest line -- joining them with a
+# bare "; " glued a separator onto a finished sentence ("...ограничений.;
+# LightLLM..."), which is what the owner actually reads in Telegram.
+_FACT_SENTENCE_END = (".", "!", "?", "…", ":")
+
+
+def _join_change_facts(facts: Iterable[str]) -> str:
+    """Join per-source facts into one digest line without doubling punctuation."""
+    joined = ""
+    for fact in facts:
+        if not joined:
+            joined = fact
+            continue
+        separator = " " if joined.endswith(_FACT_SENTENCE_END) else "; "
+        joined = f"{joined}{separator}{fact}"
+    return joined
+
+
 def _collect_changes(
     candidates: list[CompiledBriefingCandidate], start: date, end: date
 ) -> list[_ChangeItem]:
@@ -391,7 +412,7 @@ def _collect_changes(
                 )
             else:
                 what_parts.append(what)
-        what_added = "; ".join(dict.fromkeys(what_parts))
+        what_added = _join_change_facts(dict.fromkeys(what_parts))
 
         sources = tuple(
             dict.fromkeys(

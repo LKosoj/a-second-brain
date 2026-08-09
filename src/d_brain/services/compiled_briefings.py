@@ -5723,21 +5723,21 @@ class CompiledBriefingService:
 
         candidates: list[Path] = []
         for source_variant in self._lint_source_variants(raw):
-            base_dir = self._lint_source_base_dir(source_variant)
             source_path = Path(source_variant)
-            candidate = (base_dir / source_path).resolve()
-            try:
-                candidate.relative_to(base_dir)
-            except ValueError:
-                continue
-            candidates.append(candidate)
-            if candidate.exists():
-                return candidate
-            if not source_path.suffix:
-                md_candidate = candidate.with_suffix(".md")
-                candidates.append(md_candidate)
-                if md_candidate.exists():
-                    return md_candidate
+            for base_dir in self._lint_source_base_dirs(source_variant):
+                candidate = (base_dir / source_path).resolve()
+                try:
+                    candidate.relative_to(base_dir)
+                except ValueError:
+                    continue
+                candidates.append(candidate)
+                if candidate.exists():
+                    return candidate
+                if not source_path.suffix:
+                    md_candidate = candidate.with_suffix(".md")
+                    candidates.append(md_candidate)
+                    if md_candidate.exists():
+                        return md_candidate
         return candidates[0] if candidates else None
 
     def _normalize_lint_source(self, source: str) -> str:
@@ -5758,13 +5758,26 @@ class CompiledBriefingService:
                 variants.append(f"{hidden_prefix}{raw[len(visible_prefix) :]}")
         return variants
 
-    def _lint_source_base_dir(self, raw: str) -> Path:
+    def _lint_source_base_dirs(self, raw: str) -> tuple[Path, ...]:
+        """Base dirs to probe for one cited source, most likely first.
+
+        A compiled page cites vault notes and repository files alike, and the
+        two namespaces overlap: ``.claude/`` exists both in the vault (rules,
+        docs) and in the project root (the shared skills tree). Picking a
+        single base dir by prefix therefore mis-resolved every path the
+        prefix list did not name -- ``tests/``, ``AGENTS.md``, and
+        ``.claude/skills/**`` all resolved under the vault, where they do not
+        exist, and ``lint_notes`` reported them as broken source links. Both
+        roots are probed now; the prefix only decides the order, and the
+        first path that exists wins.
+        """
+        project_root = self.vault_path.parent
         if (
             raw.startswith(PROJECT_ROOT_SOURCE_PREFIXES)
             or raw in PROJECT_ROOT_SOURCE_FILES
         ):
-            return self.vault_path.parent
-        return self.vault_path
+            return (project_root, self.vault_path)
+        return (self.vault_path, project_root)
 
     def _candidate_freshness_issue(
         self,
