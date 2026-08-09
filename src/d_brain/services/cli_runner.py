@@ -3,19 +3,30 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from d_brain.services.claude_tmux import run_claude_tmux
 from d_brain.services.cli_json_stream import (
     recover_cli_error_from_raw_stream,
     recover_cli_text_from_raw_stream,
 )
 from d_brain.services.kimi_acp import run_kimi_acp
 
-AiCliName = Literal["claude", "codex", "qwen", "gemini", "kimi"]
+AiCliName = Literal[
+    "claude",
+    "claude-tmux",
+    "codex",
+    "qwen",
+    "gemini",
+    "kimi",
+    "grok",
+    "opencode",
+]
 
 _TERMINAL_BACKEND_MARKERS = (
     "quota exceeded",
@@ -38,23 +49,30 @@ class CliSpec:
 CLI_SPECS: dict[AiCliName, CliSpec] = {
     "claude": CliSpec(
         name="claude",
+        # `--output-format stream-json` requires `--verbose` in print mode,
+        # otherwise claude exits with an argument error before any request.
         argv_prefix=(
             "claude",
-            "--print",
-            "--dangerously-skip-permissions",
+            "-p",
+            "--verbose",
             "--output-format",
             "stream-json",
-            "-p",
+            "--dangerously-skip-permissions",
         ),
         stdin_prefix=(
             "claude",
-            "--print",
-            "--dangerously-skip-permissions",
+            "-p",
+            "--verbose",
             "--output-format",
             "stream-json",
-            "-p",
+            "--dangerously-skip-permissions",
         ),
         structured_output=True,
+    ),
+    "claude-tmux": CliSpec(
+        name="claude-tmux",
+        # The prompt never reaches argv here: it is pasted into a TUI session.
+        argv_prefix=("claude", "--dangerously-skip-permissions"),
     ),
     "codex": CliSpec(
         name="codex",
@@ -120,6 +138,35 @@ CLI_SPECS: dict[AiCliName, CliSpec] = {
         name="kimi",
         argv_prefix=("kimi", "acp"),
     ),
+    "grok": CliSpec(
+        name="grok",
+        # grok has no stdin fallback: the prompt is always an argv value.
+        argv_prefix=(
+            "grok",
+            "--no-auto-update",
+            "--always-approve",
+            "--no-memory",
+            "--output-format",
+            "streaming-json",
+            "-p",
+        ),
+        structured_output=True,
+    ),
+    "opencode": CliSpec(
+        name="opencode",
+        argv_prefix=("opencode", "run", "--format", "json"),
+        stdin_prefix=("opencode", "run", "--format", "json"),
+        structured_output=True,
+    ),
+}
+
+
+# Backends driven by a dedicated Python runner instead of an argv/stdin call.
+_EXTERNAL_RUNNERS: dict[
+    AiCliName, Callable[[str, Path, Mapping[str, str], int], str]
+] = {
+    "kimi": run_kimi_acp,
+    "claude-tmux": run_claude_tmux,
 }
 
 
@@ -148,6 +195,29 @@ def normalize_ai_cli(value: str) -> AiCliName:
         supported = ", ".join(sorted(CLI_SPECS))
         raise ValueError(f"Unsupported AI_CLI '{value}'. Expected one of: {supported}")
     return normalized  # type: ignore[return-value]
+
+
+def _stop_process_group(proc: subprocess.Popen[str], *, grace: float = 5.0) -> None:
+    """Stop a timed-out CLI together with the children it spawned."""
+
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        proc.kill()
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except OSError:
+        return
+    try:
+        proc.wait(timeout=grace)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
 
 
 def detect_terminal_backend_message(text: str) -> str | None:
@@ -188,7 +258,7 @@ class CliRunner:
     def build_command(self, prompt: str) -> list[str]:
         """Build argv for backend execution."""
 
-        if self.ai_cli == "kimi":
+        if self.ai_cli in _EXTERNAL_RUNNERS:
             return list(self.spec.argv_prefix)
         return [*self.spec.argv_prefix, prompt]
 
@@ -209,6 +279,13 @@ class CliRunner:
             if terminal:
                 raise CliExecutionError(terminal, stdout=raw_text)
             return recovered_text
+
+        # A CLI can report a failed turn while still exiting with code 0
+        # (quota errors from qwen/claude look like that), so surface the
+        # stream error instead of the generic recovery message.
+        stream_error = recover_cli_error_from_raw_stream(self.ai_cli, raw_text)
+        if stream_error:
+            raise CliExecutionError(stream_error, stdout=raw_text)
 
         raise CliExecutionError(
             "Failed to recover assistant text from structured CLI output",
@@ -232,9 +309,10 @@ class CliRunner:
                 if value:
                     env[key] = value
 
-        if self.ai_cli == "kimi":
+        external_runner = _EXTERNAL_RUNNERS.get(self.ai_cli)
+        if external_runner is not None:
             try:
-                output = run_kimi_acp(prompt, self.workdir, env, timeout)
+                output = external_runner(prompt, self.workdir, env, timeout)
             except TimeoutError:
                 raise
             except Exception as exc:
@@ -253,18 +331,19 @@ class CliRunner:
         )
 
         try:
-            result = subprocess.run(
+            # start_new_session puts the CLI into its own process group so a
+            # timeout can stop the whole tree, including MCP servers and other
+            # helper processes the CLI spawned.
+            proc = subprocess.Popen(
                 cmd,
                 cwd=self.workdir,
-                capture_output=True,
+                stdin=subprocess.PIPE if use_stdin else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
-                check=False,
                 env=env,
-                input=prompt if use_stdin else None,
+                start_new_session=True,
             )
-        except subprocess.TimeoutExpired as exc:
-            raise TimeoutError(str(exc)) from exc
         except OSError as exc:
             detail = str(exc)
             if exc.errno == 7 and not self.spec.stdin_prefix:
@@ -273,23 +352,35 @@ class CliRunner:
                     f"{self.ai_cli} has no stdin fallback)"
                 )
             raise CliExecutionError(detail, stderr=detail) from exc
-        if result.returncode != 0:
+
+        with proc:
+            try:
+                stdout, stderr = proc.communicate(
+                    prompt if use_stdin else None,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as exc:
+                _stop_process_group(proc)
+                proc.communicate()
+                raise TimeoutError(str(exc)) from exc
+
+        if proc.returncode != 0:
             structured_error = ""
             if self.spec.structured_output:
                 structured_error = recover_cli_error_from_raw_stream(
-                    self.ai_cli, result.stdout
+                    self.ai_cli, stdout
                 )
             error_text = (
                 structured_error
-                or result.stderr.strip()
-                or result.stdout.strip()
+                or stderr.strip()
+                or stdout.strip()
                 or "CLI execution failed"
             )
             raise CliExecutionError(
                 error_text,
-                returncode=result.returncode,
-                stdout=result.stdout,
-                stderr=result.stderr,
+                returncode=proc.returncode,
+                stdout=stdout,
+                stderr=stderr,
             )
 
-        return self._decode_stdout(result.stdout)
+        return self._decode_stdout(stdout)

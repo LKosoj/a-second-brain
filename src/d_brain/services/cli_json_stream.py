@@ -58,6 +58,12 @@ class BaseCliJsonStreamAdapter:
             return
         self._assistant_parts.append(value)
 
+    def _replace_assistant_text(self, text: str) -> None:
+        value = str(text or "")
+        if not value:
+            return
+        self._assistant_parts = [value]
+
     def _set_final_output_text(self, text: str) -> None:
         value = str(text or "")
         if not value:
@@ -119,6 +125,12 @@ class QwenJsonStreamAdapter(BaseCliJsonStreamAdapter):
             return
 
         if event_type == "result":
+            if payload.get("is_error"):
+                self._set_final_error_text(
+                    _extract_error_message(payload)
+                    or str(payload.get("result") or "")
+                )
+                return
             self._set_final_output_text(str(payload.get("result") or ""))
 
 
@@ -135,14 +147,91 @@ class GeminiJsonStreamAdapter(BaseCliJsonStreamAdapter):
         event_type = str(payload.get("type") or "").strip().lower()
         role = str(payload.get("role") or "").strip().lower()
         if event_type == "message" and role == "assistant":
-            self._append_assistant_text(_coerce_message_text(payload.get("content")))
+            text = _coerce_message_text(payload.get("content"))
+            # Only `delta` messages are fragments; a full message replaces
+            # whatever was streamed before it.
+            if payload.get("delta") is True:
+                self._append_assistant_text(text)
+            else:
+                self._replace_assistant_text(text)
             return
         if event_type == "result":
+            status = str(payload.get("status") or "").strip().lower()
+            if status and status not in {"success", "completed", "done"}:
+                self._set_final_error_text(
+                    _extract_error_message(payload) or status
+                )
+                return
             for key in ("result", "response", "content"):
                 text = _coerce_message_text(payload.get(key))
                 if text:
                     self._set_final_output_text(text)
                     return
+            return
+        if event_type == "error" or event_type.endswith(".failed"):
+            self._set_final_error_text(_extract_error_message(payload))
+
+
+class GrokJsonStreamAdapter(BaseCliJsonStreamAdapter):
+    def feed_line(self, line: str) -> None:
+        payload = loads_safe(line)
+        if not isinstance(payload, dict):
+            return
+
+        event_type = str(payload.get("type") or "").strip().lower()
+        if event_type == "text":
+            self._append_assistant_text(
+                _coerce_message_text(
+                    payload.get("data")
+                    or payload.get("text")
+                    or payload.get("content")
+                    or payload.get("message")
+                )
+            )
+            return
+        if event_type in {"error", "failed"}:
+            self._set_final_error_text(
+                _extract_error_message(payload)
+                or _coerce_message_text(payload.get("data"))
+            )
+
+
+class OpencodeJsonStreamAdapter(BaseCliJsonStreamAdapter):
+    """Read `opencode run --format json` events.
+
+    Every line carries an already assembled part, not a delta, so text parts
+    are kept as separate blocks. `reasoning` parts are model thinking and stay
+    out of the result.
+    """
+
+    def final_output_text(self) -> str:
+        return self._final_output_text.strip() or "\n\n".join(
+            self._assistant_parts
+        ).strip()
+
+    def feed_line(self, line: str) -> None:
+        payload = loads_safe(line)
+        if not isinstance(payload, dict):
+            return
+
+        event_type = str(payload.get("type") or "").strip().lower()
+        raw_part = payload.get("part")
+        part = raw_part if isinstance(raw_part, dict) else {}
+        if event_type == "text":
+            # `synthetic`/`ignored` parts are context inserts made by opencode
+            # itself, not model output.
+            if part.get("synthetic") or part.get("ignored"):
+                return
+            self._append_assistant_text(_coerce_message_text(part.get("text")))
+            return
+        if event_type == "error":
+            raw_error = payload.get("error")
+            error = raw_error if isinstance(raw_error, dict) else {}
+            raw_data = error.get("data")
+            data = raw_data if isinstance(raw_data, dict) else {}
+            self._set_final_error_text(
+                str(data.get("message") or error.get("name") or "")
+            )
 
 
 def build_cli_json_stream_adapter(cli_name: str) -> BaseCliJsonStreamAdapter | None:
@@ -155,6 +244,10 @@ def build_cli_json_stream_adapter(cli_name: str) -> BaseCliJsonStreamAdapter | N
         return ClaudeJsonStreamAdapter()
     if normalized == "gemini":
         return GeminiJsonStreamAdapter()
+    if normalized == "grok":
+        return GrokJsonStreamAdapter()
+    if normalized == "opencode":
+        return OpencodeJsonStreamAdapter()
     return None
 
 

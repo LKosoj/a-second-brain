@@ -19,10 +19,13 @@ Supported values and common authentication commands:
 | Backend | Authentication |
 |---|---|
 | Claude Code | `claude auth login` |
+| Claude Code in tmux (`claude-tmux`) | `claude auth login` |
 | Codex CLI | `codex login` |
 | Qwen Code | `qwen auth qwen-oauth` |
 | Gemini CLI | configure a supported Google/Gemini credential |
 | Kimi Code | `kimi login` |
+| Grok CLI | set `XAI_API_KEY` |
+| opencode | `opencode auth login` |
 
 Validate installation and authentication:
 
@@ -37,6 +40,18 @@ Kimi Code runs through its official ACP mode (`kimi acp`). ACP is the protocol
 used to exchange requests over the process input and output, so prompt text is
 not placed in command-line arguments. Kimi discovers the shared project skills
 through `.agents/skills`; no separate Kimi copy is needed.
+
+Grok CLI takes the prompt as a command-line argument, so very long prompts can
+hit the argument length limit; every other backend receives the prompt on
+standard input.
+
+The `claude-tmux` backend is the same Claude Code, started in its regular
+interactive interface inside a detached tmux session instead of headless mode
+(`claude -p`). The prompt is pasted through a tmux buffer, and the answer is
+read from the session transcript Claude Code writes to
+`~/.claude/projects/<project>/<session-id>.jsonl`. It exists as a fallback for
+the day headless mode goes away. It requires `tmux`; every run starts a private
+tmux server and removes it once the answer arrives.
 
 ## Deepgram
 

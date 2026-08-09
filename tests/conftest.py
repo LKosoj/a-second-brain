@@ -8,6 +8,8 @@ from typing import Any
 import pytest
 from _paths import SKILLS_TEMPLATE_ROOT
 
+from d_brain.services.cli_runner import CliExecutionError
+
 
 @pytest.fixture(autouse=True)
 def _block_real_telegram_delivery(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -32,6 +34,25 @@ def _block_real_telegram_delivery(monkeypatch: pytest.MonkeyPatch) -> None:
         "d_brain.services.telegram_delivery._send_telegram_text_to_target",
         _blocked,
     )
+
+
+@pytest.fixture(autouse=True)
+def _block_real_ai_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the suite from spending real model quota on installed CLIs.
+
+    Services build their own ``CliRunner``, so a test that exercises a full
+    service path reaches the CLI installed on the developer machine and the
+    result then depends on that machine's login state. ``CliRunner.run`` is the
+    single entry point for every backend, so blocking it there closes all of
+    them at once. It raises the same error a missing backend produces, which is
+    what service fallbacks already handle; ``tests/test_cli_runner.py``
+    overrides this fixture because it tests the runner itself.
+    """
+
+    def _blocked(*args: Any, **kwargs: Any) -> str:
+        raise CliExecutionError("real AI CLI invocation attempted in tests")
+
+    monkeypatch.setattr("d_brain.services.cli_runner.CliRunner.run", _blocked)
 
 
 def _write_vault_manifest(

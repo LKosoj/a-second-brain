@@ -19,7 +19,11 @@ from d_brain.control_plane.registry import validate_control_plane_registry
 from d_brain.manifest import ManifestValidationError, VaultManifest, load_manifest
 
 CheckLevel = Literal["OK", "INFO", "WARN", "ERR"]
-SUPPORTED_AI_CLIS = frozenset({"claude", "codex", "qwen", "gemini", "kimi"})
+SUPPORTED_AI_CLIS = frozenset(
+    {"claude", "claude-tmux", "codex", "qwen", "gemini", "kimi", "grok", "opencode"}
+)
+# Backends whose executable name differs from the AI_CLI value.
+AI_CLI_BINARIES = {"claude-tmux": "claude"}
 
 
 @dataclass(frozen=True)
@@ -222,11 +226,18 @@ class ProjectDoctor:
 
         if self.ai_cli not in SUPPORTED_AI_CLIS:
             return
-        self.ai_cli_installed = shutil.which(self.ai_cli) is not None
+        binary = AI_CLI_BINARIES.get(self.ai_cli, self.ai_cli)
+        self.ai_cli_installed = shutil.which(binary) is not None
         if not self.ai_cli_installed:
             self.report.add("ERR", f"AI CLI '{self.ai_cli}' is missing")
             return
         self.report.add("OK", f"AI CLI '{self.ai_cli}' is installed")
+        if self.ai_cli == "claude-tmux" and not shutil.which("tmux"):
+            self.ai_cli_installed = False
+            self.report.add(
+                "ERR", "AI CLI 'claude-tmux' requires tmux, which is missing"
+            )
+            return
         if self._auth_ready():
             self.report.add("OK", f"Authentication for '{self.ai_cli}' is ready")
         else:
@@ -301,11 +312,14 @@ class ProjectDoctor:
                     "GOOGLE_GENAI_USE_VERTEXAI",
                 )
             )
-        if self.ai_cli == "kimi":
+        if self.ai_cli == "grok":
+            return bool(self._value("XAI_API_KEY"))
+        if self.ai_cli in {"kimi", "opencode"}:
             return False
 
         commands = {
             "claude": (["claude", "auth", "status"], '"loggedIn": true'),
+            "claude-tmux": (["claude", "auth", "status"], '"loggedIn": true'),
             "codex": (["codex", "login", "status"], "Logged in"),
             "qwen": (["qwen", "auth", "status"], "Authentication Method"),
         }
@@ -326,10 +340,13 @@ class ProjectDoctor:
     def _auth_hint(self) -> str:
         return {
             "claude": "claude auth login",
+            "claude-tmux": "claude auth login",
             "codex": "codex login",
             "qwen": "qwen auth qwen-oauth",
             "gemini": "configure GOOGLE_API_KEY or GEMINI_API_KEY",
             "kimi": "kimi login",
+            "grok": "configure XAI_API_KEY",
+            "opencode": "opencode auth login",
         }.get(self.ai_cli, "configure the selected AI CLI")
 
     def _run_smoke(self) -> None:
@@ -340,6 +357,8 @@ class ProjectDoctor:
             )
             return
 
+        # The TUI backend spends its first seconds booting claude's interface.
+        timeout = 60 if self.ai_cli == "claude-tmux" else 20
         command = [
             sys.executable,
             "-m",
@@ -349,7 +368,7 @@ class ProjectDoctor:
             "--workdir",
             str(self.project_dir),
             "--timeout",
-            "20",
+            str(timeout),
             "--prompt",
             "Reply with exactly OK",
         ]
@@ -359,7 +378,7 @@ class ProjectDoctor:
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=30,
+                timeout=timeout + 10,
                 cwd=self.project_dir,
                 env=self.values,
             )

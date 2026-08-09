@@ -30,7 +30,7 @@ def main() -> int:
     parser.add_argument(
         "--ai-cli",
         default="claude",
-        help="claude|codex|qwen|gemini|kimi",
+        help="claude|claude-tmux|codex|qwen|gemini|kimi|grok|opencode",
     )
     parser.add_argument(
         "--workdir",

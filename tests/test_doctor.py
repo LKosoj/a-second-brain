@@ -71,6 +71,30 @@ def test_doctor_accepts_kimi_and_shows_login_hint(
     assert "run: kimi login" in output.getvalue()
 
 
+def test_doctor_checks_claude_binary_and_tmux_for_claude_tmux(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initialize_project(tmp_path)
+    environment = {**_valid_environment(), "AI_CLI": "claude-tmux"}
+    monkeypatch.setattr(
+        doctor.shutil,
+        "which",
+        lambda command: f"/usr/bin/{command}"
+        if command in {"uv", "jq", "claude"}
+        else None,
+    )
+    output = io.StringIO()
+
+    status = doctor.run_doctor(tmp_path, environ=environment, stream=output)
+
+    rendered = output.getvalue()
+    assert status == 1
+    assert "[OK] AI_CLI selects 'claude-tmux'" in rendered
+    assert "[OK] AI CLI 'claude-tmux' is installed" in rendered
+    assert "requires tmux, which is missing" in rendered
+
+
 def test_doctor_fails_when_env_file_is_missing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
