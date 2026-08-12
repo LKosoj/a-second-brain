@@ -20,6 +20,7 @@ dependencies = [
     { name = "deepgram-sdk" },
     { name = "httpx" },
     { name = "jpype1" },
+    { name = "markdown" },
     { name = "markitdown", extra = ["docx", "pdf", "pptx", "xlsx"] },
     { name = "openai" },
     { name = "pydantic" },
@@ -37,6 +38,7 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
     { name = "ruff" },
+    { name = "types-markdown" },
     { name = "types-pyyaml" },
 ]
 
@@ -47,6 +49,7 @@ requires-dist = [
     { name = "deepgram-sdk", specifier = ">=7.6,<8" },
     { name = "httpx" },
     { name = "jpype1", specifier = ">=1.7.0" },
+    { name = "markdown", specifier = ">=3.5,<4" },
     { name = "markitdown", extras = ["docx", "pdf", "pptx", "xlsx"], specifier = ">=0.1.0" },
     { name = "openai", specifier = ">=1.99.1" },
     { name = "pydantic", specifier = ">=2.0" },
@@ -64,6 +67,7 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=1.3.0" },
     { name = "pytest-cov", specifier = ">=6.0" },
     { name = "ruff", specifier = ">=0.14.14" },
+    { name = "types-markdown", specifier = ">=3.5" },
     { name = "types-pyyaml", specifier = ">=6.0.12.20250915" },
 ]
 
@@ -1048,6 +1052,15 @@ wheels = [
 ]
 
 [[package]]
+name = "markdown"
+version = "3.10.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/29/6f/da4c6aea59b3001f2e8c0ec7497475aadaf3b021c10cab5b2858f0f32b26/markdown-3.10.3.tar.gz", hash = "sha256:3589362618f743188b4d955b874402bc814f4f83f544dc207719f4baa7d9c45f", size = 372596, upload-time = "2026-07-30T19:05:29.005Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/64/69/4a5af2bc115a9a33fefe51709749de8262be3f9ba063d1753a837cdbc49c/markdown-3.10.3-py3-none-any.whl", hash = "sha256:fa6c92a00a4a3c98b22728c64a935ae1928250ae65058a6ded814d2cc29a4cea", size = 110757, upload-time = "2026-07-30T19:05:27.883Z" },
+]
+
+[[package]]
 name = "markdownify"
 version = "1.2.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2021,6 +2034,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/09/a9/6ba95a270c6f1fbcd8dac228323f2777d886cb206987444e4bce66338dd4/tqdm-4.67.3.tar.gz", hash = "sha256:7d825f03f89244ef73f1d4ce193cb1774a8179fd96f31d7e1dcde62092b960bb", size = 169598, upload-time = "2026-02-03T17:35:53.048Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/16/e1/3079a9ff9b8e11b846c6ac5c8b5bfb7ff225eee721825310c91b3b50304f/tqdm-4.67.3-py3-none-any.whl", hash = "sha256:ee1e4c0e59148062281c49d80b25b67771a127c85fc9676d3be5f243206826bf", size = 78374, upload-time = "2026-02-03T17:35:50.982Z" },
+]
+
+[[package]]
+name = "types-markdown"
+version = "3.10.2.20260712"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/19/eb/9520ed01687401b47265594955c0a9202a4f547795176de61bff77c8dfda/types_markdown-3.10.2.20260712.tar.gz", hash = "sha256:25aea17282490f35ab6b17a87771abd2f479185aaff8e8f4a0035043f02f2c52", size = 20185, upload-time = "2026-07-12T05:13:53.537Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9f/ea/a8dc2c8977870d27b8b44c4ba2952d765f9d39626e42d0083c871c1c1ebf/types_markdown-3.10.2.20260712-py3-none-any.whl", hash = "sha256:a551ddedde46e0eaca7059aa3d0e42db71afe2b53d8b58f72f2de63f3284f625", size = 25842, upload-time = "2026-07-12T05:13:52.702Z" },
 ]
 
 [[package]]

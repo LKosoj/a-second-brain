@@ -291,3 +291,36 @@ async def test_edit_text_preserves_markdown_link_parentheses() -> None:
     assert message.edits == [
         ("[x](https://example.com/a/Foo_(bar\\))", "MarkdownV2")
     ]
+
+
+@pytest.mark.asyncio
+async def test_send_text_renders_block_structure_in_html_file() -> None:
+    bot = _FakeBot()
+    text = (
+        "# Отчёт\n\n"
+        "Первая строка\nВторая строка\n\n"
+        "- пункт один\n- пункт два\n\n"
+        "| Проект | Статус |\n|---|---|\n| Alpha | active |\n\n"
+        "> цитата\n\n"
+    ) + "хвост " * 900
+
+    await send_text(bot, chat_id=42, text=text, parse_mode=None)
+
+    document = bot.documents[0][1].data.decode("utf-8")
+    assert "<h1>Отчёт</h1>" in document
+    assert "<p>Первая строка<br />" in document
+    assert "<li>пункт один</li>" in document
+    assert "<table>" in document and "<td>Alpha</td>" in document
+    assert "<blockquote>" in document
+
+
+@pytest.mark.asyncio
+async def test_send_text_escapes_raw_html_in_html_file() -> None:
+    bot = _FakeBot()
+    text = "<script>alert(1)</script>\n\n" + "текст " * 900
+
+    await send_text(bot, chat_id=42, text=text, parse_mode=None)
+
+    document = bot.documents[0][1].data.decode("utf-8")
+    assert "<script>alert(1)</script>" not in document
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in document

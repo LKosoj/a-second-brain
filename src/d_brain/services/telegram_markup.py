@@ -6,7 +6,10 @@ import html
 import re
 from html.parser import HTMLParser
 
+import markdown as markdown_lib
+
 TELEGRAM_TEXT_LIMIT = 4000
+DOCUMENT_HTML_EXTENSIONS = ["tables", "fenced_code", "nl2br"]
 EDIT_TRUNCATION_SUFFIX = " ✂️"
 LEGACY_TELEGRAM_HTML_RE = re.compile(
     r"</?(?:b|i|code|pre|s|u|a)(?:\s[^>]*)?>",
@@ -182,6 +185,24 @@ def markdown_to_html(markdown_text: str) -> str:
             f"<pre>{html.escape('\n'.join(code_lines), quote=False)}</pre>"
         )
     return "\n".join(rendered_lines)
+
+
+def markdown_to_document_html(markdown_text: str) -> str:
+    """Render markdown as full HTML body markup for a standalone document.
+
+    Unlike `markdown_to_html`, which targets the flat Telegram tag subset, this
+    keeps block structure (paragraphs, lists, tables, headings) that a browser
+    needs. Raw HTML in the payload is rendered as text, never as markup.
+    """
+
+    value = str(markdown_text or "").strip()
+    if not value:
+        return ""
+
+    renderer = markdown_lib.Markdown(extensions=DOCUMENT_HTML_EXTENSIONS)
+    renderer.preprocessors.deregister("html_block")
+    renderer.inlinePatterns.deregister("html")
+    return renderer.convert(value)
 
 
 def markdown_to_plain_text(markdown_text: str) -> str:

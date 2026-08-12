@@ -16,7 +16,10 @@ from d_brain.bot.formatters import (
     markdown_to_plain_text,
     normalize_markdown_input,
 )
-from d_brain.services.telegram_markup import markdown_to_html, markdown_to_markdown_v2
+from d_brain.services.telegram_markup import (
+    markdown_to_document_html,
+    markdown_to_markdown_v2,
+)
 
 logger = logging.getLogger(__name__)
 RICH_TEXT_LIMIT = 32768
@@ -49,7 +52,7 @@ def _telegram_message_payload(
 def _render_html_document(text: str, *, parse_mode: str | None) -> bytes:
     """Render one long markdown payload into a standalone HTML document."""
     markdown = normalize_markdown_input(text, parse_mode=parse_mode)
-    body = markdown_to_html(markdown)
+    body = markdown_to_document_html(markdown)
     if not body:
         body = f"<pre>{html.escape(markdown_to_plain_text(markdown))}</pre>"
     document = (
@@ -60,10 +63,18 @@ def _render_html_document(text: str, *, parse_mode: str | None) -> bytes:
         "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
         "  <title>d-brain message</title>\n"
         "  <style>\n"
-        "    body { font-family: system-ui, sans-serif; margin: 24px; "
-        "line-height: 1.5; }\n"
+        "    body { font-family: system-ui, sans-serif; margin: 24px auto; "
+        "max-width: 44rem; padding: 0 16px; line-height: 1.6; }\n"
+        "    h1, h2, h3, h4, h5, h6 { line-height: 1.25; margin: 1.6em 0 0.5em; }\n"
         "    pre { white-space: pre-wrap; word-break: break-word; "
-        "font-family: ui-monospace, monospace; }\n"
+        "background: #f5f5f5; padding: 12px; border-radius: 6px; }\n"
+        "    code { font-family: ui-monospace, monospace; }\n"
+        "    blockquote { margin: 1em 0; padding-left: 1em; "
+        "border-left: 3px solid #ddd; color: #555; }\n"
+        "    table { border-collapse: collapse; margin: 1em 0; }\n"
+        "    th, td { border: 1px solid #ddd; padding: 6px 10px; "
+        "text-align: left; }\n"
+        "    img { max-width: 100%; }\n"
         "  </style>\n"
         "</head>\n"
         f"<body>\n{body}\n</body>\n"
