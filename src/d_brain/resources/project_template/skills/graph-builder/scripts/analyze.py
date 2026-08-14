@@ -43,11 +43,39 @@ NON_NOTE_EXTENSIONS = {
 }
 HEALTH_HISTORY_LIMIT = 90
 DAILY_STRUCTURE_PENALTY = 4.0
+BROKEN_LINK_PENALTY = 0.5
+CODE_SPAN_PATTERN = re.compile(r"`[^`\n]*`")
+CODE_FENCE_PATTERN = re.compile(r"^\s*(?:```|~~~)")
+
+
+def _blank_code(content: str) -> str:
+    """Blank out fenced blocks and inline code spans.
+
+    Obsidian does not render a wikilink inside code, and the runtime relies
+    on that: ``services/plaud.py`` writes a raw payload reference as
+    ``` `[[imports/plaud/raw/...json]]` ``` precisely so it shows the path
+    without claiming the file is a note. Counting those anyway cost nothing
+    while every non-note target was discarded unchecked, but
+    ``_non_note_target_exists`` now decides broken-vs-ignored by whether the
+    target is on disk -- and payload retention deletes those JSON files on
+    schedule. Left in, the 539 deliberately-defused references in
+    ``imports/`` would turn into broken links the moment retention ran,
+    burying real breakage under noise the code had already opted out of.
+    """
+    lines: list[str] = []
+    in_fence = False
+    for line in content.splitlines():
+        if CODE_FENCE_PATTERN.match(line):
+            in_fence = not in_fence
+            lines.append("")
+            continue
+        lines.append("" if in_fence else CODE_SPAN_PATTERN.sub(" ", line))
+    return "\n".join(lines)
 
 
 def extract_links(content: str) -> list[str]:
-    """Extract raw [[wiki-links]] from content."""
-    return WIKILINK_PATTERN.findall(content)
+    """Extract raw [[wiki-links]] Obsidian would actually render."""
+    return WIKILINK_PATTERN.findall(_blank_code(content))
 
 
 def _note_key(vault_path: Path, note_path: Path) -> str:
@@ -106,6 +134,45 @@ def _ignored_link_reason(source_key: str, target: str) -> str | None:
     if source_key.startswith("daily/") and first_part in {"README", "README.ru"}:
         return "repo-file"
     return None
+
+
+def _non_note_target_exists(vault_path: Path, target: str) -> bool:
+    """Whether a non-note wikilink target is a file that is actually there.
+
+    ``_ignored_link_reason`` classifies by the shape of the path alone, so a
+    live ``[[src/d_brain/services/qmd.py]]`` and a ``[[tests/deleted.py]]``
+    whose target was removed months ago were indistinguishable -- both were
+    dropped before the broken-link report. That is how 92 dead links sat in
+    ``daily/`` while every health run still scored the vault 99.6 and
+    reported ``broken_links: 0``. Classification still decides *that* a
+    target is not a note; this decides whether it is still reachable.
+
+    Both roots are probed, the way ``CompiledBriefingService.
+    _lint_source_base_dirs`` probes them: the namespaces overlap, since
+    ``.claude/`` exists in the vault (rules, docs) and in the project root
+    (the shared skills tree). Every target is also retried with ``.md``
+    appended, because ``_normalize_link_target`` strips that extension on
+    the way in. Appending rather than replacing the suffix is what makes
+    ``[[README.ru]]`` resolve: ``PurePosixPath`` reads its ``.ru`` as a
+    suffix, so ``with_suffix(".md")`` probed for ``README.md`` -- a
+    different file that happens to exist -- while the real target,
+    ``README.ru.md``, was never tried at all. ``resolve()`` plus the
+    containment check keeps a ``../`` target from reporting a file outside
+    either root as present.
+    """
+    if not target:
+        return False
+    for base in (vault_path, vault_path.parent):
+        base = base.resolve()
+        for name in (target, f"{target}.md"):
+            candidate = (base / name).resolve()
+            try:
+                candidate.relative_to(base)
+            except ValueError:
+                continue
+            if candidate.exists():
+                return True
+    return False
 
 
 def _build_indexes(
@@ -232,7 +299,10 @@ def analyze_vault(vault_path: Path) -> dict[str, Any]:
             if target_key is None:
                 normalized_target = _normalize_link_target(raw_link) or raw_link.strip()
                 ignored_reason = _ignored_link_reason(source_key, normalized_target)
-                if ignored_reason is not None:
+                if ignored_reason is not None and _non_note_target_exists(
+                    vault_path,
+                    normalized_target,
+                ):
                     ignored_links.append(
                         {
                             "source": source_key,
@@ -320,7 +390,6 @@ def analyze_vault(vault_path: Path) -> dict[str, Any]:
         else 0.0
     )
     orphan_ratio = (len(orphans) / len(notes)) if notes else 0.0
-    broken_ratio = (len(broken_links) / total_wikilinks) if total_wikilinks else 0.0
     description_ratio = (
         described_notes / description_candidates if description_candidates else 1.0
     )
@@ -328,11 +397,19 @@ def analyze_vault(vault_path: Path) -> dict[str, Any]:
         20.0,
         len(malformed_daily) * DAILY_STRUCTURE_PENALTY,
     )
+    # Counted per link, not as a share of all wikilinks. The share made a
+    # broken link cheaper the more links a vault had: against 17568
+    # wikilinks -- a number MOC hubs alone inflate, one summary page carries
+    # 811 -- 52 dead links moved the score by 0.09, so a defect the owner
+    # has to repair by hand read as noise. Same per-item shape as
+    # daily_structure_penalty, and capped for the same reason: one category
+    # should not be able to zero the score on its own.
+    broken_link_penalty = min(20.0, len(broken_links) * BROKEN_LINK_PENALTY)
     health_score = max(
         0.0,
         100.0
         - (orphan_ratio * 30.0)
-        - (broken_ratio * 30.0)
+        - broken_link_penalty
         - max(0.0, (3.0 - avg_links) * 15.0)
         - ((1.0 - description_ratio) * 10.0)
         - daily_structure_penalty,

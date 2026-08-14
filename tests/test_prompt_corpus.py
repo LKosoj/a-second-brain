@@ -207,6 +207,24 @@ def test_navigation_docs_and_secondary_skills_match_current_flat_layout() -> Non
     assert "crm/personal/" not in agent_memory_schema
 
 
+def test_session_end_protocol_confines_wikilinks_to_vault_notes() -> None:
+    """The session-summary template must not invite wikilinks to non-vault paths.
+
+    "- Created: [[link]] [if any files created]" never said which files
+    qualify, so sessions filed "[[tests/test_settings_and_storage.py]]",
+    "[[deploy/d-brain-process.service]]" and "[[/tmp/resume.sh]]" into daily
+    notes. Obsidian resolves links against the vault and so never opened any
+    of them, and analyze.py's ``_ignored_link_reason`` buckets them as
+    repo-path/repo-file and drops them before the broken-link report -- so
+    once those targets were renamed or removed, the dead links sat in
+    ``daily/`` with every health run still scoring the vault at 99.6.
+    """
+    agents = (PROJECT_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+
+    assert "- Created: [[link]]" not in agents
+    assert "Only vault notes belong inside `[[...]]`" in agents
+
+
 def test_runtime_docs_omit_removed_commands_and_legacy_process_entrypoints() -> None:
     agents = (PROJECT_ROOT / "AGENTS.md").read_text(encoding="utf-8")
     weekly_reflection = (

@@ -68,9 +68,15 @@ Tests must build temporary vaults and must not depend on a developer's runtime
 ## HH:MM [text]
 Session summary: [what was discussed/decided/created]
 - Key decision: [if any]
-- Created: [[link]] [if any files created]
+- Created: [[vault/note]] for vault notes, `repo/path` for anything else
 - Next action: [if any]
 ```
+
+Only vault notes belong inside `[[...]]`. A repository, deploy, or temporary
+path written as a wikilink is dead on arrival — Obsidian resolves links against
+the vault, so it never opens one, and the link breaks for good the moment that
+file is renamed or dropped. Backticks keep the path readable without those
+costs, the same way `services/plaud.py` records a raw payload path.
 
 **Also update `vault/MEMORY.md` only if the new information is likely to remain useful weeks or months later:**
 - New durable key decision was made

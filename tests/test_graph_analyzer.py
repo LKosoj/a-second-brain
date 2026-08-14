@@ -61,8 +61,18 @@ def test_graph_analyzer_resolves_path_links_and_writes_artifacts(
         "[[summaries/2026-W14-summary]]\n[[missing-note]]\n",
         encoding="utf-8",
     )
+    # Repository root as the analyzer sees it: vault_path.parent.
+    run_agent = tmp_path / "src" / "d_brain" / "run_agent.py"
+    run_agent.parent.mkdir(parents=True)
+    run_agent.write_text("# entrypoint\n", encoding="utf-8")
+    raw_payload = vault_path / "imports/plaud/raw/2026/04/example.json"
+    raw_payload.parent.mkdir(parents=True)
+    raw_payload.write_text("{}\n", encoding="utf-8")
+
     (vault_path / "daily" / "2026-04-04.md").write_text(
-        "[[vault/goals/1-yearly-2026]]\n[[src/d_brain/run_agent.py]]\n",
+        "[[vault/goals/1-yearly-2026]]\n"
+        "[[src/d_brain/run_agent.py]]\n"
+        "[[tests/test_removed_when_published.py]]\n",
         encoding="utf-8",
     )
     (
@@ -74,7 +84,8 @@ def test_graph_analyzer_resolves_path_links_and_writes_artifacts(
         / "04"
         / "2026-04-03-110103-example.md"
     ).write_text(
-        "[[imports/plaud/raw/2026/04/example.json]]\n",
+        "[[imports/plaud/raw/2026/04/example.json]]\n"
+        "`[[imports/plaud/raw/2026/04/already-purged.json]]`\n",
         encoding="utf-8",
     )
 
@@ -85,12 +96,21 @@ def test_graph_analyzer_resolves_path_links_and_writes_artifacts(
     assert stats["total_notes"] == 6
     assert "skills/private/local-skill/SKILL" not in stats["notes"]
     assert stats["total_links"] == 3
-    assert stats["broken_link_count"] == 1
+    # The backticked payload reference is not a link Obsidian would render,
+    # so it is never counted -- neither as ignored nor as broken.
+    assert stats["total_wikilinks"] == 7
+    # A non-note target still on disk stays ignored; one whose file is gone
+    # is broken, exactly like a missing note.
     assert stats["ignored_link_count"] == 2
     assert stats["ignored_link_reasons"] == {
         "plaud-raw-payload": 1,
         "repo-path": 1,
     }
+    assert stats["broken_link_count"] == 2
+    assert sorted(item["target"] for item in stats["broken_links"]) == [
+        "missing-note",
+        "tests/test_removed_when_published.py",
+    ]
     assert stats["links_to"]["summaries/2026-W14-summary"] == [
         "MOC/MOC-weekly",
         "thoughts/retro",
@@ -104,6 +124,67 @@ def test_graph_analyzer_resolves_path_links_and_writes_artifacts(
     assert "type: technical" in report
     assert "Broken Links" in report
     assert "Ignored Non-note References" in report
+
+
+def test_broken_links_penalize_the_score_per_link_and_stay_capped(
+    tmp_path: Path,
+) -> None:
+    """Each broken link costs a fixed amount, up to a ceiling.
+
+    As a share of all wikilinks a broken link got cheaper the bigger the
+    vault grew -- 52 dead links in a 17568-link vault cost 0.09 -- so the
+    score could not distinguish a healthy vault from one the owner had to
+    repair by hand.
+    """
+    vault_path = tmp_path / "vault"
+    _write_vault_manifest(vault_path)
+    (vault_path / "thoughts").mkdir(parents=True)
+    first = vault_path / "thoughts" / "first.md"
+    second = vault_path / "thoughts" / "second.md"
+    body = "---\ndescription: Note\n---\n[[thoughts/{other}]]\n"
+    first.write_text(body.format(other="second"), encoding="utf-8")
+    second.write_text(body.format(other="first"), encoding="utf-8")
+
+    analyzer = _load_graph_analyzer()
+    healthy = analyzer.analyze_vault(vault_path)["health_score"]
+
+    first.write_text(
+        body.format(other="second") + "[[thoughts/deleted]]\n", encoding="utf-8"
+    )
+    one_broken = analyzer.analyze_vault(vault_path)["health_score"]
+
+    assert healthy - one_broken == pytest.approx(analyzer.BROKEN_LINK_PENALTY)
+
+    flood = "".join(f"[[thoughts/gone-{index}]]\n" for index in range(200))
+    first.write_text(body.format(other="second") + flood, encoding="utf-8")
+    flooded = analyzer.analyze_vault(vault_path)["health_score"]
+
+    assert healthy - flooded == pytest.approx(20.0)
+
+
+def test_graph_analyzer_probes_dotted_repo_file_names_by_appending_md(
+    tmp_path: Path,
+) -> None:
+    """``[[README.ru]]`` must be probed as ``README.ru.md``, not ``README.md``.
+
+    ``PurePosixPath("README.ru").suffix`` is ``.ru``, so replacing the
+    suffix looked for a wholly different file. In this repository that file
+    exists, which hid the bug; here only the real target is on disk, so a
+    replace-based probe reports the live link broken.
+    """
+    vault_path = tmp_path / "vault"
+    _write_vault_manifest(vault_path)
+    (vault_path / "daily").mkdir(parents=True)
+    (tmp_path / "README.ru.md").write_text("# Readme\n", encoding="utf-8")
+
+    (vault_path / "daily" / "2026-04-04.md").write_text(
+        "[[README.ru]]\n", encoding="utf-8"
+    )
+
+    stats = _load_graph_analyzer().analyze_vault(vault_path)
+
+    assert stats["broken_link_count"] == 0
+    assert stats["ignored_link_reasons"] == {"repo-file": 1}
 
 
 def test_graph_artifact_writer_requires_manifest_before_creating_artifacts(
