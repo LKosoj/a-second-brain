@@ -61,13 +61,40 @@ def load_graph() -> dict:
     return json.loads(GRAPH_PATH.read_text(encoding="utf-8"))
 
 
+def is_indexable_note(rel_path: Path) -> bool:
+    """Whether one vault-relative note may be offered as a repair target.
+
+    ``graph-builder/scripts/analyze.py`` skips every hidden directory
+    outright when it walks the same vault. Naming them one by one here
+    instead let ``.session`` through, and
+    ``.session/compile-enrich/snapshots/<hash>/blobs/compiled/**`` keeps a
+    verbatim copy of every compiled page a nightly pass was about to
+    rewrite. For a page since deleted from ``compiled/``, that copy is the
+    only file left carrying its stem -- so ``_unique_stem_match`` reads as
+    unique and the repair retargets the owner's link into a scratch cache
+    ``SNAPSHOT_RETENTION_DAYS`` deletes 14 days later. analyze.py then
+    classifies such a target as ``hidden-path`` and never reports it, so
+    nothing downstream could notice the damage either.
+
+    Matching is on the vault-relative path, not the absolute one: whether a
+    note is internal is a property of where it sits inside the vault, and
+    an absolute match also fires on any directory above the vault that
+    happens to be named like one of these.
+    """
+    parts = rel_path.parts
+    if any(part.startswith(".") for part in parts):
+        return False
+    if any(part in IGNORE_DIRS for part in parts):
+        return False
+    return not any(pattern in rel_path.as_posix() for pattern in EXCLUDE_PATTERNS)
+
+
 def build_stem_index() -> dict[str, list[str]]:
     index: dict[str, list[str]] = defaultdict(list)
     md_files = [
         file_path
         for file_path in VAULT_PATH.rglob("*.md")
-        if not any(part in IGNORE_DIRS for part in file_path.parts)
-        and not any(pattern in str(file_path) for pattern in EXCLUDE_PATTERNS)
+        if is_indexable_note(file_path.relative_to(VAULT_PATH))
     ]
     for md_file in md_files:
         rel = str(md_file.relative_to(VAULT_PATH))

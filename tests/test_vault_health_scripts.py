@@ -252,6 +252,79 @@ def test_fix_links_collapses_legacy_paths_and_removes_repo_links(
     ) == (None, "remove")
 
 
+def test_fix_links_never_retargets_a_link_into_a_hidden_runtime_cache(
+    tmp_path: Path,
+) -> None:
+    """A deleted page's snapshot copy must not become its replacement target.
+
+    ``.session/compile-enrich/snapshots/<hash>/blobs/compiled/**`` holds a
+    verbatim copy of every compiled page a nightly pass was about to
+    rewrite. Once the real page is gone from ``compiled/``, that copy is
+    the only file left carrying its stem -- so an index that walks hidden
+    folders makes ``_unique_stem_match`` look unique and points the
+    owner's link at a scratch cache ``SNAPSHOT_RETENTION_DAYS`` deletes 14
+    days later. ``analyze.py`` then files such a target under
+    ``hidden-path`` and never reports it, so nothing downstream notices.
+    """
+    vault_path = tmp_path / "vault"
+    snapshot_blobs = (
+        vault_path
+        / ".session/compile-enrich/snapshots/5b42d6fc/blobs/compiled/decisions"
+    )
+    snapshot_blobs.mkdir(parents=True)
+    (snapshot_blobs / "retired-decision.md").write_text(
+        "# Retired decision\n",
+        encoding="utf-8",
+    )
+    (vault_path / "compiled" / "decisions").mkdir(parents=True)
+    (vault_path / "compiled" / "decisions" / "live-decision.md").write_text(
+        "# Live decision\n",
+        encoding="utf-8",
+    )
+
+    module = _load_vault_health_script("fix_links")
+    module.VAULT_PATH = vault_path
+    stem_index = module.build_stem_index()
+
+    assert not [key for key in stem_index if key.startswith(".session")]
+    assert module.suggest_fix(
+        "daily/2026-08-14",
+        "compiled/decisions/retired-decision",
+        stem_index,
+    ) == (None, "remove")
+    # A page that still exists keeps being repaired as before.
+    assert module.suggest_fix(
+        "daily/2026-08-14",
+        "compiled/archive/live-decision",
+        stem_index,
+    ) == ("compiled/decisions/live-decision", "replace")
+
+
+def test_add_descriptions_skips_hidden_runtime_directories(tmp_path: Path) -> None:
+    """The same hidden-folder blind spot must not let writes reach snapshots.
+
+    ``main()`` rewrites the frontmatter of every file it collects, and the
+    snapshot blobs are exactly the bytes the compile layer diffs the next
+    pass against.
+    """
+    vault_path = tmp_path / "vault"
+    snapshot_blobs = (
+        vault_path / ".session/compile-enrich/snapshots/5b42d6fc/blobs/compiled"
+    )
+    snapshot_blobs.mkdir(parents=True)
+    (snapshot_blobs / "retired-decision.md").write_text("# Retired\n", encoding="utf-8")
+    (vault_path / "thoughts").mkdir(parents=True)
+    (vault_path / "thoughts" / "idea.md").write_text("# Idea\n", encoding="utf-8")
+
+    module = _load_vault_health_script("add_descriptions")
+    module.VAULT_PATH = vault_path
+
+    collected = module.collect_candidate_files()
+    assert [path.relative_to(vault_path).as_posix() for path in collected] == [
+        "thoughts/idea.md"
+    ]
+
+
 def test_fix_links_leaves_human_zone_untouched(
     tmp_path: Path,
     monkeypatch,

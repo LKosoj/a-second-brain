@@ -108,7 +108,7 @@ below.
 - `MAX_PAGES_PER_PASS` = 40 -- distinct compiled pages one pass may write.
 - `MAX_MODEL_CALLS_PER_PASS` = 200 -- every impact/compile/verify/JSON-repair
   call shares this one budget.
-- `MAX_ENRICHMENTS_PER_PAGE_PER_MONTH` = 8 -- beyond this, further source
+- `MAX_ENRICHMENTS_PER_PAGE_PER_MONTH` = 20 -- beyond this, further source
   material for that page waits for the decisions queue instead of
   compounding unattended drift onto one page. Counted as distinct
   (date, source) pairs in "Sources That Shaped This Page", not as rows: one

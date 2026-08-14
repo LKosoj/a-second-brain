@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from collections.abc import Callable, Iterator, Sequence
@@ -341,7 +342,7 @@ MAX_MODEL_CALLS_PER_PASS = 200
 # ТЗ 5.6 "Максимум обогащений одной страницы за календарный месяц": beyond
 # this, further source material for the page waits for the owner's decision
 # queue instead of compounding unattended drift onto one page.
-MAX_ENRICHMENTS_PER_PAGE_PER_MONTH = 8
+MAX_ENRICHMENTS_PER_PAGE_PER_MONTH = 20
 # ТЗ 5.5 inv 8 / 5.6 "Хранение снимков для отката": how long a pass's
 # pre-write snapshots stay on disk before cleanup, so a delayed manual
 # rollback stays possible without snapshots accumulating forever.
@@ -1007,7 +1008,12 @@ class CompiledBriefingService:
         self.compiled_root = self.vault_path / "compiled"
         self.state_root = self.vault_path / ".compiled"
         self.queue_path = self.state_root / "queue.json"
-        self.queue_lock_path = self.state_root / "queue.lock"
+        # One lock for every state file this service rewrites in place --
+        # see ``_state_lock``. Still the file the queue lock has always
+        # used, so a worker started before this change keeps excluding one
+        # started after it.
+        self.state_lock_path = self.state_root / "queue.lock"
+        self._state_lock_depth = threading.local()
         self.source_state_path = self.state_root / "source-state.json"
         self.launcher_lock_path = self.state_root / "launcher.lock"
         self.worker_lock_path = self.state_root / "worker.lock"
@@ -1243,10 +1249,24 @@ class CompiledBriefingService:
                     errors.extend(str(item) for item in batch.get("errors", []))
 
                     queue = self._with_queue_lock(self._load_queue)
-                    if queue:
+                    # Only a "pending" event can be claimed by the next
+                    # ``_drain_queue_once`` call. An event still "in_flight"
+                    # (a claim left behind by a killed worker whose pid got
+                    # reused, released only by the 15-minute stale-claim
+                    # recovery) keeps its old, already-past ``due_at`` -- so
+                    # counting it here made the loop below read the queue as
+                    # ready on every iteration: ``idle_deadline`` was reset,
+                    # no sleep ran, and ``while True`` had no exit condition
+                    # at all until the claim finally went stale.
+                    claimable = [
+                        event
+                        for event in queue
+                        if str(event.get("state") or "pending") == "pending"
+                    ]
+                    if claimable:
                         now_ts = datetime.now().astimezone().timestamp()
                         next_due_at = min(
-                            float(event.get("due_at") or 0) for event in queue
+                            float(event.get("due_at") or 0) for event in claimable
                         )
                         # Code review defect 1: a single `_drain_queue_once`
                         # call always honors `force` unconditionally (a
@@ -1272,7 +1292,7 @@ class CompiledBriefingService:
                         # is left to force through, latch `loop_force` to
                         # `False` for the rest of this run.
                         force_ready = loop_force and any(
-                            not event.get("backoff") for event in queue
+                            not event.get("backoff") for event in claimable
                         )
                         if not force_ready:
                             loop_force = False
@@ -1422,10 +1442,21 @@ class CompiledBriefingService:
                         updated=[],
                         errors=[],
                     )
+                    # Released with the same backoff as the `requeueable`
+                    # branch below, not as immediately due: the monthly
+                    # per-page enrichment budget is checked outside a pass
+                    # too (``_upsert_briefing``, where ``_active_pass`` is
+                    # None), so ``run_queue_worker``'s loop would otherwise
+                    # reclaim this event on the very next iteration, spend
+                    # another Impact model call resolving its targets, hit
+                    # the same month-long budget again -- and never exit.
+                    # ``attempts`` still stays unchanged: exhausting a budget
+                    # is a normal pass-ending signal, not a failed attempt.
                     self._release_claimed_queue_event(
                         remaining_event,
                         attempts=int(remaining_event.get("attempts") or 0),
-                        due_at=now_ts,
+                        due_at=now_ts + 300,
+                        backoff=True,
                     )
                 break
             processed += 1
@@ -1855,7 +1886,7 @@ class CompiledBriefingService:
         unchanged = 0
         changed = 0
 
-        with self._source_state_lock():
+        with self._state_lock():
             state = self._load_source_state_unlocked()
             entries = state["entries"]
             active_paths = {candidate.rel_path for candidate in candidates}
@@ -3518,8 +3549,8 @@ class CompiledBriefingService:
         ``vault_write_lock`` (the budget check runs before the page is
         compiled or written), so this opens its own, short-lived one --
         safe here because nothing on this call path holds the vault lock
-        already (only the separate ``_worker_lock``/``queue_lock`` files
-        guard the surrounding queue drain).
+        already (the surrounding queue drain is guarded by the separate
+        ``_worker_lock``/``_state_lock`` files, not by this one).
         """
         from d_brain.services.decisions_queue import append_decision_queue_entries
 
@@ -4947,30 +4978,55 @@ class CompiledBriefingService:
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
+    @contextmanager
+    def _state_lock(self) -> Iterator[None]:
+        """The one lock over every ``.compiled``/give-up state file: the
+        refresh queue, ``source-state.json``, and the dropped-sources
+        journal.
+
+        These were three separate helpers over the same ``state.lock`` file,
+        which read as three independent locks while behaving as one -- taking
+        any of them inside another deadlocked on the spot, since ``flock`` on
+        a second open file description of the same file blocks against the
+        first even within one process. The three shared a file on purpose
+        (their writes interleave at the same moments: a queue event is acked
+        exactly when a source finally compiles), so they are now one lock
+        that says so, and nesting is simply allowed.
+
+        Re-entrancy is tracked per *thread*, not per instance: two threads
+        sharing one service must still serialize against each other (see
+        ``test_compiled_briefings_concurrent_give_up_writes_do_not_lose_each_other``),
+        and they do -- each takes its own file description and blocks on
+        ``flock`` as before. Only a nested take on the thread that already
+        holds it passes straight through.
+        """
+        depth = getattr(self._state_lock_depth, "value", 0)
+        if depth:
+            self._state_lock_depth.value = depth + 1
+            try:
+                yield
+            finally:
+                self._state_lock_depth.value = depth
+            return
+        self._ensure_state_dirs()
+        with self.state_lock_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            self._state_lock_depth.value = 1
+            try:
+                yield
+            finally:
+                self._state_lock_depth.value = 0
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
     def _with_queue_lock(
         self,
         callback: Callable[[], QueueLockResult],
     ) -> QueueLockResult:
-        self._ensure_state_dirs()
-        with self.queue_lock_path.open("a+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                return callback()
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-    @contextmanager
-    def _source_state_lock(self) -> Iterator[None]:
-        self._ensure_state_dirs()
-        with self.queue_lock_path.open("a+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        with self._state_lock():
+            return callback()
 
     def _load_source_state(self) -> dict[str, Any]:
-        with self._source_state_lock():
+        with self._state_lock():
             return self._load_source_state_unlocked()
 
     def _load_source_state_unlocked(self) -> dict[str, Any]:
@@ -5265,40 +5321,6 @@ class CompiledBriefingService:
     def _dropped_sources_journal_path(self) -> Path:
         return self.vault_path / ".session" / "compile-dropped-sources.json"
 
-    @contextmanager
-    def _dropped_sources_lock(self) -> Iterator[None]:
-        """Serialize one read-modify-write of the give-up journal (code
-        review).
-
-        Both writers rewrite the whole file, so without this the later
-        writer's copy -- read before the earlier one's rename landed --
-        silently drops the other's entry. The two do overlap in production:
-        ``drain_queue`` releases ``worker_lock_path`` as soon as the drain
-        returns, but ``run_nightly_maintenance`` applies its deferred clears
-        in ``finally``, after the archival/backfill/lint stages, and a
-        background ``run_queue_worker`` started by an owner's write in that
-        window records the source *it* just gave up on. Losing that record
-        is exactly the silently-dropped owner signal this journal exists to
-        prevent.
-
-        Shares ``queue_lock_path`` with the queue itself rather than adding
-        a second lock file: every write here happens at the moment a queue
-        event is finally acked, or a source finally compiles. So it must
-        never be taken while ``_with_queue_lock``/``_source_state_lock`` is
-        held -- ``flock`` on a second open file description of the same file
-        deadlocks against the first. No current caller does: the drain's
-        ack/release helpers take and drop that lock on their own, around
-        these calls rather than across them.
-        """
-
-        self._ensure_state_dirs()
-        with self.queue_lock_path.open("a+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
     def _load_dropped_queue_sources(self) -> list[dict[str, Any]]:
         """Read the give-up journal, fail-safe like ``_load_queue``."""
 
@@ -5362,7 +5384,7 @@ class CompiledBriefingService:
         if not normalized:
             return
         try:
-            with self._dropped_sources_lock():
+            with self._state_lock():
                 entries = [
                     item
                     for item in self._load_dropped_queue_sources()
@@ -5440,7 +5462,7 @@ class CompiledBriefingService:
         ``_clear_dropped_queue_source`` for when this is allowed to run."""
 
         try:
-            with self._dropped_sources_lock():
+            with self._state_lock():
                 entries = self._load_dropped_queue_sources()
                 remaining = [
                     item
@@ -5873,7 +5895,7 @@ class CompiledBriefingService:
         source_excerpt: str | None = None,
     ) -> None:
         snapshot = self._source_snapshot(note_text)
-        with self._source_state_lock():
+        with self._state_lock():
             state = self._load_source_state_unlocked()
             existing_entry = state["entries"].get(rel_path) or {}
             # Additive: `applied_chunks` (idempotency-by-chunk, ТЗ 5.5
@@ -5941,7 +5963,7 @@ class CompiledBriefingService:
         health report instead of merely stopping the retries.
         """
         digest = self._sources_digest(self._source_snapshot(note_text))
-        with self._source_state_lock():
+        with self._state_lock():
             state = self._load_source_state_unlocked()
             entry = state["entries"].get(rel_path)
             if not isinstance(entry, dict):
@@ -5967,7 +5989,7 @@ class CompiledBriefingService:
         (see ``decisions_queue._apply_verify_rejected_retry``): the owner
         asked for another attempt, so the next pass must not immediately
         skip the page as still exhausted."""
-        with self._source_state_lock():
+        with self._state_lock():
             state = self._load_source_state_unlocked()
             entry = state["entries"].get(rel_path)
             if not isinstance(entry, dict) or "verify_rejected" not in entry:

@@ -252,16 +252,37 @@ def add_description_to_frontmatter(content: str, description: str) -> str:
     ).decode("utf-8")
 
 
+def collect_candidate_files() -> list[Path]:
+    """Vault notes this script may rewrite the frontmatter of.
+
+    Hidden folders are skipped wholesale, the way
+    ``graph-builder/scripts/analyze.py`` walks the same vault. Listing them
+    one by one left ``.session`` in, whose
+    ``compile-enrich/snapshots/<hash>/blobs/`` tree holds the exact bytes
+    the compile layer diffs the next pass against -- patching a description
+    into those would make a page look changed when it was not. Matching is
+    on the vault-relative path so a directory above the vault cannot
+    trigger it.
+    """
+    candidates = []
+    for file_path in VAULT_PATH.rglob("*.md"):
+        rel_path = file_path.relative_to(VAULT_PATH)
+        if any(part.startswith(".") for part in rel_path.parts):
+            continue
+        if any(part in IGNORE_DIRS for part in rel_path.parts):
+            continue
+        if any(pattern in rel_path.as_posix() for pattern in IGNORE_PATTERNS):
+            continue
+        candidates.append(file_path)
+    return candidates
+
+
 def main():
     apply = "--apply" in sys.argv
     manifest = load_manifest_for_vault(VAULT_PATH)
 
     # Get all non-daily files
-    all_files = [
-        f for f in VAULT_PATH.rglob("*.md")
-        if not any(d in f.parts for d in IGNORE_DIRS)
-        and not any(p in str(f) for p in IGNORE_PATTERNS)
-    ]
+    all_files = collect_candidate_files()
 
     print(f"Total markdown files: {len(all_files)}")
     print(f"Mode: {'APPLY' if apply else 'DRY-RUN'}")

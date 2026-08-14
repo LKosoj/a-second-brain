@@ -1606,6 +1606,46 @@ def test_compiled_briefings_concurrent_give_up_writes_do_not_lose_each_other(
     }
 
 
+def test_compiled_briefings_state_lock_allows_nesting_within_one_thread(
+    tmp_path: Path,
+) -> None:
+    """The queue, ``source-state.json`` and the give-up journal were three
+    separate lock helpers over one file, so taking any of them inside
+    another deadlocked outright -- ``flock`` on a second open file
+    description of the same file blocks against the first even within one
+    process. They are one re-entrant lock now, so a nested take must pass
+    straight through, and the state readers must work from inside it.
+
+    Bounded by a worker thread with a join timeout rather than by waiting on
+    the call itself: a regression here hangs forever, and a hung test that
+    fails after 10s is far more useful than one that blocks the suite.
+    """
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    done = threading.Event()
+    seen: list[Any] = []
+
+    def nested() -> None:
+        with service._state_lock():
+            with service._state_lock():
+                seen.append(service._load_source_state_unlocked())
+            # Still held by the outer `with` -- the inner exit must not have
+            # released the file lock underneath it.
+            seen.append(service._load_queue())
+        done.set()
+
+    worker = threading.Thread(target=nested, daemon=True)
+    worker.start()
+    worker.join(timeout=10)
+
+    assert done.is_set(), "nested _state_lock deadlocked against itself"
+    assert seen == [{"version": SOURCE_STATE_VERSION, "entries": {}}, []]
+    # Fully released once the outermost `with` exits, so an unrelated caller
+    # (in production: another process) can take it again.
+    with service._state_lock():
+        assert service._load_queue() == []
+
+
 def test_compiled_briefings_run_queue_worker_force_does_not_loop_on_retry_backoff(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1758,6 +1798,149 @@ def test_compiled_briefings_run_queue_worker_force_respects_backoff_across_poll_
     assert len(queue) == 1
     assert queue[0]["attempts"] == 1
     assert queue[0]["backoff"] is True
+
+
+def test_compiled_briefings_run_queue_worker_does_not_loop_on_budget_exhausted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``MAX_ENRICHMENTS_PER_PAGE_PER_MONTH`` is checked on the hot write
+    path too (``_upsert_briefing``, where ``_active_pass`` is None), so a
+    plain background worker -- the one every capture starts via
+    ``spawn_background_drain`` -- can get ``budget_exhausted`` back from
+    ``refresh_after_write`` for a whole calendar month. Released with
+    ``due_at=now`` and no backoff, that event was claimable again on the
+    very next loop iteration, which reset ``idle_deadline``, skipped the
+    sleep and re-ran the same source forever: an unbounded loop burning one
+    Impact model call per turn until the month rolled over.
+    """
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    service.enqueue_refresh(
+        source_path="daily/2026-08-05.md",
+        source_excerpt="body",
+        debounce_seconds=0,
+    )
+    monkeypatch.setattr(service, "is_available", lambda: True)
+    monkeypatch.setattr(
+        service,
+        "refresh_after_write",
+        lambda **kwargs: {  # type: ignore[no-untyped-def]
+            "available": True,
+            "updated": [],
+            "errors": [],
+            "budget_exhausted": True,
+        },
+    )
+
+    fake_clock = {"now": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: fake_clock["now"])
+    monkeypatch.setattr(
+        time,
+        "sleep",
+        lambda seconds: fake_clock.__setitem__("now", fake_clock["now"] + seconds),
+    )
+
+    drain_calls = {"count": 0}
+    real_drain_queue_once = service._drain_queue_once
+
+    def counting_drain_queue_once(
+        *, force: bool, max_events: int
+    ) -> dict[str, Any]:
+        drain_calls["count"] += 1
+        if drain_calls["count"] > 30:
+            raise AssertionError(
+                "run_queue_worker kept re-claiming a budget-exhausted event "
+                "instead of leaving it for a later pass"
+            )
+        return real_drain_queue_once(force=force, max_events=max_events)
+
+    monkeypatch.setattr(service, "_drain_queue_once", counting_drain_queue_once)
+
+    result = service.run_queue_worker(
+        force=False,
+        max_events=8,
+        refresh_qmd=False,
+        idle_seconds=DEFAULT_WORKER_IDLE_SECONDS,
+        poll_seconds=DEFAULT_WORKER_POLL_SECONDS,
+    )
+
+    assert result["drained"] == 0
+    queue = json.loads(
+        (vault_path / ".compiled" / "queue.json").read_text(encoding="utf-8")
+    )
+    assert len(queue) == 1
+    # Same no-penalty release as before -- only its timing changed.
+    assert queue[0]["state"] == "pending"
+    assert queue[0]["attempts"] == 0
+    assert queue[0]["backoff"] is True
+
+
+def test_compiled_briefings_run_queue_worker_ignores_in_flight_event_due_at(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An event left "in_flight" by a worker that died without releasing it
+    (and whose pid was since reused, so ``_recover_stale_claims`` keeps it
+    for the full ``DEFAULT_QUEUE_CLAIM_STALE_SECONDS``) still carries its
+    old, already-past ``due_at``. The poll loop counted it as ready work,
+    so it re-drained with no sleep and never reached its idle deadline,
+    even though ``_claim_ready_queue_events`` could not claim it at all.
+    """
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    service.enqueue_refresh(
+        source_path="daily/2026-08-05.md",
+        source_excerpt="body",
+        debounce_seconds=0,
+    )
+    queue_path = vault_path / ".compiled" / "queue.json"
+    queue = json.loads(queue_path.read_text(encoding="utf-8"))
+    queue[0]["state"] = "in_flight"
+    queue[0]["claim_token"] = "held-by-another-claim"
+    queue[0]["claimed_at"] = datetime.now().astimezone().isoformat()
+    queue[0]["claimed_pid"] = os.getpid()
+    queue_path.write_text(json.dumps(queue), encoding="utf-8")
+
+    monkeypatch.setattr(service, "is_available", lambda: True)
+
+    fake_clock = {"now": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: fake_clock["now"])
+    monkeypatch.setattr(
+        time,
+        "sleep",
+        lambda seconds: fake_clock.__setitem__("now", fake_clock["now"] + seconds),
+    )
+
+    drain_calls = {"count": 0}
+    real_drain_queue_once = service._drain_queue_once
+
+    def counting_drain_queue_once(
+        *, force: bool, max_events: int
+    ) -> dict[str, Any]:
+        drain_calls["count"] += 1
+        if drain_calls["count"] > 30:
+            raise AssertionError(
+                "run_queue_worker treated an unclaimable in_flight event as "
+                "ready work and never reached its idle deadline"
+            )
+        return real_drain_queue_once(force=force, max_events=max_events)
+
+    monkeypatch.setattr(service, "_drain_queue_once", counting_drain_queue_once)
+
+    result = service.run_queue_worker(
+        force=False,
+        max_events=8,
+        refresh_qmd=False,
+        idle_seconds=DEFAULT_WORKER_IDLE_SECONDS,
+        poll_seconds=DEFAULT_WORKER_POLL_SECONDS,
+    )
+
+    assert result["drained"] == 0
+    # The claim is left exactly as it was -- only stale-claim recovery may
+    # touch it, and it is not stale yet.
+    queue_after = json.loads(queue_path.read_text(encoding="utf-8"))
+    assert queue_after[0]["state"] == "in_flight"
 
 
 def test_compiled_briefings_normalize_paths_preserves_skills_and_project_root(
@@ -8971,7 +9154,7 @@ def test_compiled_briefings_pass_budget_constants_and_dataclass_defaults(
     defaults every field a journal entry (G6) needs."""
     assert MAX_PAGES_PER_PASS == 40
     assert MAX_MODEL_CALLS_PER_PASS == 200
-    assert MAX_ENRICHMENTS_PER_PAGE_PER_MONTH == 8
+    assert MAX_ENRICHMENTS_PER_PAGE_PER_MONTH == 20
     assert SNAPSHOT_RETENTION_DAYS == 14
 
     service = _compiled_service(tmp_path / "vault")
