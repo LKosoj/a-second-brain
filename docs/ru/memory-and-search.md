@@ -211,6 +211,10 @@ QMD пользователя. В индекс входят основные за
 | Личное | `thoughts/`, `goals/`, `daily/` | `MEMORY.md` |
 | Бизнес | `business/*.md` | `business/_index.md` |
 | Проекты | `projects/*.md` | `projects/_index.md` |
+| Семья | `family/*.md` | `family/_index.md` |
+| Личное-приватное | `private/*.md` | `private/_index.md` |
+| Хобби | `hobbies/*.md` | `hobbies/_index.md` |
+| Финансы | `finances/*.md` | `finances/_index.md` |
 
 ## Метаданные памяти
 

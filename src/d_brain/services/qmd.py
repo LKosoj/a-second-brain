@@ -171,6 +171,27 @@ class QmdService:
                 self.vault_path / "MOC",
                 "Карты контента и навигационные узлы vault.",
             ),
+            (
+                "family",
+                self.vault_path / "family",
+                "Семейные заметки, события, планы и общие активности.",
+            ),
+            (
+                "private",
+                self.vault_path / "private",
+                "Личные факты и взаимодействия с друзьями. Без policy изоляции "
+                "(owner-only vault), обычный домен для семантического поиска.",
+            ),
+            (
+                "hobbies",
+                self.vault_path / "hobbies",
+                "Увлечения, личные интересы и хобби.",
+            ),
+            (
+                "finances",
+                self.vault_path / "finances",
+                "Личные финансы, инвестиции, бюджет, налоги, финансовые цели.",
+            ),
         ]
 
     @staticmethod

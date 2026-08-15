@@ -201,6 +201,10 @@ The current domain hubs are:
 | Personal | `thoughts/`, `goals/`, `daily/` | `MEMORY.md` |
 | Business | `business/*.md` | `business/_index.md` |
 | Projects | `projects/*.md` | `projects/_index.md` |
+| Family | `family/*.md` | `family/_index.md` |
+| Private | `private/*.md` | `private/_index.md` |
+| Hobbies | `hobbies/*.md` | `hobbies/_index.md` |
+| Finances | `finances/*.md` | `finances/_index.md` |
 
 ## Memory metadata
 
