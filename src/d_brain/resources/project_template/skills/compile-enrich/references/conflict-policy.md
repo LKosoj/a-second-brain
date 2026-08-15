@@ -12,9 +12,10 @@ tier: warm
 
 Four levels, `SOURCES_TRUST_VALUES`: `own > integration > forwarded >
 inferred` (`TRUST_RANK`: own=4, integration=3, forwarded=2, inferred=1).
-Trust is decided **by code, never by the model** (`_source_trust_level`),
-and it is never used to pick a conflict winner (only dates and claim kind do
-that, see below). The rule depends on where the source lives, not just its
+Trust is decided **by code, never by the model** (`_source_trust_level`).
+It does not pick a conflict winner and it does not veto one either -- it is
+handed to the conflict adjudicator as evidence about where the words came
+from (see below). The rule depends on where the source lives, not just its
 entry marker:
 
 - `thoughts/` -- always `own`.
@@ -28,48 +29,80 @@ entry marker:
 - anything else -- `inferred` (fails closed).
 
 Only `own` and `integration` are strong enough, alone, to justify an
-automatic action with consequences (creating a task, editing CRM data,
-silently superseding an existing claim). `forwarded`/`inferred` alone must
-never trigger one.
+automatic action with consequences outside the compiled layer -- creating a
+task, editing CRM data (`_trust_allows_consequential_action`, used by
+`processor.py` and the bot capture handlers). `forwarded`/`inferred` alone
+must never trigger one.
+
+Superseding a claim on a compiled page used to be on that list and is not
+any more. The veto cost more than it bought: a PLAUD recording is capped at
+`forwarded` because it has no speaker diarization, so every date-based
+supersession coming out of a meeting recording was downgraded to a factual
+conflict and turned into an owner task -- the queue filled with pairs no
+rule could settle. Reading the transcript is exactly what tells the two
+apart, so that call now goes to a model that can read it, with the trust
+level stated as one of the things to weigh.
 
 ## Claim Kinds
 
 `CLAIM_KIND_VALUES`: `fact | opinion | commitment`.
 
-## Conflict Types
+## Conflict Adjudication
 
-`CONFLICT_TYPE_VALUES`: `temporal | factual | contextual`. The type actually
-used is decided deterministically (`_effective_conflict_type`), not by
-trusting the model's label outright:
+Every conflict is put to a model, one call per pair
+(`_adjudicate_conflict`). The call is told both claims, both source dates,
+the new source's trust level in plain language, the claim kind, the page's
+Current State, and what the compile stage labelled the conflict -- all as
+evidence, none of it as a rule. It answers with one of four outcomes
+(`CONFLICT_OUTCOME_VALUES`), which map onto the three conflict types the
+page rendering already knew how to execute (`CONFLICT_OUTCOME_TO_TYPE`):
 
-1. An **opinion**-kind new claim is always `temporal` -- an owner's opinion
-   legitimately changes over time, so a disagreement there is a
-   supersession, not something to flag for review.
-2. Otherwise, if **both** the existing and the new claim's source dates are
-   known and differ, the conflict is `temporal` regardless of what the model
-   labeled it.
-3. Otherwise the model's label is honored if it is one of the three valid
-   values; an invalid or missing label falls back to `factual` (fail-closed:
-   keep both statements, flag for owner review).
+| Outcome | What the page does |
+|---|---|
+| `new_supersedes` | the existing claim leaves "Sources That Shaped This Page" for "Claim History", crediting the new source |
+| `existing_stands` | the new claim is never added; the existing claim stays current |
+| `both_valid` | both stay, each in its own scope, and the model's `context_note` is appended to the new claim's own row |
+| `unclear` | both stay and the pair is written to "Open Conflicts" |
 
-**Temporal** conflicts resolve automatically: the later source date wins
-(`_temporal_winner_is_new`); ties or unparseable dates default to the new
-claim. Trust never enters this decision.
+Guidance carried in the prompt, not applied to the answer afterwards: dates
+are a strong argument for the newer version but not a law (a newer entry can
+be a retelling of an older one, or someone else's line); trust says where the
+words came from, not whether they are true; the owner's opinions legitimately
+change over time.
 
-**Factual** conflicts do not resolve automatically. Both sides stay
-recorded forever in "Sources That Shaped This Page"; the disagreement is
-logged as one row in "Open Conflicts" for the owner. A response through the
-decisions queue (`services/decisions_queue.py`) picks the active side,
-removes the row, and decrements the page's `conflicts_open` counter -- both
-claims still stay in the sources table either way, since there is nowhere
-else to record "which one won" per claim.
+Every failure -- unreachable model, unparseable JSON, an outcome outside the
+four -- returns `unclear`. That is the same both-claims-kept landing spot the
+whole path used to fail closed into, so a flaky network can never make a page
+assert one side. The one exception allowed through is
+`CompiledBriefingPassBudgetExceededError`: that is not a failure to decide,
+it ends the pass's work on the source and leaves it queued.
 
-**Contextual** conflicts resolve automatically, with no "Open Conflicts"
-row and no owner decision: both claims are treated as valid, each in its
-own scope. The new claim is recorded in "Sources That Shaped This Page" as
-usual; if the model supplied an explanation of how the two scopes differ
-(`context_note`), it is appended to that new claim's own row rather than
-touching the existing claim's row.
+## Retrying What Could Not Be Settled
+
+`unclear` also queues an `undecided-conflict` entry -- a retry buffer, not a
+task for the owner. The nightly pass re-adjudicates every still-open conflict
+on every compiled page (`_resolve_open_conflicts`, bounded by
+`MAX_CONFLICT_RETRIES_PER_PASS` = 20 conflicts per pass) with `attempt=2`:
+the prompt says outright that this pair has been seen before and that a
+decision is required this time, and the `unclear` option is not offered.
+Still undecided is not an escalation -- the row simply stays and the next
+pass asks again. Once a page has no open conflict left, its
+`undecided-conflict` entry (and any legacy `blocked-action` entry) is removed
+from the queue.
+
+A page that carries open conflicts but has no "Claim History" section cannot
+retire a claim: `_replace_section` is a no-op on a missing heading, so going
+ahead would remove the claim from the live ledger with nowhere to put it.
+Since every rendered page has that section, a page without one was edited by
+hand -- so `_ensure_claim_history_section` puts an empty one back in its
+canonical slot (before `## History` if present, otherwise before
+`## Owner Notes`) and the retry proceeds. Only when there is no such anchor
+either, or when the human zone's markers are ambiguous, is the page skipped
+with a warning -- before any model call is spent on it.
+
+The owner can still answer a conflict by hand from the "Очередь" screen; that
+path takes exactly the same action (`decisions_queue._retire_losing_claim`),
+so a tap and a verdict leave the page in the same shape.
 
 ## Verify
 
@@ -109,12 +142,16 @@ below.
 - `MAX_MODEL_CALLS_PER_PASS` = 200 -- every impact/compile/verify/JSON-repair
   call shares this one budget.
 - `MAX_ENRICHMENTS_PER_PAGE_PER_MONTH` = 20 -- beyond this, further source
-  material for that page waits for the decisions queue instead of
-  compounding unattended drift onto one page. Counted as distinct
-  (date, source) pairs in "Sources That Shaped This Page", not as rows: one
-  enrichment appends one row per claim, so counting rows charged a single
-  pass several times over and froze pages enriched two or three times.
+  material for that page waits until the month rolls over, and a `drift`
+  entry is queued for judgement. Counted as distinct (date, source) pairs in
+  "Sources That Shaped This Page", not as rows: one enrichment appends one
+  row per claim, so counting rows charged a single pass several times over
+  and froze pages enriched two or three times.
 - `MAX_CLAIMS_PER_PASS` = 20 -- claims accepted from one model response.
+- `MAX_CONFLICT_RETRIES_PER_PASS` = 20 -- still-open conflicts one pass
+  re-adjudicates (one model call each).
+- `MAX_DRIFT_JUDGEMENTS_PER_PASS` = 5 -- queued drift suspicions one pass
+  judges (one model call each).
 
 Exhausting a budget ends the pass normally: the remainder stays queued, and
 the exhaustion itself is reported in the owner's daily digest -- it is never
@@ -135,9 +172,27 @@ run takes only the stalest `DEFAULT_FACT_CHECK_PAGE_LIMIT` = 20
 core/active/warm pages, which works out to revisiting any single page
 roughly once a month. There is no separate monthly timer.
 
+## Drift Judgement
+
+Hitting `MAX_ENRICHMENTS_PER_PAGE_PER_MONTH` is a *suspicion* of drift, not
+a finding: a busy project page hits the cap exactly the way a page losing
+its shape does, and the counter cannot tell them apart. The nightly pass
+asks instead (`_adjudicate_drift_entries`): the model is shown the page's
+Current State and every row added to it that month, and answers whether the
+page actually drifted. A confirmed drift is recorded on the page as
+`quality_status: needs_review` with the reason -- the same two fields Verify
+uses, cleared by the next clean Verify pass -- and either way the queue entry
+goes, because the question has been answered. A failed or unusable call
+leaves the entry for the next pass rather than answering "no drift" with
+silence. The enrichment cap itself is untouched by the verdict: it is a cost
+control, not a drift finding.
+
 ## Decisions Queue Item Kinds
 
-Eight kinds exist today (`services/decisions_queue.py`):
+Nine kinds exist today (`services/decisions_queue.py`). Two of them --
+`conflict` and `drift` -- are drained automatically by the nightly pass and
+reach the owner only in the window between the pass that could not settle
+them and the pass that does:
 
 - `fact-check-rejected` -- written into `.session/decisions-queue.json` by
   `compiled_fact_check.py`. A response either confirms the page (bumps
@@ -145,19 +200,23 @@ Eight kinds exist today (`services/decisions_queue.py`):
   entry is removed.
 - `conflict` -- not stored in the JSON file at all. It is derived live, one
   item per open-conflict row, by reading every `compiled/**` page's own
-  "Open Conflicts" table directly.
-- `blocked-action` -- written into `.session/decisions-queue.json` by
-  `CompiledBriefingService._queue_blocked_action` (ТЗ 4.4/7.1/7.2) when a
-  new claim would otherwise have won a temporal supersession by source date
-  alone, but its trust level (`forwarded`/`inferred`) is not strong enough,
-  alone, to apply that replacement automatically
-  (`_trust_allows_consequential_action`). The conflict type is downgraded
-  to `factual` instead, so both claims stay recorded and the page's own
-  Open Conflicts table gets the usual row; this queue item additionally
-  explains to the owner *why* the normally-automatic date-based
-  supersession did not just happen. No dedicated response exists for it --
-  only the generic `reject`/`defer` below. Protected from eviction under
-  `QUEUE_CAP`, same as `conflict`.
+  "Open Conflicts" table directly. A response picks the side the page
+  asserts: the row goes, `conflicts_open` drops, and the losing claim moves
+  to "Claim History" with the source that displaced it.
+- `undecided-conflict` -- written into `.session/decisions-queue.json` by
+  `CompiledBriefingService._queue_undecided_conflict` when the adjudicator
+  answered `unclear`. A retry buffer for the nightly pass, not an owner
+  task; deduped by (kind, page), removed once that page has no open conflict
+  left. Protected from eviction under `QUEUE_CAP`, same as `conflict`. No
+  dedicated response -- the actual choice happens through the page's own
+  `conflict` item above.
+- `blocked-action` -- **retired producer.** It was written when a
+  `forwarded`/`inferred` source would otherwise have won a temporal
+  supersession by date alone and trust vetoed applying it. Trust no longer
+  vetoes anything (see "Source Trust" above), so nothing produces this kind;
+  the constant stays because entries written before the change are still on
+  disk, and the nightly conflict retry clears them alongside
+  `undecided-conflict`.
 - `duplicate-candidate` -- written into `.session/decisions-queue.json` when
   Resolve (ТЗ 5.2) creates a new page whose confidence against an existing
   same-domain page falls in the possible-duplicate zone (0.85-0.95, see
@@ -170,8 +229,9 @@ Eight kinds exist today (`services/decisions_queue.py`):
 - `drift` -- written into `.session/decisions-queue.json` by
   `CompiledBriefingService._queue_monthly_drift` when a page's monthly
   enrichment budget (`MAX_ENRICHMENTS_PER_PAGE_PER_MONTH`) is reached. No
-  dedicated response exists for it -- only the generic `reject`/`defer`
-  below.
+  dedicated owner response exists for it -- only the generic
+  `reject`/`defer` below -- because the nightly pass judges it instead; see
+  "Drift Judgement" above.
 - `verify-rejected` -- written by
   `CompiledBriefingService._queue_verify_rejected` once a page's Verify step
   has rejected a majority of its proposed claims

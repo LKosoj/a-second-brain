@@ -220,6 +220,64 @@ IMPORTS_PLAUD_PREFIX = "imports/plaud/"
 IMPORTS_DOCUMENTS_FORWARDED_PREFIX = "imports/documents/forwarded/"
 CLAIM_KIND_VALUES = {"fact", "opinion", "commitment"}
 CONFLICT_TYPE_VALUES = {"temporal", "factual", "contextual"}
+# What the model may answer when it adjudicates one conflict
+# (``_adjudicate_conflict``). Each value maps onto an outcome
+# ``_apply_claims_and_conflicts`` already knew how to execute back when dates
+# and trust picked it instead:
+#   new_supersedes  -> temporal, new wins: existing claim moves to Claim History
+#   existing_stands -> temporal, existing wins: the new claim is never added
+#   both_valid      -> contextual: both stay, context_note explains the split
+#   unclear         -> factual: both stay, an Open Conflicts row is written
+# ``unclear`` is deliberately the same landing spot the whole conflict path
+# used to fail closed into, so "the model could not decide" needs no separate
+# recovery branch -- see _adjudicate_conflict.
+CONFLICT_OUTCOME_VALUES = {
+    "new_supersedes",
+    "existing_stands",
+    "both_valid",
+    "unclear",
+}
+CONFLICT_OUTCOME_TO_TYPE = {
+    "new_supersedes": "temporal",
+    "existing_stands": "temporal",
+    "both_valid": "contextual",
+    "unclear": "factual",
+}
+ADJUDICATE_TIMEOUT_SECONDS = 180
+# Plain-language gloss of each trust level for the adjudication prompt. Trust
+# no longer gates the outcome (it used to, via
+# _trust_allows_consequential_action); it is now one input the model weighs,
+# so it has to arrive as something the model can reason about rather than as
+# a bare enum value it has no definition for.
+TRUST_LEVEL_EXPLANATIONS = {
+    "own": "написано самим владельцем",
+    "integration": "загружено интеграцией из документа, веба или видео",
+    "forwarded": (
+        "переслано владельцем или взято из записи встречи без разметки "
+        "говорящих — неизвестно, чьи это слова"
+    ),
+    "inferred": "происхождение не установлено",
+}
+ADJUDICATE_JSON_EXAMPLE = (
+    "{\n"
+    '  "outcome": "new_supersedes",\n'
+    '  "context_note": "",\n'
+    '  "reason": "новое утверждение датировано позже и описывает тот же '
+    'предмет"\n'
+    "}\n"
+)
+# The other half of the queue the owner was being asked to work through:
+# a page that hit MAX_ENRICHMENTS_PER_PAGE_PER_MONTH. Hitting that cap is
+# only a *suspicion* of drift -- a genuinely busy project page hits it the
+# same way a page slowly losing its shape does, and the counter cannot tell
+# them apart. So the same treatment as conflicts: the model reads what was
+# actually added this month and answers.
+DRIFT_JSON_EXAMPLE = (
+    "{\n"
+    '  "drift": true,\n'
+    '  "reason": "страница смешала три разных проекта и потеряла предмет"\n'
+    "}\n"
+)
 # Cap on claims accepted from one model response (ТЗ 5.6 budgets exist for
 # pages/candidates/model-calls per pass; claims-per-pass has no listed
 # default, so this stays generous but bounded to keep one Verify batch and
@@ -371,6 +429,17 @@ OPEN_LOOP_ABANDON_DAYS = 60
 # small budget so it never competes with the enrichment page budget
 # (``MAX_PAGES_PER_PASS``).
 MAX_COMPRESSED_PAGES_PER_PASS = 20
+# How many still-open conflicts one nightly pass re-adjudicates
+# (``_resolve_open_conflicts``). One model call each, so this is a slice of
+# MAX_MODEL_CALLS_PER_PASS -- small enough that the retry never crowds out
+# the pass's actual enrichment work, large enough to drain a normal backlog
+# in a night or two rather than a month.
+MAX_CONFLICT_RETRIES_PER_PASS = 20
+# How many queued drift suspicions one nightly pass judges
+# (``_adjudicate_drift_entries``). One model call each, same slice logic as
+# the conflict retry above; drift entries accumulate far more slowly, so
+# this is smaller.
+MAX_DRIFT_JUDGEMENTS_PER_PASS = 5
 # ТЗ 6.4 "Архивация вместо удаления": a page at tier `archive` idle at least
 # this many days, with no incoming links, moves to compiled/archive/.
 ARCHIVE_TIER_IDLE_DAYS = 180
@@ -641,56 +710,6 @@ def human_zone_markers_look_corrupted(text: str) -> bool:
 # one-token line -- so the filter does not apply at all under that length.
 HUMAN_ZONE_DUPLICATE_OVERLAP_THRESHOLD = 0.8
 HUMAN_ZONE_DUPLICATE_MIN_TOKENS = 5
-# Matches an ISO date (2026-08-05) or a Russian long-form date
-# (5 августа 2026) inside a proposed compiled-briefing title, used to force
-# a "concepts" candidate into "topics" (see _concepts_to_topics_reason).
-DATE_IN_TITLE_RE = re.compile(
-    r"\d{4}-\d{2}-\d{2}"
-    r"|\b\d{1,2}\s+(?:январ|феврал|март|апрел|ма[йя]|июн|июл|август|"
-    r"сентябр|октябр|ноябр|декабр)\w*\s+\d{4}\b",
-    re.IGNORECASE,
-)
-# Common nouns that, on their own, are not a project/people-binding signal.
-# Applied only when a project/people page has exactly ONE significant token
-# and that token is one of these words (see _concepts_to_topics_reason): a
-# one-word PROPER noun page name ("Acme", "Феникс") is a strong signal that a
-# concept mentioning it belongs to that project, but a one-word COMMON noun
-# ("migration", "платформа") matches by coincidence and must not force the
-# reroute. Page names with two or more tokens are unaffected -- a full
-# multi-word name match is already a strong signal by itself.
-GENERIC_SINGLE_TOKEN_PAGE_NAMES = frozenset(
-    {
-        "миграция",
-        "платформа",
-        "система",
-        "процесс",
-        "продукт",
-        "команда",
-        "проект",
-        "сервис",
-        "данные",
-        "клиент",
-        "задача",
-        "отчет",
-        "отчёт",
-        "встреча",
-        "план",
-        "migration",
-        "platform",
-        "system",
-        "process",
-        "product",
-        "team",
-        "project",
-        "service",
-        "data",
-        "client",
-        "task",
-        "report",
-        "meeting",
-        "plan",
-    }
-)
 # Strict YYYY-MM-DD check for the last_verified/human_reviewed frontmatter
 # fields (see _validated_date_field). Those two fields render without
 # json.dumps escaping, so a stray value containing a colon would otherwise
@@ -939,6 +958,11 @@ class CompileEnrichPass:
     touched_pages: set[str] = field(default_factory=set)
     verify_rejected: int = 0
     trust_blocked: int = 0
+    # Conflicts the nightly retry (``_resolve_open_conflicts``) settled this
+    # pass -- the counterpart of ``trust_blocked`` above, which counts the
+    # ones the write path could not settle in the first place. Journalled so
+    # a night that only repaired old conflicts still shows work done.
+    conflicts_auto_resolved: int = 0
     budget_exhausted: set[str] = field(default_factory=set)
     sources_processed: list[str] = field(default_factory=list)
     snapshot_manifest: dict[str, Any] = field(default_factory=dict)
@@ -968,9 +992,6 @@ class CompileEnrichPass:
     dropped_sources_cleared: list[tuple[str, tuple[str, ...]]] = field(
         default_factory=list
     )
-    # Дополнительно: concepts->topics domain reroutes this pass
-    # (``_concepts_to_topics_reason``), for the pass journal (G6).
-    domain_reassignments: list[dict[str, str]] = field(default_factory=list)
     # Code review (ТЗ 7.2 "факт вытеснения попадает в дайджест"): total
     # decisions-queue entries this pass evicted, across every
     # ``_queue_*`` producer call (``_record_queue_eviction``). Mirrors
@@ -1662,9 +1683,28 @@ class CompiledBriefingService:
             compressed = self._compress_cooled_pages(
                 limit=MAX_COMPRESSED_PAGES_PER_PASS
             )
+            # The retry for conflicts the write path could not settle. Runs
+            # after the queue drain so that pairs left undecided earlier
+            # tonight get their second attempt the same night, and last
+            # among the write steps so it never spends model calls the
+            # enrichment work still needed.
+            conflicts_resolved = self._resolve_open_conflicts(
+                limit=MAX_CONFLICT_RETRIES_PER_PASS
+            )
+            # The other automated queue drain: queued drift suspicions get
+            # judged rather than waiting for the owner to look at a page.
+            drift_marked = self._adjudicate_drift_entries(
+                limit=MAX_DRIFT_JUDGEMENTS_PER_PASS
+            )
             lint_issues = self.lint_notes()
             freshness_issues = self.freshness_issues()
-            if drain_result.get("updated") or archived or backfilled or compressed:
+            if (
+                drain_result.get("updated")
+                or archived
+                or backfilled
+                or compressed
+                or conflicts_resolved
+            ):
                 self._refresh_qmd_index()
 
             took_work = int(drain_result.get("drained") or 0) > 0
@@ -1673,6 +1713,8 @@ class CompiledBriefingService:
                 or archived
                 or backfilled
                 or compressed
+                or conflicts_resolved
+                or drift_marked
                 or self._active_pass.touched_pages
             )
             # ТЗ 5.5 inv 7: exhausting a budget ends the pass normally.
@@ -1748,11 +1790,14 @@ class CompiledBriefingService:
                 "backfilled": backfilled,
                 "archived": archived,
                 "compressed": compressed,
+                "conflicts_resolved": conflicts_resolved,
+                "drift_marked": drift_marked,
                 "searchable_write": bool(
                     drain_result.get("updated")
                     or archived
                     or backfilled
                     or compressed
+                    or conflicts_resolved
                 ),
                 "errors": errors,
             }
@@ -2484,9 +2529,6 @@ class CompiledBriefingService:
 
         targets: list[CompiledBriefingTarget] = []
         seen: set[tuple[str, str]] = set()
-        project_people_token_pairs: (
-            list[tuple[frozenset[str], frozenset[str]]] | None
-        ) = None
         for item in updates:
             if not isinstance(item, dict):
                 continue
@@ -2496,34 +2538,6 @@ class CompiledBriefingService:
             title = self._clean_line(item.get("title"))
             if not title:
                 continue
-            if domain == "concepts":
-                # Walked only when the model actually proposed a concepts
-                # candidate; the walk itself covers all of compiled/ and
-                # keeps projects/people afterwards.
-                if project_people_token_pairs is None:
-                    project_people_token_pairs = self._project_people_title_tokens()
-                override_reason = self._concepts_to_topics_reason(
-                    title, project_people_token_pairs
-                )
-                if override_reason:
-                    logger.info(
-                        "Compiled briefing domain override concepts->topics "
-                        "for %r: %s",
-                        title,
-                        override_reason,
-                    )
-                    domain = "topics"
-                    if self._active_pass is not None:
-                        # Дополнительно: record the reroute for the pass
-                        # journal (G6), not just the application log.
-                        self._active_pass.domain_reassignments.append(
-                            {
-                                "title": title,
-                                "from": "concepts",
-                                "to": "topics",
-                                "reason": override_reason,
-                            }
-                        )
             description = self._clean_line(item.get("description"))
             slug = self._slugify(str(item.get("slug") or title))
             if not slug:
@@ -2545,93 +2559,6 @@ class CompiledBriefingService:
             if len(targets) >= max_updates:
                 break
         return targets
-
-    def _project_people_title_tokens(
-        self,
-    ) -> list[tuple[frozenset[str], frozenset[str]]]:
-        """Collect per-page (title_tokens, slug_tokens) pairs from
-        projects/people pages.
-
-        Title and slug are two INDEPENDENT spellings of one page name, not
-        one combined name: for a Cyrillic title, ``_slugify`` transliterates
-        it into a Latin slug, so a Russian concept title can only ever
-        contain one of the two spellings, never both. Gluing them into a
-        single haystack (the previous approach) therefore made the subset
-        check below unsatisfiable for every Russian-language page. Each
-        candidate contributes its title tokens and its slug tokens as two
-        separate sets (length >= 4 each); ``_concepts_to_topics_reason``
-        matches against each independently and a hit on either is enough.
-
-        Kept per-page rather than flattened into one global set: a single
-        shared word ("система", "процесс", ...) is common across unrelated
-        project and concept titles and must not trigger the override on its
-        own, only a whole existing page name appearing inside the candidate
-        title should.
-        """
-        token_pairs: list[tuple[frozenset[str], frozenset[str]]] = []
-        for candidate in self._iter_candidates():
-            if candidate.domain not in ("projects", "people"):
-                continue
-            title_tokens = frozenset(
-                token for token in self._tokens(candidate.title) if len(token) >= 4
-            )
-            # Slugs are kebab-case ("phoenix-migration"); TOKEN_RE treats
-            # "-"/"_" as part of a token, so without splitting them here the
-            # slug would contribute one unsplittable compound token that
-            # could never match a normally-spaced concept title, silently
-            # breaking the whole-name subset check below.
-            slug_words = candidate.slug.replace("-", " ").replace("_", " ")
-            slug_tokens = frozenset(
-                token for token in self._tokens(slug_words) if len(token) >= 4
-            )
-            if title_tokens or slug_tokens:
-                token_pairs.append((title_tokens, slug_tokens))
-        return token_pairs
-
-    @classmethod
-    def _concepts_to_topics_reason(
-        cls,
-        title: str,
-        project_people_token_pairs: list[tuple[frozenset[str], frozenset[str]]],
-    ) -> str:
-        """Return a non-empty reason if a concepts title should become topics."""
-        if DATE_IN_TITLE_RE.search(title):
-            return "title contains a date"
-        title_tokens = {token for token in cls._tokens(title) if len(token) >= 4}
-        for title_page_tokens, slug_page_tokens in project_people_token_pairs:
-            for page_tokens in (title_page_tokens, slug_page_tokens):
-                # An empty set is a subset of everything in Python; guard it
-                # explicitly so a page with no significant title tokens (or
-                # no significant slug tokens) can never "match" by default.
-                if not page_tokens or not page_tokens <= title_tokens:
-                    continue
-                # Judge each spelling on its own: title and slug are not
-                # guaranteed to be transliterations of one another (the model
-                # picks ``slug`` independently of ``title``), so a generic
-                # slug must not exempt a proper-noun title, or vice versa.
-                if len(page_tokens) == 1 and cls._is_generic_page_name(
-                    next(iter(page_tokens))
-                ):
-                    continue
-                return (
-                    "title fully contains an existing project/people page "
-                    "name: " + " ".join(sorted(page_tokens))
-                )
-        return ""
-
-    @classmethod
-    def _is_generic_page_name(cls, token: str) -> bool:
-        """Tell a one-word common noun from a one-word proper noun.
-
-        A page name reaches here in either spelling, so the transliterated
-        form of a listed word ("миграция" -> "migratsiya") must count as
-        generic too even though only the original spelling is listed.
-        """
-        if token in GENERIC_SINGLE_TOKEN_PAGE_NAMES:
-            return True
-        return any(
-            cls._slugify(name) == token for name in GENERIC_SINGLE_TOKEN_PAGE_NAMES
-        )
 
     def _upsert_briefing(
         self,
@@ -3257,15 +3184,15 @@ class CompiledBriefingService:
                 pass_obj.verify_format_drift if pass_obj else 0
             ),
             "trust_blocked": pass_obj.trust_blocked if pass_obj else 0,
+            "conflicts_auto_resolved": (
+                pass_obj.conflicts_auto_resolved if pass_obj else 0
+            ),
             "queue_evictions": pass_obj.queue_evictions if pass_obj else 0,
             "budget_exhausted": (
                 sorted(pass_obj.budget_exhausted) if pass_obj else []
             ),
             "human_zone_ambiguous_pages": (
                 sorted(pass_obj.human_zone_ambiguous_pages) if pass_obj else []
-            ),
-            "domain_reassignments": (
-                list(pass_obj.domain_reassignments) if pass_obj else []
             ),
             "rollback": rollback,
         }
@@ -3621,7 +3548,7 @@ class CompiledBriefingService:
             )
         self._record_queue_eviction(evicted)
 
-    def _queue_blocked_action(
+    def _queue_undecided_conflict(
         self,
         *,
         page_rel_path: str,
@@ -3629,16 +3556,20 @@ class CompiledBriefingService:
         existing_source: str,
         new_claim: str,
         new_source: str,
-        trust: str,
     ) -> None:
-        """Queue a "действие, заблокированное низким доверием источника"
-        (ТЗ 4.4/7.1/7.2) as an owner decision: ``new_source`` would have
-        won a temporal supersession by date alone (see
-        ``_apply_claims_and_conflicts``), but its trust level is not
-        strong enough, alone, to apply that replacement automatically
-        (``_trust_allows_consequential_action``) -- code review, ТЗ 7.2:
-        this kind was declared and protected from eviction but had no
-        producer, so it never actually reached the owner.
+        """Queue one conflict the adjudicator could not settle.
+
+        This is a retry buffer, not a task for the owner. The pair is
+        re-adjudicated by the nightly pass with the escalated prompt
+        (``_adjudicate_conflict(attempt=2)``), which drops the "unclear"
+        option entirely; the owner is never asked to arbitrate unless they
+        open the queue screen themselves.
+
+        Replaces the old ``blocked-action`` producer. That kind existed to
+        explain why a date-based supersession did not happen automatically
+        when the new source's trust was too weak -- trust no longer blocks
+        anything, so the only thing left worth recording is "the model
+        looked at this pair and did not reach a verdict".
 
         Mirrors ``_queue_verify_rejected``/``_queue_monthly_drift``: called
         from inside ``_apply_claims_and_conflicts``, a point that runs
@@ -3646,29 +3577,28 @@ class CompiledBriefingService:
         opens its own, short-lived one rather than being handed a lock that
         does not exist yet at that call site.
 
-        Deduped by ``(kind, page)`` in ``append_decision_queue_entries``,
-        so a page that keeps hitting this on later passes only ever gets
-        one queue entry -- the underlying claim pair is separately
-        re-recorded on the page's own Open Conflicts table every time (the
-        "factual" branch just above this call), which is where the actual
-        keep-existing/keep-new choice happens, so nothing about the
-        conflict itself depends on requeuing this notice.
+        Deduped by ``(kind, page)`` in ``append_decision_queue_entries``, so
+        a page carrying several undecided pairs gets one entry; the pairs
+        themselves are all on the page's own Open Conflicts table, which is
+        what the retry drain actually reads.
         """
-        from d_brain.services.decisions_queue import append_decision_queue_entries
+        from d_brain.services.decisions_queue import (
+            UNDECIDED_CONFLICT_KIND,
+            append_decision_queue_entries,
+        )
 
         summary = (
-            "Автоматическая замена утверждения заблокирована: источник "
-            f"«{new_source}» имеет уровень доверия «{trust}», этого "
-            "недостаточно, чтобы применить замену без подтверждения "
-            f"владельца. Было: «{existing_claim}» ({existing_source}). "
-            f"Предлагается: «{new_claim}»."
+            "Модель не смогла решить, какая версия верна — обе оставлены на "
+            f"странице до повторного разбора. Было: «{existing_claim}» "
+            f"({existing_source}). Предлагалось: «{new_claim}» "
+            f"({new_source})."
         )
         with vault_write_lock(self.vault_path) as lock:
             evicted = append_decision_queue_entries(
                 self.vault_path,
                 [
                     {
-                        "kind": "blocked-action",
+                        "kind": UNDECIDED_CONFLICT_KIND,
                         "page": page_rel_path,
                         "summary": summary,
                         "since": date.today().isoformat(),
@@ -3843,6 +3773,10 @@ class CompiledBriefingService:
             "commitments.\n"
             "- Meetings are only for recurring series, strategic negotiations, or "
             "threads with ongoing context.\n"
+            "- Concepts must stay portable. If a candidate title carries a date, or "
+            "names one specific project, client, or person (the catalog below lists "
+            "the existing ones), it is a topic, not a concept -- you make that call, "
+            "nothing downstream reroutes it for you.\n"
             "- If the source is mixed, split it mentally into 1-6 durable threads "
             "before deciding updates.\n"
             "- Prefer 0-2 strong updates over many weak updates when one daily note "
@@ -4424,6 +4358,7 @@ class CompiledBriefingService:
                     signal=signal,
                     today=today,
                     page_rel_path=page_rel_path,
+                    page_state=self._section_text(existing_text, "Current State"),
                     record_side_effects=record_side_effects,
                 )
             )
@@ -6761,6 +6696,47 @@ class CompiledBriefingService:
         return text[: heading_match.end()] + replacement_body + text[body_end:]
 
     @classmethod
+    def _has_section(cls, text: str, heading: str) -> bool:
+        """Whether ``## heading`` exists on this page, outside the human zone.
+
+        ``_replace_section`` is a documented no-op on a missing heading, so
+        anything that moves content *between* two sections has to ask first:
+        otherwise the removal half of the move lands and the write half
+        silently does not, and the content is simply gone. Retiring a losing
+        claim into "Claim History" is exactly that kind of move.
+        """
+        zone = cls._human_zone_span(text)
+        if zone == _AMBIGUOUS_HUMAN_ZONE:
+            return False
+        pattern = re.compile(rf"^##\s+{re.escape(heading)}\s*$\n", re.MULTILINE)
+        return cls._heading_match(text, pattern, zone) is not None
+
+    @classmethod
+    def _ensure_claim_history_section(cls, text: str) -> str:
+        """Put an empty "Claim History" section back on a page that lost it.
+
+        Every page ``_render_page`` writes carries one, so a page without it
+        was edited by hand. Refusing to retire a claim there (see
+        ``_has_section``) protects the claim, but on its own it would also
+        park that page's conflicts forever -- the one dead end left in an
+        otherwise self-draining queue. So the section is restored, empty, in
+        its canonical slot, and the caller re-checks.
+
+        A no-op -- and the caller then still declines to retire anything --
+        when the section is already there, when the human zone's markers are
+        ambiguous, or when neither anchor heading exists on the page.
+        """
+        if cls._has_section(text, "Claim History"):
+            return text
+        anchor = "History" if cls._has_section(text, "History") else "Owner Notes"
+        return cls._insert_section_before(
+            text,
+            heading="Claim History",
+            before_heading=anchor,
+            new_lines=cls._render_claim_history([]),
+        )
+
+    @classmethod
     def _insert_section_before(
         cls,
         text: str,
@@ -7696,60 +7672,610 @@ class CompiledBriefingService:
         ]
         return verified_claims, conflicts
 
-    @staticmethod
-    def _effective_conflict_type(
+    def _build_conflict_adjudication_prompt(
+        self,
         *,
-        conflict_type: str,
+        page_rel_path: str,
+        page_state: str,
+        existing_claim: str,
+        existing_source: str,
         existing_date: str,
+        new_claim: str,
+        new_source: str,
         new_date: str,
+        new_trust: str,
         claim_kind: str,
+        model_conflict_type: str,
+        attempt: int,
     ) -> str:
-        """Deterministic conflict-type override -- code only, never the
-        model (ТЗ 5.4).
+        """Prompt for one conflict adjudication.
 
-        An opinion-kind new claim is always treated as temporal: owner
-        opinions legitimately change over time (ТЗ 5.3's rationale for
-        splitting fact/opinion/commitment), so an opinion disagreement is a
-        supersession, not something to flag for owner review, regardless of
-        whether both source dates are known. This is this implementation's
-        own extension of the ТЗ's literal date-based override, not stated
-        verbatim in the ТЗ -- see final report deviations.
+        Dates and trust are stated as evidence, not as a verdict: the code
+        that used to turn them into one (``_effective_conflict_type`` and the
+        ``_trust_allows_consequential_action`` gate) is gone, and the model
+        is expected to weigh them against the claims themselves.
 
-        Otherwise, per ТЗ 5.4: if both source dates are known and differ,
-        the conflict is temporal regardless of the model's label. If not,
-        the model's label is honored when valid; an invalid/missing label
-        falls back to "factual" (both statements kept, flagged for owner
-        review) as the fail-closed default.
+        ``attempt`` > 1 means this pair already came back ``unclear`` at
+        least once and is being re-adjudicated from the decisions queue. That
+        retry drops ``unclear`` from the menu: the point of a second pass is
+        to reach a decision, and leaving the escape hatch open would let the
+        same pair bounce between passes forever.
         """
-        if claim_kind == "opinion":
-            return "temporal"
-        if existing_date and new_date and existing_date != new_date:
-            return "temporal"
-        if conflict_type in CONFLICT_TYPE_VALUES:
-            return conflict_type
-        return "factual"
+        trust_gloss = TRUST_LEVEL_EXPLANATIONS.get(new_trust, new_trust)
+        outcomes = [
+            '- "new_supersedes" -- новое утверждение заменяет старое; старое '
+            "уедет в историю утверждений со ссылкой на источник.",
+            '- "existing_stands" -- старое утверждение остаётся текущим; '
+            "новое не попадёт на страницу.",
+            '- "both_valid" -- оба верны, но относятся к разным контекстам '
+            "(разные системы, команды, периоды); заполни context_note.",
+        ]
+        if attempt <= 1:
+            outcomes.append(
+                '- "unclear" -- решить нельзя даже после внимательного '
+                "чтения; обе версии останутся на странице."
+            )
+        header = (
+            "Ты ведёшь скомпилированную базу знаний личного ассистента.\n"
+            "Верни ТОЛЬКО JSON.\n\n"
+            "На одной странице столкнулись два утверждения. Реши, что "
+            "страница должна утверждать сейчас.\n"
+        )
+        if attempt > 1:
+            header += (
+                "\nЭТО ПОВТОРНЫЙ ЗАХОД. Эту же пару уже показывали, и "
+                "решение принято не было. В этот раз решение принять "
+                "обязательно: выбери один из трёх исходов ниже, варианта "
+                '"не знаю" больше нет.\n'
+            )
+        return (
+            header
+            + "\nВозможные исходы:\n"
+            + "\n".join(outcomes)
+            + "\n\nЧем руководствоваться:\n"
+            "- Даты источников — сильный довод за более свежую версию, но "
+            "не закон: более свежая запись может быть пересказом старого "
+            "или чужой репликой.\n"
+            "- Уровень доверия говорит, откуда взялись слова, а не насколько "
+            "они верны.\n"
+            "- Утверждения-мнения владельца законно меняются со временем.\n"
+            "- Если оба утверждения об одном и том же и одно явно отменяет "
+            'другое — это не "both_valid".\n\n'
+            f"[СТРАНИЦА] {page_rel_path}\n"
+            f"{self._clip(page_state, MAX_BODY_SNIPPET_CHARS) or '(пусто)'}\n\n"
+            "[СТАРОЕ УТВЕРЖДЕНИЕ]\n"
+            f"текст: {existing_claim}\n"
+            f"источник: {existing_source}\n"
+            f"дата источника: {existing_date or 'неизвестна'}\n\n"
+            "[НОВОЕ УТВЕРЖДЕНИЕ]\n"
+            f"текст: {new_claim}\n"
+            f"источник: {new_source}\n"
+            f"дата источника: {new_date or 'неизвестна'}\n"
+            f"доверие к источнику: {new_trust} — {trust_gloss}\n"
+            f"вид утверждения: {claim_kind}\n"
+            f"как назвала конфликт модель-составитель: {model_conflict_type}\n\n"
+            "Верни JSON строго такого вида:\n"
+            f"{ADJUDICATE_JSON_EXAMPLE}"
+        )
+
+    def _adjudicate_conflict(
+        self,
+        *,
+        page_rel_path: str,
+        page_state: str,
+        existing_claim: str,
+        existing_source: str,
+        existing_date: str,
+        new_claim: str,
+        new_source: str,
+        new_date: str,
+        new_trust: str,
+        claim_kind: str,
+        model_conflict_type: str,
+        attempt: int = 1,
+    ) -> tuple[str, str]:
+        """Decide one conflict's outcome. Returns ``(outcome, context_note)``.
+
+        Every failure mode -- model unreachable, unparseable JSON, an answer
+        outside ``CONFLICT_OUTCOME_VALUES`` -- returns ``("unclear", "")``,
+        which the caller renders as the same both-claims-kept Open Conflicts
+        row the whole path used to fail closed into. There is deliberately no
+        louder failure: a page must never end up asserting one side of a
+        conflict because a network call flaked.
+
+        ``CompiledBriefingPassBudgetExceededError`` is the one exception
+        allowed through. It is not a failure to decide -- it ends the pass's
+        work on this source cleanly and leaves the source queued, so letting
+        it propagate is what makes "retry on the next pass" happen without
+        any bookkeeping of our own.
+        """
+        prompt = self._build_conflict_adjudication_prompt(
+            page_rel_path=page_rel_path,
+            page_state=page_state,
+            existing_claim=existing_claim,
+            existing_source=existing_source,
+            existing_date=existing_date,
+            new_claim=new_claim,
+            new_source=new_source,
+            new_date=new_date,
+            new_trust=new_trust,
+            claim_kind=claim_kind,
+            model_conflict_type=model_conflict_type,
+            attempt=attempt,
+        )
+        try:
+            payload = self._run_json_dict_prompt(
+                prompt=prompt,
+                timeout=ADJUDICATE_TIMEOUT_SECONDS,
+                error_context="compiled briefing conflict adjudication",
+                json_example=ADJUDICATE_JSON_EXAMPLE,
+            )
+        except CompiledBriefingPassBudgetExceededError:
+            raise
+        except Exception:
+            logger.exception(
+                "Compiled briefing conflict adjudication failed for %s -- "
+                "keeping both claims",
+                page_rel_path,
+            )
+            return "unclear", ""
+
+        outcome = str(payload.get("outcome") or "").strip().lower()
+        if outcome not in CONFLICT_OUTCOME_VALUES:
+            logger.info(
+                "Compiled briefing conflict adjudication returned an "
+                "unsupported outcome %r for %s -- keeping both claims",
+                outcome,
+                page_rel_path,
+            )
+            return "unclear", ""
+        if outcome == "unclear" and attempt > 1:
+            # The retry prompt does not offer "unclear"; an answer that uses
+            # it anyway is the model ignoring the instruction, not a real
+            # verdict. Honour it as "still undecided" rather than pretending
+            # the escalation worked.
+            logger.info(
+                "Compiled briefing conflict adjudication still undecided for "
+                "%s on attempt %d",
+                page_rel_path,
+                attempt,
+            )
+        context_note = ""
+        if outcome == "both_valid":
+            context_note = self._clean_line(payload.get("context_note"))
+        return outcome, context_note
+
+    def _resolve_open_conflicts(self, *, limit: int) -> list[str]:
+        """Re-adjudicate conflicts already standing open on compiled pages.
+
+        The write path settles every conflict it creates, so a row only
+        reaches this table when the adjudicator answered ``"unclear"``.
+        This is the second attempt at exactly those pairs: same call, but
+        ``attempt=2``, whose prompt states outright that this pair has been
+        seen before and drops the "unclear" option from the menu.
+
+        Bounded by ``limit`` conflicts per pass. Failing to reach a verdict
+        again is not an error -- the row simply stays, and the next pass
+        tries it again, which is the whole design: a conflict is retried
+        until it resolves, never handed to the owner as a task.
+
+        Returns the pages actually rewritten.
+        """
+        resolved_pages: list[str] = []
+        if limit <= 0:
+            return resolved_pages
+        budget = limit
+        for candidate in self._iter_candidates():
+            if budget <= 0:
+                break
+            rows = self._open_conflicts_rows(candidate.text)
+            if not rows:
+                continue
+            page_text = self._ensure_claim_history_section(candidate.text)
+            if not self._has_section(page_text, "Claim History"):
+                # Nowhere to retire a losing claim to, and nowhere to put the
+                # section back either. Removing a claim from the live ledger
+                # anyway would delete it outright, so this page keeps its
+                # conflicts until its sections are whole again -- and it
+                # costs no model call to find that out.
+                logger.warning(
+                    "Compiled briefing %s has open conflicts but no Claim "
+                    "History section; leaving them for the owner",
+                    candidate.rel_path,
+                )
+                continue
+            try:
+                new_text, settled = self._settle_page_conflicts(
+                    rel_path=candidate.rel_path,
+                    text=page_text,
+                    rows=rows,
+                    limit=budget,
+                )
+            except CompiledBriefingPassBudgetExceededError:
+                # The pass ran out of model calls mid-page. Whatever it had
+                # already decided is discarded rather than half-written --
+                # the rows are still on the page, so the next pass starts
+                # this page over from a consistent state.
+                logger.info(
+                    "Compiled briefing conflict retry stopped on %s: pass "
+                    "model-call budget exhausted",
+                    candidate.rel_path,
+                )
+                break
+            budget -= settled
+            if new_text == candidate.text:
+                continue
+            if not self._write_settled_page(candidate, new_text):
+                continue
+            resolved_pages.append(candidate.rel_path)
+            if self._active_pass is not None:
+                self._active_pass.conflicts_auto_resolved += len(rows) - len(
+                    self._open_conflicts_rows(new_text)
+                )
+            self._drop_undecided_conflict_entries(candidate.rel_path, new_text)
+        return resolved_pages
+
+    def _settle_page_conflicts(
+        self,
+        *,
+        rel_path: str,
+        text: str,
+        rows: list[tuple[str, str, str, str, str]],
+        limit: int,
+    ) -> tuple[str, int]:
+        """Adjudicate up to ``limit`` of one page's open conflicts.
+
+        Returns the page's new text and how many pairs were adjudicated
+        (including the ones that came back undecided -- they cost a model
+        call all the same). Pure apart from the model calls: the caller
+        writes.
+        """
+        page_state = self._section_text(text, "Current State")
+        shaped_rows = self._sources_shaped_rows(text)
+        history_rows = self._claim_history_rows(text)
+        date_lookup = {
+            (source, what): row_date for row_date, source, what in shaped_rows
+        }
+        kept_rows: list[tuple[str, str, str, str, str]] = []
+        settled = 0
+        for row in rows:
+            if settled >= limit:
+                kept_rows.append(row)
+                continue
+            since, existing_claim, existing_source, new_claim, new_source = row
+            settled += 1
+            outcome, context_note = self._adjudicate_conflict(
+                page_rel_path=rel_path,
+                page_state=page_state,
+                existing_claim=existing_claim,
+                existing_source=existing_source,
+                existing_date=date_lookup.get((existing_source, existing_claim), ""),
+                new_claim=new_claim,
+                new_source=new_source,
+                new_date=date_lookup.get((new_source, new_claim), since),
+                new_trust=self._source_trust_level(new_source, ""),
+                claim_kind="fact",
+                model_conflict_type="factual",
+                attempt=2,
+            )
+            if outcome == "unclear":
+                kept_rows.append(row)
+                continue
+            if outcome == "both_valid":
+                shaped_rows = self._annotate_shaped_row(
+                    shaped_rows,
+                    source=new_source,
+                    claim=new_claim,
+                    note=context_note,
+                )
+                continue
+            keep_existing = outcome == "existing_stands"
+            loser_claim, loser_source = (
+                (new_claim, new_source) if keep_existing
+                else (existing_claim, existing_source)
+            )
+            winner_source = existing_source if keep_existing else new_source
+            remaining = [
+                shaped
+                for shaped in shaped_rows
+                if not (shaped[1] == loser_source and shaped[2] == loser_claim)
+            ]
+            if len(remaining) == len(shaped_rows):
+                # The losing claim is not in the ledger any more (a hand
+                # edit, or an earlier resolution). Closing the row is still
+                # right -- the page no longer asserts both sides.
+                continue
+            loser_date = date_lookup.get((loser_source, loser_claim), since)
+            shaped_rows = remaining
+            history_row = (loser_date, loser_source, loser_claim, winner_source)
+            # Same dedup contract as the write path: the date column is
+            # ignored, so re-retiring the same claim adds no second row.
+            if not any(existing[1:] == history_row[1:] for existing in history_rows):
+                history_rows = [*history_rows, history_row]
+
+        text = self._replace_section(
+            text,
+            "Sources That Shaped This Page",
+            self._render_sources_shaped_table(shaped_rows),
+        )
+        text = self._replace_section(
+            text, "Claim History", self._render_claim_history(history_rows)
+        )
+        text = self._replace_section(
+            text, "Open Conflicts", self._render_open_conflicts_table(kept_rows)
+        )
+        return text, settled
 
     @staticmethod
-    def _temporal_winner_is_new(*, existing_date: str, new_date: str) -> bool:
-        """Temporal resolution winner: the later source date wins (ТЗ 5.4).
-        Trust never enters this decision. Ties, and dates that are missing
-        or fail to parse (including the opinion-forced case, which reaches
-        here even without two known differing dates), default to the newly
-        processed claim.
+    def _annotate_shaped_row(
+        rows: list[tuple[str, str, str]],
+        *,
+        source: str,
+        claim: str,
+        note: str,
+    ) -> list[tuple[str, str, str]]:
+        """Append the adjudicator's "these are different scopes" note to the
+        row of the claim it was written about.
+
+        The write path can only ever append such a note to the row it is
+        adding right then (ТЗ 5.4 keeps that table append-only); here the
+        row is already on the page, so the note is folded into its text.
+        Skipped when the note is empty or already present, which keeps a
+        repeat verdict on the same pair from stacking duplicates.
         """
-        try:
-            existing_parsed = (
-                date.fromisoformat(existing_date) if existing_date else None
+        if not note:
+            return rows
+        suffix = f" ({note})"
+        return [
+            (row_date, row_source, row_what + suffix)
+            if row_source == source
+            and row_what == claim
+            and not row_what.endswith(suffix)
+            else (row_date, row_source, row_what)
+            for row_date, row_source, row_what in rows
+        ]
+
+    def _write_settled_page(
+        self, candidate: CompiledBriefingCandidate, new_text: str
+    ) -> bool:
+        """Write one page whose conflicts were just re-adjudicated.
+
+        Same freshness/encoding guards as ``_compress_cooled_pages``: the
+        page is skipped if it changed since this pass scanned it, and skipped
+        (loudly) if its bytes are not valid UTF-8, because this rewrites the
+        whole page from decoded text.
+        """
+        note_path = self.vault_path / candidate.rel_path
+        with vault_write_lock(self.vault_path) as lock:
+            try:
+                current_bytes = note_path.read_bytes()
+            except FileNotFoundError:
+                return False
+            if self._decode_page_bytes(current_bytes) != candidate.text:
+                return False
+            if current_bytes != candidate.text.encode("utf-8"):
+                logger.warning(
+                    "Compiled briefing %s has bytes that are not valid UTF-8; "
+                    "leaving its conflicts open rather than rewriting them as "
+                    "replacement characters",
+                    candidate.rel_path,
+                )
+                self._queue_undecodable_page(candidate.rel_path, existing_lock=lock)
+                return False
+            new_bytes = patch_frontmatter_bytes(
+                new_text.encode("utf-8"),
+                {
+                    "conflicts_open": len(
+                        self._open_conflicts_rows(new_text)
+                    )
+                },
             )
-        except ValueError:
-            existing_parsed = None
-        try:
-            new_parsed = date.fromisoformat(new_date) if new_date else None
-        except ValueError:
-            new_parsed = None
-        if existing_parsed is not None and new_parsed is not None:
-            return new_parsed >= existing_parsed
+            self._snapshot_pass_page(
+                candidate.rel_path, before=current_bytes, after=new_bytes
+            )
+            write_validated_vault_markdown(
+                self.vault_path,
+                note_path,
+                new_bytes,
+                manifest=self._manifest(),
+                existing_lock=lock,
+            )
         return True
+
+    def _drop_undecided_conflict_entries(self, rel_path: str, text: str) -> None:
+        """Clear a page's retry entries once it has no open conflicts left.
+
+        The entry is a pointer at the page, not at one pair (it is deduped
+        by ``(kind, page)``), so it stays meaningful until the page's last
+        conflict is settled. The retired ``"blocked-action"`` kind is
+        cleared alongside it: those entries are still on disk from before
+        adjudication existed and describe the same, now-settled situation.
+        """
+        if self._open_conflicts_rows(text):
+            return
+        from d_brain.services.decisions_queue import (
+            BLOCKED_ACTION_KIND,
+            UNDECIDED_CONFLICT_KIND,
+            remove_queue_entries_for_page,
+        )
+
+        with vault_write_lock(self.vault_path) as lock:
+            remove_queue_entries_for_page(
+                self.vault_path,
+                rel_path,
+                kinds=(UNDECIDED_CONFLICT_KIND, BLOCKED_ACTION_KIND),
+                existing_lock=lock,
+            )
+
+    def _adjudicate_drift_entries(self, *, limit: int) -> list[str]:
+        """Judge queued drift suspicions instead of asking the owner to.
+
+        A ``"drift"`` entry means one thing only: the page hit
+        ``MAX_ENRICHMENTS_PER_PAGE_PER_MONTH`` this month. That counter
+        cannot tell a page slowly losing its shape from a project page that
+        is simply busy, which is why the entry existed -- somebody had to
+        look. Here the model looks: it reads the page and everything added
+        to it this month, and answers whether the page actually drifted.
+
+        Real drift is recorded where it belongs, on the page itself
+        (``quality_status: needs_review`` plus the reason), which is the
+        same flag Verify raises and which the next successful Verify pass
+        clears. Either way the queue entry goes: the question has been
+        answered. The monthly enrichment budget is untouched by all this --
+        it is a cost control, not a drift verdict.
+
+        Returns the pages marked as drifted.
+        """
+        from d_brain.services.decisions_queue import (
+            DRIFT_KIND,
+            list_json_queue_items,
+        )
+
+        marked: list[str] = []
+        if limit <= 0:
+            return marked
+        pending = [
+            item
+            for item in list_json_queue_items(self.vault_path)
+            if item.kind == DRIFT_KIND
+        ][:limit]
+        for item in pending:
+            page_path = self.vault_path / item.page
+            try:
+                text = self._read_page_text(page_path)
+            except FileNotFoundError:
+                text = ""
+            if not text:
+                # The page is gone; the suspicion about it cannot be
+                # answered and no longer means anything.
+                self._drop_drift_entry(item.page)
+                continue
+            month_prefix = (item.since or date.today().isoformat())[:7]
+            verdict, reason = self._judge_page_drift(
+                page_rel_path=item.page,
+                text=text,
+                month_prefix=month_prefix,
+            )
+            if verdict is None:
+                # Unreachable model, unparseable answer: leave the entry so
+                # the next pass asks again.
+                continue
+            if verdict and self._flag_page_drift(item.page, text, reason):
+                marked.append(item.page)
+            self._drop_drift_entry(item.page)
+        return marked
+
+    def _judge_page_drift(
+        self, *, page_rel_path: str, text: str, month_prefix: str
+    ) -> tuple[bool | None, str]:
+        """One model call. Returns ``(drifted, reason)``; ``(None, "")`` when
+        the call or its answer was unusable, which the caller treats as "ask
+        again next pass" rather than as a verdict either way."""
+        month_rows = "\n".join(
+            f"- {row_date} {source}: {what}"
+            for row_date, source, what in self._sources_shaped_rows(text)
+            if row_date.startswith(month_prefix)
+            and what != NOT_ENRICHMENT_SOURCE_MARKER
+        )
+        page_state = self._clip(
+            self._section_text(text, "Current State"), MAX_BODY_SNIPPET_CHARS
+        )
+        prompt = (
+            "Ты ведёшь скомпилированную базу знаний личного ассистента.\n"
+            "Верни ТОЛЬКО JSON.\n\n"
+            "Эта страница обновлялась в этом месяце необычно часто. Само по "
+            "себе это ничего не значит: у активного проекта так и должно "
+            "быть. Дрейф — это другое: страница перестала быть про один "
+            "предмет, в неё стекается материал из разных тем, или её "
+            "утверждения накопились в кашу.\n\n"
+            "Реши, дрейф ли это.\n"
+            '- "drift": true — страница потеряла предмет или смешала темы; '
+            'в "reason" одной фразой скажи, что именно расползлось.\n'
+            '- "drift": false — просто активная работа по одной теме.\n\n'
+            f"[СТРАНИЦА] {page_rel_path}\n"
+            f"{page_state or '(пусто)'}\n\n"
+            f"[ЧТО ДОБАВЛЯЛОСЬ В {month_prefix}]\n"
+            f"{self._clip(month_rows, MAX_BODY_SNIPPET_CHARS) or '(ничего)'}\n\n"
+            "Верни JSON строго такого вида:\n"
+            f"{DRIFT_JSON_EXAMPLE}"
+        )
+        try:
+            payload = self._run_json_dict_prompt(
+                prompt=prompt,
+                timeout=ADJUDICATE_TIMEOUT_SECONDS,
+                error_context="compiled briefing drift judgement",
+                json_example=DRIFT_JSON_EXAMPLE,
+            )
+        except CompiledBriefingPassBudgetExceededError:
+            raise
+        except Exception:
+            logger.exception(
+                "Compiled briefing drift judgement failed for %s -- leaving "
+                "the queue entry for the next pass",
+                page_rel_path,
+            )
+            return None, ""
+        drifted = payload.get("drift")
+        if not isinstance(drifted, bool):
+            logger.info(
+                "Compiled briefing drift judgement for %s returned no usable "
+                "verdict (%r)",
+                page_rel_path,
+                drifted,
+            )
+            return None, ""
+        return drifted, self._clean_line(payload.get("reason"))
+
+    def _flag_page_drift(self, rel_path: str, text: str, reason: str) -> bool:
+        """Write the drift verdict onto the page as ``quality_status``.
+
+        Uses the same two frontmatter fields Verify uses for a
+        content-quality problem, rather than inventing a drift-specific one:
+        both mean "a human should look at this page", both are cleared by
+        the next Verify pass that comes back clean, and the digest and page
+        schema already know about them.
+        """
+        note_path = self.vault_path / rel_path
+        with vault_write_lock(self.vault_path) as lock:
+            try:
+                current_bytes = note_path.read_bytes()
+            except FileNotFoundError:
+                return False
+            if self._decode_page_bytes(current_bytes) != text:
+                return False
+            new_bytes = patch_frontmatter_bytes(
+                current_bytes,
+                {
+                    "quality_status": "needs_review",
+                    "quality_reason": reason
+                    or "страница расползлась по темам за месяц",
+                },
+            )
+            if new_bytes == current_bytes:
+                return False
+            self._snapshot_pass_page(rel_path, before=current_bytes, after=new_bytes)
+            write_validated_vault_markdown(
+                self.vault_path,
+                note_path,
+                new_bytes,
+                manifest=self._manifest(),
+                existing_lock=lock,
+            )
+        return True
+
+    def _drop_drift_entry(self, rel_path: str) -> None:
+        from d_brain.services.decisions_queue import (
+            DRIFT_KIND,
+            remove_queue_entries_for_page,
+        )
+
+        with vault_write_lock(self.vault_path) as lock:
+            remove_queue_entries_for_page(
+                self.vault_path,
+                rel_path,
+                kinds=(DRIFT_KIND,),
+                existing_lock=lock,
+            )
 
     def _apply_claims_and_conflicts(
         self,
@@ -7764,6 +8290,7 @@ class CompiledBriefingService:
         signal: dict[str, Any] | None,
         today: str,
         page_rel_path: str,
+        page_state: str = "",
         record_side_effects: bool = True,
     ) -> tuple[
         list[tuple[str, str, str]],
@@ -7775,10 +8302,11 @@ class CompiledBriefingService:
         return the updated (shaped_rows, claim_history_rows,
         open_conflict_rows).
 
-        ``page_rel_path`` is only used to queue a "blocked-action" owner
-        decision (ТЗ 7.2) when a low-trust source blocks an automatic
-        supersession below -- see the ``_trust_allows_consequential_action``
-        branch.
+        Every conflict here is settled by ``_adjudicate_conflict``, one
+        model call per pair; ``page_rel_path``/``page_state`` are what that
+        call needs to see the page the pair sits on, and ``page_rel_path``
+        also names the page in the ``"undecided-conflict"`` retry entry a
+        verdict of ``"unclear"`` leaves behind.
 
         ТЗ 5.4 note on decisions supersession ("для решений выполняется
         замещение через epistemic_memory"): deliberately NOT done here.
@@ -7813,12 +8341,13 @@ class CompiledBriefingService:
         explicit gap; the losing claim still moves to Claim History with
         its source.
 
-        ТЗ 4.4 addition: a temporal win by the new claim is only applied
-        silently (dropping the existing claim) when the new source's trust
-        level passes ``_trust_allows_consequential_action``; otherwise the
-        type is downgraded to `factual` so both sides stay and the owner
-        decides, without changing which side the date comparison would
-        have picked.
+        ТЗ 4.4 note: trust no longer gates supersession here. It used to --
+        a temporal win by a `forwarded` source was downgraded to `factual`
+        so the owner decided instead -- which in practice meant every
+        date-based supersession coming out of a PLAUD recording piled into
+        the decisions queue. Trust is now stated to the adjudicator as
+        evidence about where the words came from, and it weighs that
+        against the claims themselves.
         """
         if not claims:
             return shaped_rows, claim_history_rows, open_conflict_rows
@@ -7859,54 +8388,44 @@ class CompiledBriefingService:
                 # pairing) -- nothing to resolve.
                 continue
             claim_kind = claim_kind_by_text.get(conflict["new_claim"], "fact")
-            effective_type = self._effective_conflict_type(
-                conflict_type=conflict["type"],
+            outcome, context_note = self._adjudicate_conflict(
+                page_rel_path=page_rel_path,
+                page_state=page_state,
+                existing_claim=conflict["existing_claim"],
+                existing_source=conflict["existing_source"],
                 existing_date=existing_date,
+                new_claim=conflict["new_claim"],
+                new_source=source_rel_path,
                 new_date=new_date,
+                new_trust=current_trust,
                 claim_kind=claim_kind,
+                model_conflict_type=conflict["type"],
             )
-            winner_is_new = (
-                effective_type == "temporal"
-                and self._temporal_winner_is_new(
-                    existing_date=existing_date, new_date=new_date
-                )
-            )
-            if winner_is_new and not self._trust_allows_consequential_action(
-                current_trust
-            ):
-                # ТЗ 4.4: silently dropping the existing claim is an action
-                # with consequences; a forwarded/inferred-trust new source
-                # must not trigger it alone. Fall through to the "factual"
-                # branch below instead, which keeps both sides and queues
-                # the conflict for the owner.
-                effective_type = "factual"
-                if record_side_effects and self._active_pass is not None:
-                    # G7: count every temporal-to-factual downgrade caused
-                    # by weak source trust for the pass journal. Only the
-                    # counter belongs under this guard -- there is no pass
-                    # journal to count into outside a pass.
+            effective_type = CONFLICT_OUTCOME_TO_TYPE[outcome]
+            winner_is_new = outcome == "new_supersedes"
+            if context_note:
+                # The adjudicator's own explanation of how the two scopes
+                # differ replaces the compile stage's ``context_note`` for
+                # this pair: it was produced by the model that actually
+                # decided they coexist.
+                conflict = {**conflict, "context_note": context_note}
+            if outcome == "unclear" and record_side_effects:
+                # Undecided is the one outcome that still costs the owner a
+                # queue entry -- but as a retry buffer, not a task: the
+                # nightly pass re-adjudicates it with the escalated prompt
+                # (``attempt`` > 1). Counted on the pass journal under the
+                # old ``trust_blocked`` field, which now means "conflicts
+                # this pass could not settle" rather than "blocked by trust"
+                # -- trust no longer blocks anything.
+                if self._active_pass is not None:
                     self._active_pass.trust_blocked += 1
-                # ТЗ 7.1/7.2: this is exactly a "действие, заблокированное
-                # низким доверием источника" -- surface it to the owner as
-                # its own queue item, not only as the pass-journal counter
-                # above (code review: the "blocked-action" kind was declared
-                # and protected from eviction but had no producer). The
-                # decisions queue is the owner's, not the pass's, so this
-                # must also fire on the hot write path
-                # (``refresh_after_write``), where ``_active_pass`` is None
-                # -- otherwise the page grows an Open Conflicts row with no
-                # explanation of *why* the normally-automatic date-based
-                # supersession did not just happen. The "factual" branch
-                # just below still adds that row either way.
-                if record_side_effects:
-                    self._queue_blocked_action(
-                        page_rel_path=page_rel_path,
-                        existing_claim=conflict["existing_claim"],
-                        existing_source=conflict["existing_source"],
-                        new_claim=conflict["new_claim"],
-                        new_source=source_rel_path,
-                        trust=current_trust,
-                    )
+                self._queue_undecided_conflict(
+                    page_rel_path=page_rel_path,
+                    existing_claim=conflict["existing_claim"],
+                    existing_source=conflict["existing_source"],
+                    new_claim=conflict["new_claim"],
+                    new_source=source_rel_path,
+                )
             if effective_type == "temporal":
                 if winner_is_new:
                     dropped_existing.add(key)

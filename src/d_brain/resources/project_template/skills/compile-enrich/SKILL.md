@@ -146,15 +146,14 @@ Every compiled page lives at `compiled/<domain>/<slug>.md` (or
 `compiled/archive/<domain>/<slug>.md` once archived): `projects`, `people`,
 `topics`, `decisions`, `meetings`, `concepts`.
 
-`concepts` is the one domain the model can misroute in a specific,
-predictable way: a candidate for `concepts` is rerouted to `topics`
-whenever its title contains a date, or whenever its title fully names an
-existing project/people page (a fictional example: "Notes on Aurora
-Solutions Onboarding" belongs to the `Aurora Solutions` project, not to
-`concepts`) -- unless that page's name is a single generic common noun like
-"платформа" or "migration", which is a coincidental match, not a real
-binding. See `references/page-schema.md` for the exact rule and the full
-domain-hint table.
+Which domain a candidate lands in is decided by the model in the impact
+stage; code only checks that the answer is one of the six. `concepts` is the
+easiest one to get wrong -- a concept must stay portable, so a candidate
+whose title carries a date, or that names one specific project, client, or
+person (a fictional example: "Notes on Aurora Solutions Onboarding" belongs
+to the `Aurora Solutions` project), is a topic. That is guidance carried in
+the impact prompt, not a rule applied to the model's answer afterwards. See
+`references/page-schema.md` for the full domain-hint table.
 
 ## Owner Layer
 
@@ -163,7 +162,14 @@ The compiled layer is read by, and only by, these owner-facing surfaces --
 daily digest for what changed, the decisions queue for anything that needs a
 human call, and the "Сводка недели" screen that bundles a preview of all
 three (queue, changes, a forgotten page) plus one `human_reviewed`
-confirmation into a single half-hour weekly pass. See
+confirmation into a single half-hour weekly pass.
+
+Two queue kinds are not really a human call any more: a `conflict` is
+settled by a model when it is created and retried by the nightly pass if
+that first attempt came back undecided, and a `drift` suspicion is judged
+the same way. Both still appear on the queue screen, and answering one by
+hand does exactly what the automated path does -- but the queue is expected
+to drain itself. See
 `references/links-policy.md` for what each of these does and does not
 surface, and `references/conflict-policy.md` for the trust/conflict rules
 behind the decisions queue.
@@ -171,11 +177,11 @@ behind the decisions queue.
 ## Reference Files
 
 - `references/page-schema.md` -- frontmatter fields (and which ones are
-  code-only, never model-written), section order, the six domains, the
-  concepts-vs-topics override in full.
+  code-only, never model-written), section order, the six domains,
+  concepts-vs-topics routing in full.
 - `references/conflict-policy.md` -- source trust levels, claim kinds,
-  conflict-type resolution, Verify sampling, pass budgets, the decisions
-  queue's eight item kinds.
+  conflict adjudication and its nightly retry, drift judgement, Verify
+  sampling, pass budgets, the decisions queue's nine item kinds.
 - `references/links-policy.md` -- the human zone and why link/graph tooling
   must never touch it, the three provenance tables, what `/why` does and
   does not surface.

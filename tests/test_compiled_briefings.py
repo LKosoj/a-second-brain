@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -66,6 +67,32 @@ def _compiled_service(vault_path: Path) -> CompiledBriefingService:
     vault_path.mkdir(parents=True, exist_ok=True)
     _write_vault_manifest(vault_path)
     return CompiledBriefingService(vault_path)
+
+
+def _stub_adjudicator(
+    monkeypatch: pytest.MonkeyPatch,
+    service: CompiledBriefingService,
+    verdict: tuple[str, str] | Callable[[dict[str, Any]], tuple[str, str]],
+) -> list[dict[str, Any]]:
+    """Pin ``_adjudicate_conflict``'s verdict and capture what it was asked.
+
+    Conflict outcomes are a model decision now, so every test that drives a
+    conflict through ``_render_briefing`` has to say what the model decided
+    -- otherwise the call reaches conftest's real-CLI guard. Pass either a
+    fixed ``(outcome, context_note)`` pair or a callable that picks one per
+    conflict from the keyword arguments it was given.
+
+    The returned list collects those keyword arguments, so a test can also
+    assert what the adjudicator was told (dates, trust, claim texts).
+    """
+    seen: list[dict[str, Any]] = []
+
+    def fake(**kwargs: Any) -> tuple[str, str]:
+        seen.append(dict(kwargs))
+        return verdict(kwargs) if callable(verdict) else verdict
+
+    monkeypatch.setattr(service, "_adjudicate_conflict", fake)
+    return seen
 
 
 def _minimal_compile_payload(**overrides: Any) -> dict[str, Any]:
@@ -130,6 +157,7 @@ def _full_compiled_page_text(
     recent_changes_rows: list[tuple[str, str, str]] | None = None,
     open_loops_rows: list[tuple[str, str, str]] | None = None,
     history_rows: list[tuple[str, str, str]] | None = None,
+    conflict_rows: list[tuple[str, str, str, str, str]] | None = None,
     sources: list[str] | None = None,
     human_note: str = "No notes yet.",
 ) -> str:
@@ -187,7 +215,7 @@ def _full_compiled_page_text(
             *svc._render_sources_shaped_table(shaped_rows or []),
             "",
             "## Open Conflicts",
-            *svc._render_open_conflicts_table([]),
+            *svc._render_open_conflicts_table(conflict_rows or []),
             "",
             "## Claim History",
             *svc._render_claim_history([]),
@@ -3680,10 +3708,20 @@ def test_compiled_briefings_concepts_domain_is_registered() -> None:
     assert DOMAIN_HINTS["concepts"].strip()
 
 
-def test_compiled_briefings_resolve_targets_reroutes_concepts_for_known_project(
+def test_compiled_briefings_resolve_targets_honors_the_model_domain_choice(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Domain routing belongs to the model, not to a deterministic rule.
+
+    This candidate trips both signals the old ``_concepts_to_topics_reason``
+    override used to reroute on -- its title carries a date AND it fully
+    names an existing project page ("Phoenix Migration") -- yet the model
+    asked for ``concepts``, so ``concepts`` is what comes back. The routing
+    guidance now lives in the impact prompt (see the test below) where the
+    model can weigh it against the source, instead of in code that outranked
+    the model's answer after the fact.
+    """
     vault_path = tmp_path / "vault"
     compiled_projects = vault_path / "compiled" / "projects"
     compiled_projects.mkdir(parents=True)
@@ -3707,10 +3745,7 @@ def test_compiled_briefings_resolve_targets_reroutes_concepts_for_known_project(
             "updates": [
                 {
                     "domain": "concepts",
-                    # Fully contains the existing "Phoenix Migration" page
-                    # name (both "phoenix" and "migration"), not just one
-                    # shared word -- see _concepts_to_topics_reason.
-                    "title": "Phoenix Migration Retry Playbook",
+                    "title": "Phoenix Migration Retry Playbook 2026-08-05",
                     "slug": "phoenix-migration-retry-playbook",
                     "description": "How retries work in Phoenix Migration",
                     "reason": "captured pattern",
@@ -3731,509 +3766,30 @@ def test_compiled_briefings_resolve_targets_reroutes_concepts_for_known_project(
     )
 
     assert len(targets) == 1
-    assert targets[0].domain == "topics"
-
-
-def test_compiled_briefings_resolve_targets_reroutes_concepts_for_date_in_title(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    vault_path = tmp_path / "vault"
-    service = _compiled_service(vault_path)
-
-    def make_fake(title: str):  # noqa: ANN202
-        def fake_run_json_dict_prompt(**kwargs):  # noqa: ANN001, ANN202
-            del kwargs
-            return {
-                "updates": [
-                    {
-                        "domain": "concepts",
-                        "title": title,
-                        "slug": "dated-title",
-                        "description": "desc",
-                        "reason": "reason",
-                        "existing_path": "",
-                    }
-                ]
-            }
-
-        return fake_run_json_dict_prompt
-
-    monkeypatch.setattr(
-        service, "_run_json_dict_prompt", make_fake("Ретро 2026-08-05")
-    )
-    iso_targets = service._resolve_targets(
-        source_rel_path="daily/2026-08-05.md",
-        source_excerpt="excerpt",
-        signal=None,
-        max_updates=3,
-    )
-    assert len(iso_targets) == 1
-    assert iso_targets[0].domain == "topics"
-
-    monkeypatch.setattr(
-        service, "_run_json_dict_prompt", make_fake("Встреча 5 августа 2026")
-    )
-    ru_targets = service._resolve_targets(
-        source_rel_path="daily/2026-08-05.md",
-        source_excerpt="excerpt",
-        signal=None,
-        max_updates=3,
-    )
-    assert len(ru_targets) == 1
-    assert ru_targets[0].domain == "topics"
-
-
-def test_compiled_briefings_resolve_targets_keeps_concepts_for_neutral_title(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    vault_path = tmp_path / "vault"
-    compiled_projects = vault_path / "compiled" / "projects"
-    compiled_projects.mkdir(parents=True)
-    (compiled_projects / "phoenix-migration.md").write_text(
-        (
-            "---\n"
-            "domain: projects\n"
-            'description: "Phoenix migration track."\n'
-            "---\n\n"
-            "# Phoenix Migration\n\n"
-            "## Sources\n"
-            "- (none)\n"
-        ),
-        encoding="utf-8",
-    )
-    service = _compiled_service(vault_path)
-
-    def fake_run_json_dict_prompt(**kwargs):  # noqa: ANN001, ANN202
-        del kwargs
-        return {
-            "updates": [
-                {
-                    "domain": "concepts",
-                    # Shares a single word ("migration") with the existing
-                    # "Phoenix Migration" project page but does not contain
-                    # the page's full name -- a single shared common word
-                    # must not force this into topics (that was the bug:
-                    # any one-token overlap used to be enough).
-                    "title": "Migration Playbook",
-                    "slug": "migration-playbook",
-                    "description": "A general migration pattern",
-                    "reason": "durable reusable concept",
-                    "existing_path": "",
-                }
-            ]
-        }
-
-    monkeypatch.setattr(
-        service, "_run_json_dict_prompt", fake_run_json_dict_prompt
-    )
-
-    targets = service._resolve_targets(
-        source_rel_path="daily/2026-08-05.md",
-        source_excerpt="excerpt",
-        signal=None,
-        max_updates=3,
-    )
-
-    assert len(targets) == 1
     assert targets[0].domain == "concepts"
 
 
-def test_compiled_briefings_resolve_targets_keeps_concepts_for_common_word_overlap(
+def test_compiled_briefings_impact_prompt_carries_the_concepts_routing_rule(
     tmp_path: Path,
-    monkeypatch,
 ) -> None:
-    """Reproduces the reviewer's scenario: a common word shared between an
-    existing project title and a concept title must not force a reroute --
-    only a full existing page name appearing in the concept title should.
+    """The concepts-vs-topics knowledge must reach the model as guidance.
+
+    Deleting the code override without moving its reasoning into the prompt
+    would not hand the decision to the model -- it would just drop the
+    knowledge on the floor.
     """
-    vault_path = tmp_path / "vault"
-    compiled_projects = vault_path / "compiled" / "projects"
-    compiled_projects.mkdir(parents=True)
-    (compiled_projects / "sistema-otchetnosti.md").write_text(
-        (
-            "---\n"
-            "domain: projects\n"
-            'description: "Reporting system project."\n'
-            "---\n\n"
-            "# Система отчётности\n\n"
-            "## Sources\n"
-            "- (none)\n"
-        ),
-        encoding="utf-8",
-    )
-    service = _compiled_service(vault_path)
+    service = _compiled_service(tmp_path / "vault")
 
-    def fake_run_json_dict_prompt(**kwargs):  # noqa: ANN001, ANN202
-        del kwargs
-        return {
-            "updates": [
-                {
-                    "domain": "concepts",
-                    "title": "Система принятия решений",
-                    "slug": "sistema-prinyatiya-resheniy",
-                    "description": "Decision-making framework",
-                    "reason": "durable reusable concept",
-                    "existing_path": "",
-                }
-            ]
-        }
-
-    monkeypatch.setattr(
-        service, "_run_json_dict_prompt", fake_run_json_dict_prompt
-    )
-
-    targets = service._resolve_targets(
+    prompt = service._build_impact_prompt(
         source_rel_path="daily/2026-08-05.md",
         source_excerpt="excerpt",
         signal=None,
+        catalog=[],
         max_updates=3,
     )
 
-    assert len(targets) == 1
-    assert targets[0].domain == "concepts"
-
-
-def test_compiled_briefings_resolve_targets_reroutes_concepts_for_single_token_project(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    """A single-token project name ("Acme") must still trigger the reroute
-    when it appears whole inside the concept title.
-    """
-    vault_path = tmp_path / "vault"
-    compiled_projects = vault_path / "compiled" / "projects"
-    compiled_projects.mkdir(parents=True)
-    (compiled_projects / "acme.md").write_text(
-        (
-            "---\n"
-            "domain: projects\n"
-            'description: "Acme client project."\n'
-            "---\n\n"
-            "# Acme\n\n"
-            "## Sources\n"
-            "- (none)\n"
-        ),
-        encoding="utf-8",
-    )
-    service = _compiled_service(vault_path)
-
-    def fake_run_json_dict_prompt(**kwargs):  # noqa: ANN001, ANN202
-        del kwargs
-        return {
-            "updates": [
-                {
-                    "domain": "concepts",
-                    "title": "Миграция Acme",
-                    "slug": "migratsiya-acme",
-                    "description": "Migration approach used for Acme",
-                    "reason": "captured pattern",
-                    "existing_path": "",
-                }
-            ]
-        }
-
-    monkeypatch.setattr(
-        service, "_run_json_dict_prompt", fake_run_json_dict_prompt
-    )
-
-    targets = service._resolve_targets(
-        source_rel_path="daily/2026-08-05.md",
-        source_excerpt="excerpt",
-        signal=None,
-        max_updates=3,
-    )
-
-    assert len(targets) == 1
-    assert targets[0].domain == "topics"
-
-
-def test_compiled_briefings_resolve_targets_reroutes_concepts_for_cyrillic_project_name(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    """Reproduces the reviewer's regression report directly: a Cyrillic
-    project title ("Феникс") and its transliterated slug ("feniks") are two
-    independent spellings of the same name. Gluing both into one token set
-    made the whole-name subset check unsatisfiable for every
-    Russian-language page (a Cyrillic concept title can never contain the
-    Latin slug spelling too), so the override silently never fired. Checking
-    the title spelling and the slug spelling independently fixes this.
-    """
-    vault_path = tmp_path / "vault"
-    compiled_projects = vault_path / "compiled" / "projects"
-    compiled_projects.mkdir(parents=True)
-    (compiled_projects / "feniks.md").write_text(
-        (
-            "---\n"
-            "domain: projects\n"
-            'description: "Phoenix project track."\n'
-            "---\n\n"
-            "# Феникс\n\n"
-            "## Sources\n"
-            "- (none)\n"
-        ),
-        encoding="utf-8",
-    )
-    service = _compiled_service(vault_path)
-
-    def fake_run_json_dict_prompt(**kwargs):  # noqa: ANN001, ANN202
-        del kwargs
-        return {
-            "updates": [
-                {
-                    "domain": "concepts",
-                    "title": "Уроки проекта Феникс",
-                    "slug": "uroki-proekta-feniks",
-                    "description": "Lessons from the Phoenix project",
-                    "reason": "captured pattern",
-                    "existing_path": "",
-                }
-            ]
-        }
-
-    monkeypatch.setattr(
-        service, "_run_json_dict_prompt", fake_run_json_dict_prompt
-    )
-
-    targets = service._resolve_targets(
-        source_rel_path="daily/2026-08-05.md",
-        source_excerpt="excerpt",
-        signal=None,
-        max_updates=3,
-    )
-
-    assert len(targets) == 1
-    assert targets[0].domain == "topics"
-
-
-def test_compiled_briefings_resolve_targets_reroutes_concepts_for_cyrillic_person_name(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    """Same regression as the Phoenix project case above, but for a people
-    page: a Russian person's name ("Иван Петров") must still force a
-    concepts -> topics reroute when a concept title mentions it in full,
-    even though the page's slug is a Latin transliteration.
-    """
-    vault_path = tmp_path / "vault"
-    compiled_people = vault_path / "compiled" / "people"
-    compiled_people.mkdir(parents=True)
-    (compiled_people / "ivan-petrov.md").write_text(
-        (
-            "---\n"
-            "domain: people\n"
-            'description: "Ivan Petrov contact record."\n'
-            "---\n\n"
-            "# Иван Петров\n\n"
-            "## Sources\n"
-            "- (none)\n"
-        ),
-        encoding="utf-8",
-    )
-    service = _compiled_service(vault_path)
-
-    def fake_run_json_dict_prompt(**kwargs):  # noqa: ANN001, ANN202
-        del kwargs
-        return {
-            "updates": [
-                {
-                    "domain": "concepts",
-                    "title": "Иван Петров: договорённости по проекту",
-                    "slug": "ivan-petrov-dogovorennosti",
-                    "description": "Agreements reached with Ivan Petrov",
-                    "reason": "captured pattern",
-                    "existing_path": "",
-                }
-            ]
-        }
-
-    monkeypatch.setattr(
-        service, "_run_json_dict_prompt", fake_run_json_dict_prompt
-    )
-
-    targets = service._resolve_targets(
-        source_rel_path="daily/2026-08-05.md",
-        source_excerpt="excerpt",
-        signal=None,
-        max_updates=3,
-    )
-
-    assert len(targets) == 1
-    assert targets[0].domain == "topics"
-
-
-def test_compiled_briefings_concepts_to_topics_exempts_translit_slug() -> None:
-    """A generic-noun page's transliterated slug ("migratsiya") is not
-    itself listed in GENERIC_SINGLE_TOKEN_PAGE_NAMES, but it is just the
-    machine transliteration of the exempted Cyrillic title ("миграция"), so
-    it must inherit the same exemption rather than start matching concepts
-    through the back door. Exercised directly against
-    ``_concepts_to_topics_reason`` with a constructed page pair, since a
-    Latin token can only match a concept title that is itself in Latin.
-    """
-    page_tokens = (frozenset({"миграция"}), frozenset({"migratsiya"}))
-
-    reason = CompiledBriefingService._concepts_to_topics_reason(
-        "Migratsiya rollout notes", [page_tokens]
-    )
-
-    assert reason == ""
-
-
-def test_compiled_briefings_concepts_to_topics_judges_each_spelling_alone() -> None:
-    """``slug`` is chosen by the model independently of ``title``, so the two
-    spellings of a page name are not guaranteed to be transliterations of one
-    another. A generic slug next to a proper-noun title (and the mirror case)
-    must not silently exempt the spelling that did match.
-    """
-    proper_title_generic_slug = (frozenset({"феникс"}), frozenset({"platform"}))
-    generic_title_proper_slug = (frozenset({"данные"}), frozenset({"phoenix"}))
-
-    assert CompiledBriefingService._concepts_to_topics_reason(
-        "Отчёт по проекту Феникс за август", [proper_title_generic_slug]
-    )
-    assert CompiledBriefingService._concepts_to_topics_reason(
-        "Phoenix rollout retrospective", [generic_title_proper_slug]
-    )
-    # The generic spelling of each pair still stays exempt on its own.
-    assert (
-        CompiledBriefingService._concepts_to_topics_reason(
-            "Platform ownership rules", [proper_title_generic_slug]
-        )
-        == ""
-    )
-    assert (
-        CompiledBriefingService._concepts_to_topics_reason(
-            "Данные как продукт", [generic_title_proper_slug]
-        )
-        == ""
-    )
-
-
-def test_compiled_briefings_resolve_targets_keeps_concepts_for_common_noun_page(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    """A single-token project/people page name that is a generic common noun
-    ("Миграция") must not force a reroute on its own -- that is the reviewer's
-    reproduction of the regression: a page with exactly one significant token
-    degenerated the whole-name check into "any one shared word matches".
-
-    The filename is the real slug ``_slugify("Миграция")`` produces
-    ("migratsiya.md"), matching what the service actually writes to disk.
-
-    The concept title repeats the page name in the exact same word form on
-    purpose: with any other inflection ("миграции") the tokens simply do not
-    match and the test would pass even with the stoplist removed entirely,
-    proving nothing about the exemption it claims to cover.
-    """
-    vault_path = tmp_path / "vault"
-    compiled_projects = vault_path / "compiled" / "projects"
-    compiled_projects.mkdir(parents=True)
-    (compiled_projects / "migratsiya.md").write_text(
-        (
-            "---\n"
-            "domain: projects\n"
-            'description: "Data migration workstream."\n'
-            "---\n\n"
-            "# Миграция\n\n"
-            "## Sources\n"
-            "- (none)\n"
-        ),
-        encoding="utf-8",
-    )
-    service = _compiled_service(vault_path)
-
-    def fake_run_json_dict_prompt(**kwargs):  # noqa: ANN001, ANN202
-        del kwargs
-        return {
-            "updates": [
-                {
-                    "domain": "concepts",
-                    "title": "Миграция как принцип проектирования",
-                    "slug": "migratsiya-kak-printsip-proektirovaniya",
-                    "description": "Reusable migration checklist",
-                    "reason": "durable reusable concept",
-                    "existing_path": "",
-                }
-            ]
-        }
-
-    monkeypatch.setattr(
-        service, "_run_json_dict_prompt", fake_run_json_dict_prompt
-    )
-
-    targets = service._resolve_targets(
-        source_rel_path="daily/2026-08-05.md",
-        source_excerpt="excerpt",
-        signal=None,
-        max_updates=3,
-    )
-
-    assert len(targets) == 1
-    assert targets[0].domain == "concepts"
-
-
-def test_compiled_briefings_multi_token_page_reroutes_despite_common_noun(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    """The generic-single-token stoplist must not weaken a multi-token page
-    name match: "Платформа лояльности" has two significant tokens, one of
-    which ("платформа") is in the stoplist, but the full two-word name is
-    still a strong signal and must still force the reroute.
-
-    The filename is the real slug ``_slugify("Платформа лояльности")``
-    produces ("platforma-loyalnosti.md"), matching what the service
-    actually writes to disk.
-    """
-    vault_path = tmp_path / "vault"
-    compiled_projects = vault_path / "compiled" / "projects"
-    compiled_projects.mkdir(parents=True)
-    (compiled_projects / "platforma-loyalnosti.md").write_text(
-        (
-            "---\n"
-            "domain: projects\n"
-            'description: "Loyalty platform project."\n'
-            "---\n\n"
-            "# Платформа лояльности\n\n"
-            "## Sources\n"
-            "- (none)\n"
-        ),
-        encoding="utf-8",
-    )
-    service = _compiled_service(vault_path)
-
-    def fake_run_json_dict_prompt(**kwargs):  # noqa: ANN001, ANN202
-        del kwargs
-        return {
-            "updates": [
-                {
-                    "domain": "concepts",
-                    "title": "Платформа лояльности: новые возможности",
-                    "slug": "platforma-loyalnosti-novye-vozmozhnosti",
-                    "description": "New loyalty platform capabilities",
-                    "reason": "captured pattern",
-                    "existing_path": "",
-                }
-            ]
-        }
-
-    monkeypatch.setattr(
-        service, "_run_json_dict_prompt", fake_run_json_dict_prompt
-    )
-
-    targets = service._resolve_targets(
-        source_rel_path="daily/2026-08-05.md",
-        source_excerpt="excerpt",
-        signal=None,
-        max_updates=3,
-    )
-
-    assert len(targets) == 1
-    assert targets[0].domain == "topics"
+    assert "Concepts must stay portable." in prompt
+    assert "nothing downstream reroutes it for you" in prompt
 
 
 # --- A2: human zone ----------------------------------------------------------
@@ -7424,12 +6980,16 @@ def test_compiled_briefings_normalize_conflicts_requires_existing_source_and_ver
     assert conflicts[0]["new_claim"] == "Точная формулировка."
 
 
-def test_compiled_briefings_conflict_type_forced_temporal_when_dates_known_and_differ(
+def test_compiled_briefings_adjudicated_supersession_overrides_the_compile_label(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ТЗ 5.4: if both source dates are known and differ, the conflict is
-    temporal regardless of the model's declared type."""
+    """The adjudicator's verdict decides the outcome, not the conflict label
+    the compile stage attached and not the two source dates. Here the compile
+    stage said "factual" (both claims kept) and the adjudicator says the new
+    claim supersedes -- the supersession is what lands."""
     service = _compiled_service(tmp_path / "vault")
+    asked = _stub_adjudicator(monkeypatch, service, ("new_supersedes", ""))
     existing_text = (
         "---\ndomain: projects\n---\n\n# Demo Project\n\n"
         "## Sources That Shaped This Page\n"
@@ -7445,8 +7005,8 @@ def test_compiled_briefings_conflict_type_forced_temporal_when_dates_known_and_d
             "existing_claim": "Цена — 100 USD.",
             "existing_source": "daily/2026-07-01.md",
             "new_claim": "Цена — 150 USD.",
-            # Deliberately mislabeled: the deterministic date-based override
-            # must win over this.
+            # The compile stage's own label, passed to the adjudicator as
+            # one input among several rather than acted on directly.
             "type": "factual",
         }
     ]
@@ -7474,18 +7034,23 @@ def test_compiled_briefings_conflict_type_forced_temporal_when_dates_known_and_d
             "daily/2026-08-05.md",
         )
     ]
-    # Forced temporal, not factual -- no Open Conflicts entry even though
-    # the model said "factual".
+    # Superseded, not flagged -- no Open Conflicts entry even though the
+    # compile stage labelled the pair "factual".
     assert service._open_conflicts_rows(rendered) == []
+    # The adjudicator saw both dates and the label it was free to overrule.
+    assert asked[0]["existing_date"] == "2026-07-01"
+    assert asked[0]["model_conflict_type"] == "factual"
 
 
-def test_compiled_briefings_temporal_conflict_older_new_claim_is_dropped(
+def test_compiled_briefings_existing_stands_verdict_drops_the_new_claim(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A new claim whose source is OLDER than the existing claim's source
-    loses and is simply never added -- it was never live content, so there
-    is no Claim History entry for it either."""
+    """An ``existing_stands`` verdict keeps the page as it was: the new claim
+    is simply never added -- it was never live content, so there is no Claim
+    History entry for it either."""
     service = _compiled_service(tmp_path / "vault")
+    _stub_adjudicator(monkeypatch, service, ("existing_stands", ""))
     existing_text = (
         "---\ndomain: projects\n---\n\n# Demo Project\n\n"
         "## Sources That Shaped This Page\n"
@@ -7528,17 +7093,13 @@ def test_compiled_briefings_temporal_conflict_older_new_claim_is_dropped(
 
 def test_compiled_briefings_factual_conflict_keeps_both_and_opens_conflict(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ТЗ 5.4: a factual conflict keeps both statements, flags the page
-    conflicts_open, and records the pair for the owner decision queue (the
-    Open Conflicts table)."""
+    """ТЗ 5.4: a factual conflict keeps both statements and flags the page
+    ``conflicts_open``. This is where an ``"unclear"`` verdict lands -- the
+    row it writes is what the nightly retry later re-adjudicates."""
     service = _compiled_service(tmp_path / "vault")
-    # The new claim's source ("imports/report.md") carries no date of its
-    # own, so its record date falls back to today (ТЗ 5.4 fallback in
-    # ``_record_date_for_rel_path``). The existing row's date must match
-    # today too -- otherwise the "both dates known and differ" rule would
-    # force this conflict to "temporal" instead of the "factual" this test
-    # is about.
+    _stub_adjudicator(monkeypatch, service, ("unclear", ""))
     today = date.today().isoformat()
     existing_text = (
         "---\ndomain: projects\nconflicts_open: 0\n---\n\n# Demo Project\n\n"
@@ -7583,19 +7144,15 @@ def test_compiled_briefings_factual_conflict_keeps_both_and_opens_conflict(
     assert fields["conflicts_open"] == "1"
 
 
-def test_compiled_briefings_contextual_conflict_keeps_both_without_opening(
+def test_compiled_briefings_both_valid_verdict_keeps_both_without_opening(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ТЗ 5.4: a contextual conflict keeps both statements without touching
-    conflicts_open or the Open Conflicts table -- both are valid in their
-    own scope, so no owner decision is needed."""
+    """ТЗ 5.4: a ``both_valid`` verdict keeps both statements without
+    touching conflicts_open or the Open Conflicts table -- both hold in their
+    own scope, so nothing is left to decide."""
     service = _compiled_service(tmp_path / "vault")
-    # The new claim's source ("imports/report.md") carries no date of its
-    # own, so its record date falls back to today (ТЗ 5.4 fallback in
-    # ``_record_date_for_rel_path``). The existing row's date must match
-    # today too -- otherwise the "both dates known and differ" rule would
-    # force this conflict to "temporal" instead of the "contextual" this
-    # test is about.
+    _stub_adjudicator(monkeypatch, service, ("both_valid", ""))
     today = date.today().isoformat()
     existing_text = (
         "---\ndomain: projects\n---\n\n# Demo Project\n\n"
@@ -7941,14 +7498,13 @@ def test_compiled_briefings_sources_trust_is_fail_closed_minimum_across_passes(
 
 def test_compiled_briefings_trust_does_not_affect_conflict_winner(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ТЗ 5.4: automatic winner selection is by date only, never by trust.
-    A [photo] own-entry source (ТЗ 4.4 "own", see the F2 fix to
-    ``OWN_ENTRY_MARK_RE``) is a weaker source than the existing claim's
-    ``thoughts/`` note in nothing but appearance -- it still passes the F2
-    consequential-action trust gate (ТЗ 4.4), so the newer claim still
-    silently supersedes the older one."""
+    """Trust never picks the winner. It used to decide whether a supersession
+    was allowed to happen at all (``_trust_allows_consequential_action``);
+    now it is one input the adjudicator weighs, and its verdict stands."""
     service = _compiled_service(tmp_path / "vault")
+    asked = _stub_adjudicator(monkeypatch, service, ("new_supersedes", ""))
     existing_text = (
         "---\ndomain: projects\nsources_trust: own\n---\n\n# Demo Project\n\n"
         "## Sources That Shaped This Page\n"
@@ -7979,14 +7535,16 @@ def test_compiled_briefings_trust_does_not_affect_conflict_winner(
         existing_text=existing_text,
         existing_meta=service._frontmatter_fields(existing_text),
         signal=None,
-        # [photo] -> "own" trust (ТЗ 4.4), which permits the consequential
-        # action even though it is not the same source as the existing
-        # claim's "own" thoughts/ note.
+        # [photo] -> "own" trust (ТЗ 4.4), reported to the adjudicator
+        # rather than gating the outcome.
         source_excerpt="## 09:00 [photo]\n",
         claims=claims,
         conflicts=conflicts,
     )
 
+    # The trust level was reported, not applied: it reached the prompt and
+    # the verdict came back unchanged by it.
+    assert asked[0]["new_trust"] == "own"
     rows = service._sources_shaped_rows(rendered)
     today = date.today().isoformat()
     assert rows == [
@@ -8003,16 +7561,18 @@ def test_compiled_briefings_trust_does_not_affect_conflict_winner(
     assert service._open_conflicts_rows(rendered) == []
 
 
-def test_compiled_briefings_weak_trust_blocks_silent_temporal_supersession(
+def test_compiled_briefings_weak_trust_no_longer_blocks_temporal_supersession(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ТЗ 4.4: silently dropping the existing claim is an action with
-    consequences. When the newer (date-winning) claim's only source has
-    forwarded trust, that supersession must not happen automatically --
-    the date comparison still picks the new claim as the winner, but the
-    conflict is downgraded to `factual` (ТЗ 5.4) so both claims stay and
-    the pair goes to the owner's decision queue instead."""
+    """The rule this test used to guard is gone. A `forwarded` source (here
+    derived from the entry header inside a daily excerpt, not from the path)
+    once made an automatic supersession impossible: the pair was downgraded
+    to `factual`, both claims stayed, and the owner got the decision. Now
+    the trust level is told to the adjudicator and its verdict is what
+    happens."""
     service = _compiled_service(tmp_path / "vault")
+    asked = _stub_adjudicator(monkeypatch, service, ("new_supersedes", ""))
     existing_text = (
         "---\ndomain: projects\nsources_trust: own\n---\n\n# Demo Project\n\n"
         "## Sources That Shaped This Page\n"
@@ -8043,19 +7603,21 @@ def test_compiled_briefings_weak_trust_blocks_silent_temporal_supersession(
         existing_text=existing_text,
         existing_meta=service._frontmatter_fields(existing_text),
         signal=None,
-        # forwarded -- below the F1/F2 threshold for a consequential
-        # action, even though it is still the newer source by date.
+        # A forwarded entry: someone else's words, relayed by the owner.
         source_excerpt="## 09:00 [forward from: Bob]\nДедлайн — 15 сентября.",
         claims=claims,
         conflicts=conflicts,
     )
 
+    assert asked[0]["new_trust"] == "forwarded"
     rows = {row[2] for row in service._sources_shaped_rows(rendered)}
-    assert rows == {"Дедлайн — 1 сентября.", "Дедлайн — 15 сентября."}
-    assert service._claim_history_rows(rendered) == []
-    assert len(service._open_conflicts_rows(rendered)) == 1
+    assert rows == {"Дедлайн — 15 сентября."}
+    assert [row[2] for row in service._claim_history_rows(rendered)] == [
+        "Дедлайн — 1 сентября."
+    ]
+    assert service._open_conflicts_rows(rendered) == []
     fields = service._frontmatter_fields(rendered)
-    assert fields["conflicts_open"] == "1"
+    assert fields["conflicts_open"] == "0"
 
 
 def test_compiled_briefings_verify_sample_size_by_tier(tmp_path: Path) -> None:
@@ -8819,11 +8381,23 @@ def test_compiled_briefings_same_conflict_twice_adds_one_row_and_one_count(
 
 def test_compiled_briefings_open_conflict_closes_when_one_side_superseded(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Defect 1 (Verify/claims code review): an open conflict must be able
     to leave the table. Once a later pass supersedes one of its two sides,
     there is nothing left for the owner to choose between."""
     service = _compiled_service(tmp_path / "vault")
+    # The first render leaves the pair undecided (that is what opens the
+    # Open Conflicts row this test then closes); the second one supersedes.
+    _stub_adjudicator(
+        monkeypatch,
+        service,
+        lambda asked: (
+            ("new_supersedes", "")
+            if asked["new_claim"] == "Бюджет — 150 000 руб."
+            else ("unclear", "")
+        ),
+    )
     # Must postdate the row `_two_claim_page`/the first render below stamp
     # with today's date, on any day this test runs -- otherwise the
     # temporal winner-by-date comparison further down would not reliably
@@ -8888,11 +8462,13 @@ def test_compiled_briefings_open_conflict_closes_when_one_side_superseded(
 
 def test_compiled_briefings_repeated_conflict_in_one_payload_adds_one_history_row(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Defect 1 (Verify/claims code review): the model may emit the same
     conflict twice in one payload; the superseded claim must still produce a
     single Claim History row."""
     service = _compiled_service(tmp_path / "vault")
+    _stub_adjudicator(monkeypatch, service, ("new_supersedes", ""))
     existing_text = (
         "---\ndomain: projects\n---\n\n# Demo Project\n\n"
         "## Sources That Shaped This Page\n"
@@ -11669,13 +11245,16 @@ def test_compiled_briefings_verify_filters_by_position_not_by_duplicate_text(
     assert service._active_pass.verify_rejected == 1
 
 
-def test_compiled_briefings_trust_blocked_counter_increments_on_weak_trust_downgrade(
+def test_compiled_briefings_unclear_verdict_increments_trust_blocked_counter(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """G7: a temporal conflict downgraded to factual because the winning
-    source's trust is too weak for a consequential action (ТЗ 4.4)
-    increments the pass's ``trust_blocked`` counter."""
+    """G7 (rewritten): the ``trust_blocked`` counter no longer counts
+    supersessions blocked by a weak trust level -- trust blocks nothing now.
+    It counts the one thing left that stops an automatic resolution: the
+    adjudicator returning ``"unclear"``."""
     service = _compiled_service(tmp_path / "vault")
+    _stub_adjudicator(monkeypatch, service, ("unclear", ""))
     service._active_pass = CompileEnrichPass(pass_id="p1", snapshot_enabled=False)
     existing_text = (
         "---\ndomain: projects\nsources_trust: own\n---\n\n# Demo Project\n\n"
@@ -11715,18 +11294,17 @@ def test_compiled_briefings_trust_blocked_counter_increments_on_weak_trust_downg
     assert service._active_pass.trust_blocked == 1
 
 
-def test_compiled_briefings_trust_blocked_downgrade_queues_blocked_action_entry(
+def test_compiled_briefings_unclear_verdict_queues_undecided_conflict_entry(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Code review defect 3: the ``"blocked-action"`` queue kind was
-    declared and protected from eviction (ТЗ 7.2) but had no producer --
-    only the ``trust_blocked`` counter above incremented, so the owner
-    never actually saw why an automatic supersession did not happen. The
-    same weak-trust downgrade that increments the counter must also queue
-    an entry naming the page, the blocked claim pair, the source, and the
-    insufficient trust level, in Russian."""
+    """An undecided pair must leave a trace the nightly retry can find. The
+    entry is a retry buffer, not a task for the owner: it names the page and
+    both claim versions, and its wording says the model failed to decide --
+    not that the owner has to."""
     vault_path = tmp_path / "vault"
     service = _compiled_service(vault_path)
+    _stub_adjudicator(monkeypatch, service, ("unclear", ""))
     service._active_pass = CompileEnrichPass(pass_id="p1", snapshot_enabled=False)
     existing_text = (
         "---\ndomain: projects\nsources_trust: own\n---\n\n# Demo Project\n\n"
@@ -11735,21 +11313,6 @@ def test_compiled_briefings_trust_blocked_downgrade_queues_blocked_action_entry(
         "| --- | --- | --- |\n"
         "| 2026-07-01 | [[thoughts/idea.md]] | Дедлайн — 1 сентября. |\n"
     )
-    claims = [
-        {
-            "text": "Дедлайн — 15 сентября.",
-            "source": "daily/2026-08-05.md",
-            "kind": "fact",
-        }
-    ]
-    conflicts = [
-        {
-            "existing_claim": "Дедлайн — 1 сентября.",
-            "existing_source": "thoughts/idea.md",
-            "new_claim": "Дедлайн — 15 сентября.",
-            "type": "temporal",
-        }
-    ]
 
     service._render_briefing(
         target=_demo_target(),
@@ -11759,8 +11322,21 @@ def test_compiled_briefings_trust_blocked_downgrade_queues_blocked_action_entry(
         existing_meta=service._frontmatter_fields(existing_text),
         signal=None,
         source_excerpt="## 09:00 [forward from: Bob]\nДедлайн — 15 сентября.",
-        claims=claims,
-        conflicts=conflicts,
+        claims=[
+            {
+                "text": "Дедлайн — 15 сентября.",
+                "source": "daily/2026-08-05.md",
+                "kind": "fact",
+            }
+        ],
+        conflicts=[
+            {
+                "existing_claim": "Дедлайн — 1 сентября.",
+                "existing_source": "thoughts/idea.md",
+                "new_claim": "Дедлайн — 15 сентября.",
+                "type": "temporal",
+            }
+        ],
     )
 
     queue = json.loads(
@@ -11768,30 +11344,30 @@ def test_compiled_briefings_trust_blocked_downgrade_queues_blocked_action_entry(
     )
     assert len(queue) == 1
     entry = queue[0]
-    assert entry["kind"] == "blocked-action"
+    assert entry["kind"] == "undecided-conflict"
     assert entry["page"] == "compiled/projects/demo-project.md"
     assert entry["since"] == date.today().isoformat()
     summary = entry["summary"]
     assert "daily/2026-08-05.md" in summary
-    assert "forwarded" in summary
     assert "Дедлайн — 1 сентября." in summary
     assert "Дедлайн — 15 сентября." in summary
-    # Owner-facing text must be Russian, not a bare technical dump.
-    assert "заблокирована" in summary
+    # Owner-facing text must be Russian, and must not blame the trust level
+    # for a decision the model simply did not reach.
+    assert "не смогла решить" in summary
+    assert "forwarded" not in summary
 
 
-def test_compiled_briefings_trust_blocked_downgrade_queues_entry_outside_a_pass(
+def test_compiled_briefings_unclear_verdict_queues_entry_outside_a_pass(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Code review: the queue belongs to the owner, not to a pass, so the
-    ``"blocked-action"`` entry must also appear on the hot write path
-    (``refresh_after_write``), where ``_active_pass`` is None. Queuing it
-    from under the ``_active_pass is not None`` guard that exists only for
-    the ``trust_blocked`` journal counter left the page with an Open
-    Conflicts row and no explanation of why the date-based supersession did
-    not happen."""
+    """The queue belongs to the owner, not to a pass, so the entry must also
+    appear on the hot write path (``refresh_after_write``), where
+    ``_active_pass`` is None -- otherwise the page keeps an Open Conflicts
+    row that no retry drain ever picks up."""
     vault_path = tmp_path / "vault"
     service = _compiled_service(vault_path)
+    _stub_adjudicator(monkeypatch, service, ("unclear", ""))
     # The regression itself: no pass is active on the hot write path.
     assert service._active_pass is None
     existing_text = (
@@ -11827,26 +11403,27 @@ def test_compiled_briefings_trust_blocked_downgrade_queues_entry_outside_a_pass(
         ],
     )
 
-    # The page still records the conflict for the owner to resolve...
+    # The page still keeps both versions until the retry settles them...
     assert "Дедлайн — 1 сентября." in rendered
-    # ...and the queue now explains why it was not resolved automatically.
+    # ...and the queue now carries the pair into that retry.
     queue = json.loads(
         (vault_path / ".session" / "decisions-queue.json").read_text(encoding="utf-8")
     )
     assert [(entry["kind"], entry["page"]) for entry in queue] == [
-        ("blocked-action", "compiled/projects/demo-project.md")
+        ("undecided-conflict", "compiled/projects/demo-project.md")
     ]
 
 
-def test_compiled_briefings_blocked_action_entry_does_not_duplicate_across_passes(
+def test_compiled_briefings_undecided_conflict_entry_does_not_duplicate_across_passes(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Same weak-trust downgrade recurring on a later pass against the same
-    page (still the same still-open conflict) must not pile up a second
-    ``"blocked-action"`` entry -- deduped by ``(kind, page)`` like every
-    other queue kind."""
+    """The same pair left undecided on a later pass against the same page
+    must not pile up a second ``"undecided-conflict"`` entry -- deduped by
+    ``(kind, page)`` like every other queue kind."""
     vault_path = tmp_path / "vault"
     service = _compiled_service(vault_path)
+    _stub_adjudicator(monkeypatch, service, ("unclear", ""))
     existing_text = (
         "---\ndomain: projects\nsources_trust: own\n---\n\n# Demo Project\n\n"
         "## Sources That Shaped This Page\n"
@@ -11891,7 +11468,6 @@ def test_compiled_briefings_blocked_action_entry_does_not_duplicate_across_passe
         (vault_path / ".session" / "decisions-queue.json").read_text(encoding="utf-8")
     )
     assert len(queue) == 1
-
 
 # --- H: memory tier controls attention without suppressing updates ----------
 #
@@ -12992,6 +12568,7 @@ def test_compiled_briefings_nightly_gate_no_rollback_for_pure_archive_tier_promo
 
 def test_compiled_briefings_contextual_conflict_note_appended_to_new_row(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Дефект 3 / ТЗ 5.4: a contextual conflict with a non-empty
     context_note appends the explanation to the text of the NEW row in
@@ -13000,12 +12577,10 @@ def test_compiled_briefings_contextual_conflict_note_appended_to_new_row(
     case (see test_compiled_briefings_contextual_conflict_keeps_both_
     without_opening)."""
     service = _compiled_service(tmp_path / "vault")
-    # The new claim's source ("imports/report.md") carries no date of its
-    # own, so its record date falls back to today (ТЗ 5.4 fallback in
-    # ``_record_date_for_rel_path``). The existing row's date must match
-    # today too -- otherwise the "both dates known and differ" rule would
-    # force this conflict to "temporal" instead of the "contextual" this
-    # test is about.
+    # The verdict, and the explanation attached to it, both come from the
+    # adjudicator now -- the ``"contextual"`` label in the payload below is
+    # only what the compile stage guessed.
+    _stub_adjudicator(monkeypatch, service, ("both_valid", "разные регионы продаж"))
     today = date.today().isoformat()
     existing_text = (
         "---\ndomain: projects\n---\n\n# Demo Project\n\n"
@@ -13051,6 +12626,7 @@ def test_compiled_briefings_contextual_conflict_note_appended_to_new_row(
 
 def test_compiled_briefings_factual_conflict_survives_same_claim_contextual_note(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """ТЗ 5.4 guard: one new claim can land in a factual conflict against
     one existing claim AND a contextual conflict (with a context_note)
@@ -13062,6 +12638,15 @@ def test_compiled_briefings_factual_conflict_survives_same_claim_contextual_note
     pass that opened it (see ``factual_new_claim_texts`` in
     ``_apply_claims_and_conflicts``)."""
     service = _compiled_service(tmp_path / "vault")
+    _stub_adjudicator(
+        monkeypatch,
+        service,
+        lambda asked: (
+            ("both_valid", "разные периоды")
+            if asked["existing_claim"] == "В ЕС цена стабильна."
+            else ("unclear", "")
+        ),
+    )
     today = date.today().isoformat()
     existing_text = (
         "---\ndomain: projects\nconflicts_open: 0\n---\n\n# Demo Project\n\n"
@@ -13293,73 +12878,753 @@ def test_compiled_briefings_queue_duplicate_candidate_passes_existing_lock_throu
     assert queue_calls[0]["existing_lock"] is captured_locks[0]
 
 
-def test_compiled_briefings_domain_reassignment_recorded_in_pass_journal(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Minor addition: a concepts->topics reroute
-    (``_concepts_to_topics_reason``) is recorded on the active pass and
-    surfaces in the pass journal (``.session/compile-enrich.json``), not
-    just the application log."""
-    vault_path = tmp_path / "vault"
-    compiled_projects = vault_path / "compiled" / "projects"
-    compiled_projects.mkdir(parents=True)
-    (compiled_projects / "phoenix-migration.md").write_text(
-        (
-            "---\n"
-            "domain: projects\n"
-            'description: "Phoenix migration track."\n'
-            "---\n\n"
-            "# Phoenix Migration\n\n"
-            "## Sources\n"
-            "- (none)\n"
+# --- Automated conflict adjudication (agent decides, not the code) ---------
+#
+# The whole decisions queue used to fill up with pairs the code refused to
+# settle: a date-based supersession from a PLAUD recording was blocked by
+# trust, and every blocked pair left both an Open Conflicts row and a
+# "blocked-action" entry. Now every conflict is put to the model, and a pair
+# it cannot settle is retried by the nightly pass instead of waiting on the
+# owner.
+
+
+def _conflict_page_on_disk(
+    vault_path: Path,
+    *,
+    slug: str = "demo-project",
+    shaped_rows: list[tuple[str, str, str]],
+    conflict_rows: list[tuple[str, str, str, str, str]],
+) -> Path:
+    page_path = vault_path / "compiled" / "projects" / f"{slug}.md"
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    page_path.write_text(
+        _full_compiled_page_text(
+            shaped_rows=shaped_rows,
+            conflict_rows=conflict_rows,
+            sources=[row[1] for row in shaped_rows],
         ),
         encoding="utf-8",
     )
-    service = _compiled_service(vault_path)
-    service._active_pass = CompileEnrichPass(pass_id="p1", snapshot_enabled=False)
+    return page_path
 
-    def fake_run_json_dict_prompt(**kwargs: Any) -> dict[str, Any]:
-        del kwargs
-        return {
-            "updates": [
-                {
-                    "domain": "concepts",
-                    "title": "Phoenix Migration Retry Playbook",
-                    "slug": "phoenix-migration-retry-playbook",
-                    "description": "How retries work in Phoenix Migration",
-                    "reason": "captured pattern",
-                    "existing_path": "",
-                }
-            ]
-        }
 
-    monkeypatch.setattr(service, "_run_json_dict_prompt", fake_run_json_dict_prompt)
+def test_compiled_briefings_forwarded_plaud_source_supersedes_when_agent_says_so(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The headline regression. A PLAUD transcript is capped at trust
+    ``forwarded`` because it has no speaker diarization, and that cap used to
+    veto supersession outright: the pair was downgraded to a factual conflict,
+    both claims stayed on the page, and the owner got a "blocked-action" queue
+    entry. Now trust is evidence handed to the adjudicator, and a
+    ``new_supersedes`` verdict is actually executed."""
+    service = _compiled_service(tmp_path / "vault")
+    asked = _stub_adjudicator(monkeypatch, service, ("new_supersedes", ""))
+    existing_text = (
+        "---\ndomain: projects\nsources_trust: own\n---\n\n# Demo Project\n\n"
+        "## Sources That Shaped This Page\n"
+        "| Date | Source | What Added |\n"
+        "| --- | --- | --- |\n"
+        "| 2026-07-01 | [[thoughts/idea.md]] | Дедлайн — 1 сентября. |\n"
+    )
 
-    targets = service._resolve_targets(
-        source_rel_path="daily/2026-08-05.md",
-        source_excerpt="Обсудили retry strategy в Phoenix Migration.",
+    rendered = service._render_briefing(
+        target=_demo_target(),
+        payload=_minimal_compile_payload(),
+        source_rel_path="imports/plaud/2026-08-05-standup.md",
+        existing_text=existing_text,
+        existing_meta=service._frontmatter_fields(existing_text),
         signal=None,
-        max_updates=3,
+        source_excerpt="Расшифровка: дедлайн перенесли на 15 сентября.",
+        claims=[
+            {
+                "text": "Дедлайн — 15 сентября.",
+                "source": "imports/plaud/2026-08-05-standup.md",
+                "kind": "fact",
+            }
+        ],
+        conflicts=[
+            {
+                "existing_claim": "Дедлайн — 1 сентября.",
+                "existing_source": "thoughts/idea.md",
+                "new_claim": "Дедлайн — 15 сентября.",
+                "type": "temporal",
+            }
+        ],
     )
-    assert targets[0].domain == "topics"
 
-    service._write_pass_journal(
-        pass_id="p1",
-        started_at="2026-08-05T00:00:00+00:00",
-        status="ok",
-        error="",
+    # The weak trust level reached the model as evidence, not as a veto.
+    assert asked[0]["new_trust"] == "forwarded"
+    what_values = [row[2] for row in service._sources_shaped_rows(rendered)]
+    assert what_values == ["Дедлайн — 15 сентября."]
+    history = service._claim_history_rows(rendered)
+    assert [(row[1], row[2], row[3]) for row in history] == [
+        (
+            "thoughts/idea.md",
+            "Дедлайн — 1 сентября.",
+            "imports/plaud/2026-08-05-standup.md",
+        )
+    ]
+    assert service._open_conflicts_rows(rendered) == []
+    # Nothing was handed to the owner: this was decided, not deferred.
+    assert not (tmp_path / "vault" / ".session" / "decisions-queue.json").exists()
+
+
+def test_compiled_briefings_existing_stands_beats_a_newer_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The mirror-image regression: dates no longer decide on their own
+    either. The new source is the more recent one -- the old rule would have
+    superseded on that alone -- but the adjudicator says the existing claim
+    still stands, and that verdict is what the page reflects."""
+    service = _compiled_service(tmp_path / "vault")
+    asked = _stub_adjudicator(monkeypatch, service, ("existing_stands", ""))
+    existing_text = (
+        "---\ndomain: projects\n---\n\n# Demo Project\n\n"
+        "## Sources That Shaped This Page\n"
+        "| Date | Source | What Added |\n"
+        "| --- | --- | --- |\n"
+        "| 2026-07-01 | [[daily/2026-07-01.md]] | Дедлайн — 1 сентября. |\n"
     )
 
-    journal = json.loads(
-        (vault_path / ".session" / "compile-enrich.json").read_text(encoding="utf-8")
+    rendered = service._render_briefing(
+        target=_demo_target(),
+        payload=_minimal_compile_payload(),
+        source_rel_path="daily/2026-08-05.md",
+        existing_text=existing_text,
+        existing_meta=service._frontmatter_fields(existing_text),
+        signal=None,
+        source_excerpt="## 09:00 [text]\nКто-то сказал, что дедлайн 15 сентября.",
+        claims=[
+            {
+                "text": "Дедлайн — 15 сентября.",
+                "source": "daily/2026-08-05.md",
+                "kind": "fact",
+            }
+        ],
+        conflicts=[
+            {
+                "existing_claim": "Дедлайн — 1 сентября.",
+                "existing_source": "daily/2026-07-01.md",
+                "new_claim": "Дедлайн — 15 сентября.",
+                "type": "temporal",
+            }
+        ],
     )
-    assert len(journal["domain_reassignments"]) == 1
-    entry = journal["domain_reassignments"][0]
-    assert entry["title"] == "Phoenix Migration Retry Playbook"
-    assert entry["from"] == "concepts"
-    assert entry["to"] == "topics"
-    assert entry["reason"]
+
+    # Both dates were on the table; the model still chose the older claim.
+    assert asked[0]["existing_date"] == "2026-07-01"
+    assert asked[0]["new_date"] > asked[0]["existing_date"]
+    what_values = [row[2] for row in service._sources_shaped_rows(rendered)]
+    assert what_values == ["Дедлайн — 1 сентября."]
+    # The loser never was live content, so there is nothing to send to
+    # Claim History -- it simply is not added.
+    assert service._claim_history_rows(rendered) == []
+    assert service._open_conflicts_rows(rendered) == []
+
+
+def test_compiled_briefings_adjudication_failure_keeps_both_claims(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model call that blows up must never make the page assert one side.
+    Every failure lands on "unclear", which is exactly the both-claims-kept
+    Open Conflicts row the path used to fail closed into."""
+    service = _compiled_service(tmp_path / "vault")
+
+    def _boom(**kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        raise RuntimeError("cli unavailable")
+
+    monkeypatch.setattr(service, "_run_json_dict_prompt", _boom)
+
+    outcome, note = service._adjudicate_conflict(
+        page_rel_path="compiled/projects/demo-project.md",
+        page_state="",
+        existing_claim="Дедлайн — 1 сентября.",
+        existing_source="thoughts/idea.md",
+        existing_date="2026-07-01",
+        new_claim="Дедлайн — 15 сентября.",
+        new_source="daily/2026-08-05.md",
+        new_date="2026-08-05",
+        new_trust="own",
+        claim_kind="fact",
+        model_conflict_type="temporal",
+    )
+
+    assert (outcome, note) == ("unclear", "")
+
+
+def test_compiled_briefings_adjudication_budget_error_is_not_a_verdict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one exception allowed through. A budget exhaustion is not "could
+    not decide" -- it ends the pass's work on this source and leaves it
+    queued, so swallowing it into "unclear" would spend an owner-facing queue
+    entry on a pair nobody has actually looked at yet."""
+    service = _compiled_service(tmp_path / "vault")
+
+    def _budget(**kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        raise CompiledBriefingPassBudgetExceededError("model calls")
+
+    monkeypatch.setattr(service, "_run_json_dict_prompt", _budget)
+
+    with pytest.raises(CompiledBriefingPassBudgetExceededError):
+        service._adjudicate_conflict(
+            page_rel_path="compiled/projects/demo-project.md",
+            page_state="",
+            existing_claim="A",
+            existing_source="thoughts/idea.md",
+            existing_date="2026-07-01",
+            new_claim="B",
+            new_source="daily/2026-08-05.md",
+            new_date="2026-08-05",
+            new_trust="own",
+            claim_kind="fact",
+            model_conflict_type="temporal",
+        )
+
+
+def test_compiled_briefings_retry_prompt_escalates_and_drops_unclear(
+    tmp_path: Path,
+) -> None:
+    """The retry is not the same question asked twice. The second attempt
+    says outright that this pair has been seen before, and the "unclear"
+    option is gone -- otherwise a pair could bounce between passes forever."""
+    service = _compiled_service(tmp_path / "vault")
+    kwargs: dict[str, Any] = {
+        "page_rel_path": "compiled/projects/demo-project.md",
+        "page_state": "Текущее состояние.",
+        "existing_claim": "Дедлайн — 1 сентября.",
+        "existing_source": "thoughts/idea.md",
+        "existing_date": "2026-07-01",
+        "new_claim": "Дедлайн — 15 сентября.",
+        "new_source": "imports/plaud/2026-08-05-standup.md",
+        "new_date": "2026-08-05",
+        "new_trust": "forwarded",
+        "claim_kind": "fact",
+        "model_conflict_type": "temporal",
+    }
+
+    first = service._build_conflict_adjudication_prompt(attempt=1, **kwargs)
+    retry = service._build_conflict_adjudication_prompt(attempt=2, **kwargs)
+
+    assert '"unclear"' in first
+    assert "ПОВТОРНЫЙ" not in first
+    assert '"unclear"' not in retry
+    assert "ПОВТОРНЫЙ ЗАХОД" in retry
+    assert "решение принять" in retry
+    # Trust arrives as something the model can reason about, not a bare enum.
+    assert "неизвестно, чьи это слова" in retry
+
+
+def test_compiled_briefings_nightly_retry_resolves_a_standing_conflict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The drain the owner's queue was waiting for. A conflict already
+    standing open on a page is re-adjudicated by the nightly pass, and the
+    verdict rewrites the page: the loser leaves the live ledger for Claim
+    History, the row closes, ``conflicts_open`` drops, and the page's retry
+    entry is cleared from the queue."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_atomic_vault_write(monkeypatch)
+    page_path = _conflict_page_on_disk(
+        vault_path,
+        shaped_rows=[
+            ("2026-07-01", "thoughts/idea.md", "Дедлайн — 1 сентября."),
+            (
+                "2026-08-05",
+                "imports/plaud/2026-08-05-standup.md",
+                "Дедлайн — 15 сентября.",
+            ),
+        ],
+        conflict_rows=[
+            (
+                "2026-08-05",
+                "Дедлайн — 1 сентября.",
+                "thoughts/idea.md",
+                "Дедлайн — 15 сентября.",
+                "imports/plaud/2026-08-05-standup.md",
+            )
+        ],
+    )
+    (vault_path / ".session").mkdir(parents=True, exist_ok=True)
+    (vault_path / ".session" / "decisions-queue.json").write_text(
+        json.dumps(
+            [
+                {
+                    "kind": "undecided-conflict",
+                    "page": "compiled/projects/demo-project.md",
+                    "summary": "не разрешено",
+                    "since": "2026-08-05",
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    asked = _stub_adjudicator(monkeypatch, service, ("new_supersedes", ""))
+
+    resolved = service._resolve_open_conflicts(limit=5)
+
+    assert resolved == ["compiled/projects/demo-project.md"]
+    # A retry, explicitly: the escalated prompt, not a repeat of attempt 1.
+    assert asked[0]["attempt"] == 2
+    text = page_path.read_text(encoding="utf-8")
+    assert [row[2] for row in service._sources_shaped_rows(text)] == [
+        "Дедлайн — 15 сентября."
+    ]
+    assert [
+        (row[1], row[2], row[3]) for row in service._claim_history_rows(text)
+    ] == [
+        (
+            "thoughts/idea.md",
+            "Дедлайн — 1 сентября.",
+            "imports/plaud/2026-08-05-standup.md",
+        )
+    ]
+    assert service._open_conflicts_rows(text) == []
+    assert service._frontmatter_fields(text)["conflicts_open"] == "0"
+    assert json.loads(
+        (vault_path / ".session" / "decisions-queue.json").read_text(encoding="utf-8")
+    ) == []
+
+
+def test_compiled_briefings_nightly_retry_leaves_an_undecided_conflict_alone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Still undecided on the retry is not an error and not an escalation to
+    the owner: the row stays exactly as it was, the queue entry stays, and
+    the next pass asks again."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_atomic_vault_write(monkeypatch)
+    conflict_row = (
+        "2026-08-05",
+        "Дедлайн — 1 сентября.",
+        "thoughts/idea.md",
+        "Дедлайн — 15 сентября.",
+        "daily/2026-08-05.md",
+    )
+    page_path = _conflict_page_on_disk(
+        vault_path,
+        shaped_rows=[
+            ("2026-07-01", "thoughts/idea.md", "Дедлайн — 1 сентября."),
+            ("2026-08-05", "daily/2026-08-05.md", "Дедлайн — 15 сентября."),
+        ],
+        conflict_rows=[conflict_row],
+    )
+    before = page_path.read_text(encoding="utf-8")
+    _stub_adjudicator(monkeypatch, service, ("unclear", ""))
+
+    assert service._resolve_open_conflicts(limit=5) == []
+    assert page_path.read_text(encoding="utf-8") == before
+
+
+def test_compiled_briefings_nightly_retry_restores_a_deleted_claim_history_section(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hand-edited page that lost its "Claim History" section has nowhere
+    to retire a losing claim to, and the retry refuses to remove one from the
+    live ledger with nowhere to put it -- which on its own would park that
+    page's conflicts forever. So the section is put back, empty, in the slot
+    the renderer uses, and the verdict is executed the usual way."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_atomic_vault_write(monkeypatch)
+    page_text = _full_compiled_page_text(
+        shaped_rows=[
+            ("2026-07-01", "thoughts/idea.md", "Дедлайн — 1 сентября."),
+            ("2026-08-05", "daily/2026-08-05.md", "Дедлайн — 15 сентября."),
+        ],
+        conflict_rows=[
+            (
+                "2026-08-05",
+                "Дедлайн — 1 сентября.",
+                "thoughts/idea.md",
+                "Дедлайн — 15 сентября.",
+                "daily/2026-08-05.md",
+            )
+        ],
+        sources=["thoughts/idea.md", "daily/2026-08-05.md"],
+    ).replace("## Claim History\n(no superseded claims yet)\n", "")
+    assert "## Claim History" not in page_text
+    page_path = vault_path / "compiled" / "projects" / "demo-project.md"
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    page_path.write_text(page_text, encoding="utf-8")
+    _stub_adjudicator(monkeypatch, service, ("new_supersedes", ""))
+
+    assert service._resolve_open_conflicts(limit=5) == [
+        "compiled/projects/demo-project.md"
+    ]
+
+    text = page_path.read_text(encoding="utf-8")
+    assert [row[2] for row in service._sources_shaped_rows(text)] == [
+        "Дедлайн — 15 сентября."
+    ]
+    assert [
+        (row[1], row[2], row[3]) for row in service._claim_history_rows(text)
+    ] == [
+        ("thoughts/idea.md", "Дедлайн — 1 сентября.", "daily/2026-08-05.md"),
+    ]
+    assert service._open_conflicts_rows(text) == []
+    # Restored in its canonical slot, not appended after the owner's zone.
+    assert text.index("## Claim History") < text.index("## Owner Notes")
+
+
+def test_compiled_briefings_nightly_retry_without_an_anchor_leaves_the_conflict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The section can only be restored in front of a heading that is
+    actually there. With neither "History" nor "Owner Notes" on the page
+    there is no such slot, so the retry declines -- and finds that out
+    before spending a model call on the verdict."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_atomic_vault_write(monkeypatch)
+    page_text = _full_compiled_page_text(
+        shaped_rows=[
+            ("2026-07-01", "thoughts/idea.md", "Дедлайн — 1 сентября."),
+            ("2026-08-05", "daily/2026-08-05.md", "Дедлайн — 15 сентября."),
+        ],
+        conflict_rows=[
+            (
+                "2026-08-05",
+                "Дедлайн — 1 сентября.",
+                "thoughts/idea.md",
+                "Дедлайн — 15 сентября.",
+                "daily/2026-08-05.md",
+            )
+        ],
+        sources=["thoughts/idea.md", "daily/2026-08-05.md"],
+    ).replace("## Claim History\n(no superseded claims yet)\n", "")
+    page_text = page_text[: page_text.index("## Owner Notes")]
+    page_path = vault_path / "compiled" / "projects" / "demo-project.md"
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    page_path.write_text(page_text, encoding="utf-8")
+    asked = _stub_adjudicator(monkeypatch, service, ("new_supersedes", ""))
+
+    assert service._resolve_open_conflicts(limit=5) == []
+
+    assert asked == []
+    assert page_path.read_text(encoding="utf-8") == page_text
+
+
+def test_compiled_briefings_nightly_retry_both_valid_annotates_the_kept_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """"Both valid" closes the conflict without picking a side -- but the
+    page must then say *why* the two coexist, or it just goes back to
+    asserting two things that look contradictory."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_atomic_vault_write(monkeypatch)
+    page_path = _conflict_page_on_disk(
+        vault_path,
+        shaped_rows=[
+            ("2026-08-01", "daily/2026-08-01.md", "В США цена — 100 USD."),
+            ("2026-08-05", "imports/report.md", "В ЕС цена — 90 EUR."),
+        ],
+        conflict_rows=[
+            (
+                "2026-08-05",
+                "В США цена — 100 USD.",
+                "daily/2026-08-01.md",
+                "В ЕС цена — 90 EUR.",
+                "imports/report.md",
+            )
+        ],
+    )
+    _stub_adjudicator(
+        monkeypatch, service, ("both_valid", "разные регионы продаж")
+    )
+
+    service._resolve_open_conflicts(limit=5)
+
+    text = page_path.read_text(encoding="utf-8")
+    assert {row[2] for row in service._sources_shaped_rows(text)} == {
+        "В США цена — 100 USD.",
+        "В ЕС цена — 90 EUR. (разные регионы продаж)",
+    }
+    assert service._open_conflicts_rows(text) == []
+    assert service._claim_history_rows(text) == []
+
+
+def test_compiled_briefings_nightly_retry_stops_at_its_own_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The retry has its own small slice of the pass's model calls, so a
+    page carrying a pile of conflicts cannot starve the night's actual
+    enrichment work. What it does not get to this pass, it gets next pass."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_atomic_vault_write(monkeypatch)
+    shaped = [
+        ("2026-07-01", "thoughts/idea.md", f"Старое {index}.") for index in (1, 2, 3)
+    ]
+    shaped += [
+        ("2026-08-05", "daily/2026-08-05.md", f"Новое {index}.") for index in (1, 2, 3)
+    ]
+    page_path = _conflict_page_on_disk(
+        vault_path,
+        shaped_rows=shaped,
+        conflict_rows=[
+            (
+                "2026-08-05",
+                f"Старое {index}.",
+                "thoughts/idea.md",
+                f"Новое {index}.",
+                "daily/2026-08-05.md",
+            )
+            for index in (1, 2, 3)
+        ],
+    )
+    asked = _stub_adjudicator(monkeypatch, service, ("new_supersedes", ""))
+
+    service._resolve_open_conflicts(limit=2)
+
+    assert len(asked) == 2
+    text = page_path.read_text(encoding="utf-8")
+    remaining = service._open_conflicts_rows(text)
+    assert [row[1] for row in remaining] == ["Старое 3."]
+    assert service._frontmatter_fields(text)["conflicts_open"] == "1"
+
+
+def test_compiled_briefings_nightly_retry_keeps_the_queue_entry_until_page_is_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The retry entry points at a page, not at one pair, so it may only be
+    cleared once that page has no open conflict left -- otherwise a page with
+    two conflicts loses its place in the retry drain after the first one."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_atomic_vault_write(monkeypatch)
+    _conflict_page_on_disk(
+        vault_path,
+        shaped_rows=[
+            ("2026-07-01", "thoughts/idea.md", "Старое 1."),
+            ("2026-07-01", "thoughts/idea.md", "Старое 2."),
+            ("2026-08-05", "daily/2026-08-05.md", "Новое 1."),
+            ("2026-08-05", "daily/2026-08-05.md", "Новое 2."),
+        ],
+        conflict_rows=[
+            (
+                "2026-08-05",
+                f"Старое {index}.",
+                "thoughts/idea.md",
+                f"Новое {index}.",
+                "daily/2026-08-05.md",
+            )
+            for index in (1, 2)
+        ],
+    )
+    (vault_path / ".session").mkdir(parents=True, exist_ok=True)
+    queue_path = vault_path / ".session" / "decisions-queue.json"
+    queue_path.write_text(
+        json.dumps(
+            [
+                {
+                    "kind": "undecided-conflict",
+                    "page": "compiled/projects/demo-project.md",
+                    "summary": "не разрешено",
+                    "since": "2026-08-05",
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    _stub_adjudicator(
+        monkeypatch,
+        service,
+        lambda asked: (
+            ("new_supersedes", "") if asked["existing_claim"] == "Старое 1."
+            else ("unclear", "")
+        ),
+    )
+
+    service._resolve_open_conflicts(limit=5)
+
+    assert [entry["kind"] for entry in json.loads(
+        queue_path.read_text(encoding="utf-8")
+    )] == ["undecided-conflict"]
+
+
+# --- Automated drift judgement --------------------------------------------
+#
+# Hitting the monthly enrichment cap is a suspicion, not a verdict: a busy
+# project page hits it the same way a page losing its shape does. The model
+# reads what was actually added and answers, instead of the owner being
+# asked to go look.
+
+
+def _queue_drift_entry(vault_path: Path, page: str, *, since: str) -> Path:
+    (vault_path / ".session").mkdir(parents=True, exist_ok=True)
+    queue_path = vault_path / ".session" / "decisions-queue.json"
+    queue_path.write_text(
+        json.dumps(
+            [
+                {
+                    "kind": "drift",
+                    "page": page,
+                    "summary": "похоже на дрейф",
+                    "since": since,
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return queue_path
+
+
+def test_compiled_briefings_real_drift_is_recorded_on_the_page(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A confirmed drift is written where a human will actually meet it --
+    the page's own ``quality_status``, the same flag Verify raises and the
+    next clean Verify clears -- and the queue entry goes, because the
+    question has been answered."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_atomic_vault_write(monkeypatch)
+    page_path = vault_path / "compiled" / "projects" / "demo-project.md"
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    page_path.write_text(
+        _full_compiled_page_text(
+            shaped_rows=[
+                ("2026-08-02", "daily/2026-08-02.md", "Про склад."),
+                ("2026-08-03", "daily/2026-08-03.md", "Про найм."),
+            ],
+        ),
+        encoding="utf-8",
+    )
+    queue_path = _queue_drift_entry(
+        vault_path, "compiled/projects/demo-project.md", since="2026-08-05"
+    )
+    prompts: list[str] = []
+    monkeypatch.setattr(
+        service.runner,
+        "run",
+        lambda prompt, **kwargs: prompts.append(prompt)
+        or json.dumps({"drift": True, "reason": "смешаны склад и найм"}),
+    )
+
+    marked = service._adjudicate_drift_entries(limit=5)
+
+    assert marked == ["compiled/projects/demo-project.md"]
+    # The model was shown what actually landed on the page that month.
+    assert "Про склад." in prompts[0]
+    assert "Про найм." in prompts[0]
+    fields = service._frontmatter_fields(page_path.read_text(encoding="utf-8"))
+    assert fields["quality_status"] == "needs_review"
+    assert "смешаны склад и найм" in fields["quality_reason"]
+    assert json.loads(queue_path.read_text(encoding="utf-8")) == []
+
+
+def test_compiled_briefings_busy_page_is_not_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The case the counter could never tell apart: a page updated often
+    because the work is live. Nothing is flagged on the page, and the entry
+    still leaves the queue -- that is the whole point of asking."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_atomic_vault_write(monkeypatch)
+    page_path = vault_path / "compiled" / "projects" / "demo-project.md"
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    page_path.write_text(
+        _full_compiled_page_text(
+            shaped_rows=[("2026-08-02", "daily/2026-08-02.md", "Про склад.")],
+        ),
+        encoding="utf-8",
+    )
+    queue_path = _queue_drift_entry(
+        vault_path, "compiled/projects/demo-project.md", since="2026-08-05"
+    )
+    monkeypatch.setattr(
+        service.runner,
+        "run",
+        lambda prompt, **kwargs: json.dumps({"drift": False, "reason": ""}),
+    )
+
+    assert service._adjudicate_drift_entries(limit=5) == []
+
+    fields = service._frontmatter_fields(page_path.read_text(encoding="utf-8"))
+    assert "quality_status" not in fields
+    assert json.loads(queue_path.read_text(encoding="utf-8")) == []
+
+
+def test_compiled_briefings_unusable_drift_judgement_keeps_the_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed call is not a verdict of "no drift". The entry stays so the
+    next pass asks again -- dropping it would quietly answer the question
+    with silence."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_atomic_vault_write(monkeypatch)
+    page_path = vault_path / "compiled" / "projects" / "demo-project.md"
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    page_path.write_text(
+        _full_compiled_page_text(
+            shaped_rows=[("2026-08-02", "daily/2026-08-02.md", "Про склад.")],
+        ),
+        encoding="utf-8",
+    )
+    queue_path = _queue_drift_entry(
+        vault_path, "compiled/projects/demo-project.md", since="2026-08-05"
+    )
+
+    def _boom(**kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        raise RuntimeError("cli unavailable")
+
+    monkeypatch.setattr(service, "_run_json_dict_prompt", _boom)
+
+    assert service._adjudicate_drift_entries(limit=5) == []
+
+    assert [entry["kind"] for entry in json.loads(
+        queue_path.read_text(encoding="utf-8")
+    )] == ["drift"]
+
+
+def test_compiled_briefings_drift_entry_for_a_vanished_page_is_dropped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A suspicion about a page that no longer exists cannot be answered and
+    means nothing -- it must not sit in the queue forever costing a model
+    call on every pass."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_atomic_vault_write(monkeypatch)
+    queue_path = _queue_drift_entry(
+        vault_path, "compiled/projects/gone.md", since="2026-08-05"
+    )
+
+    def _never(**kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        raise AssertionError("no model call for a page that is not there")
+
+    monkeypatch.setattr(service, "_run_json_dict_prompt", _never)
+
+    assert service._adjudicate_drift_entries(limit=5) == []
+    assert json.loads(queue_path.read_text(encoding="utf-8")) == []
 
 
 class _FakePlaudClient:

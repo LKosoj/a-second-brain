@@ -1,6 +1,6 @@
 ---
 type: note
-description: Field-level schema for one compiled/ page -- the six domains, the concepts-vs-topics routing override, frontmatter fields, and section order. Mirrors src/d_brain/services/compiled_briefings.py; do not restate it as an independent spec.
+description: Field-level schema for one compiled/ page -- the six domains, concepts-vs-topics routing, frontmatter fields, and section order. Mirrors src/d_brain/services/compiled_briefings.py; do not restate it as an independent spec.
 last_accessed: 2026-08-05
 relevance: 0.6
 tier: warm
@@ -28,27 +28,22 @@ Every compiled page lives under `compiled/<domain>/<slug>.md` (or
 
 ## Concepts vs Topics
 
-A candidate the model proposes for `concepts` is rerouted to `topics` (never
-the reverse) whenever `_concepts_to_topics_reason` finds either signal:
+The domain a candidate lands in is the model's call, made once in the impact
+stage. Code validates that the answer is one of the six domains and nothing
+more -- it does not second-guess which one.
 
-1. **The title contains a date** -- an ISO date (`2026-08-05`) or a Russian
-   long-form date (`5 августа 2026`). A dated concept discussion is really a
-   topic snapshot, not a portable, date-free concept.
-2. **The title fully contains an existing project/people page's name** (by
-   that page's own title tokens or slug tokens). Example: a project page
-   named "Aurora Solutions" exists, and a new concepts candidate is titled
-   "Notes on Aurora Solutions Onboarding" -- that candidate is rerouted to
-   `topics` because it is really about one specific project, not a portable
-   concept.
+Earlier versions rerouted `concepts` to `topics` deterministically (a date
+regex on the title, plus a token-subset match against existing
+project/people page names, minus a common-noun stoplist). That override is
+gone: it outranked the model's answer using far less context than the model
+had, and no amount of stoplist tuning fixed the cases where a genuinely
+portable concept happened to mention a project by name.
 
-Exception to signal 2: a page name that is exactly **one generic common
-noun** (`GENERIC_SINGLE_TOKEN_PAGE_NAMES` -- words like "платформа",
-"команда", "migration", "system", "process") does not trigger the reroute on
-its own, because matching a common noun is coincidence, not a real binding
-to that project/person. A one-word **proper** noun (a fictional project like
-"Aurora", a fictional client like "Northbridge") still triggers it. A
-multi-word name is unaffected either way -- a full multi-word match is
-already a strong signal.
+The reasoning behind it now reaches the model as guidance in the impact
+prompt instead (`_build_impact_prompt`): concepts must stay portable, so a
+title carrying a date, or naming one specific project, client, or person
+from the catalog, is a topic rather than a concept. The model weighs that
+against the actual source and decides.
 
 ## Frontmatter Fields
 

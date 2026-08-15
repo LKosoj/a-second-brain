@@ -3,7 +3,14 @@
 This module is the single place that defines two things: what a queue item
 *is*, and what an owner response to it physically does to the vault.
 
-Eight item kinds exist in production today:
+Nine item kinds exist in production today. Two of them -- ``"conflict"``
+and ``"drift"`` -- are no longer really the owner's work: the nightly pass
+adjudicates both with a model call and settles them itself (see
+``CompiledBriefingService._resolve_open_conflicts`` and
+``_adjudicate_drift_entries``). They still appear on the queue screen,
+because an owner who opens it before the next pass runs should see what is
+pending and may still answer by hand, and their manual handlers below take
+exactly the same action the automated path does.
 
 - ``"fact-check-rejected"`` -- written by ``compiled_fact_check.py`` into
   ``.session/decisions-queue.json`` when a page fails its monthly re-check.
@@ -16,11 +23,19 @@ Eight item kinds exist in production today:
   shrinks). ``list_queue_items`` derives one item per open-conflict row by
   reading every ``compiled/**`` page directly, the same way
   ``compiled_enrich_report._collect_conflicts`` already does for the digest.
-  A response means picking which side is "active": the row is removed from
-  "Open Conflicts" and ``conflicts_open`` is decremented (as an int). Both
-  claims stay recorded in the sources table regardless of which side was
-  picked -- there is nowhere else to record a per-claim "winner", so the
-  choice is only preserved in the response journal below, for audit.
+  A response means picking which side the page asserts: the row is removed
+  from "Open Conflicts", ``conflicts_open`` is decremented (as an int), and
+  the losing claim leaves "Sources That Shaped This Page" for "Claim
+  History" with the source that displaced it (``_retire_losing_claim``) --
+  the same move the write path makes for a supersession decided at compile
+  time. Nothing is deleted, so ``/why`` can still explain where the losing
+  claim went; the tap itself is additionally recorded in the response
+  journal below, for audit.
+
+  Normally the owner never has to tap at all: every conflict is put to the
+  model when it is created, and one it could not settle is retried by the
+  nightly pass with an escalated prompt. A row survives to this screen only
+  between the pass that failed to settle it and the pass that does.
 
 - ``"duplicate-candidate"`` (задача N) -- written by a producer elsewhere
   (out of scope for this module) into ``.session/decisions-queue.json`` when
@@ -46,8 +61,15 @@ Eight item kinds exist in production today:
   per calendar month, so a page that keeps hitting the cap this month only
   ever gets one queue entry, while drifting again next month replaces that
   entry instead of being swallowed by it (see ``_dedup_key``). This module
-  offers no dedicated response for it (no known
-  automatic remedy exists) -- only the generic ``reject``/``defer`` below.
+  offers no dedicated response for it -- only the generic
+  ``reject``/``defer`` below -- because the answer is not an owner action:
+  hitting the cap is a *suspicion* of drift and nothing more (a busy project
+  page hits it exactly the way a page losing its shape does). The nightly
+  pass judges it instead: ``_adjudicate_drift_entries`` shows the model the
+  page and everything added to it that month, records a confirmed drift as
+  ``quality_status: needs_review`` on the page itself, and drops the entry
+  either way. The monthly enrichment cap is untouched by that verdict -- it
+  is a cost control, not a drift finding.
 
 - ``"verify-rejected"`` (ТЗ 5.2 step 4 / 7.2) -- written by
   ``CompiledBriefingService._queue_verify_rejected`` once a page's Verify
@@ -62,21 +84,34 @@ Eight item kinds exist in production today:
   still exhausted; "Отклонить" (the generic reject below) just drops the
   queue entry and leaves the page exhausted as-is.
 
-- ``"blocked-action"`` (ТЗ 4.4/7.1/7.2) -- written by
-  ``CompiledBriefingService._queue_blocked_action`` when a low-trust source
+- ``"blocked-action"`` (ТЗ 4.4/7.1/7.2) -- **retired producer, entries may
+  still be on disk.** It was written when a low-trust source
   (``forwarded``/``inferred``) would otherwise have won a temporal
-  supersession by date alone: ``_trust_allows_consequential_action`` blocks
-  applying it automatically, so both claims stay on the page (the same
-  "factual" Open Conflicts row the page itself gets) and this entry tells
-  the owner *why* -- page, the two claims, the blocking source, its trust
-  level. Same shape as ``"drift"``: ``kind``, ``page``, ``summary``,
-  ``since``. Deduped by ``(kind, page)``, so a page that keeps getting
-  blocked on later passes only ever gets the one entry; the conflict itself
-  is still (separately) re-recorded on the page every time, so nothing
-  about it is lost by not requeuing here. Protected from eviction
-  (``_PROTECTED_QUEUE_KINDS``) per ТЗ 7.2. No dedicated response exists for
-  it (the actual choice between the two claims happens via the page's own
-  ``"conflict"`` item above) -- only the generic ``reject``/``defer`` below.
+  supersession by date alone: trust vetoed applying it automatically, so
+  both claims stayed on the page and this entry told the owner why. In
+  practice that made every date-based supersession coming out of a PLAUD
+  recording -- which has no speaker diarization and is therefore always
+  capped at ``forwarded`` -- into an owner task. Trust is now stated to the
+  conflict adjudicator as evidence rather than applied as a veto, so
+  nothing produces this kind any more. Still declared, still protected from
+  eviction, and cleared by the nightly conflict retry once the page it
+  points at has no open conflict left.
+
+- ``"undecided-conflict"`` -- written by
+  ``CompiledBriefingService._queue_undecided_conflict`` when the conflict
+  adjudicator answered "unclear": the model looked at the pair and did not
+  reach a verdict, so both claims stay on the page with an Open Conflicts
+  row. This is a retry buffer, not a task -- the nightly pass re-adjudicates
+  the page's conflicts with an escalated prompt that offers no "unclear"
+  option, and removes this entry once the page is clear. Same shape as
+  ``"drift"``: ``kind``, ``page``, ``summary``, ``since``. Deduped by
+  ``(kind, page)`` -- a page carrying several undecided pairs gets one
+  entry, because the pairs themselves are all on the page's own Open
+  Conflicts table, which is what the retry actually reads. Protected from
+  eviction: an entry evicted here is a page the retry stops visiting. No
+  dedicated response (the choice between the two claims happens via the
+  page's own ``"conflict"`` item above) -- only the generic
+  ``reject``/``defer`` below.
 
 - ``"page-encoding-broken"`` -- written by
   ``CompiledBriefingService._queue_undecodable_page`` when a compiled
@@ -199,15 +234,17 @@ evicts the oldest (by ``since``) entries first, except entries whose
 protected by kind even though they never actually reach this file (they
 live on pages) -- documented as a deliberate, currently-vacuous safety
 margin rather than reworking this into a tier lookup for a case that cannot
-occur yet. ``"blocked-action"`` items DO reach this file (produced by
-``CompiledBriefingService._queue_blocked_action``) and are protected for
-real.
+occur yet. ``"undecided-conflict"`` items DO reach this file (produced by
+``CompiledBriefingService._queue_undecided_conflict``) and are protected for
+real, as are the ``"blocked-action"`` entries left on disk by its retired
+predecessor: evicting either is losing a page the nightly conflict retry
+would otherwise revisit.
 
 Eviction candidates are drawn from entries already on file first, never
 shrinking a small ``new_entries`` call just because protected entries
-already on file have piled up to ``QUEUE_CAP`` or beyond -- plausible once a
-real ``"blocked-action"`` producer exists, one distinct page at a time, each
-never auto-resolving. In that situation there is nothing evictable in
+already on file have piled up to ``QUEUE_CAP`` or beyond -- plausible when
+many pages carry an unsettled conflict at once, one distinct page at a
+time. In that situation there is nothing evictable in
 ``existing`` at all, and the combined list is simply allowed to grow past
 ``QUEUE_CAP`` rather than dropping the entry a caller just asked to queue
 before the owner ever saw it once.
@@ -270,14 +307,30 @@ _RESPONSE_JOURNAL_RELATIVE_PATH = Path(".session") / "decisions-queue-responses.
 QUEUE_CAP = 30
 # See module docstring: "conflict" is protected even though no producer
 # ever writes one to the JSON file today (ТЗ names it as needing protection,
-# but it lives on pages, not here); "blocked-action" is the other kind ТЗ
-# 7.2 names as needing protection, and does have a real producer
-# (``CompiledBriefingService._queue_blocked_action``).
-_PROTECTED_QUEUE_KINDS = frozenset({"conflict", "blocked-action"})
+# but it lives on pages, not here). "blocked-action" keeps its protection
+# for the entries already on disk from before adjudication existed, and
+# "undecided-conflict" -- its replacement -- inherits it: both mark a real
+# claim pair that is still unresolved on a page, so evicting one under
+# QUEUE_CAP would lose the only pointer to it.
+_PROTECTED_QUEUE_KINDS = frozenset(
+    {"conflict", "blocked-action", "undecided-conflict"}
+)
 
 FACT_CHECK_REJECTED_KIND = "fact-check-rejected"
 CONFLICT_KIND = "conflict"
+# Retired producer (``CompiledBriefingService._queue_blocked_action``): trust
+# no longer blocks a supersession, the adjudicator decides instead. The kind
+# stays because entries written before that change are still on disk, and
+# the retry drain has to be able to recognise and close them.
 BLOCKED_ACTION_KIND = "blocked-action"
+# One conflict ``_adjudicate_conflict`` could not settle. A retry buffer,
+# not an owner task -- see ``CompiledBriefingService._queue_undecided_conflict``.
+UNDECIDED_CONFLICT_KIND = "undecided-conflict"
+# Kinds that only point at a page whose conflict is still open. The conflict
+# itself is already listed from the page's own Open Conflicts table, so
+# ``list_queue_items`` leaves these out rather than showing the owner the
+# same disagreement twice.
+_CONFLICT_POINTER_KINDS = frozenset({BLOCKED_ACTION_KIND, UNDECIDED_CONFLICT_KIND})
 DUPLICATE_CANDIDATE_KIND = "duplicate-candidate"
 # ТЗ 5.6 monthly-per-page enrichment budget overrun. No dedicated response
 # exists for it (see module docstring) -- it only ever gets the generic
@@ -630,15 +683,15 @@ def _regenerate_queue_document_after_append(
     file itself changed, instead of leaving it to lag until the owner
     answers something or the nightly safety net runs (ТЗ 7.2 code review).
 
-    Every current caller of ``append_decision_queue_entries``
-    (``compiled_fact_check.run_monthly_fact_check``,
-    ``CompiledBriefingService._queue_duplicate_candidate``,
-    ``CompiledBriefingService._queue_monthly_drift``) already holds the
-    vault write lock and passes it through as ``existing_lock`` -- see the
-    module docstring. Using that lock directly, instead of opening a second
-    ``vault_write_lock`` here, is mandatory, not a nicety: flock is not
-    reentrant across two open file descriptors to the same file, so a
-    second acquisition from inside a lock already held would self-deadlock
+    Called after both directions of an automated queue change --
+    ``append_decision_queue_entries`` and
+    ``remove_queue_entries_for_page``. Every current caller of either
+    already holds the vault write lock and passes it through as
+    ``existing_lock`` -- see the module docstring. Using that lock directly,
+    instead of opening a second ``vault_write_lock`` here, is mandatory, not
+    a nicety: flock is not reentrant across two open file descriptors to the
+    same file, so a second acquisition from inside a lock already held would
+    self-deadlock
     (this module has hit that exact bug before, see the "Writes go
     through..." docstring section above). If no lock was passed -- should
     not happen given the documented contract, but a future caller might get
@@ -647,8 +700,8 @@ def _regenerate_queue_document_after_append(
     """
     if existing_lock is None:
         logger.warning(
-            "append_decision_queue_entries called without a held vault "
-            "lock for %s; decisions queue mirror not regenerated",
+            "Decisions queue changed without a held vault lock for %s; "
+            "decisions queue mirror not regenerated",
             vault_path,
         )
         return
@@ -685,6 +738,44 @@ def _remove_queue_entry(vault_path: Path, *, kind: str, page: str) -> None:
     _atomic_write_text(
         path, json.dumps(remaining, ensure_ascii=False, indent=2) + "\n"
     )
+
+
+def remove_queue_entries_for_page(
+    vault_path: Path,
+    page: str,
+    *,
+    kinds: tuple[str, ...],
+    existing_lock: VaultWriteLock | None = None,
+) -> int:
+    """Drop every entry of the given kinds pointing at one page.
+
+    The counterpart of ``append_decision_queue_entries`` for the automated
+    path: the nightly conflict retry
+    (``CompiledBriefingService._resolve_open_conflicts``) clears a page's
+    entries once it has settled that page's last open conflict, so the
+    owner's queue empties by itself instead of waiting for a tap on a
+    question that is no longer open.
+
+    Idempotent, and returns how many entries were removed. Refreshes the
+    human-readable mirror the same way an append does -- and, for the same
+    flock-is-not-reentrant reason documented there, only when the caller
+    passes the lock it already holds.
+    """
+    path = vault_path / DECISIONS_QUEUE_RELATIVE_PATH
+    existing = _read_raw_queue(path)
+    remaining = [
+        entry
+        for entry in existing
+        if not (entry.get("kind") in kinds and entry.get("page") == page)
+    ]
+    removed = len(existing) - len(remaining)
+    if not removed:
+        return 0
+    _atomic_write_text(
+        path, json.dumps(remaining, ensure_ascii=False, indent=2) + "\n"
+    )
+    _regenerate_queue_document_after_append(vault_path, existing_lock=existing_lock)
+    return removed
 
 
 def _json_backed_items(vault_path: Path) -> list[QueueItem]:
@@ -741,18 +832,43 @@ def _conflict_items(candidates: list[CompiledBriefingCandidate]) -> list[QueueIt
     return items
 
 
+def list_json_queue_items(vault_path: Path) -> list[QueueItem]:
+    """Only the entries stored in ``.session/decisions-queue.json``.
+
+    ``list_queue_items`` below also walks every ``compiled/**`` page to
+    derive the live ``"conflict"`` items; a caller that wants one JSON-backed
+    kind (the nightly drift judgement wants ``"drift"``) does not need that
+    walk and should not pay for it.
+    """
+    return _json_backed_items(Path(vault_path))
+
+
 def list_queue_items(vault_path: Path) -> list[QueueItem]:
     """All current decisions queue items: JSON-backed entries first (file
     order), then one item per open-conflict row across ``compiled/**``
     (candidate order, i.e. sorted by path -- see
     ``CompiledBriefingService._iter_candidates``).
 
+    ``"undecided-conflict"`` and its retired predecessor
+    ``"blocked-action"`` are left out. Both are pointers at a page whose
+    conflict is still open, and that conflict is already in this list, as a
+    live ``"conflict"`` item carrying the two claim texts and the two
+    buttons to choose between them. Listing the pointer as well showed the
+    owner every unsettled pair twice -- which is most of how a queue of
+    eight real disagreements came to read as sixteen items. They stay in the
+    JSON file, where the nightly retry's bookkeeping uses them.
+
     Pure and read-only: never writes, never calls a model.
     """
     vault_path = Path(vault_path)
     service = CompiledBriefingService(vault_path)
     candidates = service._iter_candidates()
-    return [*_json_backed_items(vault_path), *_conflict_items(candidates)]
+    json_items = [
+        item
+        for item in _json_backed_items(vault_path)
+        if item.kind not in _CONFLICT_POINTER_KINDS
+    ]
+    return [*json_items, *_conflict_items(candidates)]
 
 
 def action_button_specs(item: QueueItem) -> tuple[tuple[str, str], ...]:
@@ -811,6 +927,7 @@ QUEUE_KIND_LABELS = {
     DRIFT_KIND: "дрейф",
     VERIFY_REJECTED_KIND: "отклонено проверкой",
     BLOCKED_ACTION_KIND: "действие заблокировано",
+    UNDECIDED_CONFLICT_KIND: "конфликт не разрешён",
     PAGE_ENCODING_BROKEN_KIND: "кодировка файла страницы",
     HUMAN_ZONE_AMBIGUOUS_KIND: "маркеры личной зоны",
 }
@@ -1023,6 +1140,82 @@ def _apply_fact_check_reject(vault_path: Path, item: QueueItem) -> ResponseOutco
     return ResponseOutcome(ok=True, message=message)
 
 
+def _retire_losing_claim(
+    text: str,
+    *,
+    conflict_row: tuple[str, str, str, str, str],
+    keep_existing: bool,
+) -> str:
+    """Move the losing side of a resolved conflict into "Claim History".
+
+    Dropping the Open Conflicts row on its own only clears the flag: both
+    claims stay side by side in "Sources That Shaped This Page", so the page
+    goes on asserting the two of them at once and merely stops saying they
+    disagree. That was the whole behaviour of resolving a conflict before
+    adjudication existed -- the owner's tap recorded a preference in the
+    response journal and changed nothing the page said.
+
+    This makes the resolution real, the same way the write path already does
+    it for a supersession decided at compile time
+    (``_apply_claims_and_conflicts``): the loser leaves the live ledger and
+    lands in Claim History with the source that displaced it, so nothing is
+    deleted and ``/why`` can still explain where it went.
+
+    Returns ``text`` untouched when the losing claim is not in the ledger --
+    a page edited by hand in between, or a conflict whose loser was already
+    retired by an earlier response -- and likewise when the page has no
+    "Claim History" section and none can be put back (see
+    ``_ensure_claim_history_section``): ``_replace_section`` is a no-op on a
+    missing heading, so going ahead would drop the claim from the live
+    ledger with nowhere to land, which is a deletion, not a retirement.
+    """
+    _since, existing_claim, existing_source, new_claim, new_source = conflict_row
+    if keep_existing:
+        loser_claim, loser_source = new_claim, new_source
+        winner_source = existing_source
+    else:
+        loser_claim, loser_source = existing_claim, existing_source
+        winner_source = new_source
+
+    shaped_rows = CompiledBriefingService._sources_shaped_rows(text)
+    remaining = [
+        row
+        for row in shaped_rows
+        if not (row[1] == loser_source and row[2] == loser_claim)
+    ]
+    if len(remaining) == len(shaped_rows):
+        return text
+    loser_date = next(
+        row[0]
+        for row in shaped_rows
+        if row[1] == loser_source and row[2] == loser_claim
+    )
+
+    # Only now that something is actually being retired: a page that keeps
+    # its ledger unchanged should come back byte-identical, section or no.
+    text = CompiledBriefingService._ensure_claim_history_section(text)
+    if not CompiledBriefingService._has_section(text, "Claim History"):
+        return text
+
+    history_rows = CompiledBriefingService._claim_history_rows(text)
+    history_row = (loser_date, loser_source, loser_claim, winner_source)
+    # Same dedup contract as the write path: the date column is ignored, so
+    # re-retiring the same claim never adds a second history row.
+    if not any(row[1:] == history_row[1:] for row in history_rows):
+        history_rows = [*history_rows, history_row]
+
+    text = CompiledBriefingService._replace_section(
+        text,
+        "Sources That Shaped This Page",
+        CompiledBriefingService._render_sources_shaped_table(remaining),
+    )
+    return CompiledBriefingService._replace_section(
+        text,
+        "Claim History",
+        CompiledBriefingService._render_claim_history(history_rows),
+    )
+
+
 def _apply_conflict_choice(
     vault_path: Path, item: QueueItem, action_id: str
 ) -> ResponseOutcome:
@@ -1077,6 +1270,11 @@ def _apply_conflict_choice(
             text,
             "Open Conflicts",
             CompiledBriefingService._render_open_conflicts_table(remaining_rows),
+        )
+        new_text = _retire_losing_claim(
+            new_text,
+            conflict_row=item.conflict_row,
+            keep_existing=action_id == "keep_existing",
         )
         new_bytes = patch_frontmatter_bytes(
             new_text.encode("utf-8"), {"conflicts_open": len(remaining_rows)}

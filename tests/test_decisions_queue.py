@@ -30,7 +30,11 @@ import pytest
 
 from d_brain.manifest import load_manifest_for_vault
 from d_brain.services import compiled_fact_check, decisions_queue
-from d_brain.services.compiled_briefings import CompiledBriefingService
+from d_brain.services.compiled_briefings import (
+    HUMAN_ZONE_END,
+    HUMAN_ZONE_START,
+    CompiledBriefingService,
+)
 from d_brain.services.compiled_fact_check import run_monthly_fact_check
 from d_brain.services.decisions_queue import (
     BLOCKED_ACTION_KIND,
@@ -68,6 +72,9 @@ def _page_text(
     conflicts_open: int = 0,
     sources_rows: list[tuple[str, str, str]],
     conflicts_rows: list[tuple[str, str, str, str, str]] | None = None,
+    claim_history: bool = False,
+    history_rows: list[tuple[str, str, str, str]] | None = None,
+    owner_notes: bool = False,
 ) -> str:
     """Render one ``compiled/**`` page in the shape ``CompiledBriefingService``
     itself writes and parses, using its own table renderers -- mirrors
@@ -97,6 +104,17 @@ def _page_text(
     if conflicts_rows:
         body += ["", "## Open Conflicts", ""]
         body += CompiledBriefingService._render_open_conflicts_table(conflicts_rows)
+    if claim_history or history_rows:
+        body += ["", "## Claim History", ""]
+        body += CompiledBriefingService._render_claim_history(history_rows or [])
+    if owner_notes:
+        # The last section a real page always ends with -- and the anchor
+        # ``_ensure_claim_history_section`` puts a missing Claim History back
+        # in front of. Off by default so the older tests keep exercising a
+        # page where the section cannot be restored at all. The marker pair
+        # is not optional: the heading without it reads as a corrupted human
+        # zone, and every section helper then fails closed on the page.
+        body += ["", "## Owner Notes", f"{HUMAN_ZONE_START}\nПусто.\n{HUMAN_ZONE_END}"]
     return frontmatter + "\n".join(body) + "\n"
 
 
@@ -178,6 +196,66 @@ def test_list_queue_items_includes_conflict_rows_from_pages(
     assert items[0].conflict_row == row
     assert "Контракт продлён на год" in items[0].summary
     assert "Контракт продлён на два года" in items[0].summary
+
+
+def test_list_queue_items_hides_the_conflict_pointer_kinds(
+    tmp_path, write_vault_manifest
+):
+    """The duplication that made the queue read twice its real size. An
+    unsettled pair leaves both an Open Conflicts row on the page and an
+    ``undecided-conflict`` pointer in the JSON file (legacy entries use the
+    retired ``blocked-action`` kind). Only the row belongs on the owner's
+    screen -- it is the one carrying both claim texts and both buttons."""
+    vault = tmp_path / "vault"
+    write_vault_manifest(vault)
+    row = (
+        "2026-07-15",
+        "Контракт на год",
+        "daily/a.md",
+        "Контракт на два года",
+        "daily/b.md",
+    )
+    _write_page(
+        vault,
+        "compiled/topics/aurora.md",
+        sources_rows=[("2026-07-01", "daily/a.md", "Контракт на год")],
+        conflicts_rows=[row],
+        conflicts_open=1,
+    )
+    _write_queue(
+        vault,
+        [
+            {
+                "kind": "undecided-conflict",
+                "page": "compiled/topics/aurora.md",
+                "summary": "не разрешено",
+                "since": "2026-07-15",
+            },
+            {
+                "kind": "blocked-action",
+                "page": "compiled/topics/aurora.md",
+                "summary": "старая запись",
+                "since": "2026-07-10",
+            },
+            {
+                "kind": "drift",
+                "page": "compiled/topics/aurora.md",
+                "summary": "похоже на дрейф",
+                "since": "2026-07-12",
+            },
+        ],
+    )
+
+    items = list_queue_items(vault)
+
+    assert [item.kind for item in items] == ["drift", "conflict"]
+    # Hidden from the screen, still on disk for the nightly retry.
+    assert {
+        entry["kind"]
+        for entry in json.loads(
+            (vault / ".session" / "decisions-queue.json").read_text(encoding="utf-8")
+        )
+    } == {"undecided-conflict", "blocked-action", "drift"}
 
 
 def test_list_queue_items_combines_json_then_conflicts_in_order(
@@ -1644,12 +1722,13 @@ def test_apply_response_conflict_choice_refuses_undecodable_page_bytes(
     assert page_path.read_bytes() == original
 
 
-def test_apply_response_conflict_choice_sources_table_stays_byte_identical(
+def test_apply_response_conflict_choice_leaves_a_claim_it_cannot_find_alone(
     tmp_path, write_vault_manifest, monkeypatch
 ):
-    """Invariant required by задача L: resolving a conflict never shrinks or
-    otherwise touches the "Sources That Shaped This Page" table -- only the
-    "Open Conflicts" table and the ``conflicts_open`` counter change."""
+    """The losing claim is only retired if it is actually in the live ledger.
+    Here it is not -- a hand edit, or an earlier response that already
+    retired it -- so the sources table must come out byte-identical instead
+    of the handler inventing a row to remove."""
     vault = tmp_path / "vault"
     write_vault_manifest(vault)
     row = (
@@ -1678,6 +1757,214 @@ def test_apply_response_conflict_choice_sources_table_stays_byte_identical(
 
     after_sources = _sources_table_section(page_path.read_text(encoding="utf-8"))
     assert after_sources == before_sources
+
+
+def test_apply_response_conflict_choice_retires_the_losing_claim(
+    tmp_path, write_vault_manifest, monkeypatch
+):
+    """What the owner's tap is actually for. Dropping the Open Conflicts row
+    alone only cleared the flag: both claims stayed side by side in the live
+    ledger, so the page went on asserting the two of them at once and merely
+    stopped saying they disagreed. The losing side must leave the ledger for
+    Claim History, with the source that displaced it."""
+    vault = tmp_path / "vault"
+    write_vault_manifest(vault)
+    row = (
+        "2026-07-15",
+        "Контракт на год",
+        "daily/a.md",
+        "Контракт на два года",
+        "daily/b.md",
+    )
+    _write_page(
+        vault,
+        "compiled/topics/aurora.md",
+        sources_rows=[
+            ("2026-07-01", "daily/a.md", "Контракт на год"),
+            ("2026-07-15", "daily/b.md", "Контракт на два года"),
+        ],
+        conflicts_rows=[row],
+        conflicts_open=1,
+        claim_history=True,
+    )
+    _install_fake_page_writer(monkeypatch)
+    item = list_queue_items(vault)[0]
+
+    outcome = apply_response(vault, item, "keep_new")
+
+    assert outcome.ok is True
+    new_text = (vault / "compiled/topics/aurora.md").read_text(encoding="utf-8")
+    assert [
+        row[2] for row in CompiledBriefingService._sources_shaped_rows(new_text)
+    ] == ["Контракт на два года"]
+    assert CompiledBriefingService._claim_history_rows(new_text) == [
+        ("2026-07-01", "daily/a.md", "Контракт на год", "daily/b.md")
+    ]
+
+
+def test_apply_response_conflict_choice_keep_existing_retires_the_new_claim(
+    tmp_path, write_vault_manifest, monkeypatch
+):
+    """The mirror case: choosing the existing claim retires the *new* one,
+    crediting the existing claim's source as what displaced it."""
+    vault = tmp_path / "vault"
+    write_vault_manifest(vault)
+    row = (
+        "2026-07-15",
+        "Контракт на год",
+        "daily/a.md",
+        "Контракт на два года",
+        "daily/b.md",
+    )
+    _write_page(
+        vault,
+        "compiled/topics/aurora.md",
+        sources_rows=[
+            ("2026-07-01", "daily/a.md", "Контракт на год"),
+            ("2026-07-15", "daily/b.md", "Контракт на два года"),
+        ],
+        conflicts_rows=[row],
+        conflicts_open=1,
+        claim_history=True,
+    )
+    _install_fake_page_writer(monkeypatch)
+    item = list_queue_items(vault)[0]
+
+    apply_response(vault, item, "keep_existing")
+
+    new_text = (vault / "compiled/topics/aurora.md").read_text(encoding="utf-8")
+    assert [
+        row[2] for row in CompiledBriefingService._sources_shaped_rows(new_text)
+    ] == ["Контракт на год"]
+    assert CompiledBriefingService._claim_history_rows(new_text) == [
+        ("2026-07-15", "daily/b.md", "Контракт на два года", "daily/a.md")
+    ]
+
+
+def test_apply_response_conflict_choice_without_claim_history_keeps_the_ledger(
+    tmp_path, write_vault_manifest, monkeypatch
+):
+    """A page with no "Claim History" section has nowhere to retire a claim
+    to, and ``_replace_section`` is a no-op on a missing heading -- so going
+    ahead would take the claim out of the live ledger and drop it on the
+    floor. Here the section cannot even be restored: the page carries no
+    "Owner Notes" (nor "History") heading to put it in front of. The conflict
+    still closes; the ledger is left whole."""
+    vault = tmp_path / "vault"
+    write_vault_manifest(vault)
+    row = (
+        "2026-07-15",
+        "Контракт на год",
+        "daily/a.md",
+        "Контракт на два года",
+        "daily/b.md",
+    )
+    _write_page(
+        vault,
+        "compiled/topics/aurora.md",
+        sources_rows=[
+            ("2026-07-01", "daily/a.md", "Контракт на год"),
+            ("2026-07-15", "daily/b.md", "Контракт на два года"),
+        ],
+        conflicts_rows=[row],
+        conflicts_open=1,
+    )
+    page_path = vault / "compiled/topics/aurora.md"
+    before_sources = _sources_table_section(page_path.read_text(encoding="utf-8"))
+    _install_fake_page_writer(monkeypatch)
+    item = list_queue_items(vault)[0]
+
+    apply_response(vault, item, "keep_new")
+
+    new_text = page_path.read_text(encoding="utf-8")
+    assert _sources_table_section(new_text) == before_sources
+    assert CompiledBriefingService._open_conflicts_rows(new_text) == []
+
+
+def test_apply_response_conflict_choice_restores_a_deleted_claim_history_section(
+    tmp_path, write_vault_manifest, monkeypatch
+):
+    """Every page the pass renders carries a "Claim History" section, so a
+    page without one was edited by hand. Refusing to retire anything there
+    protects the claim but parks the conflict forever, so the section is put
+    back -- in front of "Owner Notes", where the renderer itself puts it --
+    and the retirement goes through as usual."""
+    vault = tmp_path / "vault"
+    write_vault_manifest(vault)
+    row = (
+        "2026-07-15",
+        "Контракт на год",
+        "daily/a.md",
+        "Контракт на два года",
+        "daily/b.md",
+    )
+    _write_page(
+        vault,
+        "compiled/topics/aurora.md",
+        sources_rows=[
+            ("2026-07-01", "daily/a.md", "Контракт на год"),
+            ("2026-07-15", "daily/b.md", "Контракт на два года"),
+        ],
+        conflicts_rows=[row],
+        conflicts_open=1,
+        owner_notes=True,
+    )
+    page_path = vault / "compiled/topics/aurora.md"
+    assert "## Claim History" not in page_path.read_text(encoding="utf-8")
+    _install_fake_page_writer(monkeypatch)
+    item = list_queue_items(vault)[0]
+
+    apply_response(vault, item, "keep_new")
+
+    new_text = page_path.read_text(encoding="utf-8")
+    assert [
+        row[2] for row in CompiledBriefingService._sources_shaped_rows(new_text)
+    ] == ["Контракт на два года"]
+    assert CompiledBriefingService._claim_history_rows(new_text) == [
+        ("2026-07-01", "daily/a.md", "Контракт на год", "daily/b.md")
+    ]
+    # Restored where the renderer would have put it, not appended at the end.
+    assert new_text.index("## Claim History") < new_text.index("## Owner Notes")
+
+
+def test_apply_response_conflict_choice_retirement_does_not_duplicate_history(
+    tmp_path, write_vault_manifest, monkeypatch
+):
+    """Re-retiring the same claim -- the same pair conflicting again on a
+    later date, or a second tap -- must not stack a second history row. The
+    dedup ignores the date column, exactly like the write path's own."""
+    vault = tmp_path / "vault"
+    write_vault_manifest(vault)
+    row = (
+        "2026-07-15",
+        "Контракт на год",
+        "daily/a.md",
+        "Контракт на два года",
+        "daily/b.md",
+    )
+    _write_page(
+        vault,
+        "compiled/topics/aurora.md",
+        sources_rows=[
+            ("2026-07-01", "daily/a.md", "Контракт на год"),
+            ("2026-07-15", "daily/b.md", "Контракт на два года"),
+        ],
+        conflicts_rows=[row],
+        conflicts_open=1,
+        claim_history=True,
+        history_rows=[
+            ("2026-06-01", "daily/a.md", "Контракт на год", "daily/b.md")
+        ],
+    )
+    _install_fake_page_writer(monkeypatch)
+    item = list_queue_items(vault)[0]
+
+    apply_response(vault, item, "keep_new")
+
+    new_text = (vault / "compiled/topics/aurora.md").read_text(encoding="utf-8")
+    assert CompiledBriefingService._claim_history_rows(new_text) == [
+        ("2026-06-01", "daily/a.md", "Контракт на год", "daily/b.md")
+    ]
 
 
 def test_apply_response_conflict_choice_idempotent_when_row_already_gone(
