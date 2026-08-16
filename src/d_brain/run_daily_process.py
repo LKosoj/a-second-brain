@@ -293,6 +293,7 @@ def main() -> int:
         getattr(settings, "openai_api_key", ""),
         getattr(settings, "openai_base_url", ""),
         getattr(settings, "openai_model", ""),
+        getattr(settings, "recall_planner_disable_thinking", False),
     )
     try:
         result = _run_processor_cycle(processor, day, args.mode)

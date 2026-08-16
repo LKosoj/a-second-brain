@@ -154,6 +154,7 @@ class CliProcessor:
         openai_api_key: str = "",
         openai_base_url: str = "",
         openai_model: str = "",
+        recall_planner_disable_thinking: bool = False,
     ) -> None:
         self.vault_path = Path(vault_path)
         self.todoist_api_key = todoist_api_key
@@ -163,11 +164,13 @@ class CliProcessor:
         self._openai_api_key = openai_api_key.strip()
         self._openai_base_url = openai_base_url.strip()
         self._openai_model = openai_model.strip()
+        self._recall_planner_disable_thinking = recall_planner_disable_thinking
         self._recall_planner_config = RecallPlannerConfig(
             model=self._openai_model,
             api_key=self._openai_api_key,
             base_url=self._openai_base_url,
             language=self.content_language,
+            disable_thinking=self._recall_planner_disable_thinking,
         )
         self._project_runner = CliRunner(self.vault_path.parent, ai_cli)
         self._assistant_runner = CliRunner(self.vault_path, ai_cli)

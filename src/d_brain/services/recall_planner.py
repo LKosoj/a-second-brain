@@ -236,6 +236,7 @@ class RecallPlannerConfig:
     api_key: str = ""
     base_url: str = ""
     language: str = "en"
+    disable_thinking: bool = False
 
     @property
     def enabled(self) -> bool:
@@ -838,11 +839,11 @@ def plan_qmd_recall(
         return RecallPlan()
 
     planner_client = client or _build_client(config)
-    response = planner_client.chat.completions.create(
-        model=config.model,
-        temperature=0,
-        response_format={"type": "json_object"},
-        messages=[
+    create_kwargs: dict[str, Any] = {
+        "model": config.model,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
             {"role": "system", "content": _PLANNER_SYSTEM_PROMPT},
             {
                 "role": "user",
@@ -854,8 +855,11 @@ def plan_qmd_recall(
                 ),
             },
         ],
-        timeout=_PLANNER_REQUEST_TIMEOUT,
-    )
+        "timeout": _PLANNER_REQUEST_TIMEOUT,
+    }
+    if config.disable_thinking:
+        create_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+    response = planner_client.chat.completions.create(**create_kwargs)
     content = response.choices[0].message.content or "{}"
     payload = _extract_first_json_dict(content)
     return _normalize_plan(
