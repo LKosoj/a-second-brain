@@ -14,6 +14,7 @@ import json
 import os
 import re
 import stat
+import sys
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -36,7 +37,7 @@ from d_brain.services.vault_lock import (
 
 _TOP_LEVEL_FIELD = re.compile(rb"^[A-Za-z][A-Za-z0-9_-]*:")
 _FIELD_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]*\Z")
-_SEMANTIC_FIELDS = frozenset({"description", "tags", "status", "scope"})
+_SEMANTIC_FIELDS = frozenset({"description", "tags", "status"})
 _EPISTEMIC_SEMANTIC_FIELDS = frozenset(
     {
         "epistemic_confidence",
@@ -567,6 +568,14 @@ def _rename_noreplace(
     destination_name: str,
 ) -> None:
     renameat2 = getattr(_LIBC, "renameat2", None)
+    if renameat2 is None and sys.platform != "darwin":
+        # On Linux without glibc >= 2.28 the non-atomic fallback is unsafe --
+        # silently taking it would mean data loss on stale-NFS-style failures.
+        # Fail closed and let the operator know the kernel/libc is too old.
+        raise UnsafeVaultPathError(
+            "renameat2 is unavailable on this platform and the non-atomic "
+            f"fallback is only supported on Darwin; sys.platform={sys.platform!r}"
+        )
     if renameat2 is not None:
         ctypes.set_errno(0)
         result = renameat2(
@@ -605,6 +614,11 @@ def _rename_exchange(
     destination_name: str,
 ) -> None:
     renameat2 = getattr(_LIBC, "renameat2", None)
+    if renameat2 is None and sys.platform != "darwin":
+        raise UnsafeVaultPathError(
+            "renameat2 is unavailable on this platform and the non-atomic "
+            f"fallback is only supported on Darwin; sys.platform={sys.platform!r}"
+        )
     if renameat2 is not None:
         ctypes.set_errno(0)
         result = renameat2(
@@ -621,12 +635,19 @@ def _rename_exchange(
 
     # macOS / BSD fallback: POSIX has no RENAME_EXCHANGE equivalent, so simulate
     # it with three renames through a temporary name in the staging directory.
-    # The sequence is not atomic, but the writer already keeps a recovery hard
-    # link for the original source (``recovery_name``, set up at
-    # ``frontmatter.py:897`` before this function is called). On any crash
-    # window between the steps, ``_rollback_publication`` re-publishes the
-    # target from that guard link, so the vault never loses the original
-    # content.
+    # The sequence is **not** atomic. If ``os.rename`` raises mid-sequence, the
+    # ``except BaseException`` block tries to undo the first swap by renaming
+    # ``swap_name`` back over ``destination_name``; if that recovery rename
+    # itself fails (a narrow window, but a real double I/O failure in one
+    # directory), the target can be lost from this directory. The writer
+    # additionally keeps a recovery hard link for the original source
+    # (``recovery_name``, set up at ``frontmatter.py:897`` before this function
+    # is called); on a crash window between steps, ``_rollback_publication``
+    # re-publishes the target from that guard link, but only when
+    # ``published and not durable_commit``. Crash-window safety therefore
+    # depends on the directory's I/O being healthy enough to surface any
+    # mid-sequence failure as a raised exception, which is the common case on
+    # local filesystems.
     #
     # Pre-state:
     #   source_fd / source_name      -> new content (candidate)
@@ -1859,19 +1880,6 @@ def validate_semantic_payload(
         if value not in _ALLOWED_STATUSES:
             raise FrontmatterError("status is not an allowed card status")
         result["status"] = value
-    if "scope" in requested:
-        value = payload["scope"]
-        from d_brain.config import LIFE_SCOPES, normalize_life_scope
-
-        if not isinstance(value, str):
-            raise FrontmatterError("scope must be a string")
-        try:
-            result["scope"] = normalize_life_scope(value)
-        except ValueError as exc:
-            allowed = ", ".join(LIFE_SCOPES)
-            raise FrontmatterError(
-                f"scope '{value}' is not allowed (allowed: {allowed})"
-            ) from exc
     if _EPISTEMIC_SEMANTIC_FIELDS & set(requested):
         from d_brain.services.epistemic_memory import (
             EPISTEMIC_CONFIDENCE_VALUES,
