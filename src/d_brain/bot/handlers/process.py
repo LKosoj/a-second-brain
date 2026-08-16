@@ -40,6 +40,7 @@ def _build_processor() -> CliProcessor:
         getattr(settings, "openai_api_key", ""),
         getattr(settings, "openai_base_url", ""),
         getattr(settings, "openai_model", ""),
+        getattr(settings, "recall_planner_disable_thinking", False),
     )
 
 
