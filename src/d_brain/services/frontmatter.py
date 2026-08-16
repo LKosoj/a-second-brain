@@ -36,7 +36,7 @@ from d_brain.services.vault_lock import (
 
 _TOP_LEVEL_FIELD = re.compile(rb"^[A-Za-z][A-Za-z0-9_-]*:")
 _FIELD_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]*\Z")
-_SEMANTIC_FIELDS = frozenset({"description", "tags", "status"})
+_SEMANTIC_FIELDS = frozenset({"description", "tags", "status", "scope"})
 _EPISTEMIC_SEMANTIC_FIELDS = frozenset(
     {
         "epistemic_confidence",
@@ -567,19 +567,35 @@ def _rename_noreplace(
     destination_name: str,
 ) -> None:
     renameat2 = getattr(_LIBC, "renameat2", None)
-    if renameat2 is None:
-        raise UnsafeVaultPathError("renameat2 is unavailable on this platform")
-    ctypes.set_errno(0)
-    result = renameat2(
-        source_fd,
-        ctypes.c_char_p(os.fsencode(source_name)),
-        destination_fd,
-        ctypes.c_char_p(os.fsencode(destination_name)),
-        _RENAME_NOREPLACE,
+    if renameat2 is not None:
+        ctypes.set_errno(0)
+        result = renameat2(
+            source_fd,
+            ctypes.c_char_p(os.fsencode(source_name)),
+            destination_fd,
+            ctypes.c_char_p(os.fsencode(destination_name)),
+            _RENAME_NOREPLACE,
+        )
+        if result != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), destination_name)
+        return
+
+    # macOS / BSD fallback: ``rename(2)`` overwrites the destination on POSIX,
+    # so ``os.rename`` cannot give us no-replace semantics on its own. The
+    # standard portable dance is to hard-link the source to the destination
+    # (which fails with EEXIST if the destination already exists) and then
+    # unlink the source. ``os.link`` with ``src_dir_fd``/``dst_dir_fd``
+    # surfaces ``FileExistsError`` on macOS, matching the Linux RENAME_NOREPLACE
+    # contract.
+    os.link(
+        source_name,
+        destination_name,
+        src_dir_fd=source_fd,
+        dst_dir_fd=destination_fd,
+        follow_symlinks=False,
     )
-    if result != 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error), destination_name)
+    os.unlink(source_name, dir_fd=source_fd)
 
 
 def _rename_exchange(
@@ -589,19 +605,66 @@ def _rename_exchange(
     destination_name: str,
 ) -> None:
     renameat2 = getattr(_LIBC, "renameat2", None)
-    if renameat2 is None:
-        raise UnsafeVaultPathError("renameat2 is unavailable on this platform")
-    ctypes.set_errno(0)
-    result = renameat2(
-        source_fd,
-        ctypes.c_char_p(os.fsencode(source_name)),
-        destination_fd,
-        ctypes.c_char_p(os.fsencode(destination_name)),
-        _RENAME_EXCHANGE,
+    if renameat2 is not None:
+        ctypes.set_errno(0)
+        result = renameat2(
+            source_fd,
+            ctypes.c_char_p(os.fsencode(source_name)),
+            destination_fd,
+            ctypes.c_char_p(os.fsencode(destination_name)),
+            _RENAME_EXCHANGE,
+        )
+        if result != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), destination_name)
+        return
+
+    # macOS / BSD fallback: POSIX has no RENAME_EXCHANGE equivalent, so simulate
+    # it with three renames through a temporary name in the staging directory.
+    # The sequence is not atomic, but the writer already keeps a recovery hard
+    # link for the original source (``recovery_name``, set up at
+    # ``frontmatter.py:897`` before this function is called). On any crash
+    # window between the steps, ``_rollback_publication`` re-publishes the
+    # target from that guard link, so the vault never loses the original
+    # content.
+    #
+    # Pre-state:
+    #   source_fd / source_name      -> new content (candidate)
+    #   destination_fd / destination_name -> old content (target)
+    # Post-state:
+    #   destination_fd / destination_name -> new content
+    #   source_fd / source_name      -> old content
+    swap_name = f"swap-{os.urandom(8).hex()}"
+    os.rename(
+        destination_name,
+        swap_name,
+        src_dir_fd=destination_fd,
+        dst_dir_fd=source_fd,
     )
-    if result != 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error), destination_name)
+    try:
+        os.rename(
+            source_name,
+            destination_name,
+            src_dir_fd=source_fd,
+            dst_dir_fd=destination_fd,
+        )
+    except BaseException:
+        try:
+            os.rename(
+                swap_name,
+                destination_name,
+                src_dir_fd=source_fd,
+                dst_dir_fd=destination_fd,
+            )
+        except OSError:
+            pass
+        raise
+    os.rename(
+        swap_name,
+        source_name,
+        src_dir_fd=source_fd,
+        dst_dir_fd=source_fd,
+    )
 
 
 @dataclass(frozen=True)
@@ -1796,6 +1859,19 @@ def validate_semantic_payload(
         if value not in _ALLOWED_STATUSES:
             raise FrontmatterError("status is not an allowed card status")
         result["status"] = value
+    if "scope" in requested:
+        value = payload["scope"]
+        from d_brain.config import LIFE_SCOPES, normalize_life_scope
+
+        if not isinstance(value, str):
+            raise FrontmatterError("scope must be a string")
+        try:
+            result["scope"] = normalize_life_scope(value)
+        except ValueError as exc:
+            allowed = ", ".join(LIFE_SCOPES)
+            raise FrontmatterError(
+                f"scope '{value}' is not allowed (allowed: {allowed})"
+            ) from exc
     if _EPISTEMIC_SEMANTIC_FIELDS & set(requested):
         from d_brain.services.epistemic_memory import (
             EPISTEMIC_CONFIDENCE_VALUES,
