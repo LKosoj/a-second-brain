@@ -141,6 +141,7 @@ async def handle_text(message: Message) -> None:
         getattr(settings, "openai_api_key", ""),
         getattr(settings, "openai_base_url", ""),
         getattr(settings, "openai_model", ""),
+        getattr(settings, "recall_planner_disable_thinking", False),
     )
     status_message = await _upsert_status_message(
         message,
