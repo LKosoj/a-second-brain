@@ -14,6 +14,7 @@ import json
 import os
 import re
 import stat
+import sys
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -567,19 +568,43 @@ def _rename_noreplace(
     destination_name: str,
 ) -> None:
     renameat2 = getattr(_LIBC, "renameat2", None)
-    if renameat2 is None:
-        raise UnsafeVaultPathError("renameat2 is unavailable on this platform")
-    ctypes.set_errno(0)
-    result = renameat2(
-        source_fd,
-        ctypes.c_char_p(os.fsencode(source_name)),
-        destination_fd,
-        ctypes.c_char_p(os.fsencode(destination_name)),
-        _RENAME_NOREPLACE,
+    if renameat2 is None and sys.platform != "darwin":
+        # On Linux without glibc >= 2.28 the non-atomic fallback is unsafe --
+        # silently taking it would mean data loss on stale-NFS-style failures.
+        # Fail closed and let the operator know the kernel/libc is too old.
+        raise UnsafeVaultPathError(
+            "renameat2 is unavailable on this platform and the non-atomic "
+            f"fallback is only supported on Darwin; sys.platform={sys.platform!r}"
+        )
+    if renameat2 is not None:
+        ctypes.set_errno(0)
+        result = renameat2(
+            source_fd,
+            ctypes.c_char_p(os.fsencode(source_name)),
+            destination_fd,
+            ctypes.c_char_p(os.fsencode(destination_name)),
+            _RENAME_NOREPLACE,
+        )
+        if result != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), destination_name)
+        return
+
+    # macOS / BSD fallback: ``rename(2)`` overwrites the destination on POSIX,
+    # so ``os.rename`` cannot give us no-replace semantics on its own. The
+    # standard portable dance is to hard-link the source to the destination
+    # (which fails with EEXIST if the destination already exists) and then
+    # unlink the source. ``os.link`` with ``src_dir_fd``/``dst_dir_fd``
+    # surfaces ``FileExistsError`` on macOS, matching the Linux RENAME_NOREPLACE
+    # contract.
+    os.link(
+        source_name,
+        destination_name,
+        src_dir_fd=source_fd,
+        dst_dir_fd=destination_fd,
+        follow_symlinks=False,
     )
-    if result != 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error), destination_name)
+    os.unlink(source_name, dir_fd=source_fd)
 
 
 def _rename_exchange(
@@ -589,19 +614,78 @@ def _rename_exchange(
     destination_name: str,
 ) -> None:
     renameat2 = getattr(_LIBC, "renameat2", None)
-    if renameat2 is None:
-        raise UnsafeVaultPathError("renameat2 is unavailable on this platform")
-    ctypes.set_errno(0)
-    result = renameat2(
-        source_fd,
-        ctypes.c_char_p(os.fsencode(source_name)),
-        destination_fd,
-        ctypes.c_char_p(os.fsencode(destination_name)),
-        _RENAME_EXCHANGE,
+    if renameat2 is None and sys.platform != "darwin":
+        raise UnsafeVaultPathError(
+            "renameat2 is unavailable on this platform and the non-atomic "
+            f"fallback is only supported on Darwin; sys.platform={sys.platform!r}"
+        )
+    if renameat2 is not None:
+        ctypes.set_errno(0)
+        result = renameat2(
+            source_fd,
+            ctypes.c_char_p(os.fsencode(source_name)),
+            destination_fd,
+            ctypes.c_char_p(os.fsencode(destination_name)),
+            _RENAME_EXCHANGE,
+        )
+        if result != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), destination_name)
+        return
+
+    # macOS / BSD fallback: POSIX has no RENAME_EXCHANGE equivalent, so simulate
+    # it with three renames through a temporary name in the staging directory.
+    # The sequence is **not** atomic. If ``os.rename`` raises mid-sequence, the
+    # ``except BaseException`` block tries to undo the first swap by renaming
+    # ``swap_name`` back over ``destination_name``; if that recovery rename
+    # itself fails (a narrow window, but a real double I/O failure in one
+    # directory), the target can be lost from this directory. The writer
+    # additionally keeps a recovery hard link for the original source
+    # (``recovery_name``, set up at ``frontmatter.py:897`` before this function
+    # is called); on a crash window between steps, ``_rollback_publication``
+    # re-publishes the target from that guard link, but only when
+    # ``published and not durable_commit``. Crash-window safety therefore
+    # depends on the directory's I/O being healthy enough to surface any
+    # mid-sequence failure as a raised exception, which is the common case on
+    # local filesystems.
+    #
+    # Pre-state:
+    #   source_fd / source_name      -> new content (candidate)
+    #   destination_fd / destination_name -> old content (target)
+    # Post-state:
+    #   destination_fd / destination_name -> new content
+    #   source_fd / source_name      -> old content
+    swap_name = f"swap-{os.urandom(8).hex()}"
+    os.rename(
+        destination_name,
+        swap_name,
+        src_dir_fd=destination_fd,
+        dst_dir_fd=source_fd,
     )
-    if result != 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error), destination_name)
+    try:
+        os.rename(
+            source_name,
+            destination_name,
+            src_dir_fd=source_fd,
+            dst_dir_fd=destination_fd,
+        )
+    except BaseException:
+        try:
+            os.rename(
+                swap_name,
+                destination_name,
+                src_dir_fd=source_fd,
+                dst_dir_fd=destination_fd,
+            )
+        except OSError:
+            pass
+        raise
+    os.rename(
+        swap_name,
+        source_name,
+        src_dir_fd=source_fd,
+        dst_dir_fd=source_fd,
+    )
 
 
 @dataclass(frozen=True)
