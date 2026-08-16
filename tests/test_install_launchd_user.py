@@ -4,6 +4,16 @@ The script is plain bash, so the tests run it under ``subprocess.run`` with
 ``uv`` and ``launchctl`` patched in the PATH and assert on rendered
 plist files. We never call ``launchctl load`` -- the script's ``--enable``
 mode is exercised only by hand on a real macOS host.
+
+PATH isolation: tests replace the inherited PATH entirely rather than
+prepending stubs to it. ``install-launchd-user.sh`` decides whether to
+render the optional ``plaud-sync`` / ``qmd-maintenance`` agents with
+``command -v qmd`` / a grep over ``.env``; if the host has ``qmd`` (or a
+PLAUD_BEARER_TOKEN) installed outside the stub dir, a prepend-only PATH
+would still surface it and the test for "optional plists are skipped"
+would fail. The fake PATH here is exactly ``<stub_dir>:/usr/bin:/bin``,
+which is enough for bash, sed, grep, mkdir, cp, chmod, and the stubs
+themselves, but cannot accidentally pick up a host install of ``qmd``.
 """
 
 from __future__ import annotations
@@ -18,6 +28,13 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "install-launchd-user.sh"
+
+# Minimal PATH used by the install-script tests. Only the directories that
+# ship the standard utilities the script and the bash interpreter need.
+# ``/usr/local/bin``, ``/opt/homebrew/bin``, and user-local bins are
+# deliberately excluded so that a host install of ``qmd`` (or anything
+# else) cannot satisfy ``command -v qmd`` inside the test.
+_ISOLATED_SYSTEM_PATH = "/usr/bin:/bin"
 
 
 def _make_stub_dir(tmp_path: Path) -> Path:
@@ -77,8 +94,14 @@ def _prepare_project(project_dir: Path) -> None:
 
 @pytest.fixture
 def fake_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Provide a stub-only PATH: stubs + system utilities, nothing else.
+
+    Replaces the inherited PATH entirely so that ``command -v qmd`` and
+    other host-installed binaries cannot accidentally satisfy optional
+    prerequisites inside the script.
+    """
     bin_dir = _make_stub_dir(tmp_path)
-    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("PATH", f"{bin_dir}:{_ISOLATED_SYSTEM_PATH}")
     return bin_dir
 
 

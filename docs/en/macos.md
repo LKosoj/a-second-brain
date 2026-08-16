@@ -33,7 +33,6 @@ $EDITOR .env
 # Pick your brain: AI_CLI=opencode (default in .env.example is claude)
 # VAULT_PATH=$HOME/second-brain/repo/vault
 # CONTENT_LANGUAGE=ru
-# LIFE_SCOPE_DEFAULT=personal
 
 # 3. Smoke-test
 uv run --frozen --no-dev a-second-brain doctor ~/second-brain/repo
