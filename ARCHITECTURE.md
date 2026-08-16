@@ -8,7 +8,7 @@ The distributable application and the user's data have separate lifecycles:
 public Git repository                 private instance
 ├── src/d_brain/                      ├── .env
 ├── resources/vault_template/  init → ├── vault/
-├── deploy/*.in                       ├── .vault-backups/
+├── deploy/*.in (systemd + launchd)   ├── .vault-backups/
 └── tests/                             └── runtime logs/state
 ```
 
@@ -50,3 +50,5 @@ override the registry.
 - Vault writes are constrained by the manifest and cooperative write lock.
 - Initializers refuse to overwrite an existing vault.
 - User systemd units run without root and with basic service hardening.
+  LaunchAgent plists (macOS) deliver the same schedule without root and
+  source `.env` via `scripts/lib/run_with_env.sh`.

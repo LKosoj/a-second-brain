@@ -13,6 +13,7 @@ English and Russian pages are maintained as mirrored documentation sets.
 | Data recovery | [Backup and restore](en/backup-and-restore.md) | [Резервное копирование и восстановление](ru/backup-and-restore.md) |
 | Problem solving | [Troubleshooting](en/troubleshooting.md) | [Устранение неполадок](ru/troubleshooting.md) |
 | System design | [Architecture](en/architecture.md) | [Архитектура](ru/architecture.md) |
+| macOS deployment | [macOS](en/macos.md) | [macOS](ru/macos.md) |
 | Contributing | [Development](en/development.md) | [Разработка](ru/development.md) |
 
 Advanced references:

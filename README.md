@@ -241,6 +241,25 @@ enabled timer; see
 [Integrations](docs/en/integrations.md). No root-owned system service is
 installed.
 
+### macOS
+
+systemd is unavailable on macOS, so the same schedules run as user
+LaunchAgents rendered from `deploy/com.second-brain.*.plist.in`.
+See [macOS deployment](docs/en/macos.md) for the full procedure. The
+short version:
+
+```bash
+bash scripts/install-launchd-user.sh --enable
+sudo pmset -a sleep 0 disksleep 0 displaysleep 0   # keep the bot polling
+```
+
+`--enable` is idempotent and renders only the agents whose prerequisites
+are satisfied (PLAUD token, `qmd` binary). To roll back:
+
+```bash
+bash scripts/install-launchd-user.sh --uninstall
+```
+
 ## Privacy boundary
 
 - In a source checkout, the generated `vault/` is inside the project directory

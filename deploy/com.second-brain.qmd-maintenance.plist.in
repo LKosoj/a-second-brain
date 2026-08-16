@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.second-brain.qmd-maintenance</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>@WRAPPER@</string>
+        <string>@PROJECT_DIR@</string>
+        <string>@UV_BIN@</string>
+        <string>run</string>
+        <string>--frozen</string>
+        <string>--no-dev</string>
+        <string>a-second-brain</string>
+        <string>qmd</string>
+        <string>cleanup</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>@PROJECT_DIR@</string>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>@LOG_DIR@/qmd-maintenance.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>@LOG_DIR@/qmd-maintenance.err.log</string>
+</dict>
+</plist>
