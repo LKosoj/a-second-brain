@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.second-brain.plaud-sync</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>@WRAPPER@</string>
+        <string>@PROJECT_DIR@</string>
+        <string>@UV_BIN@</string>
+        <string>run</string>
+        <string>--frozen</string>
+        <string>--no-dev</string>
+        <string>python</string>
+        <string>-m</string>
+        <string>d_brain.run_plaud_sync</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>@PROJECT_DIR@</string>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>StandardOutPath</key>
+    <string>@LOG_DIR@/plaud-sync.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>@LOG_DIR@/plaud-sync.err.log</string>
+</dict>
+</plist>

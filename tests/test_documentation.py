@@ -11,6 +11,7 @@ DOCUMENTATION_PAGES = {
     "development.md",
     "getting-started.md",
     "integrations.md",
+    "macos.md",
     "memory-and-search.md",
     "operations.md",
     "troubleshooting.md",

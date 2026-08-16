@@ -247,6 +247,25 @@ a-second-brain run
 [Интеграции](docs/ru/integrations.md). Системный root-сервис установщик не
 создаёт.
 
+### macOS
+
+systemd на macOS недоступен, поэтому те же расписания запускаются как
+пользовательские LaunchAgents, рендерящиеся из
+`deploy/com.second-brain.*.plist.in`. Полная инструкция — в
+[развёртывании на macOS](docs/ru/macos.md). Короткая версия:
+
+```bash
+bash scripts/install-launchd-user.sh --enable
+sudo pmset -a sleep 0 disksleep 0 displaysleep 0   # чтобы бот не засыпал
+```
+
+`--enable` идемпотентен и добавляет только те агенты, чьи предусловия
+выполнены (токен PLAUD, бинарь `qmd`). Откат:
+
+```bash
+bash scripts/install-launchd-user.sh --uninstall
+```
+
 ## Граница приватности
 
 - В исходном checkout созданный `vault/` находится внутри каталога проекта,
