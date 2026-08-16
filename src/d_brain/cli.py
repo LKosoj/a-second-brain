@@ -81,6 +81,8 @@ def initialize_project(target: Path) -> Path:
     for relative in _SKILL_ALIASES:
         alias = project_dir / relative
         alias.parent.mkdir(parents=True, exist_ok=True)
+        if alias.exists() or alias.is_symlink():
+            continue
         alias.symlink_to("../skills", target_is_directory=True)
 
     project_template = resources.joinpath("project_template")
