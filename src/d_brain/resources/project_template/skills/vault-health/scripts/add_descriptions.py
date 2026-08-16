@@ -211,6 +211,42 @@ def generate_description(rel_path: str, content: str, fm: dict) -> str | None:
             return truncate(para)
         return f"Goal: {Path(rel_path).stem.replace('-', ' ')}"
 
+    # Family
+    if rel_path.startswith("family/"):
+        body = get_body_after_frontmatter(content)
+        para = extract_first_paragraph(body)
+        if para:
+            return truncate(para)
+        return f"Family: {Path(rel_path).stem.replace('-', ' ').title()}"
+
+    # Private
+    if rel_path.startswith("private/"):
+        body = get_body_after_frontmatter(content)
+        para = extract_first_paragraph(body)
+        if para:
+            return truncate(para)
+        return f"Private: {Path(rel_path).stem.replace('-', ' ').title()}"
+
+    # Hobbies
+    if rel_path.startswith("hobbies/"):
+        body = get_body_after_frontmatter(content)
+        para = extract_first_paragraph(body)
+        if para:
+            return truncate(para)
+        stem = Path(rel_path).stem
+        stem = re.sub(r"^\d{4}-\d{2}-\d{2}-", "", stem)
+        return f"Hobby: {stem.replace('-', ' ').title()}"
+
+    # Finances
+    if rel_path.startswith("finances/"):
+        body = get_body_after_frontmatter(content)
+        para = extract_first_paragraph(body)
+        if para:
+            return truncate(para)
+        stem = Path(rel_path).stem
+        stem = re.sub(r"^\d{4}-\d{2}-\d{2}-", "", stem)
+        return f"Finances: {stem.replace('-', ' ').title()}"
+
     # Summaries
     if rel_path.startswith("summaries/"):
         stem = Path(rel_path).stem

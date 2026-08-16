@@ -13,7 +13,11 @@
     "vault/imports",
     "vault/compiled",
     "vault/summaries",
-    "vault/MOC"
+    "vault/MOC",
+    "vault/family",
+    "vault/private",
+    "vault/hobbies",
+    "vault/finances"
   ],
   "infrastructure": [
     "vault/.claude",

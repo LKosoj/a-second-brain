@@ -12,8 +12,11 @@ Read capture.json from Phase 1. Create Todoist tasks, save thoughts, update busi
 - `.session/capture.json` — output from Phase 1
 - `business/crm.md`, `business/network.md`, `business/events.md` — business work areas
 - `projects/clients.md`, `projects/leads.md`, `projects/projects.md` — project work areas
+- `family/events.md`, `family/plans.md`, `family/notes.md` — family life areas
+- `hobbies/<slug>.md` — personal hobbies and interests
+- `finances/<slug>.md` — personal finances, investments, budget
 
-The business and projects indexes are already in the injected core context.
+The business, projects, family, hobbies and finances indexes are already in the injected core context.
 
 ## Task
 
@@ -73,6 +76,15 @@ For entries with `classification: "crm_update"`:
   - `projects/projects.md`
 - Update only when the entry materially changes what is true.
 - If the current flat files clearly need a new linked note, create one conservatively and link it from the proper index instead of inventing a deep path.
+
+### 4a. Update personal-life domains
+
+For entries whose content is about a personal-life area:
+- `family_event`, `family_observation` → `family/events.md`, `family/plans.md`, or `family/notes.md`
+- `hobby`, `interest`, `personal_project_observation` → create or update `hobbies/<slug>.md`
+- `financial_observation`, `investment_observation`, `budget_observation` → create or update `finances/<slug>.md`
+- Prefer updating an existing file. Use the domain's `_index.md` as the linking hub.
+- Do not auto-route to `private/` — `private/` is owner-managed (Obsidian or explicit `/do`), no automatic EXECUTE write path.
 
 ### 5. Build links
 
