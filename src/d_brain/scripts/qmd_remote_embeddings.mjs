@@ -1,6 +1,16 @@
 #!/usr/bin/env node
 
-import { isQwen3EmbeddingModel } from "/usr/local/lib/node_modules/@tobilu/qmd/dist/llm.js";
+import { existsSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const QMD_NODE_CANDIDATES = [
+  `${process.env.HOME}/.local/lib/node_modules/@tobilu/qmd`,
+  "/usr/local/lib/node_modules/@tobilu/qmd",
+];
+const QMD_NODE_PATH =
+  QMD_NODE_CANDIDATES.find((p) => existsSync(p)) ?? QMD_NODE_CANDIDATES[0];
+const _llmMod = await import(pathToFileURL(`${QMD_NODE_PATH}/dist/llm.js`).href);
+const { isQwen3EmbeddingModel } = _llmMod;
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 
