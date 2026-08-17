@@ -1,10 +1,16 @@
 #!/usr/bin/env node
 
-import {
-  createStore,
-  extractSnippet,
-  reciprocalRankFusion,
-} from "/usr/local/lib/node_modules/@tobilu/qmd/dist/store.js";
+import { existsSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const QMD_NODE_CANDIDATES = [
+  `${process.env.HOME}/.local/lib/node_modules/@tobilu/qmd`,
+  "/usr/local/lib/node_modules/@tobilu/qmd",
+];
+const QMD_NODE_PATH =
+  QMD_NODE_CANDIDATES.find((p) => existsSync(p)) ?? QMD_NODE_CANDIDATES[0];
+const _storeMod = await import(pathToFileURL(`${QMD_NODE_PATH}/dist/store.js`).href);
+const { createStore, extractSnippet, reciprocalRankFusion } = _storeMod;
 import {
   embedTextsViaRemote,
   formatRemoteQuery,
