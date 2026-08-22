@@ -27,6 +27,7 @@ from d_brain.services.compiled_briefings import (
     HUMAN_ZONE_START,
     IMPACT_CATALOG_MAX_CHARS,
     IMPACT_TIMEOUT_SECONDS,
+    MAX_AUTO_VERIFY_RETRIES,
     MAX_CLAIMS_PER_PASS,
     MAX_ENRICHMENTS_PER_PAGE_PER_MONTH,
     MAX_MODEL_CALLS_PER_PASS,
@@ -13459,6 +13460,364 @@ def test_compiled_briefings_nightly_retry_keeps_the_queue_entry_until_page_is_cl
     assert [entry["kind"] for entry in json.loads(
         queue_path.read_text(encoding="utf-8")
     )] == ["undecided-conflict"]
+
+
+# --- Automated answers to the owner's own queue ---------------------------
+#
+# The items the two judges above never touched: a page whose fact-check
+# failed, two pages that may be the same page, a source Verify keeps
+# rejecting. Each carries real buttons -- and each used to wait for a tap
+# that never came, counting in the digest every night until it did.
+
+
+def _write_owner_queue(vault_path: Path, entries: list[dict[str, str]]) -> Path:
+    (vault_path / ".session").mkdir(parents=True, exist_ok=True)
+    queue_path = vault_path / ".session" / "decisions-queue.json"
+    queue_path.write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+    return queue_path
+
+
+def _bypass_decisions_queue_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``apply_response`` writes through the same CAS-protected helpers this
+    sandbox cannot run (see ``_bypass_atomic_vault_write``), from
+    ``decisions_queue``'s own namespace."""
+
+    def _patch(
+        vault_path: Path, path: Path, fields: dict[str, str], **kwargs: Any
+    ) -> None:
+        del vault_path, kwargs
+        text = path.read_text(encoding="utf-8")
+        head, _, rest = text.partition("---\n")
+        body, _, tail = rest.partition("---\n")
+        extra = "".join(f"{key}: {value}\n" for key, value in fields.items())
+        path.write_text(f"{head}---\n{body}{extra}---\n{tail}", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "d_brain.services.decisions_queue.patch_validated_vault_frontmatter", _patch
+    )
+    monkeypatch.setattr(
+        "d_brain.services.decisions_queue.write_validated_vault_markdown",
+        lambda *args, **kwargs: None,
+    )
+
+
+def test_compiled_briefings_failed_fact_check_is_decided_not_queued(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The model is shown the page and what happened, picks one of the same
+    buttons the owner's screen offers, and the decision is applied through
+    ``apply_response`` -- the exact call a tap makes."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_atomic_vault_write(monkeypatch)
+    _bypass_decisions_queue_writes(monkeypatch)
+    page_path = vault_path / "compiled" / "projects" / "demo-project.md"
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    page_path.write_text(
+        _full_compiled_page_text(
+            shaped_rows=[("2026-08-02", "daily/2026-08-02.md", "Про склад.")],
+        ),
+        encoding="utf-8",
+    )
+    queue_path = _write_owner_queue(
+        vault_path,
+        [
+            {
+                "kind": "fact-check-rejected",
+                "page": "compiled/projects/demo-project.md",
+                "summary": "перепроверка не подтвердила часть утверждений",
+                "since": "2026-08-07",
+            }
+        ],
+    )
+    prompts: list[str] = []
+    monkeypatch.setattr(
+        service.runner,
+        "run",
+        lambda prompt, **kwargs: prompts.append(prompt)
+        or json.dumps({"action": "confirm", "reason": "источник всё ещё в силе"}),
+    )
+
+    answered = service._auto_answer_queue_items(limit=5)
+
+    assert answered == ["fact-check-rejected:compiled/projects/demo-project.md"]
+    # Told what each button actually does, not just its label.
+    assert "перепроверена сегодня" in prompts[0]
+    assert "compiled/archive" in prompts[0]
+    assert json.loads(queue_path.read_text(encoding="utf-8")) == []
+    fields = service._frontmatter_fields(page_path.read_text(encoding="utf-8"))
+    assert fields["last_verified"] == date.today().isoformat()
+
+
+def test_compiled_briefings_duplicate_candidate_is_decided(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both pages go to the model, because deciding whether two pages are
+    the same page cannot be done from one of them."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_atomic_vault_write(monkeypatch)
+    _bypass_decisions_queue_writes(monkeypatch)
+    for slug, state in (
+        ("demo-project", "Про склад в Твери."),
+        ("demo-project-2", "Про найм в Казани."),
+    ):
+        page_path = vault_path / "compiled" / "projects" / f"{slug}.md"
+        page_path.parent.mkdir(parents=True, exist_ok=True)
+        page_path.write_text(
+            _full_compiled_page_text(
+                shaped_rows=[("2026-08-02", "daily/2026-08-02.md", "изменение")],
+            ).replace("Demo state.", state),
+            encoding="utf-8",
+        )
+    queue_path = _write_owner_queue(
+        vault_path,
+        [
+            {
+                "kind": "duplicate-candidate",
+                "page": "compiled/projects/demo-project-2.md",
+                "candidate_page": "compiled/projects/demo-project.md",
+                "summary": "две страницы выглядят как одна и та же",
+                "since": "2026-08-07",
+            }
+        ],
+    )
+    prompts: list[str] = []
+    monkeypatch.setattr(
+        service.runner,
+        "run",
+        lambda prompt, **kwargs: prompts.append(prompt)
+        or json.dumps({"action": "distinct", "reason": "разные предметы"}),
+    )
+
+    answered = service._auto_answer_queue_items(limit=5)
+
+    assert answered == ["duplicate-candidate:compiled/projects/demo-project-2.md"]
+    assert "Про склад в Твери." in prompts[0]
+    assert "Про найм в Казани." in prompts[0]
+    assert json.loads(queue_path.read_text(encoding="utf-8")) == []
+
+
+def test_compiled_briefings_verify_retry_stops_after_the_retry_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry re-queues the source, so a page Verify rejects for a
+    structural reason would come back, be retried, and return again every
+    night forever. After ``MAX_AUTO_VERIFY_RETRIES`` the attempt is stopped
+    -- decided, and without spending a model call to reach a conclusion the
+    journal already shows."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_atomic_vault_write(monkeypatch)
+    _bypass_decisions_queue_writes(monkeypatch)
+    page_path = vault_path / "compiled" / "projects" / "demo-project.md"
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    page_path.write_text(
+        _full_compiled_page_text(
+            shaped_rows=[("2026-08-02", "daily/2026-08-02.md", "Про склад.")],
+        ),
+        encoding="utf-8",
+    )
+    journal_path = vault_path / ".session" / "decisions-queue-responses.jsonl"
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    journal_path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "at": f"2026-08-0{index + 1}T21:00:00+03:00",
+                    "kind": "verify-rejected",
+                    "page": "compiled/projects/demo-project.md",
+                    "action": "retry",
+                    "chosen": "повторная проверка",
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+            for index in range(MAX_AUTO_VERIFY_RETRIES)
+        ),
+        encoding="utf-8",
+    )
+    queue_path = _write_owner_queue(
+        vault_path,
+        [
+            {
+                "kind": "verify-rejected",
+                "page": "compiled/projects/demo-project.md",
+                "summary": "проверка отклоняет утверждения по этому источнику",
+                "since": "2026-08-07",
+            }
+        ],
+    )
+
+    def _no_model_call(prompt: str, **kwargs: Any) -> str:
+        raise AssertionError("the retry budget must be decided without the model")
+
+    monkeypatch.setattr(service.runner, "run", _no_model_call)
+
+    answered = service._auto_answer_queue_items(limit=5)
+
+    assert answered == ["verify-rejected:compiled/projects/demo-project.md"]
+    assert json.loads(queue_path.read_text(encoding="utf-8")) == []
+
+
+def test_compiled_briefings_unusable_queue_decision_keeps_the_item(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An answer outside the offered actions is not a decision. The item
+    stays for the next pass -- the same rule the drift judge follows, and
+    the reason nothing here falls back to a guess."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_atomic_vault_write(monkeypatch)
+    _bypass_decisions_queue_writes(monkeypatch)
+    page_path = vault_path / "compiled" / "projects" / "demo-project.md"
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    page_path.write_text(
+        _full_compiled_page_text(
+            shaped_rows=[("2026-08-02", "daily/2026-08-02.md", "Про склад.")],
+        ),
+        encoding="utf-8",
+    )
+    queue_path = _write_owner_queue(
+        vault_path,
+        [
+            {
+                "kind": "fact-check-rejected",
+                "page": "compiled/projects/demo-project.md",
+                "summary": "перепроверка не подтвердила часть утверждений",
+                "since": "2026-08-07",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        service.runner,
+        "run",
+        lambda prompt, **kwargs: json.dumps({"action": "подумать", "reason": ""}),
+    )
+
+    assert service._auto_answer_queue_items(limit=5) == []
+
+    assert len(json.loads(queue_path.read_text(encoding="utf-8"))) == 1
+
+
+def test_compiled_briefings_manual_repair_items_are_left_to_the_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page whose bytes are not UTF-8 is fixed in an editor. The only
+    action offered for it is "drop from the queue", which would delete the
+    owner's only notice that the page stopped updating -- so this path does
+    not touch it at all, and spends no model call finding that out."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    page_path = vault_path / "compiled" / "projects" / "demo-project.md"
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    page_path.write_text(
+        _full_compiled_page_text(
+            shaped_rows=[("2026-08-02", "daily/2026-08-02.md", "Про склад.")],
+        ),
+        encoding="utf-8",
+    )
+    queue_path = _write_owner_queue(
+        vault_path,
+        [
+            {
+                "kind": "page-encoding-broken",
+                "page": "compiled/projects/demo-project.md",
+                "summary": "файл страницы не читается как UTF-8",
+                "since": "2026-08-07",
+            }
+        ],
+    )
+
+    def _no_model_call(prompt: str, **kwargs: Any) -> str:
+        raise AssertionError("a manual-repair item must not reach the model")
+
+    monkeypatch.setattr(service.runner, "run", _no_model_call)
+
+    assert service._auto_answer_queue_items(limit=5) == []
+
+    assert len(json.loads(queue_path.read_text(encoding="utf-8"))) == 1
+
+
+def test_compiled_briefings_queue_decisions_stop_on_an_exhausted_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Running out of model calls stops this step; it must not fail the
+    pass. A failed pass rolls back the enrichment writes that already
+    succeeded tonight, and this is the least urgent work of the night."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_atomic_vault_write(monkeypatch)
+    _bypass_decisions_queue_writes(monkeypatch)
+    page_path = vault_path / "compiled" / "projects" / "demo-project.md"
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    page_path.write_text(
+        _full_compiled_page_text(
+            shaped_rows=[("2026-08-02", "daily/2026-08-02.md", "Про склад.")],
+        ),
+        encoding="utf-8",
+    )
+    queue_path = _write_owner_queue(
+        vault_path,
+        [
+            {
+                "kind": "fact-check-rejected",
+                "page": "compiled/projects/demo-project.md",
+                "summary": "перепроверка не подтвердила часть утверждений",
+                "since": "2026-08-07",
+            }
+        ],
+    )
+    service._active_pass = CompileEnrichPass(pass_id="p1", snapshot_enabled=False)
+    service._active_pass.model_calls_used = MAX_MODEL_CALLS_PER_PASS
+
+    assert service._auto_answer_queue_items(limit=5) == []
+
+    assert len(json.loads(queue_path.read_text(encoding="utf-8"))) == 1
+    assert "model-calls-per-pass" in service._active_pass.budget_exhausted
+
+
+def test_compiled_briefings_stale_queue_entries_are_swept(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failure that started this: a page renamed away left an entry no
+    response could answer and no pass could clear, counting in the owner's
+    digest every night."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_decisions_queue_writes(monkeypatch)
+    page_path = vault_path / "compiled" / "projects" / "demo-project.md"
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    page_path.write_text(
+        _full_compiled_page_text(
+            shaped_rows=[("2026-08-02", "daily/2026-08-02.md", "Про склад.")],
+        ),
+        encoding="utf-8",
+    )
+    queue_path = _write_owner_queue(
+        vault_path,
+        [
+            {
+                "kind": "blocked-action",
+                "page": "compiled/decisions/renamed-away.md",
+                "summary": "замена заблокирована уровнем доверия",
+                "since": "2026-08-07",
+            }
+        ],
+    )
+    service._active_pass = CompileEnrichPass(pass_id="p1", snapshot_enabled=False)
+
+    assert service._sweep_stale_queue_entries() == 1
+
+    assert json.loads(queue_path.read_text(encoding="utf-8")) == []
+    assert service._active_pass.queue_stale_pruned == 1
 
 
 # --- Automated drift judgement --------------------------------------------

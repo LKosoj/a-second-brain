@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 from uuid import uuid4
 
 from d_brain.manifest import VaultManifest, load_manifest_for_vault
@@ -41,6 +41,11 @@ from d_brain.services.json_normalizer import extract_first_json_dict
 from d_brain.services.localization import normalize_language, prompt_language_name
 from d_brain.services.qmd import QmdService
 from d_brain.services.vault_lock import VaultWriteLock, vault_write_lock
+
+if TYPE_CHECKING:
+    # Type-only: ``decisions_queue`` imports this module at runtime, so every
+    # real use of it here is a local import inside the method that needs it.
+    from d_brain.services.decisions_queue import QueueItem
 
 logger = logging.getLogger(__name__)
 QueueLockResult = TypeVar("QueueLockResult")
@@ -278,6 +283,16 @@ DRIFT_JSON_EXAMPLE = (
     '  "reason": "страница смешала три разных проекта и потеряла предмет"\n'
     "}\n"
 )
+# The rest of that queue: the items that carried real buttons for the owner
+# and simply waited for a tap (``_auto_answer_queue_items``). The model is
+# shown the same choices the owner's screen offers, with what each one does
+# spelled out, and picks one.
+QUEUE_DECISION_JSON_EXAMPLE = (
+    "{\n"
+    '  "action": "confirm",\n'
+    '  "reason": "источник подтверждает то же самое, страница не устарела"\n'
+    "}\n"
+)
 # Cap on claims accepted from one model response (ТЗ 5.6 budgets exist for
 # pages/candidates/model-calls per pass; claims-per-pass has no listed
 # default, so this stays generous but bounded to keep one Verify batch and
@@ -440,6 +455,18 @@ MAX_CONFLICT_RETRIES_PER_PASS = 20
 # the conflict retry above; drift entries accumulate far more slowly, so
 # this is smaller.
 MAX_DRIFT_JUDGEMENTS_PER_PASS = 5
+# How many of the owner's own decidable queue items one nightly pass answers
+# for them (``_auto_answer_queue_items``). One model call each, same slice
+# logic again. These are the kinds that used to wait for a tap that never
+# came -- ``decisions_queue.AUTO_DECIDABLE_KINDS``.
+MAX_QUEUE_DECISIONS_PER_PASS = 5
+# How many times the automated path will send one page back for another
+# Verify attempt before it stops trying. A retry re-queues the source, so a
+# page Verify keeps rejecting for a structural reason would otherwise come
+# back, be retried, and return again every night at one model call each.
+# Counted from the response journal, owner's own taps included
+# (``decisions_queue.count_logged_responses``).
+MAX_AUTO_VERIFY_RETRIES = 2
 # ТЗ 6.4 "Архивация вместо удаления": a page at tier `archive` idle at least
 # this many days, with no incoming links, moves to compiled/archive/.
 ARCHIVE_TIER_IDLE_DAYS = 180
@@ -963,6 +990,13 @@ class CompileEnrichPass:
     # ones the write path could not settle in the first place. Journalled so
     # a night that only repaired old conflicts still shows work done.
     conflicts_auto_resolved: int = 0
+    # Owner queue items this pass answered on the owner's behalf
+    # (``_auto_answer_queue_items``) and stale entries it swept
+    # (``prune_stale_queue_entries``). Journalled for the same reason as the
+    # line above, and reported in the digest: a decision taken for the owner
+    # has to be visible to the owner.
+    queue_auto_decisions: int = 0
+    queue_stale_pruned: int = 0
     budget_exhausted: set[str] = field(default_factory=set)
     sources_processed: list[str] = field(default_factory=list)
     snapshot_manifest: dict[str, Any] = field(default_factory=dict)
@@ -1696,6 +1730,14 @@ class CompiledBriefingService:
             drift_marked = self._adjudicate_drift_entries(
                 limit=MAX_DRIFT_JUDGEMENTS_PER_PASS
             )
+            # Free first: entries about a page that no longer exists are
+            # swept before the judge below spends a model call reading one.
+            self._sweep_stale_queue_entries()
+            # And the rest of the owner's queue -- the items that really did
+            # need a decision -- is decided instead of waiting for a tap.
+            queue_answered = self._auto_answer_queue_items(
+                limit=MAX_QUEUE_DECISIONS_PER_PASS
+            )
             lint_issues = self.lint_notes()
             freshness_issues = self.freshness_issues()
             if (
@@ -1704,6 +1746,7 @@ class CompiledBriefingService:
                 or backfilled
                 or compressed
                 or conflicts_resolved
+                or queue_answered
             ):
                 self._refresh_qmd_index()
 
@@ -1715,6 +1758,7 @@ class CompiledBriefingService:
                 or compressed
                 or conflicts_resolved
                 or drift_marked
+                or queue_answered
                 or self._active_pass.touched_pages
             )
             # ТЗ 5.5 inv 7: exhausting a budget ends the pass normally.
@@ -1792,6 +1836,7 @@ class CompiledBriefingService:
                 "compressed": compressed,
                 "conflicts_resolved": conflicts_resolved,
                 "drift_marked": drift_marked,
+                "queue_answered": queue_answered,
                 "searchable_write": bool(
                     drain_result.get("updated")
                     or archived
@@ -3188,6 +3233,10 @@ class CompiledBriefingService:
                 pass_obj.conflicts_auto_resolved if pass_obj else 0
             ),
             "queue_evictions": pass_obj.queue_evictions if pass_obj else 0,
+            "queue_auto_decisions": (
+                pass_obj.queue_auto_decisions if pass_obj else 0
+            ),
+            "queue_stale_pruned": pass_obj.queue_stale_pruned if pass_obj else 0,
             "budget_exhausted": (
                 sorted(pass_obj.budget_exhausted) if pass_obj else []
             ),
@@ -8276,6 +8325,243 @@ class CompiledBriefingService:
                 kinds=(DRIFT_KIND,),
                 existing_lock=lock,
             )
+
+    def _sweep_stale_queue_entries(self) -> int:
+        """Drop queue entries whose page no longer exists, before anything
+        else looks at the queue tonight.
+
+        Pure bookkeeping, no model call: a question about a page that was
+        renamed or archived has no answer left to give, and until this ran
+        it counted in the owner's digest forever while the "Очередь" screen
+        had nothing to show. Best-effort -- a failure here must not take the
+        rest of the pass with it.
+        """
+        from d_brain.services.decisions_queue import prune_stale_queue_entries
+
+        try:
+            pruned = prune_stale_queue_entries(self.vault_path)
+        except Exception:
+            logger.exception("Decisions queue stale sweep failed")
+            return 0
+        if pruned and self._active_pass is not None:
+            self._active_pass.queue_stale_pruned += len(pruned)
+        for kind, page in pruned:
+            logger.info(
+                "Decisions queue entry %s for %s dropped: page is gone",
+                kind,
+                page,
+            )
+        return len(pruned)
+
+    def _auto_answer_queue_items(self, *, limit: int) -> list[str]:
+        """Answer the owner's decidable queue items instead of waiting for
+        a tap that never comes.
+
+        The two automated judges above take the items that were never really
+        the owner's work (a conflict the write path could not settle, a
+        page that hit its monthly cap). This one takes the items that *were*
+        -- a page whose monthly fact-check failed, two pages that may be the
+        same page, a source Verify keeps rejecting -- and answers them the
+        same way the owner would from the "Очередь" screen: by choosing one
+        of the buttons that screen offers.
+
+        The choice goes through ``decisions_queue.apply_response``, the
+        exact call the bot makes for a tap, so an automated decision and a
+        manual one are the same write, the same lock, and the same audit
+        line in the response journal. Nothing here reimplements what a
+        decision does.
+
+        Bounded by ``limit`` items per pass, one model call each. An item
+        the model cannot answer is left alone for the next pass -- the same
+        rule the drift judge uses, and the reason nothing here ever falls
+        back to a guess. Running out of the pass's model-call budget stops
+        this step instead of failing the pass: it is the last and least
+        urgent work of the night, and a failed pass rolls back enrichment
+        writes that already succeeded.
+
+        Known limit: ``apply_response`` builds its own service instance, so
+        a page it archives or patches is not in this pass's snapshot and is
+        not undone by a pass rollback. That is the same path an owner's tap
+        takes, which is also outside any pass -- a decision, once applied,
+        stands on its own.
+
+        Returns ``"kind:page"`` for each item actually answered.
+        """
+        from d_brain.services.decisions_queue import (
+            AUTO_DECIDABLE_KINDS,
+            VERIFY_REJECTED_KIND,
+            apply_response,
+            auto_action_specs,
+            count_logged_responses,
+            list_queue_items,
+        )
+
+        answered: list[str] = []
+        if limit <= 0:
+            return answered
+        pending = [
+            item
+            for item in list_queue_items(self.vault_path)
+            if item.kind in AUTO_DECIDABLE_KINDS
+        ][:limit]
+        for item in pending:
+            actions = auto_action_specs(item)
+            if not actions:
+                continue
+            if (
+                item.kind == VERIFY_REJECTED_KIND
+                and count_logged_responses(
+                    self.vault_path, page=item.page, action_id="retry"
+                )
+                >= MAX_AUTO_VERIFY_RETRIES
+            ):
+                # Already sent back for another Verify attempt as often as
+                # this path is willing to. Retrying again costs a model call
+                # to reach the same rejection, so the attempt stops here --
+                # decided, not deferred, and with no model call spent on
+                # reaching that conclusion.
+                action_id = "reject"
+            else:
+                try:
+                    action_id = self._judge_queue_item(item=item, actions=actions)
+                except CompiledBriefingPassBudgetExceededError:
+                    # The pass ran out of model calls. Stop here rather than
+                    # let it out: this is the last and least urgent step of
+                    # the night, and raising would fail the whole pass --
+                    # and a failed pass rolls back the enrichment writes
+                    # that already succeeded. The unanswered items are
+                    # still on the queue for tomorrow.
+                    logger.info(
+                        "Automated queue decisions stopped: pass model-call "
+                        "budget exhausted"
+                    )
+                    break
+                if not action_id:
+                    continue
+            try:
+                outcome = apply_response(self.vault_path, item, action_id)
+            except CompiledBriefingPassBudgetExceededError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Automated decision %s for queue item %s/%s failed",
+                    action_id,
+                    item.kind,
+                    item.page,
+                )
+                continue
+            if not outcome.ok:
+                logger.info(
+                    "Automated decision %s for queue item %s/%s did not "
+                    "apply: %s",
+                    action_id,
+                    item.kind,
+                    item.page,
+                    outcome.message,
+                )
+                continue
+            answered.append(f"{item.kind}:{item.page}")
+            if self._active_pass is not None:
+                self._active_pass.queue_auto_decisions += 1
+        return answered
+
+    def _judge_queue_item(
+        self, *, item: QueueItem, actions: tuple[tuple[str, str], ...]
+    ) -> str:
+        """One model call. Returns the chosen ``action_id``, or ``""`` when
+        the call or its answer was unusable -- which the caller treats as
+        "ask again next pass" rather than as a decision either way.
+
+        The model is shown what the owner's screen shows (the page, what
+        happened, and for a duplicate candidate the other page too) plus
+        what each button actually does to the vault, which the labels alone
+        do not say.
+        """
+        from d_brain.services.decisions_queue import queue_kind_label
+
+        page_state = self._clip(
+            self._section_text(
+                self._read_page_text_or_empty(self.vault_path / item.page),
+                "Current State",
+            ),
+            MAX_BODY_SNIPPET_CHARS,
+        )
+        other_page_block = ""
+        if item.candidate_page:
+            other_state = self._clip(
+                self._section_text(
+                    self._read_page_text_or_empty(
+                        self.vault_path / item.candidate_page
+                    ),
+                    "Current State",
+                ),
+                MAX_BODY_SNIPPET_CHARS,
+            )
+            other_page_block = (
+                f"\n[ВТОРАЯ СТРАНИЦА] {item.candidate_page}\n"
+                f"{other_state or '(пусто)'}\n"
+            )
+        options = "\n".join(
+            f'- "{action_id}" — {effect}' for action_id, effect in actions
+        )
+        allowed = ", ".join(f'"{action_id}"' for action_id, _effect in actions)
+        prompt = (
+            "Ты ведёшь скомпилированную базу знаний личного ассистента.\n"
+            "Верни ТОЛЬКО JSON.\n\n"
+            "Владелец не разбирает эту очередь руками — решение принимаешь "
+            "ты. Отложить нельзя: выбери один из вариантов ниже. Если "
+            "уверенности нет, выбирай тот, который ничего не ломает и "
+            "оставляет материал на месте.\n\n"
+            f"[ВОПРОС] {queue_kind_label(item.kind)}\n"
+            f"[СТРАНИЦА] {item.page}\n"
+            f"{page_state or '(пусто)'}\n"
+            f"{other_page_block}\n"
+            f"[ЧТО СЛУЧИЛОСЬ]\n{self._clip(item.summary, MAX_BODY_SNIPPET_CHARS)}\n\n"
+            f"[ВАРИАНТЫ]\n{options}\n\n"
+            f'В поле "action" верни ровно одно из: {allowed}. '
+            'В "reason" — одной фразой, почему.\n\n'
+            "Верни JSON строго такого вида:\n"
+            f"{QUEUE_DECISION_JSON_EXAMPLE}"
+        )
+        try:
+            payload = self._run_json_dict_prompt(
+                prompt=prompt,
+                timeout=ADJUDICATE_TIMEOUT_SECONDS,
+                error_context="compiled briefing queue decision",
+                json_example=QUEUE_DECISION_JSON_EXAMPLE,
+            )
+        except CompiledBriefingPassBudgetExceededError:
+            raise
+        except Exception:
+            logger.exception(
+                "Automated queue decision failed for %s/%s -- leaving the "
+                "item for the next pass",
+                item.kind,
+                item.page,
+            )
+            return ""
+        chosen = self._clean_line(payload.get("action"))
+        valid = {action_id for action_id, _effect in actions}
+        if chosen not in valid:
+            logger.info(
+                "Automated queue decision for %s/%s returned no usable "
+                "action (%r)",
+                item.kind,
+                item.page,
+                payload.get("action"),
+            )
+            return ""
+        return chosen
+
+    def _read_page_text_or_empty(self, path: Path) -> str:
+        """``_read_page_text`` with a missing (or unreadable) page as empty
+        text: the queue item is still answerable without the page body, and
+        an item pointing at a page that vanished mid-pass must not raise out
+        of an automated decision."""
+        try:
+            return self._read_page_text(path)
+        except (OSError, ValueError):
+            return ""
 
     def _apply_claims_and_conflicts(
         self,

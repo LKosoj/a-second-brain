@@ -35,7 +35,11 @@ from d_brain.services.compiled_enrich_report import (
     collect_weekly_review,
     read_pass_status,
 )
-from d_brain.services.decisions_queue import CONFLICT_KIND, QUEUE_CAP
+from d_brain.services.decisions_queue import (
+    CONFLICT_KIND,
+    QUEUE_CAP,
+    list_queue_items,
+)
 from d_brain.services.frontmatter import parse_frontmatter_bytes, validate_document
 
 DAY = date(2026, 8, 5)
@@ -684,9 +688,9 @@ def test_decisions_queue_deduplicated_against_page_conflicts(
                 "since": DAY.isoformat(),
             },
             {
-                "kind": "blocked-action",
+                "kind": "duplicate-candidate",
                 "page": "compiled/decisions/budget.md",
-                "summary": "задача не создана: источник только forwarded",
+                "summary": "похоже на дубль страницы про бюджет",
                 "since": DAY.isoformat(),
             },
         ],
@@ -696,7 +700,7 @@ def test_decisions_queue_deduplicated_against_page_conflicts(
 
     assert digest is not None
     assert digest.count(duplicate_summary) == 1
-    assert "задача не создана: источник только forwarded" in digest
+    assert "похоже на дубль страницы про бюджет" in digest
 
 
 def test_decisions_queue_dedup_ignores_case_spacing_and_a_trailing_period(
@@ -771,13 +775,13 @@ def test_decisions_queue_dedup_keeps_the_same_summary_on_another_page(
         vault,
         [
             {
-                "kind": "blocked-action",
+                "kind": "duplicate-candidate",
                 "page": "compiled/decisions/budget.md",
                 "summary": shared_summary,
                 "since": DAY.isoformat(),
             },
             {
-                "kind": "blocked-action",
+                "kind": "duplicate-candidate",
                 "page": "compiled/decisions/hiring.md",
                 "summary": shared_summary,
                 "since": DAY.isoformat(),
@@ -789,6 +793,63 @@ def test_decisions_queue_dedup_keeps_the_same_summary_on_another_page(
 
     assert digest is not None
     assert digest.count(shared_summary) == 2
+
+
+def test_digest_counts_only_what_the_queue_screen_shows(
+    tmp_path, write_vault_manifest
+):
+    """The digest's decision count and the "Очередь" screen must agree.
+
+    Both conflict-pointer kinds are hidden by ``list_queue_items`` (the
+    conflict they point at is already listed from the page itself), so
+    counting them here sent the owner to a screen with nothing on it -- one
+    renamed page left a "Требует решения — ещё 1 пункт" line that could
+    never be answered.
+    """
+    vault = tmp_path / "vault"
+    write_vault_manifest(vault)
+    _write_queue(
+        vault,
+        [
+            {
+                "kind": "blocked-action",
+                "page": "compiled/decisions/budget.md",
+                "summary": "замена заблокирована уровнем доверия",
+                "since": DAY.isoformat(),
+            },
+            {
+                "kind": "undecided-conflict",
+                "page": "compiled/decisions/hiring.md",
+                "summary": "модель не смогла выбрать между версиями",
+                "since": DAY.isoformat(),
+            },
+        ],
+    )
+
+    assert _read_decisions_queue(vault) == []
+    assert list_queue_items(vault) == []
+    # Nothing else happened, so with both entries hidden this is a quiet day.
+    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="no-work"))
+    assert digest is None
+
+
+def test_digest_reports_queue_items_the_pass_decided_itself(
+    tmp_path, write_vault_manifest
+):
+    """A decision taken for the owner has to be visible to the owner: it
+    lands in "Что изменилось" (the work is done), not in "Требует решения"
+    (nothing is being asked)."""
+    vault = tmp_path / "vault"
+    write_vault_manifest(vault)
+
+    digest = build_daily_digest(
+        vault, DAY, pass_status=PassStatus(status="ok", auto_decisions=3)
+    )
+
+    assert digest is not None
+    assert "**Что изменилось**" in digest
+    assert "3 пункт(ов) разобрано автоматически" in digest
+    assert "**Требует решения**" not in digest
 
 
 def test_decisions_queue_missing_file_is_empty_not_error(

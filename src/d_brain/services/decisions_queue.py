@@ -329,8 +329,11 @@ UNDECIDED_CONFLICT_KIND = "undecided-conflict"
 # Kinds that only point at a page whose conflict is still open. The conflict
 # itself is already listed from the page's own Open Conflicts table, so
 # ``list_queue_items`` leaves these out rather than showing the owner the
-# same disagreement twice.
-_CONFLICT_POINTER_KINDS = frozenset({BLOCKED_ACTION_KIND, UNDECIDED_CONFLICT_KIND})
+# same disagreement twice. Public because the digest
+# (``compiled_enrich_report._read_decisions_queue``) has to skip exactly the
+# same kinds: it counts what the "Очередь" screen shows, and a count that
+# includes an item the screen hides sends the owner to an empty screen.
+CONFLICT_POINTER_KINDS = frozenset({BLOCKED_ACTION_KIND, UNDECIDED_CONFLICT_KIND})
 DUPLICATE_CANDIDATE_KIND = "duplicate-candidate"
 # ТЗ 5.6 monthly-per-page enrichment budget overrun. No dedicated response
 # exists for it (see module docstring) -- it only ever gets the generic
@@ -778,6 +781,52 @@ def remove_queue_entries_for_page(
     return removed
 
 
+def prune_stale_queue_entries(vault_path: Path) -> list[tuple[str, str]]:
+    """Drop entries whose page is no longer on disk. Returns ``(kind, page)``
+    pairs removed, newest bookkeeping first for the caller's journal.
+
+    Every entry in this file is a question about one compiled page. When
+    that page is renamed, archived, or deleted, the question loses its
+    subject: every response handler above soft-fails on a missing page, and
+    no automated pass clears the entry either -- the nightly conflict retry
+    only walks pages that still exist. The entry then counts toward the
+    digest's "Требует решения" line forever while the "Очередь" screen has
+    nothing to tap, which is how one renamed page in August left a queue
+    item nobody could ever answer.
+
+    ``_adjudicate_drift_entries`` already applies this exact rule to its own
+    kind ("the page is gone; the suspicion about it no longer means
+    anything"); this is the same rule for every kind, run once a night.
+
+    Refuses to prune anything when ``compiled/`` itself is missing: every
+    producer writes a ``compiled/**`` page path, so an absent tree means the
+    vault is not fully there rather than that every queued page died at once.
+    """
+    vault_path = Path(vault_path)
+    if not (vault_path / "compiled").is_dir():
+        return []
+    path = vault_path / DECISIONS_QUEUE_RELATIVE_PATH
+    manifest = load_manifest_for_vault(vault_path)
+    # Read, decide, and write inside one lock: a producer appending an entry
+    # between a read out here and the write below would have it dropped.
+    with vault_write_lock(vault_path) as lock:
+        kept: list[dict[str, Any]] = []
+        pruned: list[tuple[str, str]] = []
+        for entry in _read_raw_queue(path):
+            page = str(entry.get("page") or "").strip()
+            if page and not (vault_path / page).exists():
+                pruned.append((str(entry.get("kind") or ""), page))
+                continue
+            kept.append(entry)
+        if not pruned:
+            return []
+        _atomic_write_text(
+            path, json.dumps(kept, ensure_ascii=False, indent=2) + "\n"
+        )
+        write_queue_document(vault_path, manifest=manifest, existing_lock=lock)
+    return pruned
+
+
 def _json_backed_items(vault_path: Path) -> list[QueueItem]:
     path = vault_path / DECISIONS_QUEUE_RELATIVE_PATH
     items: list[QueueItem] = []
@@ -866,7 +915,7 @@ def list_queue_items(vault_path: Path) -> list[QueueItem]:
     json_items = [
         item
         for item in _json_backed_items(vault_path)
-        if item.kind not in _CONFLICT_POINTER_KINDS
+        if item.kind not in CONFLICT_POINTER_KINDS
     ]
     return [*json_items, *_conflict_items(candidates)]
 
@@ -911,6 +960,121 @@ def action_button_specs(item: QueueItem) -> tuple[tuple[str, str], ...]:
         ("reject", "Отклонить (удалить из очереди)"),
         ("defer", "Отложить"),
     )
+
+
+# --- Automated answers (nightly judge) ------------------------------------
+#
+# The kinds the nightly pass answers on the owner's behalf
+# (``CompiledBriefingService._auto_answer_queue_items``), and nothing else.
+# Deliberately narrower than "every kind on the queue":
+#
+# - ``"conflict"`` has its own automated path already
+#   (``_resolve_open_conflicts``, with an escalated second-attempt prompt);
+#   judging it here as well would put two different judges on one pair.
+# - ``"drift"`` likewise (``_adjudicate_drift_entries``), and
+#   ``"undecided-conflict"``/``"blocked-action"`` are bookkeeping pointers
+#   the conflict retry clears, never questions in their own right.
+# - ``"page-encoding-broken"`` and ``"human-zone-ambiguous"`` have no
+#   answer inside the vault at all: the only action offered for them is
+#   ``reject``, which drops the question without fixing the file, so an
+#   automated "decision" would just delete the owner's only notice that a
+#   page stopped updating. They stay on the queue until the file is
+#   re-saved by hand.
+# - An unrecognised kind is never guessed at, here as everywhere else in
+#   this module.
+AUTO_DECIDABLE_KINDS = frozenset(
+    {FACT_CHECK_REJECTED_KIND, DUPLICATE_CANDIDATE_KIND, VERIFY_REJECTED_KIND}
+)
+
+# What each automated choice actually does to the vault, in the words the
+# judging model is shown -- a label like "Архивировать страницу" tells the
+# owner enough because the owner knows this system, while the model has to
+# be told the consequence outright to weigh it. Keyed by ``(kind,
+# action_id)``, and every key must be an id ``action_button_specs`` really
+# offers for that kind: ``apply_response`` validates the id against exactly
+# that list, so an entry that drifts out of sync raises rather than doing
+# something unintended.
+_AUTO_ACTION_EFFECTS: dict[tuple[str, str], str] = {
+    (FACT_CHECK_REJECTED_KIND, "confirm"): (
+        "оставить страницу как есть и записать, что она перепроверена сегодня"
+    ),
+    (FACT_CHECK_REJECTED_KIND, "reject"): (
+        "убрать страницу в архив compiled/archive — она перестаёт обновляться "
+        "и попадать в поиск, но не удаляется, и ссылки на неё сохраняются"
+    ),
+    (DUPLICATE_CANDIDATE_KIND, "link"): (
+        "проставить на обеих страницах взаимную пометку duplicate_of; тексты "
+        "не сливаются, обе страницы остаются на месте"
+    ),
+    (DUPLICATE_CANDIDATE_KIND, "distinct"): (
+        "ничего не менять на страницах, вопрос закрыт: это разные предметы"
+    ),
+    (VERIFY_REJECTED_KIND, "retry"): (
+        "сбросить счётчик отклонений и вернуть источник в очередь, чтобы "
+        "проверка попробовала снова"
+    ),
+    (VERIFY_REJECTED_KIND, "reject"): (
+        "прекратить попытки по этому источнику; страница остаётся с тем "
+        "содержимым, что уже есть"
+    ),
+}
+
+
+def auto_action_specs(item: QueueItem) -> tuple[tuple[str, str], ...]:
+    """``(action_id, effect)`` pairs an automated judge may choose between.
+
+    Derived from ``action_button_specs`` rather than listed separately, so
+    the nightly judge can never take an action the owner's own screen does
+    not offer for that kind. ``defer`` is dropped: an automated pass that
+    defers has done nothing, and the item would come back to the exact same
+    judge tomorrow.
+
+    Empty tuple for any kind outside ``AUTO_DECIDABLE_KINDS`` -- the caller
+    treats that as "leave this one to the owner".
+    """
+    if item.kind not in AUTO_DECIDABLE_KINDS:
+        return ()
+    return tuple(
+        (action_id, _AUTO_ACTION_EFFECTS[(item.kind, action_id)])
+        for action_id, _label in action_button_specs(item)
+        if (item.kind, action_id) in _AUTO_ACTION_EFFECTS
+    )
+
+
+def count_logged_responses(vault_path: Path, *, page: str, action_id: str) -> int:
+    """How many times ``action_id`` was already applied to ``page``, per the
+    response journal.
+
+    Used as a loop brake by the nightly judge: a ``"verify-rejected"`` retry
+    puts the source back in the queue, and if Verify keeps rejecting it the
+    entry returns, gets retried again, and so on forever at one model call
+    per night. Counting from the journal keeps that brake out of the queue
+    schema, and counts the owner's own taps too -- if a page has already
+    been retried by hand twice, the automated path is not the one to try a
+    third time.
+
+    Tolerant like every other read here: a missing or corrupt journal
+    counts as zero rather than raising.
+    """
+    path = Path(vault_path) / _RESPONSE_JOURNAL_RELATIVE_PATH
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return 0
+    count = 0
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("page") == page and entry.get("action") == action_id:
+            count += 1
+    return count
 
 
 # --- Shared queue-line rendering (задача N) --------------------------------

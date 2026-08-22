@@ -37,6 +37,7 @@ from d_brain.services.compiled_briefings import (
 )
 from d_brain.services.compiled_fact_check import run_monthly_fact_check
 from d_brain.services.decisions_queue import (
+    AUTO_DECIDABLE_KINDS,
     BLOCKED_ACTION_KIND,
     CONFLICT_KIND,
     DRIFT_KIND,
@@ -51,9 +52,11 @@ from d_brain.services.decisions_queue import (
     action_button_specs,
     append_decision_queue_entries,
     apply_response,
+    auto_action_specs,
     format_queue_item_line,
     list_queue_items,
     mark_page_human_reviewed,
+    prune_stale_queue_entries,
     queue_document_path,
     queue_item_fingerprint,
     queue_kind_label,
@@ -134,6 +137,110 @@ def _write_queue(vault: Path, entries: list[dict[str, object]]) -> None:
 
 def _sources_table_section(text: str) -> str:
     return CompiledBriefingService._section_text(text, "Sources That Shaped This Page")
+
+
+# --- prune_stale_queue_entries ----------------------------------------------
+#
+# The failure this closes: a page renamed in August left a queue entry
+# pointing at a path that no longer existed. Nothing could answer it (every
+# response handler soft-fails on a missing page) and nothing cleared it (the
+# nightly conflict retry only walks pages that still exist), so it counted in
+# the owner's digest every night for two weeks.
+
+
+def test_prune_stale_queue_entries_drops_entries_whose_page_is_gone(
+    tmp_path, write_vault_manifest
+):
+    vault = tmp_path / "vault"
+    write_vault_manifest(vault)
+    _write_page(vault, "compiled/topics/alive.md", sources_rows=[])
+    _write_queue(
+        vault,
+        [
+            {
+                "kind": BLOCKED_ACTION_KIND,
+                "page": "compiled/decisions/renamed-away.md",
+                "summary": "замена заблокирована",
+                "since": "2026-08-07",
+            },
+            {
+                "kind": FACT_CHECK_REJECTED_KIND,
+                "page": "compiled/topics/alive.md",
+                "summary": "проверка не подтвердила утверждения",
+                "since": "2026-08-07",
+            },
+        ],
+    )
+
+    pruned = prune_stale_queue_entries(vault)
+
+    assert pruned == [(BLOCKED_ACTION_KIND, "compiled/decisions/renamed-away.md")]
+    remaining = json.loads(
+        (vault / ".session" / "decisions-queue.json").read_text(encoding="utf-8")
+    )
+    assert [entry["page"] for entry in remaining] == ["compiled/topics/alive.md"]
+
+
+def test_prune_stale_queue_entries_is_a_no_op_without_a_compiled_tree(
+    tmp_path, write_vault_manifest
+):
+    """An absent ``compiled/`` means the vault is not fully there -- every
+    producer writes a ``compiled/**`` path, so "every queued page is missing
+    at once" is a mount problem, not a queue to empty."""
+    vault = tmp_path / "vault"
+    write_vault_manifest(vault)
+    _write_queue(
+        vault,
+        [
+            {
+                "kind": FACT_CHECK_REJECTED_KIND,
+                "page": "compiled/topics/alive.md",
+                "summary": "проверка не подтвердила утверждения",
+                "since": "2026-08-07",
+            }
+        ],
+    )
+
+    assert prune_stale_queue_entries(vault) == []
+    remaining = json.loads(
+        (vault / ".session" / "decisions-queue.json").read_text(encoding="utf-8")
+    )
+    assert len(remaining) == 1
+
+
+# --- auto_action_specs -------------------------------------------------------
+
+
+def test_auto_action_specs_are_a_subset_of_the_owner_buttons(
+    tmp_path, write_vault_manifest
+):
+    """The nightly judge may only take actions the owner's own screen
+    offers -- ``apply_response`` validates the id against exactly that list,
+    so a drifted table would raise instead of doing something unintended.
+    ``defer`` is never offered: an automated pass that defers has done
+    nothing."""
+    for kind in sorted(AUTO_DECIDABLE_KINDS):
+        item = QueueItem(
+            kind=kind, page="compiled/topics/a.md", summary="…", since="2026-08-07"
+        )
+        owner_ids = {action_id for action_id, _label in action_button_specs(item)}
+        auto_ids = {action_id for action_id, _effect in auto_action_specs(item)}
+
+        assert auto_ids
+        assert auto_ids <= owner_ids
+        assert "defer" not in auto_ids
+
+
+def test_auto_action_specs_leaves_manual_repair_kinds_to_the_owner():
+    """A broken encoding or an ambiguous human-zone marker is fixed in an
+    editor, not in the vault: the only action offered is ``reject``, which
+    would drop the owner's only notice that the page stopped updating."""
+    for kind in (PAGE_ENCODING_BROKEN_KIND, HUMAN_ZONE_AMBIGUOUS_KIND, DRIFT_KIND):
+        item = QueueItem(
+            kind=kind, page="compiled/topics/a.md", summary="…", since="2026-08-07"
+        )
+
+        assert auto_action_specs(item) == ()
 
 
 # --- list_queue_items --------------------------------------------------------

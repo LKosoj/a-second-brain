@@ -164,12 +164,19 @@ human call, and the "Сводка недели" screen that bundles a preview of
 three (queue, changes, a forgotten page) plus one `human_reviewed`
 confirmation into a single half-hour weekly pass.
 
-Two queue kinds are not really a human call any more: a `conflict` is
+Most queue kinds are not really a human call any more. A `conflict` is
 settled by a model when it is created and retried by the nightly pass if
 that first attempt came back undecided, and a `drift` suspicion is judged
-the same way. Both still appear on the queue screen, and answering one by
-hand does exactly what the automated path does -- but the queue is expected
-to drain itself. See
+the same way. The three kinds that carry real buttons --
+`fact-check-rejected`, `duplicate-candidate`, `verify-rejected` --
+are answered by `_auto_answer_queue_items` in the same pass, which picks
+one of those same buttons and applies it through `apply_response`, the
+exact call a tap makes. Entries about a page that no longer exists are
+swept first, for free, by `prune_stale_queue_entries`. What is left for the
+owner is `page-encoding-broken` and `human-zone-ambiguous`, whose remedy is
+outside the vault (re-save the file, fix the markers). Everything still
+appears on the queue screen, and answering by hand does exactly what the
+automated path does -- but the queue is expected to drain itself. See
 `references/links-policy.md` for what each of these does and does not
 surface, and `references/conflict-policy.md` for the trust/conflict rules
 behind the decisions queue.

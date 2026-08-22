@@ -58,6 +58,7 @@ from d_brain.services.compiled_briefings import (
     CompiledBriefingService,
 )
 from d_brain.services.decisions_queue import (
+    CONFLICT_POINTER_KINDS,
     DECISIONS_QUEUE_RELATIVE_PATH,
     QUEUE_CAP,
     QueueItem,
@@ -143,6 +144,15 @@ class PassStatus:
     restart itself, so silence would let pages stop being enriched
     indefinitely.
 
+    ``auto_decisions`` mirrors the journal's ``queue_auto_decisions`` field:
+    how many decisions-queue items this pass answered on the owner's behalf
+    (``compiled_briefings``'s ``_auto_answer_queue_items``). Unlike every
+    field above it, this one is not a problem -- it reports work already
+    finished -- so it goes in "Что изменилось" rather than "Требует
+    решения", and it does not by itself keep a quiet day from being
+    suppressed: a night whose only event was clearing a queue item nobody
+    was waiting on is still a quiet night.
+
     ``dropped_sources`` holds the vault-relative source paths the refresh
     queue gave up on entirely (``compiled_briefings``'s
     ``_record_dropped_queue_source``): the owner wrote something, three
@@ -160,6 +170,7 @@ class PassStatus:
     human_zone_ambiguous_pages: tuple[str, ...] = ()
     worker_crash: str = ""
     dropped_sources: tuple[str, ...] = ()
+    auto_decisions: int = 0
 
 
 # ТЗ 5.2 step 6 pass journal path, vault-relative -- written by
@@ -271,12 +282,21 @@ def read_pass_status(vault_path: Path) -> PassStatus:
         if isinstance(human_zone_raw, list)
         else ()
     )
+    auto_decisions_raw = payload.get("queue_auto_decisions")
+    auto_decisions = (
+        auto_decisions_raw
+        if isinstance(auto_decisions_raw, int)
+        and not isinstance(auto_decisions_raw, bool)
+        and auto_decisions_raw > 0
+        else 0
+    )
     return PassStatus(
         status=status,
         error=error if isinstance(error, str) else "",
         budget_exhausted=budget_exhausted,
         queue_evictions=queue_evictions,
         human_zone_ambiguous_pages=human_zone_ambiguous_pages,
+        auto_decisions=auto_decisions,
     )
 
 
@@ -457,7 +477,15 @@ def _collect_conflicts(
 
 def _read_decisions_queue(vault_path: Path) -> list[_DecisionItem]:
     """Read ``.session/decisions-queue.json``; see the module docstring for
-    the expected shape. Any absence or corruption yields an empty list."""
+    the expected shape. Any absence or corruption yields an empty list.
+
+    Skips ``CONFLICT_POINTER_KINDS`` for the same reason ``list_queue_items``
+    does: they point at a page whose conflict is already listed here from
+    the page's own Open Conflicts table, so counting them restates one
+    disagreement twice. It also keeps this count honest about the screen it
+    sends the owner to -- the "Очередь" screen hides these kinds, so an
+    entry counted here but hidden there is a decision line nobody can act
+    on."""
     path = vault_path / DECISIONS_QUEUE_RELATIVE_PATH
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -474,6 +502,8 @@ def _read_decisions_queue(vault_path: Path) -> list[_DecisionItem]:
         if not page or not summary:
             continue
         kind = str(entry.get("kind") or "").strip() or "queued"
+        if kind in CONFLICT_POINTER_KINDS:
+            continue
         since = str(entry.get("since") or "").strip()
         items.append(_DecisionItem(page=page, summary=summary, kind=kind, since=since))
     return items
@@ -793,8 +823,14 @@ def _render_digest(
     if decision_lines:
         lines += ["", "**Требует решения**", *decision_lines]
 
-    if changes:
-        lines += ["", "**Что изменилось**", *(_render_change_line(i) for i in changes)]
+    change_lines = [_render_change_line(item) for item in changes]
+    if pass_status.auto_decisions > 0:
+        change_lines.append(
+            f"- Очередь решений: {pass_status.auto_decisions} пункт(ов) "
+            "разобрано автоматически — решения записаны в журнал ответов."
+        )
+    if change_lines:
+        lines += ["", "**Что изменилось**", *change_lines]
 
     if revisit:
         revisit_lines = [f"- [[{rel_path}|{title}]]" for rel_path, title in revisit]

@@ -435,6 +435,25 @@ today; four have their own dedicated actions:
   a mutual `duplicate_of` frontmatter marker on both pages; any actual
   merge stays the owner's call.
 
+**The queue answers itself.** None of these items is meant to wait for a
+tap: the nightly enrichment pass works through the queue on the owner's
+behalf. The free part first — an entry about a page that is no longer on
+disk (renamed, archived, or deleted) is simply swept: there is nothing left
+to answer, and until this sweep existed such an entry counted toward the
+“needs a decision” line every night while the queue screen showed nothing
+to tap. Then the model answers the items that carry a real choice:
+“fact-check failed,” “possible duplicate,” and “rejected by Verify.” It is
+shown the same options the owner's screen offers plus what each one
+actually does to the vault, and its choice is applied by exactly the code a
+button tap runs, with the same line in the response journal. Up to five
+items per pass, one model call each; an item the model cannot answer is
+left for the next night rather than closed on a guess. “Rejected by Verify”
+is sent back for another attempt at most twice (the owner's own taps
+included) — past that the retries stop, or a page Verify rejects for a
+structural reason would loop there every night. How many items a night
+settled shows up in the digest's “what changed” block. The queue screen is
+still there: the owner can answer anything the pass has not reached yet.
+
 The other four — a page that outgrew its monthly enrichment budget
 (“drift”), a claim replacement blocked by a low-trust source
 (“blocked-action”), a page file saved in an unreadable encoding
@@ -444,7 +463,12 @@ The other four — a page that outgrew its monthly enrichment budget
 the queue file all fall back to just “reject” and “defer”; nothing here
 guesses what an unfamiliar kind should do. For the last two the remedy is
 outside the queue entirely: re-save the file as UTF-8, or fix the markers by
-hand — until then the page is neither enriched nor compressed. Only the small
+hand — until then the page is neither enriched nor compressed. That is also
+why the automated pass leaves them alone: the one action available,
+“reject,” does not fix the file, it only erases the owner's sole notice
+that the page stopped updating. The first two kinds in that list are
+handled by their own separate nightly steps — the model judges drift, and
+`blocked-action` is cleared by the conflict retry. Only the small
 internal queue file has a size limit, 30 entries: past that, the oldest
 entries are dropped first, except entries whose *kind* is `conflict` or
 `blocked-action`. Open conflicts, however, never actually land in that

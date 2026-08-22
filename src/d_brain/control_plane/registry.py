@@ -250,7 +250,9 @@ CONTROL_PLANE_REGISTRY: tuple[WorkflowSpec, ...] = (
         allowed_writes=("compiled", "qmd", ".session", "summaries"),
         fallback_behavior=(
             "Best-effort nightly drain, lint, and source-aware backfill for "
-            "compiled briefings."
+            "compiled briefings, plus the automated pass over the owner's "
+            "decisions queue: stale entries swept, and the decidable kinds "
+            "answered for the owner instead of waiting for a tap."
         ),
         notes="Scheduled compiled maintenance after daily and periodic cycles.",
     ),
