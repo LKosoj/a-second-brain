@@ -404,7 +404,11 @@ later pass the way the other cases eventually can; a crashed background
 worker means no new write reaches a compiled page at all until it is
 restarted (the reason comes from `.session/compile-queue-worker.json`); and
 a source the queue gave up on will never re-enter it on its own — until the owner opens and saves the note again, no compiled
-page for it will exist at all. That give-up list lives in
+page for it will exist at all. The exhausted-monthly-enrichment-budget line
+names the page itself (the first five paths plus a count of the rest) and how
+many sources the pass put back on the queue because of it: opening that page
+is the owner's only available action, and "the remainder stays in the queue"
+reads the same for one deferred source and for fifty. That give-up list lives in
 `.session/compile-dropped-sources.json`, is not keyed by date (so it repeats
 in the digest every day until the source finally compiles), and is rendered
 as the first five names plus a count of the rest, so a backend outage across

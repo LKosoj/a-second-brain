@@ -1465,6 +1465,166 @@ def test_read_pass_status_no_work_with_budget_exhausted_does_not_suppress(
     assert "Бюджет прохода исчерпан" in digest
 
 
+def test_read_pass_status_reads_monthly_capped_pages_and_deferred_sources(tmp_path):
+    """The two fields that make a monthly-cap budget line actionable: which
+    page ran out of enrichments, and how much source material the pass left
+    in the queue behind it."""
+    _write_journal(
+        tmp_path,
+        {
+            "status": "ok",
+            "budget_exhausted": ["monthly-enrichments-per-page"],
+            "monthly_capped_pages": ["compiled/projects/demo.md"],
+            "deferred_queue_sources": 4,
+        },
+    )
+
+    status = read_pass_status(tmp_path)
+
+    assert status.monthly_capped_pages == ("compiled/projects/demo.md",)
+    assert status.deferred_queue_sources == 4
+
+
+def test_read_pass_status_tolerates_bad_monthly_cap_fields(tmp_path):
+    """Same tolerance as every other field this reader parses: a journal
+    written before these fields existed, or one hand-edited into the wrong
+    shape, must degrade to "unknown" rather than crash or invent a page."""
+    _write_journal(
+        tmp_path,
+        {
+            "status": "ok",
+            "monthly_capped_pages": "compiled/projects/demo.md",
+            "deferred_queue_sources": "many",
+        },
+    )
+
+    status = read_pass_status(tmp_path)
+
+    assert status.monthly_capped_pages == ()
+    assert status.deferred_queue_sources == 0
+
+
+def test_budget_line_names_the_page_that_hit_the_monthly_cap(
+    tmp_path, write_vault_manifest
+):
+    """The only action this budget offers the owner is "open that page and
+    decide whether it is still one page", so the line has to say which page
+    -- "какая-то страница" named nothing to open."""
+    vault = tmp_path / "vault"
+    (vault / "compiled").mkdir(parents=True)
+    write_vault_manifest(vault)
+
+    digest = build_daily_digest(
+        vault,
+        DAY,
+        pass_status=PassStatus(
+            status="success",
+            budget_exhausted=("monthly-enrichments-per-page",),
+            monthly_capped_pages=("compiled/projects/demo.md",),
+        ),
+    )
+
+    assert digest is not None
+    assert "[[compiled/projects/demo.md]]" in digest
+    assert "какая-то страница" not in digest
+
+
+def test_budget_line_without_recorded_pages_keeps_the_page_less_wording(
+    tmp_path, write_vault_manifest
+):
+    """A journal from before ``monthly_capped_pages`` existed has no path to
+    name -- the line must fall back to the old wording, not invent one."""
+    vault = tmp_path / "vault"
+    (vault / "compiled").mkdir(parents=True)
+    write_vault_manifest(vault)
+
+    digest = build_daily_digest(
+        vault,
+        DAY,
+        pass_status=PassStatus(
+            status="success",
+            budget_exhausted=("monthly-enrichments-per-page",),
+        ),
+    )
+
+    assert digest is not None
+    assert "какая-то страница" in digest
+
+
+def test_budget_line_names_several_capped_pages_and_caps_the_list(
+    tmp_path, write_vault_manifest
+):
+    """More capped pages than the line will name: every one is counted, the
+    first few are named, and the rest are summarized -- one bad month must
+    not turn this line into the whole digest."""
+    vault = tmp_path / "vault"
+    (vault / "compiled").mkdir(parents=True)
+    write_vault_manifest(vault)
+    pages = tuple(f"compiled/projects/demo-{index}.md" for index in range(7))
+
+    digest = build_daily_digest(
+        vault,
+        DAY,
+        pass_status=PassStatus(
+            status="success",
+            budget_exhausted=("monthly-enrichments-per-page",),
+            monthly_capped_pages=pages,
+        ),
+    )
+
+    assert digest is not None
+    assert "[[compiled/projects/demo-0.md]]" in digest
+    assert "[[compiled/projects/demo-4.md]]" in digest
+    assert "[[compiled/projects/demo-5.md]]" not in digest
+    assert "и ещё 2" in digest
+
+
+def test_digest_reports_how_many_sources_the_budget_left_in_the_queue(
+    tmp_path, write_vault_manifest
+):
+    """ТЗ 5.5 инв 7 says the remainder stays in the queue; the owner also
+    needs to know how big that remainder is, otherwise "остаток остался в
+    очереди" reads the same for one deferred source and for fifty."""
+    vault = tmp_path / "vault"
+    (vault / "compiled").mkdir(parents=True)
+    write_vault_manifest(vault)
+
+    digest = build_daily_digest(
+        vault,
+        DAY,
+        pass_status=PassStatus(
+            status="no-work",
+            budget_exhausted=("monthly-enrichments-per-page",),
+            monthly_capped_pages=("compiled/projects/demo.md",),
+            deferred_queue_sources=6,
+        ),
+    )
+
+    assert digest is not None
+    assert "в очереди осталось источников: 6" in digest
+
+
+def test_digest_without_deferred_sources_adds_no_remainder_line(
+    tmp_path, write_vault_manifest
+):
+    """Non-regression: a budget that ended a pass with nothing left claimed
+    must not gain a "0 источников" line."""
+    vault = tmp_path / "vault"
+    (vault / "compiled").mkdir(parents=True)
+    write_vault_manifest(vault)
+
+    digest = build_daily_digest(
+        vault,
+        DAY,
+        pass_status=PassStatus(
+            status="success", budget_exhausted=("pages-per-pass",)
+        ),
+    )
+
+    assert digest is not None
+    assert "осталось источников" not in digest
+
+
 def test_budget_exhausted_labels_cover_every_name_the_core_can_write():
     """Задача N дефект 1: cross-check the full set of technical constraint
     names ``compiled_briefings.py`` (the core -- out of this task's edit
@@ -1473,18 +1633,23 @@ def test_budget_exhausted_labels_cover_every_name_the_core_can_write():
     the core ever adds a new ``pass_obj.budget_exhausted.add("...")`` call
     site without a matching entry here, this test must fail instead of
     letting an untranslated technical name reach the owner silently via the
-    unknown-name fallback."""
+    unknown-name fallback. ``MONTHLY_CAP_BUDGET_NAME`` is translated by
+    ``_describe_monthly_cap`` instead of the table, because its sentence
+    carries the capped pages' paths, so it counts as covered too."""
     import inspect
     import re
 
     from d_brain.services import compiled_briefings
-    from d_brain.services.compiled_enrich_report import _BUDGET_EXHAUSTED_LABELS
+    from d_brain.services.compiled_enrich_report import (
+        _BUDGET_EXHAUSTED_LABELS,
+        MONTHLY_CAP_BUDGET_NAME,
+    )
 
     source = inspect.getsource(compiled_briefings)
     names = set(re.findall(r'budget_exhausted\.add\("([^"]+)"\)', source))
 
     assert names, "no budget_exhausted.add(...) call sites found in the core"
-    assert names <= set(_BUDGET_EXHAUSTED_LABELS)
+    assert names <= set(_BUDGET_EXHAUSTED_LABELS) | {MONTHLY_CAP_BUDGET_NAME}
 
 
 def test_describe_budget_exhausted_unknown_name_is_non_empty_and_safe():

@@ -1,9 +1,9 @@
 ---
 type: note
 description: Organize the vault by using live graph reports, fixing obvious navigation issues, and proposing conservative link/MOC cleanups that match the current repo layout.
-last_accessed: 2026-04-04
-relevance: 0.26
-tier: archive
+last_accessed: 2026-08-30
+relevance: 1.0
+tier: active
 name: note-organizer
 ---
 

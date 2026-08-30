@@ -141,7 +141,7 @@ below.
 - `MAX_PAGES_PER_PASS` = 40 -- distinct compiled pages one pass may write.
 - `MAX_MODEL_CALLS_PER_PASS` = 200 -- every impact/compile/verify/JSON-repair
   call shares this one budget.
-- `MAX_ENRICHMENTS_PER_PAGE_PER_MONTH` = 20 -- beyond this, further source
+- `MAX_ENRICHMENTS_PER_PAGE_PER_MONTH` = 35 -- beyond this, further source
   material for that page waits until the month rolls over, and a `drift`
   entry is queued for judgement. Counted as distinct (date, source) pairs in
   "Sources That Shaped This Page", not as rows: one enrichment appends one
@@ -237,8 +237,11 @@ them and the pass that does:
   has rejected a majority of its proposed claims
   `MAX_VERIFY_REJECTED_RETRIES` times in a row against the same source
   snapshot (both the incremental refresh path and the nightly freshness
-  backfill count toward the same retry counter). Incremental entries retain
-  the source event, including for a page that has not been created yet.
+  backfill count toward the same retry counter). Every entry retains the
+  source Verify rejected -- the incremental path takes it from the queue
+  event (including for a page that has not been created yet), the backfill
+  from the exception, since one backfill call can refresh a page from
+  several sources.
   "Повторить проверку" clears the page's retry counter and returns that
   source to the refresh queue; the generic `reject` below just drops the
   queue entry and leaves the page exhausted as-is. No producer reaches this

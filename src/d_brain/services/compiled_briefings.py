@@ -88,7 +88,19 @@ class CompiledBriefingVerificationRejectedError(RuntimeError):
     Callers must treat this exactly like ``CompiledBriefingWriteConflict``
     (skip the page, log, keep going) — see ``refresh_after_write`` and
     ``_backfill_freshness_notes``.
+
+    ``source_rel_path`` is the source whose claims were rejected.
+    ``_backfill_freshness_notes`` refreshes one page from several sources in
+    a single call, so without it the ``"verify-rejected"`` queue entry it
+    writes once the retries run out cannot name a source to re-run -- and
+    such an entry's "Повторить проверку" (the owner's, or the nightly
+    auto-answer that picks it) only resets a counter, leaving nothing to
+    trigger the retry it just promised.
     """
+
+    def __init__(self, message: str, *, source_rel_path: str = "") -> None:
+        super().__init__(message)
+        self.source_rel_path = source_rel_path
 
 
 class CompiledBriefingPassBudgetExceededError(RuntimeError):
@@ -415,7 +427,7 @@ MAX_MODEL_CALLS_PER_PASS = 200
 # ТЗ 5.6 "Максимум обогащений одной страницы за календарный месяц": beyond
 # this, further source material for the page waits for the owner's decision
 # queue instead of compounding unattended drift onto one page.
-MAX_ENRICHMENTS_PER_PAGE_PER_MONTH = 20
+MAX_ENRICHMENTS_PER_PAGE_PER_MONTH = 35
 # ТЗ 5.5 inv 8 / 5.6 "Хранение снимков для отката": how long a pass's
 # pre-write snapshots stay on disk before cleanup, so a delayed manual
 # rollback stays possible without snapshots accumulating forever.
@@ -998,6 +1010,18 @@ class CompileEnrichPass:
     queue_auto_decisions: int = 0
     queue_stale_pruned: int = 0
     budget_exhausted: set[str] = field(default_factory=set)
+    # The pages behind a ``"monthly-enrichments-per-page"`` entry in
+    # ``budget_exhausted`` above. That name alone only says *some* page ran
+    # out of monthly enrichments, which the owner cannot act on -- the whole
+    # point of the digest line is "open this page". Journalled separately so
+    # ``compiled_enrich_report.py`` can name them instead of saying "какая-то
+    # страница".
+    monthly_capped_pages: set[str] = field(default_factory=set)
+    # Queue events this pass released back to "pending" because a budget
+    # ended the drain (``_drain_queue_once``). Journalled next to
+    # ``budget_exhausted`` so the digest can say how much source material is
+    # still waiting, not just that a limit was hit.
+    deferred_queue_sources: int = 0
     sources_processed: list[str] = field(default_factory=list)
     snapshot_manifest: dict[str, Any] = field(default_factory=dict)
     # ТЗ 5.5 inv 5, second condition: pages whose only touch this pass was
@@ -1490,7 +1514,10 @@ class CompiledBriefingService:
                 # 15-minute stale-claim recovery kicks in. None of the
                 # released events count toward ``processed`` below -- they
                 # were not actually handled this pass.
-                for remaining_event in selected[index:]:
+                deferred_events = selected[index:]
+                if self._active_pass is not None:
+                    self._active_pass.deferred_queue_sources += len(deferred_events)
+                for remaining_event in deferred_events:
                     self._record_queue_worker_event(
                         remaining_event,
                         outcome="deferred_budget_exhausted",
@@ -2720,6 +2747,7 @@ class CompiledBriefingService:
                 # Pass-level bookkeeping for the nightly digest; there is no
                 # journal to record into outside a pass.
                 pass_obj.budget_exhausted.add("monthly-enrichments-per-page")
+                pass_obj.monthly_capped_pages.add(rel_path)
             # ТЗ 5.6 table: exceeding this budget also goes "в очередь
             # решений с пометкой о дрейфе", on top of the pass-level
             # budget-exhaustion bookkeeping above (which only reaches the
@@ -3239,6 +3267,12 @@ class CompiledBriefingService:
             "queue_stale_pruned": pass_obj.queue_stale_pruned if pass_obj else 0,
             "budget_exhausted": (
                 sorted(pass_obj.budget_exhausted) if pass_obj else []
+            ),
+            "monthly_capped_pages": (
+                sorted(pass_obj.monthly_capped_pages) if pass_obj else []
+            ),
+            "deferred_queue_sources": (
+                pass_obj.deferred_queue_sources if pass_obj else 0
             ),
             "human_zone_ambiguous_pages": (
                 sorted(pass_obj.human_zone_ambiguous_pages) if pass_obj else []
@@ -7520,7 +7554,8 @@ class CompiledBriefingService:
             if candidate_payload is None:
                 raise CompiledBriefingVerificationRejectedError(
                     f"Verify response for {source_rel_path} did not parse as "
-                    f"JSON even after repair; treated as a full rejection ({exc})"
+                    f"JSON even after repair; treated as a full rejection ({exc})",
+                    source_rel_path=source_rel_path,
                 ) from exc
             self._mark_verify_unavailable(
                 candidate_payload,
@@ -7639,7 +7674,8 @@ class CompiledBriefingService:
             if candidate_payload is None:
                 raise CompiledBriefingVerificationRejectedError(
                     f"Verify rejected {rejected_count}/{len(sample)} sampled claims "
-                    f"for {source_rel_path}; page write aborted"
+                    f"for {source_rel_path}; page write aborted",
+                    source_rel_path=source_rel_path,
                 )
             candidate_payload.setdefault("_quality_issues", []).append(
                 f"Verify rejected {rejected_count}/{len(sample)} sampled claims"
@@ -8963,8 +8999,16 @@ class CompiledBriefingService:
                 if rejection_count >= MAX_VERIFY_REJECTED_RETRIES:
                     # ТЗ 7.2: retries are exhausted -- hand the page to the
                     # owner instead of silently skipping it forever (see
-                    # ``_queue_verify_rejected``).
-                    self._queue_verify_rejected(page_rel_path=candidate.rel_path)
+                    # ``_queue_verify_rejected``). The rejected source goes
+                    # into the entry with it: "Повторить проверку" re-enqueues
+                    # exactly that source, so an entry written without one
+                    # answers the question and then retries nothing. This loop
+                    # can refresh a page from several sources, so the source
+                    # is taken from the exception rather than guessed at.
+                    self._queue_verify_rejected(
+                        page_rel_path=candidate.rel_path,
+                        source_rel_path=exc.source_rel_path or source_paths[0],
+                    )
                 continue
             except CompiledBriefingPassBudgetExceededError:
                 # ТЗ 5.5 inv 7 / G3: stop the whole backfill loop, not just

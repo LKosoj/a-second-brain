@@ -1,9 +1,9 @@
 ---
 type: note
 description: Generate a weekly review from daily files, goals, and completed Todoist tasks. Focus on wins, drag, and next-week priorities without silently rewriting goal files.
-last_accessed: 2026-04-04
-relevance: 0.26
-tier: archive
+last_accessed: 2026-08-30
+relevance: 1.0
+tier: active
 name: weekly-digest
 ---
 

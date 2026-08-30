@@ -1,9 +1,9 @@
 ---
 type: note
 description: GTD-style triage for a batch of inbox items. Decide whether each item should become a task, note, project, waiting item, or stay as archive-only context.
-last_accessed: 2026-04-04
-relevance: 0.26
-tier: archive
+last_accessed: 2026-08-30
+relevance: 1.0
+tier: active
 name: inbox-processor
 ---
 

@@ -1,8 +1,8 @@
 ---
 type: note
-last_accessed: 2026-04-04
-relevance: 0.26
-tier: archive
+last_accessed: 2026-08-30
+relevance: 1.0
+tier: active
 paths: "thoughts/**/*.md"
 ---
 

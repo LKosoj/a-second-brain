@@ -1,8 +1,8 @@
 ---
 type: note
-last_accessed: 2026-05-05
-relevance: 0.36
-tier: archive
+last_accessed: 2026-08-30
+relevance: 1.0
+tier: active
 paths: "goals/**/*.md"
 ---
 

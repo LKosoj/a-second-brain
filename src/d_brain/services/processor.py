@@ -1272,6 +1272,30 @@ WORKFLOW:
             return []
         return payload if isinstance(payload, list) else []
 
+    def _weekly_system_reflection_handoff_summary(
+        self,
+        *,
+        note_path: Path | None,
+        title: str,
+        processed_observations: int,
+        carry_forward_observations: int,
+    ) -> str:
+        """One sentence recording this weekly system reflection in handoff."""
+        copy = self._owner_report_defaults()
+        counts = (
+            f"{copy['processed_observations_label']}: {processed_observations}, "
+            f"{copy['carry_forward_label']}: {carry_forward_observations}."
+        )
+        if note_path is not None:
+            note_rel_path = note_path.relative_to(self.vault_path).as_posix()
+            return (
+                f"{copy['reflection_daily_log']} "
+                f"[[{note_rel_path}|{title}]]. {counts}"
+            )
+        if carry_forward_observations > 0:
+            return f"{copy['retained_daily_log']} {counts}"
+        return f"{copy['no_system_signals_daily']} {counts}"
+
     def _log_weekly_system_reflection(
         self,
         *,
@@ -1634,6 +1658,57 @@ WORKFLOW:
                 self._render_handoff_sections(frontmatter, sections),
                 lock=lock,
             )
+
+    @staticmethod
+    def _splice_handoff_last_session(text: str, sentence: str) -> str:
+        """Add one sentence to the "Last Session" block, leaving every other
+        byte of the handoff exactly as it was.
+
+        Appends rather than replaces: the daily reflect phase writes that
+        section earlier in the same scheduled run, and a weekly cycle that
+        overwrote it would drop the day's own summary from the only file the
+        next session reads for continuity. Re-appending the same sentence is
+        a no-op, so a cycle that runs twice on one day does not say the same
+        thing twice.
+
+        Splices instead of re-rendering the whole document on purpose: the
+        rendering path normalizes every other section too (deduping
+        observations, among other things), which is the right thing for
+        ``_compact_handoff_file`` and the wrong thing for a write whose only
+        business is one sentence -- see
+        ``_merge_handoff_observation_snapshot``, which deliberately leaves a
+        concurrently edited handoff alone.
+        """
+        matches = list(HANDOFF_SECTION_RE.finditer(text))
+        for index, match in enumerate(matches):
+            if match.group(1) != "Last Session":
+                continue
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            current = text[match.end() : end].strip()
+            if sentence in current:
+                return text
+            if not current or current == HANDOFF_EMPTY_SECTION["Last Session"]:
+                merged = sentence
+            else:
+                merged = current + " " + sentence
+            tail = text[end:]
+            separator = "\n\n" if tail else "\n"
+            return text[: match.end()] + "\n" + merged + separator + tail
+        return text
+
+    def _append_handoff_last_session(self, sentence: str) -> None:
+        """Record one sentence in the rolling handoff "Last Session" section."""
+        text = " ".join(str(sentence or "").split())
+        if not text:
+            return
+        self._ensure_handoff_file()
+        handoff_path = self._handoff_path()
+        with vault_write_lock(self.vault_path) as lock:
+            current = handoff_path.read_text(encoding="utf-8")
+            updated = self._splice_handoff_last_session(current, text)
+            if updated == current:
+                return
+            self._write_vault_markdown(handoff_path, updated, lock=lock)
 
     def _merge_handoff_observation_snapshot(
         self,
@@ -3399,7 +3474,8 @@ or recent vault notes before answering instead of guessing.
         # ``_write_pass_journal`` writes does), so read it back the same way
         # the compile digest itself does (``compiled_enrich_report``) rather
         # than leaving this combined report silent about it.
-        budget_exhausted = read_pass_status(self.vault_path).budget_exhausted
+        pass_status = read_pass_status(self.vault_path)
+        budget_exhausted = pass_status.budget_exhausted
         if self.content_language == "ru":
             report_lines = [
                 "## 🧩 Поддержка compiled-слоя",
@@ -3457,11 +3533,23 @@ or recent vault notes before answering instead of guessing.
             if self.content_language == "ru":
                 report_lines.append(
                     "- Бюджет прохода исчерпан: "
-                    + "; ".join(describe_budget_exhausted(budget_exhausted))
+                    + "; ".join(
+                        describe_budget_exhausted(
+                            budget_exhausted,
+                            # Without the paths this line says only that
+                            # *some* compiled page ran out of monthly
+                            # enrichments, which names no page to open --
+                            # the one action the owner has here.
+                            monthly_capped_pages=pass_status.monthly_capped_pages,
+                        )
+                    )
                 )
             else:
+                capped = ", ".join(pass_status.monthly_capped_pages)
                 report_lines.append(
-                    "- Pass budget exhausted: " + ", ".join(budget_exhausted)
+                    "- Pass budget exhausted: "
+                    + ", ".join(budget_exhausted)
+                    + (f" ({capped})" if capped else "")
                 )
         result["report"] = "\n".join(report_lines)
         result["processed_entries"] = len(result.get("archived", []))
@@ -4391,6 +4479,19 @@ Return exactly one JSON object:
                 observations,
                 carry_forward,
                 observation_revision,
+            )
+        )
+        # The reflection has just rewritten handoff's ``Observations``; the
+        # rest of the file still describes whatever session ran last, so
+        # without this the one document the next session reads for
+        # continuity never mentions that a weekly reflection happened at all
+        # (weekly-reflection.md: handoff keeps one rolling status block).
+        self._append_handoff_last_session(
+            self._weekly_system_reflection_handoff_summary(
+                note_path=note_path,
+                title=title,
+                processed_observations=processed_observations,
+                carry_forward_observations=len(carry_forward),
             )
         )
         self._log_weekly_system_reflection(

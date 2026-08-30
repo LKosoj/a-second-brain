@@ -1,8 +1,8 @@
 ---
 type: note
-last_accessed: 2026-04-03
-relevance: 0.26
-tier: archive
+last_accessed: 2026-08-30
+relevance: 1.0
+tier: active
 paths: "thoughts/reflections/YYYY-W*"
 ---
 
@@ -48,8 +48,9 @@ A useful reflection usually contains:
 5. Propose concrete improvements (file + change)
 6. Write reflection file
 7. Clear processed observations from handoff.md (keep unprocessed)
-8. Add reflection to daily log
-9. In the scheduled Sunday cycle, switch `goals/3-weekly.md` to the next ISO week after reflection completes without error
+8. Record the reflection in handoff.md `## Last Session` (appended by the runtime, not written by hand)
+9. Add reflection to daily log
+10. In the scheduled Sunday cycle, switch `goals/3-weekly.md` to the next ISO week after reflection completes without error
 
 Prefer recurring operational patterns over one-off incidents.
 Every proposal should name the exact file and the smallest useful change.

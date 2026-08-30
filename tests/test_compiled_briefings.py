@@ -8662,6 +8662,10 @@ def test_compiled_briefings_backfill_queues_verify_rejected_after_retries_exhaus
     assert entry["page"] == "compiled/projects/demo.md"
     assert entry["since"] == date.today().isoformat()
     assert entry["summary"]
+    # The entry has to carry the source too: "Повторить проверку" re-enqueues
+    # that source, and an entry written without one only resets a counter
+    # that nothing then acts on.
+    assert entry["source_path"] == "daily/a.md"
 
     # A later pass against the same exhausted source snapshot (still
     # skipped by ``_verify_rejection_exhausted`` before Verify even runs
@@ -8669,6 +8673,61 @@ def test_compiled_briefings_backfill_queues_verify_rejected_after_retries_exhaus
     assert service._backfill_freshness_notes(limit=1) == []
     entries_again = json.loads(queue_path.read_text(encoding="utf-8"))
     assert len(entries_again) == 1
+
+
+def test_compiled_briefings_backfill_verify_rejected_entry_names_rejected_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One backfill call refreshes a page from every changed source it has,
+    so the queue entry must name the source Verify actually rejected -- not
+    whichever source happened to come first. The rejected source travels on
+    the exception itself for exactly this reason."""
+    vault_path = tmp_path / "vault"
+    compiled_root = vault_path / "compiled" / "projects"
+    daily_root = vault_path / "daily"
+    compiled_root.mkdir(parents=True)
+    daily_root.mkdir(parents=True)
+    (daily_root / "a.md").write_text("Before A.\n", encoding="utf-8")
+    (daily_root / "b.md").write_text("Before B.\n", encoding="utf-8")
+    (compiled_root / "demo.md").write_text(
+        (
+            "---\n"
+            "domain: projects\n"
+            "freshness_state: fresh\n"
+            "---\n\n"
+            "# Demo\n\n"
+            "## Sources\n"
+            "- [[daily/a.md]]\n"
+            "- [[daily/b.md]]\n"
+        ),
+        encoding="utf-8",
+    )
+    service = _compiled_service(vault_path)
+    service.initialize_source_state()
+    (daily_root / "a.md").write_text("After A.\n", encoding="utf-8")
+    (daily_root / "b.md").write_text("After B.\n", encoding="utf-8")
+
+    def fake_upsert_briefing(**kwargs: Any) -> BriefingUpsertResult:
+        source_rel_path = str(kwargs["source_rel_path"])
+        if source_rel_path == "daily/b.md":
+            raise CompiledBriefingVerificationRejectedError(
+                "rejected", source_rel_path=source_rel_path
+            )
+        return BriefingUpsertResult(path="compiled/projects/demo.md", written=True)
+
+    monkeypatch.setattr(service, "is_available", lambda: True)
+    monkeypatch.setattr(service, "_upsert_briefing", fake_upsert_briefing)
+
+    for _attempt in range(MAX_VERIFY_REJECTED_RETRIES):
+        service._backfill_freshness_notes(limit=1)
+
+    entries = json.loads(
+        (vault_path / ".session" / "decisions-queue.json").read_text(encoding="utf-8")
+    )
+    assert len(entries) == 1
+    assert entries[0]["kind"] == "verify-rejected"
+    assert entries[0]["source_path"] == "daily/b.md"
 
 
 def test_compiled_briefings_incremental_refresh_queues_verify_rejected_after_retries(
@@ -8731,7 +8790,7 @@ def test_compiled_briefings_pass_budget_constants_and_dataclass_defaults(
     defaults every field a journal entry (G6) needs."""
     assert MAX_PAGES_PER_PASS == 40
     assert MAX_MODEL_CALLS_PER_PASS == 200
-    assert MAX_ENRICHMENTS_PER_PAGE_PER_MONTH == 20
+    assert MAX_ENRICHMENTS_PER_PAGE_PER_MONTH == 35
     assert SNAPSHOT_RETENTION_DAYS == 14
 
     service = _compiled_service(tmp_path / "vault")
@@ -9412,6 +9471,11 @@ def test_compiled_briefings_monthly_enrichment_budget_blocks_page(
         )
     assert calls == []
     assert "monthly-enrichments-per-page" in service._active_pass.budget_exhausted
+    # The constraint name alone names no page to open, which is the only
+    # action this budget leaves the owner -- the path is recorded next to it.
+    assert service._active_pass.monthly_capped_pages == {
+        "compiled/projects/demo-project.md"
+    }
 
 
 def test_compiled_briefings_monthly_budget_counts_enrichments_not_claims(
@@ -10441,6 +10505,73 @@ def test_compiled_briefings_nightly_gate_does_not_fail_on_budget_exhaustion(
     assert journal["status"] != "failed"
     assert journal["rollback"] is None
     assert journal["budget_exhausted"] == ["monthly-enrichments-per-page"]
+
+
+def test_compiled_briefings_pass_journal_records_capped_pages_and_deferred_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """G6: the two fields that turn "какой-то бюджет исчерпан" into
+    something the owner can act on -- which page ran out of monthly
+    enrichments, and how many queued sources the pass left behind."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+
+    def fake_drain_queue(**kwargs: Any) -> dict[str, Any]:
+        assert service._active_pass is not None
+        service._active_pass.budget_exhausted.add("monthly-enrichments-per-page")
+        service._active_pass.monthly_capped_pages.add("compiled/projects/demo.md")
+        service._active_pass.deferred_queue_sources += 3
+        return {"drained": 1, "updated": [], "consolidations": [], "errors": []}
+
+    monkeypatch.setattr(service, "drain_queue", fake_drain_queue)
+    monkeypatch.setattr(service, "_archive_stale_notes", lambda limit=5: [])
+    monkeypatch.setattr(service, "_backfill_freshness_notes", lambda limit=5: [])
+    monkeypatch.setattr(service, "lint_notes", lambda: [])
+    monkeypatch.setattr(service, "freshness_issues", lambda: [])
+
+    service.run_nightly_maintenance()
+
+    journal = json.loads(
+        (vault_path / ".session" / "compile-enrich.json").read_text(encoding="utf-8")
+    )
+    assert journal["monthly_capped_pages"] == ["compiled/projects/demo.md"]
+    assert journal["deferred_queue_sources"] == 3
+
+
+def test_compiled_briefings_drain_counts_sources_left_by_budget_exhaustion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every event released back to "pending" when a budget ends the drain
+    is source material the owner is still waiting on, so the pass counts
+    them -- including the ones it never reached."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    for day in ("04", "05", "06"):
+        service.enqueue_refresh(
+            source_path=f"daily/2026-04-{day}.md",
+            source_excerpt="text",
+            debounce_seconds=0,
+        )
+
+    monkeypatch.setattr(service, "is_available", lambda: True)
+
+    def fake_refresh(
+        *, source_path: str, source_excerpt: str = "", max_updates: int = 3
+    ) -> dict[str, Any]:
+        if source_path == "daily/2026-04-04.md":
+            return {"updated": [], "errors": []}
+        return {"updated": [], "errors": [], "budget_exhausted": True}
+
+    monkeypatch.setattr(service, "refresh_after_write", fake_refresh)
+    service._active_pass = CompileEnrichPass(pass_id="p1", snapshot_enabled=False)
+
+    service.drain_queue(force=True, max_events=50, refresh_qmd=False)
+
+    # The event that hit the budget plus the one behind it that was never
+    # reached; the first event was processed and acked, so it does not count.
+    assert service._active_pass.deferred_queue_sources == 2
 
 
 def test_compiled_briefings_nightly_gate_reports_no_work_when_queue_empty(

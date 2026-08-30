@@ -114,6 +114,17 @@ class PassStatus:
     being suppressed as a quiet day (``build_daily_digest``): exhausting a
     budget is never "nothing happened".
 
+    ``monthly_capped_pages`` and ``deferred_queue_sources`` mirror the two
+    journal fields that make a ``"monthly-enrichments-per-page"`` budget
+    line actionable. The constraint name on its own says only that *some*
+    page ran out of monthly enrichments and that *some* source material is
+    still queued, which is not enough to do anything about: the owner needs
+    the page to open (``monthly_capped_pages``) and the size of what is
+    waiting (``deferred_queue_sources``, the queue events the pass released
+    back to "pending" when a budget ended its drain). Neither field forces a
+    digest on its own -- both only ever appear alongside the
+    ``budget_exhausted`` entry that already does.
+
     ``queue_evictions`` mirrors the journal's own field (ТЗ 7.2: the owner
     must learn when the ``QUEUE_CAP``-item decisions-queue cap forced old
     entries out): how many pre-existing queue entries this pass evicted on
@@ -166,6 +177,8 @@ class PassStatus:
     status: str
     error: str = ""
     budget_exhausted: tuple[str, ...] = ()
+    monthly_capped_pages: tuple[str, ...] = ()
+    deferred_queue_sources: int = 0
     queue_evictions: int = 0
     human_zone_ambiguous_pages: tuple[str, ...] = ()
     worker_crash: str = ""
@@ -264,6 +277,24 @@ def read_pass_status(vault_path: Path) -> PassStatus:
         if isinstance(budget_raw, list)
         else ()
     )
+    monthly_capped_raw = payload.get("monthly_capped_pages")
+    monthly_capped_pages = (
+        tuple(
+            item.strip()
+            for item in monthly_capped_raw
+            if isinstance(item, str) and item.strip()
+        )
+        if isinstance(monthly_capped_raw, list)
+        else ()
+    )
+    deferred_raw = payload.get("deferred_queue_sources")
+    deferred_queue_sources = (
+        deferred_raw
+        if isinstance(deferred_raw, int)
+        and not isinstance(deferred_raw, bool)
+        and deferred_raw > 0
+        else 0
+    )
     queue_evictions_raw = payload.get("queue_evictions")
     queue_evictions = (
         queue_evictions_raw
@@ -294,6 +325,8 @@ def read_pass_status(vault_path: Path) -> PassStatus:
         status=status,
         error=error if isinstance(error, str) else "",
         budget_exhausted=budget_exhausted,
+        monthly_capped_pages=monthly_capped_pages,
+        deferred_queue_sources=deferred_queue_sources,
         queue_evictions=queue_evictions,
         human_zone_ambiguous_pages=human_zone_ambiguous_pages,
         auto_decisions=auto_decisions,
@@ -663,24 +696,25 @@ _CARRYOVER_SUMMARY_TEMPLATE = (
     "— см. «Очередь» в меню."
 )
 
+# The one ``budget_exhausted`` name whose owner-facing line is built by a
+# function rather than read from the table below: it is the only budget tied
+# to a specific page, so its sentence carries the paths the journal recorded
+# (see ``_describe_monthly_cap``).
+MONTHLY_CAP_BUDGET_NAME = "monthly-enrichments-per-page"
+
 # ТЗ 5.5 inv 7 / 5.6: human-readable translations of the technical
 # constraint names ``compiled_briefings.py``'s ``_write_pass_journal`` may
 # record in the ``budget_exhausted`` field -- one entry per
-# ``pass_obj.budget_exhausted.add(...)`` call site in that module. The
-# owner must never see the bare technical name (ТЗ: "перевести в понятный
-# текст, а не показывать как есть"). Kept here, not in
-# ``compiled_briefings.py``, because that module owns the pass mechanics,
-# not the owner-facing wording.
+# ``pass_obj.budget_exhausted.add(...)`` call site in that module, except
+# ``MONTHLY_CAP_BUDGET_NAME`` above. The owner must never see the bare
+# technical name (ТЗ: "перевести в понятный текст, а не показывать как
+# есть"). Kept here, not in ``compiled_briefings.py``, because that module
+# owns the pass mechanics, not the owner-facing wording.
 _BUDGET_EXHAUSTED_LABELS: dict[str, str] = {
     "pages-per-pass": (
         "достигнут дневной лимит страниц, которые можно изменить за один "
         f"проход ({MAX_PAGES_PER_PASS}) — остаток остался в очереди до "
         "следующего прохода"
-    ),
-    "monthly-enrichments-per-page": (
-        "какая-то страница уже обогащалась максимально допустимое число "
-        f"раз в этом календарном месяце ({MAX_ENRICHMENTS_PER_PAGE_PER_MONTH}) "
-        "— остальные источники для неё остались в очереди"
     ),
     "model-calls-per-pass": (
         "исчерпан лимит обращений к модели за один проход "
@@ -689,10 +723,59 @@ _BUDGET_EXHAUSTED_LABELS: dict[str, str] = {
     ),
 }
 
+# Same cap, and the same reason, as ``_MAX_HUMAN_ZONE_PAGES_SHOWN`` below:
+# the path is the actionable part of this line, but one bad month must not
+# let the budget line crowd out the rest of the digest.
+_MAX_MONTHLY_CAPPED_PAGES_SHOWN = 5
 
-def describe_budget_exhausted(names: tuple[str, ...]) -> list[str]:
+
+def _describe_monthly_cap(pages: tuple[str, ...]) -> str:
+    """The ``MONTHLY_CAP_BUDGET_NAME`` line, naming the pages that hit the
+    cap.
+
+    The only thing the owner can do about this budget is open the page and
+    decide whether it is really still one page, so the line has to say which
+    page it is. A journal written before ``monthly_capped_pages`` existed
+    (or one hand-edited since) has no paths to name, and then the wording
+    falls back to the previous, page-less sentence rather than inventing a
+    path.
+    """
+    if not pages:
+        return (
+            "какая-то страница уже обогащалась максимально допустимое число "
+            f"раз в этом календарном месяце ({MAX_ENRICHMENTS_PER_PAGE_PER_MONTH}) "
+            "— остальные источники для неё остались в очереди"
+        )
+    shown = pages[:_MAX_MONTHLY_CAPPED_PAGES_SHOWN]
+    page_list = ", ".join(f"[[{page}]]" for page in shown)
+    remaining = len(pages) - len(shown)
+    if remaining > 0:
+        page_list += f" и ещё {remaining}"
+    if len(pages) == 1:
+        subject = f"страница {page_list} уже обогащалась"
+        tail = "остальные источники для неё остались в очереди"
+    else:
+        subject = f"страницы {page_list} уже обогащались"
+        tail = "остальные источники для них остались в очереди"
+    return (
+        f"{subject} максимально допустимое число раз в этом календарном "
+        f"месяце ({MAX_ENRICHMENTS_PER_PAGE_PER_MONTH}) — {tail}"
+    )
+
+
+def describe_budget_exhausted(
+    names: tuple[str, ...],
+    *,
+    monthly_capped_pages: tuple[str, ...] = (),
+) -> list[str]:
     """Translate journal ``budget_exhausted`` names into owner-readable
     Russian sentences, one per name, in the given order.
+
+    ``monthly_capped_pages`` is the journal's field of the same name -- the
+    pages behind a ``MONTHLY_CAP_BUDGET_NAME`` entry. Passing it turns the
+    page-less "какая-то страница" wording into one that names them; leaving
+    it out keeps the old wording, which is what a caller reading an older
+    journal gets.
 
     A name outside ``_BUDGET_EXHAUSTED_LABELS`` (a constraint added to
     ``compiled_briefings.py`` after this table was last updated, or a
@@ -702,6 +785,9 @@ def describe_budget_exhausted(names: tuple[str, ...]) -> list[str]:
     """
     described = []
     for name in names:
+        if name == MONTHLY_CAP_BUDGET_NAME:
+            described.append(_describe_monthly_cap(monthly_capped_pages))
+            continue
         label = _BUDGET_EXHAUSTED_LABELS.get(name)
         if label is None:
             label = f"исчерпан один из бюджетов прохода (ограничение «{name}»)"
@@ -785,8 +871,17 @@ def _render_digest(
         decision_lines.append(f"- {_FAILURE_FALLBACK_LINE}")
     decision_lines.extend(
         f"- Бюджет прохода исчерпан: {description}."
-        for description in describe_budget_exhausted(pass_status.budget_exhausted)
+        for description in describe_budget_exhausted(
+            pass_status.budget_exhausted,
+            monthly_capped_pages=pass_status.monthly_capped_pages,
+        )
     )
+    if pass_status.deferred_queue_sources > 0:
+        decision_lines.append(
+            "- Из-за исчерпанного бюджета в очереди осталось источников: "
+            f"{pass_status.deferred_queue_sources} — они вернулись в очередь "
+            "и будут обработаны следующим проходом."
+        )
     if pass_status.queue_evictions > 0:
         decision_lines.append(
             "- Очередь решений переполнена: "

@@ -655,6 +655,110 @@ def test_weekly_reflection_removes_processed_snapshot_without_concurrency(
     assert snapshot[1] in observations
 
 
+def test_weekly_reflection_records_itself_in_handoff_last_session(
+    tmp_path: Path,
+) -> None:
+    """The reflection rewrites handoff's ``Observations`` and leaves the
+    rest of the file describing whatever ran before it, so the one document
+    the next session reads for continuity never mentioned that a weekly
+    reflection had happened at all. The record is appended, not written
+    over: the daily reflect phase fills that same section earlier in the
+    same scheduled run."""
+    vault_path = tmp_path / "vault"
+    session_path = vault_path / ".session"
+    daily_path = vault_path / "daily"
+    session_path.mkdir(parents=True)
+    daily_path.mkdir(parents=True)
+    today = date.today().isoformat()
+    (daily_path / f"{today}.md").write_text(f"# {today}\n", encoding="utf-8")
+    (session_path / "handoff.md").write_text(
+        (
+            "---\n"
+            "type: note\n"
+            f"last_accessed: {today}\n"
+            "relevance: 1.0\n"
+            "tier: active\n"
+            "---\n\n"
+            "# Передача сессии\n\n"
+            "## Last Session\nDaily processing done.\n\n"
+            "## Key Decisions\n- keep\n\n"
+            "## In Progress\n- weekly\n\n"
+            "## Next Steps\n- reflect\n\n"
+            "## Observations\n- [pattern] process this\n"
+        ),
+        encoding="utf-8",
+    )
+    processor = CliProcessor(vault_path)
+    processor._run_json_phase = lambda prompt, phase_name: {  # type: ignore[method-assign]
+        "create_reflection": True,
+        "title": "Трение в очереди",
+        "report_markdown": "",
+        "reflection_markdown": "## Friction\nSomething recurring.",
+        "carry_forward_observations": [],
+    }
+
+    processor.generate_weekly_system_reflection(refresh_qmd=False)
+
+    last_session = _markdown_section(
+        (session_path / "handoff.md").read_text(encoding="utf-8"),
+        "Last Session",
+    )
+    year, week, _ = date.today().isocalendar()
+    assert "Daily processing done." in last_session
+    note_rel_path = f"thoughts/reflections/{year}-W{week:02d}-system-reflection.md"
+    assert note_rel_path in last_session
+    assert "Обработано наблюдений: 1" in last_session
+
+
+def test_weekly_reflection_handoff_record_is_not_repeated_on_a_second_run(
+    tmp_path: Path,
+) -> None:
+    """Two reflections on one day (a manual re-run after the scheduled one)
+    must not leave the same sentence in "Last Session" twice."""
+    vault_path = tmp_path / "vault"
+    session_path = vault_path / ".session"
+    daily_path = vault_path / "daily"
+    session_path.mkdir(parents=True)
+    daily_path.mkdir(parents=True)
+    today = date.today().isoformat()
+    (daily_path / f"{today}.md").write_text(f"# {today}\n", encoding="utf-8")
+    (session_path / "handoff.md").write_text(
+        (
+            "---\n"
+            "type: note\n"
+            f"last_accessed: {today}\n"
+            "relevance: 1.0\n"
+            "tier: active\n"
+            "---\n\n"
+            "# Передача сессии\n\n"
+            "## Last Session\n(none)\n\n"
+            "## Key Decisions\n- keep\n\n"
+            "## In Progress\n- weekly\n\n"
+            "## Next Steps\n- reflect\n\n"
+            "## Observations\n- [pattern] process this\n"
+        ),
+        encoding="utf-8",
+    )
+    processor = CliProcessor(vault_path)
+    processor._run_json_phase = lambda prompt, phase_name: {  # type: ignore[method-assign]
+        "create_reflection": False,
+        "title": "",
+        "report_markdown": "",
+        "reflection_markdown": "",
+        "carry_forward_observations": ["- [pattern] process this"],
+    }
+
+    processor.generate_weekly_system_reflection(refresh_qmd=False)
+    processor.generate_weekly_system_reflection(refresh_qmd=False)
+
+    last_session = _markdown_section(
+        (session_path / "handoff.md").read_text(encoding="utf-8"),
+        "Last Session",
+    )
+    assert last_session.count("нерешённые наблюдения") == 1
+    assert "(none)" not in last_session
+
+
 def test_generate_weekly_system_reflection_retains_unresolved_observations(
     tmp_path: Path,
 ) -> None:
