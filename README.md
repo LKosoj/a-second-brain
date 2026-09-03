@@ -153,13 +153,14 @@ commands and the bot help screen for the complete Telegram command list.
 
 ## Requirements
 
-- a dedicated unprivileged Linux account with Python 3.12 or newer
+- a dedicated unprivileged Linux account with Python 3.12 or newer (macOS is
+  also supported via launchd, see [macOS deployment](docs/en/macos.md))
 - [uv](https://docs.astral.sh/uv/)
 - `jq`
 - a Telegram bot token from BotFather
 - a Deepgram API key for voice transcription
 - one installed and authenticated AI CLI: Claude Code, Codex CLI, Qwen Code,
-  Gemini CLI, or Kimi Code
+  Gemini CLI, Kimi Code, Grok CLI, or opencode
 
 Todoist, web extraction, PLAUD, QMD, and encrypted backups are optional and
 have additional requirements. See [Integrations](docs/en/integrations.md) and

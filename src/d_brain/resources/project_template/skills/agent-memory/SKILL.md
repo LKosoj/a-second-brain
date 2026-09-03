@@ -40,7 +40,7 @@ Minimum expectations:
 - meaningful `description`
 - sparse lowercase `tags`
 - real `status`
-- automatic `last_accessed`, `relevance`, `tier`
+- automatic `last_accessed`, `relevance`, `tier`, `access_count`
 - no duplicate facts across multiple notes
 
 ## Search and Memory Signals

@@ -8,6 +8,7 @@ query, then building, filing, and delivering the brief the same way
 ``run_compiled_brief.py``'s CLI already does.
 """
 
+import asyncio
 import logging
 from contextlib import suppress
 from datetime import date
@@ -83,7 +84,9 @@ async def process_brief_request(message: Message, brief_type: str, query: str) -
     vault_path = Path(settings.vault_path)
 
     try:
-        result = build_brief(vault_path, brief_type=brief_type, query=query)
+        result = await asyncio.to_thread(
+            build_brief, vault_path, brief_type=brief_type, query=query
+        )
     except Exception:
         # Same guard, and for the same reason, as ``why.py``'s around
         # ``build_why`` (code review): both re-read every ``compiled/**``
@@ -123,7 +126,9 @@ async def process_brief_request(message: Message, brief_type: str, query: str) -
     # ТЗ 6.2: a page that reaches a brief counts as "used" -- best-effort,
     # a touch failure must not take down the brief reply itself.
     try:
-        QmdService(vault_path).touch_notes([result.source_rel_path])
+        await asyncio.to_thread(
+            QmdService(vault_path).touch_notes, [result.source_rel_path]
+        )
     except Exception as exc:  # pragma: no cover - best-effort touch
         logger.warning(
             "Failed to touch brief source %s: %s", result.source_rel_path, exc

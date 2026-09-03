@@ -110,10 +110,28 @@ def _markdown_links_to_html_placeholders(text: str) -> tuple[str, list[str]]:
 def _markdown_inline_to_html(text: str) -> str:
     value, href_placeholders = _markdown_links_to_html_placeholders(text)
 
-    value = re.sub(r"`([^`]+)`", r"<code>\1</code>", value)
+    code_placeholders: list[str] = []
+
+    def _stash_code(match: re.Match[str]) -> str:
+        code_placeholders.append(f"<code>{match.group(1)}</code>")
+        return f"\x00CODE{len(code_placeholders) - 1}\x00"
+
+    # Code spans must be protected before emphasis is applied, otherwise
+    # `*`/`_`/`~` inside `` `...` `` get misread as emphasis markers.
+    value = re.sub(r"`([^`]+)`", _stash_code, value)
     value = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", value)
     value = re.sub(r"~~(.+?)~~", r"<s>\1</s>", value)
-    value = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", value)
+    # A `*` followed or preceded by whitespace cannot open/close emphasis
+    # (CommonMark flanking rule), so `5 * 3 * 2` is left untouched.
+    value = re.sub(
+        r"(?<!\*)\*(?!\s)([^*\n]+?)(?<!\s)\*(?!\*)", r"<i>\1</i>", value
+    )
+    if code_placeholders:
+        value = re.sub(
+            r"\x00CODE(\d+)\x00",
+            lambda m: code_placeholders[int(m.group(1))],
+            value,
+        )
     if href_placeholders:
         value = re.sub(
             r"\x00LINK(\d+)\x00",

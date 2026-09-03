@@ -11,6 +11,7 @@ import ctypes
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import stat
@@ -18,7 +19,7 @@ import sys
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -34,6 +35,15 @@ from d_brain.services.vault_lock import (
     require_live_vault_write_lock,
     vault_write_lock,
 )
+
+logger = logging.getLogger(__name__)
+
+# Append-only audit trail for every write through
+# ``write_validated_vault_markdown`` (аудит 2026-09-03, п.20): one JSON line
+# per successful write, plus a snapshot of the overwritten content so
+# ``recover_ops_journal`` (see ``d_brain recover`` in cli.py) can undo it.
+_OPS_JOURNAL_RELATIVE_PATH = Path(".session") / "ops.jsonl"
+_OPS_SNAPSHOTS_RELATIVE_DIR = Path(".session") / "ops-snapshots"
 
 _TOP_LEVEL_FIELD = re.compile(rb"^[A-Za-z][A-Za-z0-9_-]*:")
 _FIELD_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]*\Z")
@@ -220,6 +230,13 @@ def split_frontmatter_bytes(content: bytes) -> tuple[bytes | None, bytes, bytes]
         return None, content, newline
 
     offset = len(opening)
+    # An empty header ("---\n---\n" or "---\n---") closes right at the
+    # opening's own newline -- there is no header line to contribute the
+    # extra newline the general "\n---\n" search below requires.
+    immediate_closing = b"---" + newline
+    if unmarked[offset : offset + len(immediate_closing)] == immediate_closing:
+        return b"", unmarked[offset + len(immediate_closing) :], newline
+
     closing = newline + b"---" + newline
     closing_index = unmarked.find(closing, offset)
     if closing_index == -1:
@@ -320,6 +337,10 @@ def _field_value_end_lines(header: bytes) -> dict[str, int]:
         root = yaml.compose(header.decode("utf-8"), Loader=_UniqueKeyLoader)
     except (UnicodeDecodeError, yaml.YAMLError) as exc:
         raise FrontmatterError(f"invalid YAML frontmatter: {exc}") from exc
+    if root is None:
+        # Matches _parse_yaml: an empty header is an empty mapping, not an
+        # error -- there are simply no field spans to report.
+        return {}
     if not isinstance(root, yaml.nodes.MappingNode):
         raise FrontmatterError("frontmatter must be a YAML mapping")
     result: dict[str, int] = {}
@@ -415,7 +436,13 @@ def patch_frontmatter_bytes(content: bytes, updates: Mapping[str, Any]) -> bytes
     candidate = b"---" + newline + header + separator + b"---" + newline + document.body
     reparsed = parse_frontmatter_bytes(candidate)
     for field, value in updates.items():
-        if reparsed.fields.get(field) != value:
+        # The loader's timestamp resolver is disabled (see _UniqueKeyLoader),
+        # so a rendered date/datetime always reparses as a plain string --
+        # the same convention _daily_frontmatter uses for its unquoted
+        # ``date: 2026-09-03``. Compare against that string form instead of
+        # the original object, which the reparsed value can never equal.
+        expected = value.isoformat() if isinstance(value, (date, datetime)) else value
+        if reparsed.fields.get(field) != expected:
             raise FrontmatterError(f"patched field did not round-trip: {field}")
     if reparsed.body != document.body:
         raise FrontmatterError("frontmatter patch changed Markdown body")
@@ -858,13 +885,22 @@ def _atomic_write_at(
     expected_full_sha256: str | None = None,
     require_absent: bool = False,
     capability: _VaultWriteCapability | None = None,
-) -> None:
+) -> tuple[bytes, str] | None:
+    """Publish ``content`` at ``target_name`` and report the replaced file.
+
+    Returns ``(old_bytes, old_sha256)`` when ``target_name`` already existed
+    -- this function reads and hashes it anyway as part of its own commit
+    protocol, so callers that also need those bytes (e.g. the ops-journal
+    writer in ``write_validated_vault_markdown``) can reuse this instead of
+    reading the file a second time. Returns ``None`` for a brand-new target.
+    """
     stage_name: str | None = None
     stage_fd: int | None = None
     stage_identity: tuple[int, int] | None = None
     candidate_fd: int | None = None
     source_fd: int | None = None
     source_identity: tuple[int, int, int, int] | None = None
+    source_bytes: bytes | None = None
     source_hash: str | None = None
     candidate_name: str | None = None
     recovery_name: str | None = None
@@ -1092,6 +1128,11 @@ def _atomic_write_at(
         except OSError:
             if not durable_commit:
                 raise
+    if source_identity is not None:
+        assert source_bytes is not None
+        assert source_hash is not None
+        return source_bytes, source_hash
+    return None
 
 
 def atomic_write_bytes(path: Path, content: bytes) -> None:
@@ -1513,6 +1554,8 @@ def write_validated_vault_markdown(
                 target_name,
             ):
                 expected_source = None
+                sha_before: str | None = None
+                old_bytes: bytes | None = None
                 if preserve_existing_body:
                     try:
                         existing_bytes, identity, existing_hash = _read_regular_at(
@@ -1528,7 +1571,9 @@ def write_validated_vault_markdown(
                             "frontmatter write changed Markdown body"
                         )
                     expected_source = (identity, existing_hash)
-                _atomic_write_at(
+                    sha_before = existing_hash
+                    old_bytes = existing_bytes
+                previous = _atomic_write_at(
                     parent_fd,
                     target_name,
                     content,
@@ -1537,7 +1582,464 @@ def write_validated_vault_markdown(
                     require_absent=require_absent,
                     capability=lock,
                 )
+                if not preserve_existing_body and previous is not None:
+                    # ``_atomic_write_at`` already read and hashed the
+                    # replaced file as part of its own commit protocol;
+                    # reuse that instead of reading the same bytes a second
+                    # time just for the ops journal (code review, аудит
+                    # 2026-09-03 п.20, warning 2). The ``preserve_existing_body``
+                    # branch above already has its own pre-write read (needed
+                    # there to validate the body did not change), so it keeps
+                    # using that instead.
+                    old_bytes, sha_before = previous
+                _record_ops_journal_entry(
+                    root.path,
+                    relative,
+                    sha_before=sha_before,
+                    old_bytes=old_bytes,
+                    content=content,
+                )
     return document
+
+
+def ensure_run_identity(
+    prefix: str, workflow: str, *, now: datetime | None = None
+) -> str:
+    """Give the current process a stable identity for the ops journal.
+
+    ``write_validated_vault_markdown``/``patch_validated_vault_frontmatter``
+    read ``D_BRAIN_RUN_ID``/``D_BRAIN_WORKFLOW`` from the environment when
+    neither is passed explicitly. Without this, every vault write a scheduled
+    process makes lands in ``.session/ops.jsonl`` with ``run_id: null``, and
+    ``a-second-brain recover`` has nothing to select. ``setdefault`` is used
+    so a value already set by a wrapper script or a test is not clobbered.
+    Returns the resolved run_id.
+    """
+    when = now or datetime.now()
+    run_id = os.environ.setdefault(
+        "D_BRAIN_RUN_ID", f"{prefix}-{when:%Y%m%d-%H%M%S}"
+    )
+    os.environ.setdefault("D_BRAIN_WORKFLOW", workflow)
+    return run_id
+
+
+def _record_ops_journal_entry(
+    vault_path: Path,
+    relative_path: str,
+    *,
+    sha_before: str | None,
+    old_bytes: bytes | None,
+    content: bytes | None,
+    run_id: str | None = None,
+    workflow: str | None = None,
+) -> None:
+    """Append one line to ``.session/ops.jsonl`` recording a successful write.
+
+    Best-effort: this is an audit/rollback aid, not part of the write's
+    correctness, so any failure here is logged as a warning and swallowed
+    rather than raised -- a broken journal must never block the Markdown
+    write it would have recorded.
+
+    When ``sha_before`` names a file that existed before this write, its
+    old bytes are snapshotted to
+    ``.session/ops-snapshots/<sha_before[:16]>.md.bak`` (once per hash) so
+    ``recover_ops_journal`` can restore them later. The ``.bak`` suffix (not
+    ``.md``) is deliberate: this is a raw content snapshot, not a vault note,
+    and some tooling treats any ``.md`` write as a direct vault mutation.
+    """
+    # Deliberate simplification: this journal/snapshot bookkeeping under
+    # ``.session`` uses plain ``Path`` I/O rather than the dir_fd/O_NOFOLLOW
+    # hardened primitives above (``_atomic_write_at`` / ``_read_regular_at``).
+    # It is a best-effort audit aid, not the write path itself, so the extra
+    # symlink-attack hardening is not worth the complexity here.
+    try:
+        sha_after = (
+            hashlib.sha256(content).hexdigest() if content is not None else None
+        )
+        backup: str | None = None
+        if sha_before is not None and old_bytes is not None:
+            snapshot_relative = (
+                _OPS_SNAPSHOTS_RELATIVE_DIR / f"{sha_before[:16]}.md.bak"
+            )
+            snapshot_path = Path(vault_path) / snapshot_relative
+            if not snapshot_path.exists():
+                snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+                snapshot_path.write_bytes(old_bytes)
+            else:
+                # Reused snapshot (same sha_before as an earlier write):
+                # refresh its mtime so it does not look artificially stale
+                # to ``prune_ops_journal`` -- belt-and-suspenders alongside
+                # that function's own "referenced by a kept entry" guard.
+                try:
+                    os.utime(snapshot_path, None)
+                except OSError:
+                    pass
+            backup = snapshot_relative.as_posix()
+        entry = {
+            "ts": datetime.now(UTC).isoformat(),
+            "run_id": (
+                run_id if run_id is not None else os.environ.get("D_BRAIN_RUN_ID")
+            ),
+            "workflow": (
+                workflow
+                if workflow is not None
+                else os.environ.get("D_BRAIN_WORKFLOW")
+            ),
+            "path": relative_path,
+            "sha_before": sha_before,
+            "sha_after": sha_after,
+            "backup": backup,
+        }
+        journal_path = Path(vault_path) / _OPS_JOURNAL_RELATIVE_PATH
+        journal_path.parent.mkdir(parents=True, exist_ok=True)
+        with journal_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        logger.warning(
+            "Failed to append vault ops journal entry for %s: %s",
+            relative_path,
+            exc,
+        )
+
+
+def _read_vault_bytes_hardened(
+    root_fd: int, relative_path: str
+) -> tuple[bytes | None, str | None]:
+    """Read ``relative_path`` under ``root_fd`` via the symlink-safe walk.
+
+    Uses the same ``_open_vault_file_parent``/``_read_regular_at`` machinery
+    as the rest of this module, so a symlink at *any* path component --
+    including an intermediate directory, not just the final name -- is
+    rejected rather than followed.
+
+    Returns ``(None, None)`` when the file, or one of its parent
+    directories, simply does not exist. Raises ``UnsafeVaultPathError`` for
+    anything unsafe (a symlink anywhere on the path, a non-regular target).
+    """
+    try:
+        with _open_vault_file_parent(root_fd, relative_path, create=False) as (
+            parent_fd,
+            name,
+        ):
+            try:
+                content, _identity, content_hash = _read_regular_at(parent_fd, name)
+            except FileNotFoundError:
+                return None, None
+            except OSError as exc:
+                raise UnsafeVaultPathError(
+                    f"cannot read vault file safely: {exc}"
+                ) from exc
+    except FileNotFoundError:
+        return None, None
+    return content, content_hash
+
+
+def _unlink_vault_file_hardened(root_fd: int, relative_path: str) -> None:
+    """Remove ``relative_path`` if present, honoring the symlink-safe walk.
+
+    A missing parent directory or missing file is treated as already
+    removed (mirrors ``Path.unlink(missing_ok=True)``). Raises
+    ``UnsafeVaultPathError`` instead of removing anything if the final
+    component turns out to be a symlink.
+    """
+    try:
+        with _open_vault_file_parent(root_fd, relative_path, create=False) as (
+            parent_fd,
+            name,
+        ):
+            try:
+                target_stat = os.lstat(name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                return
+            if stat.S_ISLNK(target_stat.st_mode):
+                raise UnsafeVaultPathError("vault file target is a symlink")
+            os.unlink(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return
+
+
+def recover_ops_journal(vault_path: Path, run_id: str) -> dict[str, list[str]]:
+    """Undo every write recorded for ``run_id`` in ``.session/ops.jsonl``.
+
+    Entries are replayed most-recent-first. A file whose current content no
+    longer matches the entry's ``sha_after`` was touched again after this
+    run wrote it, so it is left alone and reported as skipped rather than
+    clobbering that later change. Otherwise the file is restored from its
+    snapshot, or removed when the entry has no ``sha_before`` (the write
+    created a brand-new file). The returned ``restored``/``removed`` lists are
+    disjoint per entry and in replay order; a path rewritten several times in
+    one run appears once per undone entry. The rollback itself is journaled the same
+    way, tagged ``workflow: "recover"`` and with ``run_id`` set to
+    ``f"recover:{run_id}"`` rather than ``run_id`` itself -- this keeps a
+    second ``recover(run_id)`` call from ever selecting its own previous
+    rollback entries and undoing them (idempotency: calling ``recover`` on
+    the same ``run_id`` twice restores nothing new the second time).
+
+    Journal-sourced paths (both the entry's ``path`` and its ``backup``) are
+    revalidated as vault-relative before use, and every read, write, and
+    delete against them goes through this module's descriptor-based,
+    ``O_NOFOLLOW`` walk (``_open_vault_file_parent`` and friends) instead of
+    plain ``Path`` I/O -- so a symlink swapped in at *any* path component,
+    not just the final name, is rejected rather than followed. The whole
+    rollback runs under the shared ``vault_write_lock`` used by every other
+    vault writer.
+
+    Only overwrites and patches recorded by ``write_validated_vault_markdown``
+    (including ``write_import_vault_markdown``, which delegates to it) and by
+    ``patch_validated_vault_frontmatter`` are covered.
+    ``move_validated_vault_markdown`` does not append to this journal, so a
+    move can never be rolled back here -- only a rewrite or frontmatter patch
+    at a note's existing path is.
+
+    Do not run this concurrently with the bot or the nightly maintenance
+    process -- both write through the same ops journal and vault files, and
+    a rollback racing a live write is not guaranteed to land cleanly.
+    """
+    vault_path = Path(vault_path)
+    journal_path = vault_path / _OPS_JOURNAL_RELATIVE_PATH
+    try:
+        raw = journal_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raw = ""
+
+    entries: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict) and entry.get("run_id") == run_id:
+            entries.append(entry)
+
+    restored: list[str] = []
+    removed: list[str] = []
+    skipped: list[str] = []
+    with _open_vault_root_once(vault_path) as root:
+        with vault_markdown_write_lock(root) as lock:
+            for entry in reversed(entries):
+                raw_path = entry.get("path")
+                if not isinstance(raw_path, str):
+                    continue
+                try:
+                    relative_path = _vault_relative_file_path(
+                        root.path, Path(raw_path)
+                    )
+                except UnsafeVaultPathError as exc:
+                    logger.warning(
+                        "Skipping recover for %s: unsafe path (%s)", raw_path, exc
+                    )
+                    skipped.append(raw_path)
+                    continue
+                try:
+                    current_bytes, current_hash = _read_vault_bytes_hardened(
+                        lock.root_fd, relative_path
+                    )
+                except UnsafeVaultPathError as exc:
+                    logger.warning(
+                        "Skipping recover for %s: unsafe target (%s)",
+                        relative_path,
+                        exc,
+                    )
+                    skipped.append(relative_path)
+                    continue
+
+                if current_hash != entry.get("sha_after"):
+                    logger.warning(
+                        "Skipping recover for %s: content changed since run %s",
+                        relative_path,
+                        run_id,
+                    )
+                    skipped.append(relative_path)
+                    continue
+
+                sha_before = entry.get("sha_before")
+                if sha_before is None:
+                    try:
+                        _unlink_vault_file_hardened(lock.root_fd, relative_path)
+                    except UnsafeVaultPathError as exc:
+                        logger.warning(
+                            "Skipping recover for %s: unsafe target (%s)",
+                            relative_path,
+                            exc,
+                        )
+                        skipped.append(relative_path)
+                        continue
+                    _record_ops_journal_entry(
+                        root.path,
+                        relative_path,
+                        sha_before=current_hash,
+                        old_bytes=current_bytes,
+                        content=None,
+                        run_id=f"recover:{run_id}",
+                        workflow="recover",
+                    )
+                    removed.append(relative_path)
+                    continue
+                else:
+                    backup = entry.get("backup")
+                    if not isinstance(backup, str):
+                        skipped.append(relative_path)
+                        continue
+                    try:
+                        backup_relative = _vault_relative_file_path(
+                            root.path, Path(backup)
+                        )
+                    except UnsafeVaultPathError as exc:
+                        logger.warning(
+                            "Skipping recover for %s: unsafe backup path (%s)",
+                            relative_path,
+                            exc,
+                        )
+                        skipped.append(relative_path)
+                        continue
+                    try:
+                        snapshot_bytes, _snapshot_hash = _read_vault_bytes_hardened(
+                            lock.root_fd, backup_relative
+                        )
+                    except UnsafeVaultPathError as exc:
+                        logger.warning(
+                            "Skipping recover for %s: unsafe backup (%s)",
+                            relative_path,
+                            exc,
+                        )
+                        skipped.append(relative_path)
+                        continue
+                    if snapshot_bytes is None:
+                        skipped.append(relative_path)
+                        continue
+                    try:
+                        with _open_vault_file_parent(
+                            lock.root_fd, relative_path, create=True
+                        ) as (parent_fd, target_name):
+                            # Same staged rename + fsync commit protocol as
+                            # ``atomic_write_bytes``/``write_vault_file_bytes``
+                            # -- reused directly (rather than calling those
+                            # helpers) because they would each reacquire
+                            # ``vault_write_lock`` themselves and deadlock
+                            # against the lock already held here.
+                            _atomic_write_at(
+                                parent_fd, target_name, snapshot_bytes, capability=lock
+                            )
+                    except (OSError, UnsafeVaultPathError) as exc:
+                        logger.warning(
+                            "Skipping recover for %s: cannot restore safely (%s)",
+                            relative_path,
+                            exc,
+                        )
+                        skipped.append(relative_path)
+                        continue
+                    _record_ops_journal_entry(
+                        root.path,
+                        relative_path,
+                        sha_before=current_hash,
+                        old_bytes=current_bytes,
+                        content=snapshot_bytes,
+                        run_id=f"recover:{run_id}",
+                        workflow="recover",
+                    )
+                    restored.append(relative_path)
+    return {"restored": restored, "removed": removed, "skipped": skipped}
+
+
+def prune_ops_journal(
+    vault_path: Path, *, max_age_days: int = 30, now: datetime | None = None
+) -> dict[str, int]:
+    """Drop ``.session`` ops-journal entries and snapshots older than N days.
+
+    ``.session/ops.jsonl`` and ``.session/ops-snapshots/`` are append-only and
+    otherwise grow without bound, which also means every encrypted backup of
+    the vault sweeps up the full history. This trims both to a rolling
+    ``max_age_days`` window: ``ops.jsonl`` is rewritten (atomically, via a
+    temp file + ``os.replace``) keeping only lines whose ``ts`` is within the
+    window, and snapshot files under ``ops-snapshots`` older than the window
+    (by mtime) are deleted. An entry the parser cannot make sense of (missing
+    or malformed ``ts``, or the line isn't a JSON object) is kept rather than
+    guessed away, and never counts toward ``dropped_entries``.
+
+    Snapshots are content-addressed by ``sha_before`` and can be shared by
+    several journal entries (a later write that happens to reproduce an
+    earlier hash reuses the same snapshot file). So a snapshot referenced by
+    ``backup`` on any entry that survives this prune is kept regardless of
+    its own mtime -- age-based deletion only applies to snapshots that no
+    surviving entry points to.
+
+    Called once per night at the end of ``_run_scheduled_cycle_locked``
+    (``services/processor.py``) with the default window, and on demand via
+    ``a-second-brain ops-prune``. The whole rewrite runs under
+    ``vault_write_lock`` so it does not interleave with the bot's or the
+    nightly process's own journal writes.
+    """
+    if max_age_days < 0:
+        raise ValueError(f"max_age_days must be >= 0, got {max_age_days}")
+    vault_path = Path(vault_path)
+    cutoff = (now if now is not None else datetime.now(UTC)) - timedelta(
+        days=max_age_days
+    )
+
+    journal_path = vault_path / _OPS_JOURNAL_RELATIVE_PATH
+
+    with vault_write_lock(vault_path):
+        try:
+            raw = journal_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            raw = ""
+
+        kept_lines: list[str] = []
+        kept_backups: set[str] = set()
+        dropped_entries = 0
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            entry: Any = None
+            is_old = False
+            try:
+                entry = json.loads(stripped)
+                ts = datetime.fromisoformat(entry["ts"])
+                is_old = ts < cutoff
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                # Cannot tell the age of this line: keep it rather than
+                # risk dropping a live entry over a parsing quirk.
+                is_old = False
+            if is_old:
+                dropped_entries += 1
+            else:
+                kept_lines.append(stripped)
+                if isinstance(entry, dict):
+                    backup = entry.get("backup")
+                    if isinstance(backup, str):
+                        kept_backups.add(backup)
+
+        if raw and dropped_entries:
+            payload = "".join(line + "\n" for line in kept_lines)
+            journal_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = journal_path.with_name(
+                journal_path.name + f".tmp-{os.getpid()}"
+            )
+            tmp_path.write_text(payload, encoding="utf-8")
+            os.replace(tmp_path, journal_path)
+
+        dropped_snapshots = 0
+        snapshots_dir = vault_path / _OPS_SNAPSHOTS_RELATIVE_DIR
+        if snapshots_dir.is_dir():
+            cutoff_ts = cutoff.timestamp()
+            for snapshot in snapshots_dir.iterdir():
+                relative_snapshot = (
+                    _OPS_SNAPSHOTS_RELATIVE_DIR / snapshot.name
+                ).as_posix()
+                if relative_snapshot in kept_backups:
+                    continue
+                try:
+                    if snapshot.is_file() and snapshot.stat().st_mtime < cutoff_ts:
+                        snapshot.unlink()
+                        dropped_snapshots += 1
+                except OSError:
+                    continue
+
+    return {"dropped_entries": dropped_entries, "dropped_snapshots": dropped_snapshots}
 
 
 def _fresh_memory_fields() -> dict[str, Any]:
@@ -1582,6 +2084,9 @@ def move_validated_vault_markdown(
     The source is validated and read only after acquiring the lock.  A matching
     pre-existing destination is deduplicated; a conflicting destination fails
     without changing either note.
+
+    Not recorded in the ops journal (``.session/ops.jsonl``): ``recover_ops_journal``
+    cannot undo a move, only the rewrites and frontmatter patches it does track.
     """
     with _open_vault_root_once(vault_path) as root:
         source_relative = _vault_relative_markdown_path(root.path, source_path)
@@ -1688,7 +2193,14 @@ def patch_validated_vault_frontmatter(
     manifest: VaultManifest | None = None,
     existing_lock: VaultWriteLock | None = None,
 ) -> FrontmatterDocument:
-    """Losslessly patch top-level frontmatter while keeping body bytes stable."""
+    """Losslessly patch top-level frontmatter while keeping body bytes stable.
+
+    Recorded in the ops journal the same way ``write_validated_vault_markdown``
+    is (аудит 2026-09-03, п.20, round-4 warning 3) -- callers such as the
+    decisions queue, fact-check, and memory-engine supersession flows patch
+    frontmatter directly through this function, and were previously invisible
+    to ``recover_ops_journal``.
+    """
     with _open_vault_root_once(vault_path) as root:
         relative = _vault_relative_markdown_path(root.path, path)
         with vault_markdown_write_lock(root, existing_lock) as lock:
@@ -1722,6 +2234,13 @@ def patch_validated_vault_frontmatter(
                     candidate,
                     expected_source=(identity, current_hash),
                     capability=lock,
+                )
+                _record_ops_journal_entry(
+                    root.path,
+                    relative,
+                    sha_before=current_hash,
+                    old_bytes=current,
+                    content=candidate,
                 )
                 return document
 

@@ -33,6 +33,7 @@ from d_brain.services.youtube_transcript import (
     YouTubeTranscriptService,
 )
 
+CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 LINK_SUMMARY_TIMEOUT = 45
 YOUTUBE_SUMMARY_TIMEOUT = 120
 GENERIC_URL_RE = re.compile(r"https?://[^\s<>()\[\]\"']+", re.IGNORECASE)
@@ -405,6 +406,8 @@ class LinkSummaryService:
 
         def _is_public_ip(value: str) -> bool:
             ip = ipaddress.ip_address(value)
+            if isinstance(ip, ipaddress.IPv4Address) and ip in CGNAT_NETWORK:
+                return False
             return not (
                 ip.is_private
                 or ip.is_loopback

@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -28,6 +28,7 @@ from d_brain.services.frontmatter import (
 )
 from d_brain.services.localization import normalize_language, translate
 from d_brain.services.qmd import QmdService
+from d_brain.services.secrets import scrub_secrets
 from d_brain.services.source_links import SourceInfo, format_source_markdown
 
 YOUTUBE_TIMEOUT = 120
@@ -380,7 +381,7 @@ class YouTubeTranscriptService:
 
     @staticmethod
     def _yt_dlp_command(args: Iterable[str]) -> list[str]:
-        return [sys.executable, "-m", "yt_dlp", *args]
+        return [sys.executable, "-m", "yt_dlp", "--no-playlist", *args]
 
     def _run_yt_dlp(self, args: Iterable[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -439,6 +440,16 @@ class YouTubeArchiveService:
         refresh_qmd: bool = True,
     ) -> YouTubeArchiveResult:
         manifest = self._manifest_for_writes()
+        transcript_text, transcript_scrub_count = scrub_secrets(transcript.transcript)
+        summary, summary_scrub_count = scrub_secrets(summary)
+        transcript = replace(transcript, transcript=transcript_text)
+        scrub_count = transcript_scrub_count + summary_scrub_count
+        if scrub_count:
+            logger.info(
+                "scrub_secrets: %d replacement(s) in %s",
+                scrub_count,
+                f"youtube:{transcript.video_id or transcript.url}",
+            )
         raw_path = self._build_path(
             root=self.raw_root,
             timestamp=timestamp,

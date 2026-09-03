@@ -16,6 +16,11 @@
         <string>-m</string>
         <string>d_brain.run_plaud_sync</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>UV_BIN</key>
+        <string>@UV_BIN@</string>
+    </dict>
     <key>WorkingDirectory</key>
     <string>@PROJECT_DIR@</string>
     <key>StartInterval</key>

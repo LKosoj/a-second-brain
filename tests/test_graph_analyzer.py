@@ -314,7 +314,10 @@ def test_graph_link_builder_never_writes_inside_the_human_zone(tmp_path: Path) -
     builder = _load_graph_link_builder()
     page = _compiled_page_with_human_related(tmp_path)
 
-    assert builder.apply_link(page, "topics/quantum-widgets", dry_run=False) is True
+    assert (
+        builder.apply_link(page.parent, page, "topics/quantum-widgets", dry_run=False)
+        is True
+    )
 
     content = page.read_text(encoding="utf-8")
     start = content.index("<!-- human:start -->")
@@ -342,7 +345,10 @@ def test_graph_link_builder_keeps_human_zone_bytes_including_line_endings(
     )
     page.write_bytes(b"# Aurora\n\n## Owner Notes\n" + zone + b"\n")
 
-    assert builder.apply_link(page, "topics/quantum-widgets", dry_run=False) is True
+    assert (
+        builder.apply_link(page.parent, page, "topics/quantum-widgets", dry_run=False)
+        is True
+    )
 
     after = page.read_bytes()
     assert zone in after
@@ -368,7 +374,10 @@ def test_graph_link_builder_skips_a_note_that_is_not_valid_utf8(
     original = b"# Aurora\n\nOwner note: \xff\xfe\n"
     page.write_bytes(original)
 
-    assert builder.apply_link(page, "topics/quantum-widgets", dry_run=False) is False
+    assert (
+        builder.apply_link(page.parent, page, "topics/quantum-widgets", dry_run=False)
+        is False
+    )
 
     assert page.read_bytes() == original
     assert "[SKIP]" in capsys.readouterr().out
@@ -388,7 +397,10 @@ def test_graph_link_builder_leaves_ambiguous_human_zone_untouched(
     )
     page.write_text(original, encoding="utf-8")
 
-    assert builder.apply_link(page, "topics/quantum-widgets", dry_run=False) is False
+    assert (
+        builder.apply_link(page.parent, page, "topics/quantum-widgets", dry_run=False)
+        is False
+    )
     assert page.read_text(encoding="utf-8") == original
 
 
@@ -409,7 +421,10 @@ def test_graph_link_builder_leaves_unpaired_marker_human_zone_untouched(
     )
     page.write_text(original, encoding="utf-8")
 
-    assert builder.apply_link(page, "topics/quantum-widgets", dry_run=False) is False
+    assert (
+        builder.apply_link(page.parent, page, "topics/quantum-widgets", dry_run=False)
+        is False
+    )
     assert page.read_text(encoding="utf-8") == original
 
 

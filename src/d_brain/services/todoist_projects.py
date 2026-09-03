@@ -4,19 +4,19 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from d_brain.services.cli_runner import CliRunner
+from d_brain.services.cli_runner import CliRunner, build_subprocess_env
 from d_brain.services.json_normalizer import extract_first_json_dict
 
 logger = logging.getLogger(__name__)
 
 TODOIST_PROJECTS_LIMIT = 200
 TODOIST_PROJECT_ROUTING_TIMEOUT = 180
+TODOIST_FIND_PROJECTS_TIMEOUT = 120
 TODOIST_PROJECT_CATALOG_TTL_SECONDS = 3600
 
 
@@ -81,20 +81,27 @@ class TodoistProjectCatalog:
 
     def refresh(self) -> dict[str, Any]:
         payload = {"limit": TODOIST_PROJECTS_LIMIT}
-        result = subprocess.run(
-            [
-                "mcp-cli",
-                "call",
-                "todoist",
-                "find-projects",
-                json.dumps(payload, ensure_ascii=False),
-            ],
-            cwd=self.vault_path,
-            capture_output=True,
-            text=True,
-            check=False,
-            env={**os.environ, **self.build_env()},
-        )
+        try:
+            result = subprocess.run(
+                [
+                    "mcp-cli",
+                    "call",
+                    "todoist",
+                    "find-projects",
+                    json.dumps(payload, ensure_ascii=False),
+                ],
+                cwd=self.vault_path,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=build_subprocess_env(self.build_env()),
+                timeout=TODOIST_FIND_PROJECTS_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Todoist find-projects timed out after "
+                f"{TODOIST_FIND_PROJECTS_TIMEOUT}s"
+            ) from exc
         if result.returncode != 0:
             error_text = result.stderr.strip() or result.stdout.strip()
             raise RuntimeError(error_text or "Todoist find-projects failed")

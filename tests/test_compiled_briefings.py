@@ -1714,7 +1714,10 @@ def test_compiled_briefings_run_queue_worker_force_does_not_loop_on_retry_backof
     real_drain_queue_once = service._drain_queue_once
 
     def counting_drain_queue_once(
-        *, force: bool, max_events: int
+        *,
+        force: bool,
+        max_events: int,
+        on_event_processed: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         drain_calls["count"] += 1
         if drain_calls["count"] > 5:
@@ -1722,7 +1725,11 @@ def test_compiled_briefings_run_queue_worker_force_does_not_loop_on_retry_backof
                 "run_queue_worker kept re-claiming a retry-backoff event "
                 "under --force instead of honoring its due_at"
             )
-        return real_drain_queue_once(force=force, max_events=max_events)
+        return real_drain_queue_once(
+            force=force,
+            max_events=max_events,
+            on_event_processed=on_event_processed,
+        )
 
     monkeypatch.setattr(service, "_drain_queue_once", counting_drain_queue_once)
 
@@ -1797,7 +1804,10 @@ def test_compiled_briefings_run_queue_worker_force_respects_backoff_across_poll_
     real_drain_queue_once = service._drain_queue_once
 
     def counting_drain_queue_once(
-        *, force: bool, max_events: int
+        *,
+        force: bool,
+        max_events: int,
+        on_event_processed: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         drain_calls["count"] += 1
         if drain_calls["count"] > 30:
@@ -1805,7 +1815,11 @@ def test_compiled_briefings_run_queue_worker_force_respects_backoff_across_poll_
                 "run_queue_worker's poll loop did not stop within the "
                 "idle window -- possible pacing regression"
             )
-        return real_drain_queue_once(force=force, max_events=max_events)
+        return real_drain_queue_once(
+            force=force,
+            max_events=max_events,
+            on_event_processed=on_event_processed,
+        )
 
     monkeypatch.setattr(service, "_drain_queue_once", counting_drain_queue_once)
 
@@ -1874,7 +1888,10 @@ def test_compiled_briefings_run_queue_worker_does_not_loop_on_budget_exhausted(
     real_drain_queue_once = service._drain_queue_once
 
     def counting_drain_queue_once(
-        *, force: bool, max_events: int
+        *,
+        force: bool,
+        max_events: int,
+        on_event_processed: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         drain_calls["count"] += 1
         if drain_calls["count"] > 30:
@@ -1882,7 +1899,11 @@ def test_compiled_briefings_run_queue_worker_does_not_loop_on_budget_exhausted(
                 "run_queue_worker kept re-claiming a budget-exhausted event "
                 "instead of leaving it for a later pass"
             )
-        return real_drain_queue_once(force=force, max_events=max_events)
+        return real_drain_queue_once(
+            force=force,
+            max_events=max_events,
+            on_event_processed=on_event_processed,
+        )
 
     monkeypatch.setattr(service, "_drain_queue_once", counting_drain_queue_once)
 
@@ -1945,7 +1966,10 @@ def test_compiled_briefings_run_queue_worker_ignores_in_flight_event_due_at(
     real_drain_queue_once = service._drain_queue_once
 
     def counting_drain_queue_once(
-        *, force: bool, max_events: int
+        *,
+        force: bool,
+        max_events: int,
+        on_event_processed: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         drain_calls["count"] += 1
         if drain_calls["count"] > 30:
@@ -1953,7 +1977,11 @@ def test_compiled_briefings_run_queue_worker_ignores_in_flight_event_due_at(
                 "run_queue_worker treated an unclaimable in_flight event as "
                 "ready work and never reached its idle deadline"
             )
-        return real_drain_queue_once(force=force, max_events=max_events)
+        return real_drain_queue_once(
+            force=force,
+            max_events=max_events,
+            on_event_processed=on_event_processed,
+        )
 
     monkeypatch.setattr(service, "_drain_queue_once", counting_drain_queue_once)
 

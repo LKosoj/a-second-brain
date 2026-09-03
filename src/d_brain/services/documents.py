@@ -36,6 +36,7 @@ from d_brain.services.localization import (
     translate,
 )
 from d_brain.services.qmd import QmdService
+from d_brain.services.secrets import scrub_secrets
 from d_brain.services.source_links import SourceInfo, format_source_markdown
 
 logger = logging.getLogger(__name__)
@@ -242,8 +243,26 @@ class DocumentArchiveService:
             file_format=file_format,
             original_name=file_name,
         )
+        plain_text, plain_text_scrub_count = scrub_secrets(
+            str(payload.get("plain_text", "") or "")
+        )
+        if plain_text_scrub_count:
+            logger.info(
+                "scrub_secrets: %d replacement(s) in %s",
+                plain_text_scrub_count,
+                f"documents:{file_name}",
+            )
+        caption_scrub_count = 0
+        if caption:
+            caption, caption_scrub_count = scrub_secrets(caption)
+            if caption_scrub_count:
+                logger.info(
+                    "scrub_secrets: %d replacement(s) in %s",
+                    caption_scrub_count,
+                    f"documents caption:{file_name}",
+                )
         extraction = DocumentExtractionResult(
-            plain_text=str(payload.get("plain_text", "") or ""),
+            plain_text=plain_text,
             title=str(payload.get("title", "") or self._title_from_name(file_name)),
             format=str(payload.get("format", file_format) or file_format),
             warnings=[str(item) for item in payload.get("warnings", []) if str(item)],
@@ -486,8 +505,7 @@ class DocumentArchiveService:
             str(raw_path),
             "--format",
             file_format,
-            "--name",
-            original_name,
+            f"--name={original_name}",
         ]
         try:
             proc = subprocess.run(

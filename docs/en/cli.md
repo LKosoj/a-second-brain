@@ -117,6 +117,33 @@ uv run --frozen --no-dev a-second-brain run
 Stop the foreground process with `Ctrl+C`. Production operation should use the
 provided systemd user unit.
 
+## `a-second-brain recover`
+
+Every rewrite or frontmatter patch the runtime makes through the validated
+vault writers is recorded in `vault/.session/ops.jsonl` together with a
+snapshot of the previous file content. `recover` undoes every recorded change
+of one run:
+
+```bash
+a-second-brain recover daily-process-20260903-210000 --vault vault
+```
+
+The `run_id` is printed at the end of the nightly digest. File moves are not
+journaled and cannot be undone. Do not run `recover` while the bot or the
+nightly process is running: both write to the same journal.
+
+## `a-second-brain ops-prune`
+
+Drop journal entries and snapshot backups older than N days (default 30):
+
+```bash
+a-second-brain ops-prune --vault vault --days 30
+```
+
+The nightly cycle already prunes the journal to a 30-day window, so this is
+only needed for a manual cleanup. The same "not alongside the bot or the
+nightly process" rule applies.
+
 ## General help
 
 ```bash

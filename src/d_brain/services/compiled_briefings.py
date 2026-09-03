@@ -1314,9 +1314,19 @@ class CompiledBriefingService:
                 )
                 while True:
                     self._touch_worker_state(worker_pid)
+                    # Touching once more per event inside the drain, not
+                    # just once per loop iteration above: a batch of up to
+                    # ``max_events`` sources, each worth a multi-minute
+                    # model timeout, can run long enough that the
+                    # once-per-iteration heartbeat above goes stale before
+                    # the batch returns -- see ``_drain_queue_once``'s
+                    # ``on_event_processed`` docstring.
                     batch = self._drain_queue_once(
                         force=loop_force,
                         max_events=max_events,
+                        on_event_processed=lambda: self._touch_worker_state(
+                            worker_pid
+                        ),
                     )
                     total_drained += int(batch.get("drained") or 0)
                     updated_paths.extend(
@@ -1448,8 +1458,19 @@ class CompiledBriefingService:
         *,
         force: bool,
         max_events: int,
+        on_event_processed: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
-        """Drain one ready queue batch without taking the outer worker lock."""
+        """Drain one ready queue batch without taking the outer worker lock.
+
+        ``on_event_processed``, when given, is called once after each
+        event's ``refresh_after_write`` call returns (success, error, or
+        budget-exhausted alike). ``run_queue_worker`` passes its worker
+        heartbeat writer here: a batch of up to ``max_events`` sources, each
+        good for a multi-minute model timeout, can run long enough between
+        loop iterations that the once-per-iteration heartbeat there goes
+        stale mid-batch, making ``spawn_background_drain`` think this worker
+        is dead and wipe its state -- see ``_worker_state_is_live``.
+        """
 
         selected = self._claim_ready_queue_events(
             force=force,
@@ -1500,6 +1521,8 @@ class CompiledBriefingService:
                         due_at=now_ts,
                     )
                 raise
+            if on_event_processed is not None:
+                on_event_processed()
             updated_paths.extend(str(path) for path in result.get("updated", []))
             if result.get("budget_exhausted"):
                 # ТЗ 5.5 inv 7 / G3: budget exhaustion is a normal
@@ -1616,8 +1639,14 @@ class CompiledBriefingService:
                     )
                 continue
 
+            # "ai-cli-unavailable" is a transient CLI-downtime error, not a
+            # verdict on the source itself (unlike "empty-source" and
+            # "unsupported-path" below, which describe the source and would
+            # fail again on retry no matter what) -- it must go through the
+            # same attempts<3 backoff path as any other retriable error, or
+            # a few minutes of CLI downtime permanently drops every source
+            # queued during it after a single attempt.
             retriable = event_errors not in (
-                ["ai-cli-unavailable"],
                 ["empty-source"],
                 ["unsupported-path"],
             )
@@ -1833,6 +1862,16 @@ class CompiledBriefingService:
                 )
                 errors = [*queue_errors, gate_error]
                 rollback_report = self.rollback_compile_enrich_pass(pass_id)
+                # The qmd search index was already refreshed above (right
+                # after the drain/backfill/etc. steps) from this pass's own
+                # writes -- a gate firing here means some of those writes
+                # just got reverted, so the index still points at rolled-
+                # back content until it is rebuilt again. Only worth doing
+                # when something was actually put back, not on every gate
+                # trip (a pass with nothing to roll back changed nothing the
+                # index needs to catch up on).
+                if rollback_report.get("restored"):
+                    self._refresh_qmd_index()
             elif missing_source_pages:
                 status = "failed"
                 gate_error = (
@@ -1842,6 +1881,16 @@ class CompiledBriefingService:
                 )
                 errors = [*queue_errors, gate_error]
                 rollback_report = self.rollback_compile_enrich_pass(pass_id)
+                # The qmd search index was already refreshed above (right
+                # after the drain/backfill/etc. steps) from this pass's own
+                # writes -- a gate firing here means some of those writes
+                # just got reverted, so the index still points at rolled-
+                # back content until it is rebuilt again. Only worth doing
+                # when something was actually put back, not on every gate
+                # trip (a pass with nothing to roll back changed nothing the
+                # index needs to catch up on).
+                if rollback_report.get("restored"):
+                    self._refresh_qmd_index()
             elif not took_work and not pages_changed:
                 # ТЗ 7.1: "no-work" must mean the whole pass did nothing --
                 # an empty queue with a real archival or backfill change is
@@ -2771,6 +2820,28 @@ class CompiledBriefingService:
             error_context="compiled briefing render",
             json_example=COMPILE_JSON_EXAMPLE,
         )
+        # Memoized for the lifetime of this one upsert call only (never
+        # stored on ``self``): ``_extract_and_verify_claims`` below renders a
+        # draft via ``_render_briefing(record_side_effects=False)`` purely to
+        # hand Verify a candidate page, and the final render right after it
+        # renders the same claims/conflicts again -- both go through
+        # ``_apply_claims_and_conflicts``, which used to call
+        # ``_adjudicate_conflict`` once per render per conflict pair. That
+        # doubled the model calls and let the (non-deterministic) verdict
+        # the final render sees differ from the one Verify actually approved.
+        # Keying on (page, existing_source, existing_claim, new_claim, type)
+        # makes the second render reuse the first render's verdict for the
+        # same pair instead of re-asking the model. ``type`` is part of the
+        # key, not just the first four, because ``_normalize_conflicts``
+        # does not deduplicate its input: a model response can legally
+        # contain two conflict entries that share the same
+        # (existing_source, existing_claim, new_claim) triple but disagree
+        # on ``type`` (e.g. one tagged "temporal", one "factual") -- each
+        # goes into ``_adjudicate_conflict`` as advisory context that can
+        # steer its verdict, so collapsing them onto one cache slot would
+        # let the second entry's outcome silently reuse a verdict reached
+        # under the other's framing.
+        adjudication_cache: dict[tuple[str, str, str, str, str], tuple[str, str]] = {}
         claims, conflicts = self._extract_and_verify_claims(
             payload=payload,
             target=target,
@@ -2780,6 +2851,7 @@ class CompiledBriefingService:
             existing_text=existing_text,
             existing_meta=existing_meta,
             signal=signal,
+            adjudication_cache=adjudication_cache,
         )
         try:
             rendered = self._render_briefing(
@@ -2792,6 +2864,7 @@ class CompiledBriefingService:
                 source_excerpt=source_excerpt,
                 claims=claims,
                 conflicts=conflicts,
+                adjudication_cache=adjudication_cache,
             )
         except HumanZoneMarkerError:
             # Same page-skipped-because-of-broken-markers class as the
@@ -3097,30 +3170,49 @@ class CompiledBriefingService:
         write and from ``_archive_candidate`` before the move/delete.
 
         A no-op with no active pass or with snapshots disabled for it. Only
-        the first call for a given ``rel_path`` in one pass takes effect --
-        the ТЗ wants the page's state before the PASS started, not before
-        each individual write inside it, so a page enriched twice in one
-        pass still rolls back to how it looked before the pass began.
+        the first call for a given ``rel_path`` in one pass records
+        ``before``/``fingerprint_before``/``source_state_before`` -- the ТЗ
+        wants the page's state before the PASS started, not before each
+        individual write inside it, so a page enriched twice in one pass
+        still rolls back to how it looked before the pass began. Every call
+        (first or repeat) does refresh ``fingerprint_after`` to this write's
+        result, though: without that, a page written twice in one pass kept
+        the *first* write's ``fingerprint_after`` on record, which no longer
+        matched the page's actual current bytes, so
+        ``rollback_compile_enrich_pass``'s fingerprint check always found a
+        "changed since the pass" mismatch and reported the page ``skipped``
+        instead of rolling it back.
         """
         pass_obj = self._active_pass
         if pass_obj is None or not pass_obj.snapshot_enabled:
             return
+        fingerprint_after = self._full_content_fingerprint(after)
+        after_hex = fingerprint_after.hex() if fingerprint_after is not None else None
         if rel_path in pass_obj.snapshot_manifest:
+            pass_obj.snapshot_manifest[rel_path]["fingerprint_after"] = after_hex
+            _atomic_write_text(
+                self._pass_snapshot_manifest_path(pass_obj.pass_id),
+                json.dumps(pass_obj.snapshot_manifest, ensure_ascii=False, indent=2),
+            )
             return
         if before is not None:
             _atomic_write_bytes(
                 self._pass_snapshot_blob_path(pass_obj.pass_id, rel_path), before
             )
         fingerprint_before = self._full_content_fingerprint(before)
-        fingerprint_after = self._full_content_fingerprint(after)
+        # Captured once, alongside the page bytes, so a rollback can put
+        # this page's applied-chunk ledger back the way it was too (see
+        # ``rollback_compile_enrich_pass``) -- otherwise a rolled-back
+        # enrichment's chunk hash stays recorded in source-state.json and
+        # ``_duplicate_source_chunk`` blocks ever re-applying it.
+        source_state_before = self._load_source_state()["entries"].get(rel_path)
         pass_obj.snapshot_manifest[rel_path] = {
             "existed": before is not None,
             "fingerprint_before": (
                 fingerprint_before.hex() if fingerprint_before is not None else None
             ),
-            "fingerprint_after": (
-                fingerprint_after.hex() if fingerprint_after is not None else None
-            ),
+            "fingerprint_after": after_hex,
+            "source_state_before": source_state_before,
         }
         _atomic_write_text(
             self._pass_snapshot_manifest_path(pass_obj.pass_id),
@@ -3196,6 +3288,17 @@ class CompiledBriefingService:
                 "manifest_found": manifest_found,
             }
 
+        # Keyed by page rel_path, collected while the page files themselves
+        # are restored/removed below and applied to source-state.json in one
+        # batch afterwards (ТЗ 5.5 inv 8): a rolled-back page's chunk-hash
+        # ledger in ``applied_chunks`` must go back with it, or
+        # ``_duplicate_source_chunk`` sees the (now reverted) page still
+        # carrying the hash of the enrichment that no longer applied to it
+        # and refuses to ever re-apply that same source chunk again. ``None``
+        # means the page had no source-state entry before the pass (a
+        # brand-new page); restoring that page to "did not exist" must drop
+        # its entry entirely, not leave the pass's own state behind.
+        state_restores: dict[str, dict[str, Any] | None] = {}
         with vault_write_lock(self.vault_path):
             for rel_path, entry in manifest.items():
                 if not isinstance(entry, dict):
@@ -3222,6 +3325,18 @@ class CompiledBriefingService:
                 elif file_path.exists():
                     file_path.unlink()
                 restored.append(rel_path)
+                state_restores[rel_path] = entry.get("source_state_before")
+            if state_restores:
+                with self._state_lock():
+                    state = self._load_source_state_unlocked()
+                    for restored_rel_path, source_state_before in (
+                        state_restores.items()
+                    ):
+                        if source_state_before is None:
+                            state["entries"].pop(restored_rel_path, None)
+                        else:
+                            state["entries"][restored_rel_path] = source_state_before
+                    self._write_source_state_unlocked(state)
         return {
             "restored": sorted(restored),
             "skipped": sorted(skipped),
@@ -4082,6 +4197,8 @@ class CompiledBriefingService:
         claims: list[dict[str, str]] | None = None,
         conflicts: list[dict[str, str]] | None = None,
         record_side_effects: bool = True,
+        adjudication_cache: dict[tuple[str, str, str, str, str], tuple[str, str]]
+        | None = None,
     ) -> str:
         claims = claims or []
         conflicts = conflicts or []
@@ -4443,6 +4560,7 @@ class CompiledBriefingService:
                     page_rel_path=page_rel_path,
                     page_state=self._section_text(existing_text, "Current State"),
                     record_side_effects=record_side_effects,
+                    adjudication_cache=adjudication_cache,
                 )
             )
         else:
@@ -7704,11 +7822,18 @@ class CompiledBriefingService:
         existing_text: str,
         existing_meta: dict[str, str],
         signal: dict[str, Any] | None,
+        adjudication_cache: dict[tuple[str, str, str, str, str], tuple[str, str]]
+        | None = None,
     ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
         """Claims/conflicts extraction entry point, called from
         ``_upsert_briefing`` before rendering. Returns ``([], [])`` when the
         payload carries no claims -- existing compile passes without a
         ``claims`` key are entirely unaffected (see final report).
+
+        ``adjudication_cache``, when given, is forwarded unchanged into the
+        draft render below so a conflict pair adjudicated here (to build the
+        Verify candidate) is not re-adjudicated by ``_upsert_briefing``'s
+        own final render of the very same claims/conflicts.
         """
         raw_claims = payload.get("claims")
         if not raw_claims:
@@ -7738,6 +7863,7 @@ class CompiledBriefingService:
             claims=claims,
             conflicts=conflicts,
             record_side_effects=False,
+            adjudication_cache=adjudication_cache,
         )
         verified_claims = self._verify_claims_batch(
             claims=claims,
@@ -8014,6 +8140,16 @@ class CompiledBriefingService:
         (including the ones that came back undecided -- they cost a model
         call all the same). Pure apart from the model calls: the caller
         writes.
+
+        ``new_trust`` is derived from ``_source_excerpt(new_source, "")``
+        (re-reads the source file by path when no excerpt is at hand),
+        exactly like ``refresh_daily_fully``/``_backfill_freshness_notes``
+        already recover source content this same way -- passing the empty
+        string straight to ``_source_trust_level`` made every ``daily/``
+        source read back as ``inferred`` here (its trust rule needs an
+        excerpt's entry headers to tell ``[voice]`` from ``[forward
+        from: ...]``; an empty one has none), even when the original write
+        rated the very same source ``own``.
         """
         page_state = self._section_text(text, "Current State")
         shaped_rows = self._sources_shaped_rows(text)
@@ -8038,7 +8174,9 @@ class CompiledBriefingService:
                 new_claim=new_claim,
                 new_source=new_source,
                 new_date=date_lookup.get((new_source, new_claim), since),
-                new_trust=self._source_trust_level(new_source, ""),
+                new_trust=self._source_trust_level(
+                    new_source, self._source_excerpt(new_source, "")
+                ),
                 claim_kind="fact",
                 model_conflict_type="factual",
                 attempt=2,
@@ -8614,6 +8752,8 @@ class CompiledBriefingService:
         page_rel_path: str,
         page_state: str = "",
         record_side_effects: bool = True,
+        adjudication_cache: dict[tuple[str, str, str, str, str], tuple[str, str]]
+        | None = None,
     ) -> tuple[
         list[tuple[str, str, str]],
         list[tuple[str, str, str, str]],
@@ -8670,6 +8810,19 @@ class CompiledBriefingService:
         the decisions queue. Trust is now stated to the adjudicator as
         evidence about where the words came from, and it weighs that
         against the claims themselves.
+
+        ``adjudication_cache``, when given, memoizes ``_adjudicate_conflict``
+        verdicts per (page, existing_source, existing_claim, new_claim, type)
+        pair for the caller's lifetime -- ``_upsert_briefing`` renders the page
+        twice (once via ``_extract_and_verify_claims`` to build Verify's
+        candidate, once for real), and without this every conflict pair on
+        the page was adjudicated twice: double the model calls, and a
+        chance for the second, non-deterministic verdict to disagree with
+        the one Verify actually saw. The cache is created fresh per upsert
+        call (never stored on ``self``), so the retry path
+        (``_settle_page_conflicts``, which calls ``_adjudicate_conflict``
+        directly and never passes a cache here) never reuses a verdict
+        across nights.
         """
         if not claims:
             return shaped_rows, claim_history_rows, open_conflict_rows
@@ -8710,19 +8863,36 @@ class CompiledBriefingService:
                 # pairing) -- nothing to resolve.
                 continue
             claim_kind = claim_kind_by_text.get(conflict["new_claim"], "fact")
-            outcome, context_note = self._adjudicate_conflict(
-                page_rel_path=page_rel_path,
-                page_state=page_state,
-                existing_claim=conflict["existing_claim"],
-                existing_source=conflict["existing_source"],
-                existing_date=existing_date,
-                new_claim=conflict["new_claim"],
-                new_source=source_rel_path,
-                new_date=new_date,
-                new_trust=current_trust,
-                claim_kind=claim_kind,
-                model_conflict_type=conflict["type"],
+            cache_key = (
+                page_rel_path,
+                conflict["existing_source"],
+                conflict["existing_claim"],
+                conflict["new_claim"],
+                conflict["type"],
             )
+            cached_verdict = (
+                adjudication_cache.get(cache_key)
+                if adjudication_cache is not None
+                else None
+            )
+            if cached_verdict is not None:
+                outcome, context_note = cached_verdict
+            else:
+                outcome, context_note = self._adjudicate_conflict(
+                    page_rel_path=page_rel_path,
+                    page_state=page_state,
+                    existing_claim=conflict["existing_claim"],
+                    existing_source=conflict["existing_source"],
+                    existing_date=existing_date,
+                    new_claim=conflict["new_claim"],
+                    new_source=source_rel_path,
+                    new_date=new_date,
+                    new_trust=current_trust,
+                    claim_kind=claim_kind,
+                    model_conflict_type=conflict["type"],
+                )
+                if adjudication_cache is not None:
+                    adjudication_cache[cache_key] = (outcome, context_note)
             effective_type = CONFLICT_OUTCOME_TO_TYPE[outcome]
             winner_is_new = outcome == "new_supersedes"
             if context_note:

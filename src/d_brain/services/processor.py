@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, redirect_stdout
@@ -35,7 +36,11 @@ from d_brain.manifest import (
     VaultManifest,
     load_manifest_for_vault,
 )
-from d_brain.services.cli_runner import CliExecutionError, CliRunner
+from d_brain.services.cli_runner import (
+    CliExecutionError,
+    CliRunner,
+    build_subprocess_env,
+)
 from d_brain.services.compiled_briefings import (
     QUESTION_CONTEXT_LIMIT,
     CompiledBriefingCandidate,
@@ -60,7 +65,10 @@ from d_brain.services.daily_workflow import (  # isort: skip
     run_json_phase,
 )
 from d_brain.services.entry_status import (
+    DAILY_ENTRY_RE,
     ENTRY_STATUS_ALREADY_PROCESSED,
+    extract_entry_statuses,
+    format_entry_status_comments,
     normalize_entry_type,
     parse_daily_entry_statuses,
 )
@@ -70,6 +78,7 @@ from d_brain.services.frontmatter import (
     UnsafeVaultPathError,
     parse_frontmatter_bytes,
     patch_frontmatter_bytes,
+    prune_ops_journal,
     write_validated_vault_markdown,
 )
 from d_brain.services.json_normalizer import extract_first_json_dict
@@ -99,6 +108,10 @@ REFLECT_DAILY_START_MARKER = "<!-- d-brain:reflect:start -->"
 REFLECT_DAILY_END_MARKER = "<!-- d-brain:reflect:end -->"
 TEXT_INTENT_CAPTURE = "capture"
 TEXT_INTENT_QUESTION = "question"
+# Consecutive scheduled-cycle failures a periodic step tolerates before it
+# self-disables (see ``_record_job_step_health``); the same threshold the
+# dashboard's "Отключённые шаги" screen (bot/dashboard.py) reads back.
+JOB_HEALTH_DISABLE_THRESHOLD = 3
 VAULT_HEALTH_LOW_SCORE_THRESHOLD = 80.0
 VAULT_HEALTH_REPORT_SECTION_RE = re.compile(
     r"^#{1,6}[ \t]+(?:(?:📊|🩺)[ \t]+)?"
@@ -139,6 +152,84 @@ QUESTION_ANSWER_TABLE_ROW_RE = re.compile(r"^[ \t]*\|")
 
 class ProcessAlreadyRunningError(RuntimeError):
     """Raised when a duplicate full processing run is attempted."""
+
+
+def job_health_path(vault_path: Path) -> Path:
+    """Path to the scheduled-cycle step failure-tracking file."""
+    return Path(vault_path) / ".session" / "job-health.json"
+
+
+def load_job_health(vault_path: Path) -> dict[str, Any]:
+    """Load the per-step failure-streak state for the scheduled cycle.
+
+    Module-level (not a ``CliProcessor`` method) so the dashboard's
+    "Отключённые шаги" screen (bot/dashboard.py) can read and edit it
+    without building a full processor instance.
+    """
+    path = job_health_path(vault_path)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        logger.warning("Invalid job-health state at %s", path)
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_job_health(vault_path: Path, payload: dict[str, Any]) -> None:
+    """Persist the per-step failure-streak state for the scheduled cycle.
+
+    Writes to a temporary file and ``os.replace``s it into place so a reader
+    never observes a partially-written file. This is not itself sufficient to
+    prevent a read-modify-write race between two callers (the scheduled
+    cycle and the bot's ``reenable_job_step``) -- callers must additionally
+    hold ``vault_write_lock`` around their whole load-modify-save sequence.
+    """
+    path = job_health_path(vault_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(f"{path.suffix}.tmp-{os.getpid()}")
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(tmp_path, path)
+
+
+def cycle_step_label(cycle_name: str, *, content_language: str = "ru") -> str:
+    """Localized display label for one scheduled-cycle step name.
+
+    Module-level (not a ``CliProcessor`` method) so the dashboard's
+    "Отключённые шаги" screen (bot/dashboard.py) can show the same Russian
+    labels as ``CliProcessor._cycle_label`` (which delegates here) without
+    building a full processor instance.
+    """
+    labels_ru = {
+        "daily": "Ежедневная обработка",
+        "weekly_digest": "Недельный дайджест",
+        "weekly_system_reflection": "Системная рефлексия",
+        "weekly_goals_rollover": "Переключение недельного фокуса",
+        "monthly": "Месячный обзор",
+        "yearly": "Годовой обзор",
+        "maintenance.compiled-nightly": "Поддержка compiled-слоя",
+        "maintenance.vault-health": "Здоровье vault",
+        "maintenance.compiled-fact-check": "Проверка фактов compiled",
+        "maintenance.compiled-digest": "Дайджест обогащения compiled",
+    }
+    labels_en = {
+        "daily": "Daily Processing",
+        "weekly_digest": "Weekly Digest",
+        "weekly_system_reflection": "System Reflection",
+        "weekly_goals_rollover": "Weekly Goals Rollover",
+        "monthly": "Monthly Review",
+        "yearly": "Yearly Review",
+        "maintenance.compiled-nightly": "Compiled Maintenance",
+        "maintenance.vault-health": "Vault Health",
+        "maintenance.compiled-fact-check": "Compiled Fact Check",
+        "maintenance.compiled-digest": "Compiled Digest",
+    }
+    labels = labels_ru if content_language == "ru" else labels_en
+    return labels.get(cycle_name, cycle_name)
 
 
 class CliProcessor:
@@ -182,6 +273,15 @@ class CliProcessor:
             catalog=self._project_catalog,
         )
         self._scheduled_cycle_lock_held = False
+        self._scheduled_cycle_day: date | None = None
+        # True only while ``run_scheduled_cycle`` holds the cycle lock (see
+        # its try/finally): every prompt run through ``_run_prompt``/
+        # ``_run_vault_prompt`` during the unattended nightly cycle -- daily
+        # capture/execute/reflect, periodic digests, audits -- asks
+        # ``CliRunner`` for the shell/network-denying backend flags instead
+        # of the interactive default. `/do`, `/process` preview, and `/why`
+        # never set this, so they keep full tool access.
+        self._restricted_mode = False
         self._daily_workflow = DailyWorkflow(self)
         # Compiled-page candidates ranked for the question currently being
         # answered (ТЗ 7.4 code-review defect 2): set fresh by
@@ -305,6 +405,7 @@ class CliProcessor:
             prompt,
             timeout=DEFAULT_TIMEOUT,
             extra_env=extra_env,
+            restricted=self._restricted_mode,
         )
 
     def _run_vault_prompt(self, prompt: str) -> str:
@@ -316,6 +417,7 @@ class CliProcessor:
         return self._assistant_runner.run(
             prompt,
             timeout=DEFAULT_TIMEOUT,
+            restricted=self._restricted_mode,
             extra_env=extra_env,
         )
 
@@ -808,8 +910,16 @@ class CliProcessor:
         summary_path: Path,
         refresh_qmd: bool,
         extra_lines: list[str] | None = None,
+        day: date | None = None,
     ) -> None:
-        """Append one concise periodic-review entry to today's daily."""
+        """Append one concise periodic-review entry to the cycle day's daily.
+
+        ``day`` pins the target daily file to the cycle's day even if a long
+        phase pushes the wall clock past midnight; the entry's ``HH:MM``
+        still reflects ``timestamp``'s actual time of day.
+        """
+        if day is not None:
+            timestamp = datetime.combine(day, timestamp.timetz())
         summary_rel_path = summary_path.relative_to(self.vault_path).as_posix()
         lines = [f"{label}: [[{summary_rel_path}|{summary_path.stem}]]"]
         if extra_lines:
@@ -1057,6 +1167,7 @@ class CliProcessor:
             summary_path=weekly_path,
             refresh_qmd=False,
             extra_lines=[f"{actual_week} -> {target_week}"],
+            day=today,
         )
         if refresh_qmd:
             self._refresh_qmd_index()
@@ -1305,8 +1416,16 @@ WORKFLOW:
         processed_observations: int,
         carry_forward_observations: int,
         refresh_qmd: bool,
+        day: date | None = None,
     ) -> None:
-        """Append one concise weekly system reflection entry to today's daily."""
+        """Append one concise weekly system reflection entry to the cycle day's daily.
+
+        ``day`` pins the target daily file to the cycle's day even if a long
+        phase pushes the wall clock past midnight; the entry's ``HH:MM``
+        still reflects ``timestamp``'s actual time of day.
+        """
+        if day is not None:
+            timestamp = datetime.combine(day, timestamp.timetz())
         copy = self._owner_report_defaults()
         carry_forward_line = (
             f"- {copy['carry_forward_label']}: {carry_forward_observations}"
@@ -1918,6 +2037,7 @@ WORKFLOW:
                 capture_output=True,
                 text=True,
                 check=False,
+                env=build_subprocess_env(),
                 timeout=self._UV_SCRIPT_TIMEOUT_SECONDS,
             )
         except FileNotFoundError as exc:
@@ -1947,6 +2067,7 @@ WORKFLOW:
                 capture_output=True,
                 text=True,
                 check=False,
+                env=build_subprocess_env(),
                 timeout=self._UV_SCRIPT_TIMEOUT_SECONDS,
             )
         except FileNotFoundError as exc:
@@ -2096,7 +2217,7 @@ WORKFLOW:
                     capture_output=True,
                     text=True,
                     check=False,
-                    env={**os.environ, **self._cli_extra_env()},
+                    env=build_subprocess_env(self._cli_extra_env()),
                     timeout=3600,
                 )
             except subprocess.TimeoutExpired:
@@ -2438,6 +2559,90 @@ WORKFLOW:
 
         if changed:
             self._recompute_capture_stats(capture_data)
+
+    def _mark_daily_entries_processed(self, day: date) -> None:
+        """Tag every entry EXECUTE just handled so a same-day rerun skips it.
+
+        Reuses the marker ``_apply_entry_status_guardrails`` already reads
+        (``entry_status.py``'s ``already_processed``, the same one
+        ``storage.append_to_daily``/``plaud.py`` write for duplicate
+        transcripts) instead of inventing a second one. Nothing previously
+        wrote it after a normal EXECUTE run, so a second scheduled run of a
+        day already processed re-classified every entry from scratch and
+        could recreate Todoist tasks and thoughts. The reflect phase's own
+        ``[d-brain]`` summary block is not a captured entry and is left
+        alone, matching ``_apply_entry_status_guardrails``' entry model.
+        """
+        # In the real scheduled pipeline this is a no-op: daily_workflow.run
+        # already bootstraps frontmatter via _ensure_daily_file before
+        # capture. But _normalize_saved_thoughts (this method's only caller)
+        # also has its own direct unit tests that skip straight to it with a
+        # frontmatter-less fixture daily file (see
+        # test_normalize_saved_thoughts_repairs_*_frontmatter) -- without
+        # this, the validated write below rejects that file outright.
+        daily_file = self._ensure_daily_file(day)
+        try:
+            original_bytes = daily_file.read_bytes()
+        except FileNotFoundError:
+            return
+        original = original_bytes.decode("utf-8")
+        matches = list(DAILY_ENTRY_RE.finditer(original))
+        if not matches:
+            return
+
+        marker_line = format_entry_status_comments((ENTRY_STATUS_ALREADY_PROCESSED,))
+        pieces: list[str] = []
+        cursor = 0
+        changed = False
+        for index, match in enumerate(matches):
+            block_end = (
+                matches[index + 1].start()
+                if index + 1 < len(matches)
+                else len(original)
+            )
+            pieces.append(original[cursor : match.end()])
+            block = original[match.end() : block_end]
+            entry_type = normalize_entry_type(match.group("type"))
+            if entry_type != "d-brain" and (
+                ENTRY_STATUS_ALREADY_PROCESSED not in extract_entry_statuses(block)
+            ):
+                pieces.append(f"\n{marker_line}")
+                changed = True
+            pieces.append(block)
+            cursor = block_end
+        pieces.append(original[cursor:])
+
+        if not changed:
+            return
+
+        candidate = "".join(pieces)
+        with vault_write_lock(self.vault_path) as lock:
+            try:
+                current_bytes = daily_file.read_bytes()
+            except FileNotFoundError:
+                return
+            if current_bytes != original_bytes:
+                logger.warning(
+                    "Daily file for %s changed concurrently; skipped processed markers",
+                    day,
+                )
+                return
+            try:
+                self._write_vault_markdown(
+                    daily_file,
+                    candidate,
+                    lock=lock,
+                    expected_full_sha256=sha256(original_bytes).hexdigest(),
+                )
+            except UnsafeVaultPathError as exc:
+                if str(exc) != (
+                    "atomic write source does not match expected_full_sha256"
+                ):
+                    raise
+                logger.warning(
+                    "Daily file for %s changed concurrently; skipped processed markers",
+                    day,
+                )
 
     def _build_capture_prompt(self, day: date) -> str:
         """Prompt for the shared capture phase."""
@@ -3108,6 +3313,13 @@ or recent vault notes before answering instead of guessing.
         if normalized_count:
             logger.info("Normalized %s thought note(s) after execute", normalized_count)
 
+        # Not thought-note cleanup itself, but this is the one place
+        # ``daily_workflow.DailyWorkflow._execute`` calls right after
+        # ``execute.json`` is written -- i.e. exactly "EXECUTE has
+        # succeeded" -- so idempotency marking piggybacks on it rather than
+        # adding a second call site there.
+        self._mark_daily_entries_processed(day)
+
     def _write_reflect_daily_block(
         self,
         day: date,
@@ -3624,6 +3836,63 @@ or recent vault notes before answering instead of guessing.
         result["processed_entries"] = int(result.get("pages_patched") or 0)
         return result
 
+    def _freshness_lint_report(self) -> str:
+        """Owner-facing summary of compiled facts that carry no date or source.
+
+        Runs ``skills/vault-health/scripts/freshness_lint.py`` in-process (the
+        same way ``_load_memory_engine_module`` does for memory-engine) and
+        renders at most a few findings. Returns "" when the script or the
+        ``compiled/`` directory is absent, when nothing is flagged, or when
+        the lint itself fails -- a weekly digest must never be lost over a
+        lint problem, so failures only go to the service log.
+        """
+        script_path = (
+            self.vault_path.parent / "skills/vault-health/scripts/freshness_lint.py"
+        )
+        if not script_path.exists():
+            return ""
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "d_brain_freshness_lint_runtime", script_path
+            )
+            if spec is None or spec.loader is None:
+                return ""
+            module = importlib.util.module_from_spec(spec)
+            # ``@dataclass`` on the script's ``Finding`` resolves its string
+            # annotations through ``sys.modules[cls.__module__]``.
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            findings = list(module.lint_vault(self.vault_path))
+        except Exception:
+            logger.warning("Freshness lint failed", exc_info=True)
+            return ""
+        if not findings:
+            return ""
+
+        shown = findings[:5]
+        hidden = len(findings) - len(shown)
+        if self.content_language == "ru":
+            lines = [
+                "## 🕰 Свежесть compiled-страниц",
+                "",
+                f"- Фактов без даты или источника: {len(findings)}",
+            ]
+            more = f"- … и ещё {hidden}"
+        else:
+            lines = [
+                "## 🕰 Compiled Page Freshness",
+                "",
+                f"- Facts without a date or source: {len(findings)}",
+            ]
+            more = f"- … and {hidden} more"
+        lines.extend(
+            f"- `{finding.path}:{finding.line}` — {finding.reason}"
+            for finding in shown
+        )
+        if hidden:
+            lines.append(more)
+        return "\n".join(lines)
+
     def _run_vault_health_cycle(self) -> dict[str, Any]:
         """Rebuild graph stats and apply a safe repair pass when health is low."""
         try:
@@ -3709,7 +3978,7 @@ or recent vault notes before answering instead of guessing.
             "searchable_write": repair_applied,
         }
 
-    def _run_compiled_digest_cycle(self) -> dict[str, Any]:
+    def _run_compiled_digest_cycle(self, *, day: date | None = None) -> dict[str, Any]:
         """Build, write, and deliver the ТЗ 7.1 owner digest for the
         compiled-enrichment layer as the last of the ``scheduled-post``
         maintenance workflows (registry.py: it reads the pass journal
@@ -3744,7 +4013,12 @@ or recent vault notes before answering instead of guessing.
                 "searchable_write": False,
             }
 
-        today = date.today()
+        # ``day`` is only set when called directly; the scheduled maintenance
+        # dispatcher (``_run_control_plane_maintenance_workflow``) calls this
+        # with no arguments, so fall back to the cycle day pinned by
+        # ``_run_scheduled_cycle_locked`` before finally defaulting to
+        # ``date.today()`` for any other caller.
+        today = day or self._scheduled_cycle_day or date.today()
         try:
             pass_status = read_pass_status(self.vault_path)
             digest = build_daily_digest(self.vault_path, today, pass_status=pass_status)
@@ -3927,33 +4201,7 @@ EXECUTION:
 
     def _cycle_label(self, cycle_name: str) -> str:
         """Localized display label for one scheduled review cycle."""
-        copy = self._owner_report_defaults()
-        labels_ru = {
-            "daily": "Ежедневная обработка",
-            "weekly_digest": copy["weekly_digest_title"],
-            "weekly_system_reflection": copy["system_reflection_title"],
-            "weekly_goals_rollover": "Переключение недельного фокуса",
-            "monthly": copy["monthly_review_title"],
-            "yearly": copy["yearly_review_title"],
-            "maintenance.compiled-nightly": "Поддержка compiled-слоя",
-            "maintenance.vault-health": "Здоровье vault",
-            "maintenance.compiled-fact-check": "Проверка фактов compiled",
-            "maintenance.compiled-digest": "Дайджест обогащения compiled",
-        }
-        labels_en = {
-            "daily": "Daily Processing",
-            "weekly_digest": copy["weekly_digest_title"],
-            "weekly_system_reflection": copy["system_reflection_title"],
-            "weekly_goals_rollover": "Weekly Goals Rollover",
-            "monthly": copy["monthly_review_title"],
-            "yearly": copy["yearly_review_title"],
-            "maintenance.compiled-nightly": "Compiled Maintenance",
-            "maintenance.vault-health": "Vault Health",
-            "maintenance.compiled-fact-check": "Compiled Fact Check",
-            "maintenance.compiled-digest": "Compiled Digest",
-        }
-        labels = labels_ru if self.content_language == "ru" else labels_en
-        return labels.get(cycle_name, cycle_name)
+        return cycle_step_label(cycle_name, content_language=self.content_language)
 
     def _build_control_plane_cycle_record(
         self,
@@ -3998,6 +4246,157 @@ EXECUTION:
             str(report or "").strip() for report in reports if str(report or "").strip()
         ]
         return "\n\n".join(parts)
+
+    def _is_job_step_disabled(self, step_name: str) -> bool:
+        """Whether a periodic scheduled-cycle step is currently self-disabled."""
+        entry = load_job_health(self.vault_path).get(step_name)
+        return bool(isinstance(entry, dict) and entry.get("disabled"))
+
+    def _record_job_step_health(self, step_name: str, result: dict[str, Any]) -> bool:
+        """Update one step's consecutive-failure streak; return True if newly disabled.
+
+        A step is any periodic scheduled-cycle entry (weekly digest,
+        monthly/yearly review, weekly goals rollover, or a
+        ``scheduled-post`` maintenance workflow) run by
+        ``_run_scheduled_cycle_locked`` -- never the daily pipeline itself.
+        ``result`` follows the same ``{"error": ...}`` convention every
+        cycle result in this file already uses; a run without an ``error``
+        key resets the streak.
+        """
+        # Held for the whole load-modify-save sequence: the bot's
+        # ``reenable_job_step`` (triggered from /menu) can run concurrently
+        # against this same file and must not interleave with it.
+        with vault_write_lock(self.vault_path):
+            health = load_job_health(self.vault_path)
+            raw_entry = health.get(step_name)
+            entry = raw_entry if isinstance(raw_entry, dict) else {}
+            error = str(result.get("error") or "").strip()
+            newly_disabled = False
+            if error:
+                consecutive = int(entry.get("consecutive_failures") or 0) + 1
+                disabled = consecutive >= JOB_HEALTH_DISABLE_THRESHOLD
+                newly_disabled = disabled and not entry.get("disabled")
+                health[step_name] = {
+                    "consecutive_failures": consecutive,
+                    "last_error": error,
+                    "last_failure_at": datetime.now().astimezone().isoformat(
+                        timespec="seconds"
+                    ),
+                    "disabled": disabled,
+                }
+            else:
+                health[step_name] = {
+                    "consecutive_failures": 0,
+                    "last_error": entry.get("last_error", ""),
+                    "last_failure_at": entry.get("last_failure_at", ""),
+                    "disabled": False,
+                }
+            save_job_health(self.vault_path, health)
+        return newly_disabled
+
+    def _disabled_step_skip_report(self, step_name: str) -> str:
+        """Owner-facing block for a step skipped because it is self-disabled."""
+        label = self._cycle_label(step_name)
+        if self.content_language == "ru":
+            return (
+                f"⛔ **{label}**\n\n"
+                f"Шаг отключён после {JOB_HEALTH_DISABLE_THRESHOLD} сбоев подряд "
+                "и пропущен. Включить снова: /menu → «Отключённые шаги»."
+            )
+        return (
+            f"⛔ **{label}**\n\n"
+            f"Step disabled after {JOB_HEALTH_DISABLE_THRESHOLD} consecutive "
+            "failures and skipped. Re-enable: /menu → \"Disabled steps\"."
+        )
+
+    def _disabled_step_transition_report(self, step_name: str) -> str:
+        """Extra owner-facing line for the failure that just disabled a step."""
+        label = self._cycle_label(step_name)
+        if self.content_language == "ru":
+            return (
+                f"⛔ Шаг «{label}» отключён после "
+                f"{JOB_HEALTH_DISABLE_THRESHOLD} сбоев подряд. "
+                "Включить снова: /menu → «Отключённые шаги»."
+            )
+        return (
+            f'⛔ Step "{label}" disabled after {JOB_HEALTH_DISABLE_THRESHOLD} '
+            'consecutive failures. Re-enable: /menu → "Disabled steps".'
+        )
+
+    def _disabled_steps_summary_report(self) -> str | None:
+        """One summary line for every currently self-disabled step.
+
+        Unlike ``_disabled_step_skip_report`` (only shown on the day a
+        disabled step's own schedule would have fired), this always lists
+        every disabled step so, e.g., a disabled monthly review isn't only
+        mentioned once a month.
+        """
+        health = load_job_health(self.vault_path)
+        disabled_names = sorted(
+            name
+            for name, entry in health.items()
+            if isinstance(entry, dict) and entry.get("disabled")
+        )
+        if not disabled_names:
+            return None
+        labels = ", ".join(self._cycle_label(name) for name in disabled_names)
+        if self.content_language == "ru":
+            return f"⛔ Отключены: {labels}"
+        return f"⛔ Disabled: {labels}"
+
+    def _verify_scheduled_cycle_artifacts(
+        self,
+        today: date,
+        daily_result: dict[str, Any],
+        periodic_cycles: list[dict[str, Any]],
+    ) -> list[str]:
+        """Warn about scheduled-cycle artifacts that should exist but don't.
+
+        A best-effort trip-wire, not a hard failure: every path checked here
+        is written by some other, already-tested step of this same cycle
+        (the reflect phase's daily block, ``_ensure_handoff_file``,
+        ``_rebuild_graph``, the compiled-digest maintenance workflow). If
+        disk state disagrees with what the cycle just reported doing, that
+        is worth a line in the owner's report and a service-log warning --
+        not a raised exception that would swallow everything the cycle
+        already accomplished.
+        """
+        missing: list[str] = []
+
+        if "error" not in daily_result and not daily_result.get("empty_daily"):
+            try:
+                daily_text = self._get_daily_file(today).read_text(encoding="utf-8")
+            except OSError:
+                daily_text = ""
+            if REFLECT_DAILY_START_MARKER not in daily_text:
+                missing.append(f"daily/{today.isoformat()}.md (блок reflect)")
+
+        if not self._handoff_path().exists():
+            missing.append(".session/handoff.md")
+
+        if not (self.vault_path / ".graph" / "vault-graph.json").exists():
+            missing.append(".graph/vault-graph.json")
+
+        digest_cycle = next(
+            (
+                cycle
+                for cycle in periodic_cycles
+                if cycle.get("name") == "maintenance.compiled-digest"
+            ),
+            None,
+        )
+        if digest_cycle is not None:
+            digest_result = digest_cycle.get("result")
+            digest_result = digest_result if isinstance(digest_result, dict) else {}
+            if not digest_result.get("skipped") and "error" not in digest_result:
+                if not digest_path(self.vault_path, today).exists():
+                    missing.append("дайджест обогащения compiled за сегодня")
+
+        lines: list[str] = []
+        for artifact in missing:
+            logger.warning("VERIFY: missing scheduled-cycle artifact: %s", artifact)
+            lines.append(f"🔴 VERIFY: нет {artifact}")
+        return lines
 
     @staticmethod
     def _strip_vault_health_report_section(report: str) -> str:
@@ -4312,6 +4711,9 @@ EXECUTION:
             report_markdown = summary_markdown or (
                 f"📅 **{copy['weekly_digest_title']}**"
             )
+            freshness_report = self._freshness_lint_report()
+            if freshness_report:
+                report_markdown = f"{report_markdown}\n\n{freshness_report}"
 
             summary_path: Path | None = None
             try:
@@ -4322,6 +4724,7 @@ EXECUTION:
                     label=copy["weekly_digest_title"],
                     summary_path=summary_path,
                     refresh_qmd=False,
+                    day=today,
                 )
                 if refresh_qmd:
                     self._refresh_qmd_index()
@@ -4501,6 +4904,7 @@ Return exactly one JSON object:
             processed_observations=processed_observations,
             carry_forward_observations=len(carry_forward),
             refresh_qmd=False,
+            day=today,
         )
         if refresh_qmd:
             self._refresh_qmd_index()
@@ -4610,6 +5014,7 @@ MONTHLY REVIEW RULES:
                     label=copy["monthly_review_title"],
                     summary_path=summary_path,
                     refresh_qmd=False,
+                    day=today,
                 )
                 if refresh_qmd:
                     self._refresh_qmd_index()
@@ -4731,6 +5136,7 @@ YEARLY REVIEW RULES:
                     summary_path=summary_path,
                     refresh_qmd=False,
                     extra_lines=extra_lines,
+                    day=today,
                 )
                 if refresh_qmd:
                     self._refresh_qmd_index()
@@ -4814,10 +5220,22 @@ YEARLY REVIEW RULES:
         try:
             with self._scheduled_process_lock():
                 self._scheduled_cycle_lock_held = True
+                # See ``_restricted_mode``'s docstring in ``__init__``: every
+                # prompt run for the rest of this cycle (through
+                # ``_run_prompt``/``_run_vault_prompt``) asks CliRunner for
+                # the shell/network-denying backend flags.
+                self._restricted_mode = True
                 try:
                     return self._run_scheduled_cycle_locked(day)
                 finally:
                     self._scheduled_cycle_lock_held = False
+                    self._restricted_mode = False
+                    # Pinned for the duration of this cycle only (see
+                    # ``_run_scheduled_cycle_locked``) -- clear it so a later,
+                    # unrelated direct call to ``_run_compiled_digest_cycle``
+                    # on this same processor instance does not pick up a
+                    # stale day.
+                    self._scheduled_cycle_day = None
         except ProcessAlreadyRunningError as exc:
             logger.warning("%s", exc)
             return {"error": str(exc), "processed_entries": 0}
@@ -4825,6 +5243,13 @@ YEARLY REVIEW RULES:
     def _run_scheduled_cycle_locked(self, day: date | None = None) -> dict[str, Any]:
         """Run scheduled processing while the full-cycle lock is held."""
         today = day or date.today()
+        # Pins the cycle day for entrypoints dispatched generically by name
+        # (``_run_control_plane_maintenance_workflow``, e.g.
+        # ``_run_compiled_digest_cycle``) that cannot take ``today`` as a
+        # direct argument without breaking that dispatcher's single-arg
+        # call signature. A long-running nightly cycle can cross midnight,
+        # so those entrypoints must not fall back to ``date.today()``.
+        self._scheduled_cycle_day = today
         daily_result = self.process_daily(today, mode=SCHEDULED_MODE)
         reports = [
             self._strip_vault_health_report_section(
@@ -4845,6 +5270,9 @@ YEARLY REVIEW RULES:
 
         if "error" not in daily_result:
             for cycle_name in self._scheduled_cycle_names_for_day(today):
+                if self._is_job_step_disabled(cycle_name):
+                    reports.append(self._disabled_step_skip_report(cycle_name))
+                    continue
                 try:
                     if cycle_name == "weekly_digest":
                         cycle_result = self.generate_weekly_digest(
@@ -4869,6 +5297,8 @@ YEARLY REVIEW RULES:
                 except Exception as exc:
                     logger.exception("Scheduled periodic cycle failed: %s", cycle_name)
                     cycle_result = {"error": str(exc), "processed_entries": 0}
+
+                newly_disabled = self._record_job_step_health(cycle_name, cycle_result)
 
                 label = self._cycle_label(cycle_name)
                 periodic_cycles.append(
@@ -4896,44 +5326,55 @@ YEARLY REVIEW RULES:
                         ]
                     )
                 reports.append(cycle_report)
+                if newly_disabled:
+                    reports.append(self._disabled_step_transition_report(cycle_name))
 
         if run_weekly_goals_rollover:
             rollover_name = "weekly_goals_rollover"
             rollover_label = self._cycle_label(rollover_name)
-            try:
-                rollover_result = self.rollover_weekly_goals(
-                    day=today,
-                    refresh_qmd=False,
-                )
-            except Exception as exc:
-                logger.exception("Scheduled weekly goals rollover failed")
-                rollover_result = {"error": str(exc), "processed_entries": 0}
+            if self._is_job_step_disabled(rollover_name):
+                reports.append(self._disabled_step_skip_report(rollover_name))
+            else:
+                try:
+                    rollover_result = self.rollover_weekly_goals(
+                        day=today,
+                        refresh_qmd=False,
+                    )
+                except Exception as exc:
+                    logger.exception("Scheduled weekly goals rollover failed")
+                    rollover_result = {"error": str(exc), "processed_entries": 0}
 
-            periodic_cycles.append(
-                {
-                    "name": rollover_name,
-                    "label": rollover_label,
-                    "result": rollover_result,
-                }
-            )
-            audits.append(
-                self._safe_audit_cycle_result(
-                    cycle_name=rollover_name,
-                    day=today,
-                    result=rollover_result,
+                newly_disabled = self._record_job_step_health(
+                    rollover_name, rollover_result
                 )
-            )
 
-            rollover_report = str(rollover_result.get("report", "")).strip()
-            if not rollover_report and "error" in rollover_result:
-                rollover_report = "\n".join(
-                    [
-                        f"❌ **{rollover_label}**",
-                        "",
-                        f"`{str(rollover_result['error'])}`",
-                    ]
+                periodic_cycles.append(
+                    {
+                        "name": rollover_name,
+                        "label": rollover_label,
+                        "result": rollover_result,
+                    }
                 )
-            reports.append(rollover_report)
+                audits.append(
+                    self._safe_audit_cycle_result(
+                        cycle_name=rollover_name,
+                        day=today,
+                        result=rollover_result,
+                    )
+                )
+
+                rollover_report = str(rollover_result.get("report", "")).strip()
+                if not rollover_report and "error" in rollover_result:
+                    rollover_report = "\n".join(
+                        [
+                            f"❌ **{rollover_label}**",
+                            "",
+                            f"`{str(rollover_result['error'])}`",
+                        ]
+                    )
+                reports.append(rollover_report)
+                if newly_disabled:
+                    reports.append(self._disabled_step_transition_report(rollover_name))
 
         # Maintenance workflows run regardless of daily processing outcome
         # so that compiled briefings, vault health, etc. stay fresh even when
@@ -4942,6 +5383,9 @@ YEARLY REVIEW RULES:
             kind="maintenance",
             trigger="scheduled-post",
         ):
+            if self._is_job_step_disabled(workflow.name):
+                reports.append(self._disabled_step_skip_report(workflow.name))
+                continue
             try:
                 cycle_result = self._run_control_plane_maintenance_workflow(
                     workflow.name
@@ -4951,6 +5395,7 @@ YEARLY REVIEW RULES:
                     "Scheduled maintenance workflow failed: %s", workflow.name
                 )
                 cycle_result = {"error": str(exc), "processed_entries": 0}
+            newly_disabled = self._record_job_step_health(workflow.name, cycle_result)
             periodic_cycles.append(
                 self._build_control_plane_cycle_record(
                     workflow.name,
@@ -4981,8 +5426,28 @@ YEARLY REVIEW RULES:
                     ]
                 )
             reports.append(cycle_report)
+            if newly_disabled:
+                reports.append(self._disabled_step_transition_report(workflow.name))
+
+        # ``.session/ops.jsonl`` and its snapshots are append-only; trim them
+        # to the rolling window once per night. Best-effort: the journal is
+        # a safety net, not a deliverable, so a failed prune is logged only.
+        try:
+            prune_ops_journal(self.vault_path)
+        except Exception:
+            logger.warning("Ops journal prune failed", exc_info=True)
 
         self._refresh_qmd_index()
+
+        disabled_summary = self._disabled_steps_summary_report()
+        if disabled_summary:
+            reports.append(disabled_summary)
+
+        reports.extend(
+            self._verify_scheduled_cycle_artifacts(
+                today, daily_result, periodic_cycles
+            )
+        )
 
         combined_report = self._combine_reports(*reports)
         task_candidates = [

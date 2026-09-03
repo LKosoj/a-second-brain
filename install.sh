@@ -24,7 +24,12 @@ else
   echo "Keeping existing private vault at $PROJECT_DIR/vault"
 fi
 
-chmod 600 "$PROJECT_DIR/.env"
+if [[ -f "$PROJECT_DIR/.env" ]]; then
+  chmod 600 "$PROJECT_DIR/.env"
+else
+  echo "No .env found (existing vault without .env, e.g. a restored vault)." >&2
+  echo "Copy it manually: cp $PROJECT_DIR/.env.example $PROJECT_DIR/.env" >&2
+fi
 
 echo
 echo "Installation prepared."

@@ -31,6 +31,8 @@ uv run skills/vault-health/scripts/connect_orphans.py --apply
 bash skills/vault-health/scripts/backlinks.sh "business/crm"
 uv run skills/vault-health/scripts/fix_links.py
 uv run skills/vault-health/scripts/fix_links.py --apply
+uv run skills/vault-health/scripts/freshness_lint.py vault
+uv run skills/vault-health/scripts/freshness_lint.py vault --json
 ```
 
 ## Current Vault Topology
@@ -62,6 +64,10 @@ code inside `CompiledBriefingService`, never by heuristics. `add_descriptions.py
 and any similar description-generation tooling must never guess at or
 overwrite these five fields on a compiled page; see
 [[skills/compile-enrich/SKILL|compile-enrich]] for what each one means.
+
+## Freshness Lint
+
+`freshness_lint.py` reports compiled-page facts (money amounts, percentages, тыс/млн/k/M counts, item counters, version numbers) that have no date and no source link within the same line or the two lines around them, skipping frontmatter, code blocks, and `## Sources`/`## Источники` sections; the page's own `updated:` frontmatter field does not count as a date for a fact in the body, since it only says when the page was last compiled, not when that specific fact was true. Run it with `uv run skills/vault-health/scripts/freshness_lint.py vault [--json] [--limit N]`, it always exits 0 since it is a report rather than a gate, and it also exposes `lint_vault(vault_path) -> list[Finding]` for other tooling (e.g. the weekly report) to import directly.
 
 ## Usage Notes
 

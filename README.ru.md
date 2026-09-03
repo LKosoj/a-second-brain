@@ -157,13 +157,15 @@ vault/
 
 ## Требования
 
-- отдельная непривилегированная учётная запись Linux с Python 3.12 или новее;
+- отдельная непривилегированная учётная запись Linux с Python 3.12 или новее
+  (macOS тоже поддерживается через launchd, см. [развёртывание на
+  macOS](docs/ru/macos.md));
 - [uv](https://docs.astral.sh/uv/);
 - `jq`;
 - токен Telegram-бота от BotFather;
 - API-ключ Deepgram для распознавания голоса;
 - один установленный и авторизованный AI CLI: Claude Code, Codex CLI,
-  Qwen Code, Gemini CLI или Kimi Code.
+  Qwen Code, Gemini CLI, Kimi Code, Grok CLI или opencode.
 
 Todoist, веб-экстракция, PLAUD, QMD и зашифрованные резервные копии
 необязательны и требуют дополнительных зависимостей и настроек. См. разделы

@@ -12,6 +12,13 @@ ExecStart=@UV_BIN@ run --frozen --no-dev a-second-brain run
 Restart=on-failure
 RestartSec=10
 NoNewPrivileges=true
+# The claude-tmux backend spawns a detached tmux session that outlives this
+# unit's main process on purpose. KillMode=control-group (the default) would
+# kill that session's processes too whenever systemd restarts or stops the
+# bot; process-only signalling leaves it running. Trade-off: any other child
+# still alive at stop/restart time (an ffmpeg transcode, a non-tmux AI CLI
+# run) is left running too and finishes or exits on its own.
+KillMode=process
 
 [Install]
 WantedBy=default.target

@@ -861,6 +861,7 @@ def test_run_daily_process_sends_scheduled_digest_with_changes(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     sent: list[tuple[str, str | None, bool]] = []
+    monkeypatch.setenv("D_BRAIN_RUN_ID", "daily-process-test")
 
     class FakeProcessor:
         def process_daily(self, day: date, *, mode: str):  # noqa: ANN202
@@ -948,7 +949,9 @@ def test_run_daily_process_sends_scheduled_digest_with_changes(
                 "- День сместился в qmd ranking tuning и recall contract.\n"
                 "- MEMORY.md очищен до durable operating context.\n\n"
                 "**Новые задачи**\n"
-                "- Проверить ranking qmd"
+                "- Проверить ranking qmd\n\n"
+                "run_id: daily-process-test (откат: a-second-brain recover "
+                f"daily-process-test --vault {tmp_path})"
             ),
             None,
             True,

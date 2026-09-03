@@ -23,9 +23,9 @@ Run before proposing a change:
 uv run --frozen --group dev ruff check .
 uv run --frozen --group dev mypy src
 uv run --frozen --group dev pytest -q
-shellcheck install.sh scripts/*.sh \
+shellcheck install.sh scripts/*.sh scripts/lib/*.sh \
   src/d_brain/resources/vault_template/.claude/hooks/*.sh
-bash -n install.sh scripts/*.sh
+bash -n install.sh scripts/*.sh scripts/lib/*.sh
 uv build
 git diff --check
 ```

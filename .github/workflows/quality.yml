@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -19,6 +23,7 @@ jobs:
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           version: "0.11.26"
+          enable-cache: true
 
       - name: Sync locked dependencies
         run: uv sync --frozen --group dev
@@ -26,11 +31,24 @@ jobs:
       - name: Ruff
         run: uv run --frozen ruff check .
 
+      - name: Ruff (project template skills, informational)
+        continue-on-error: true
+        run: uv run --frozen ruff check --isolated --select E,F,B src/d_brain/resources/project_template/skills
+
       - name: Mypy
         run: uv run --frozen mypy src
 
       - name: Tests
         run: uv run --frozen pytest -q
+
+      - name: Shellcheck
+        run: shellcheck install.sh scripts/*.sh scripts/lib/*.sh
+
+      - name: Dependency audit
+        run: |
+          uv export --frozen --no-hashes --no-emit-project --format requirements-txt \
+            -o "${{ runner.temp }}/requirements-audit.txt"
+          uvx pip-audit --strict -r "${{ runner.temp }}/requirements-audit.txt"
 
       - name: Build
         run: uv build

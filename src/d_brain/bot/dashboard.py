@@ -1,10 +1,11 @@
 """Inline dashboard rendering and state for the Telegram bot."""
 
+import asyncio
 import hashlib
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Literal, TypedDict
+from typing import Any, Literal, TypedDict
 
 from aiogram import Bot
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
@@ -26,11 +27,20 @@ from d_brain.services.file_browser import (
     BrowserRoot,
     FileBrowserService,
 )
+from d_brain.services.processor import (
+    JOB_HEALTH_DISABLE_THRESHOLD,
+    cycle_step_label,
+    load_job_health,
+    save_job_health,
+)
 from d_brain.services.session import SessionStore
 from d_brain.services.telegram_markup import (
+    TELEGRAM_TEXT_LIMIT,
     markdown_to_markdown_v2,
     normalize_markdown_input,
+    truncate_plain_text_for_edit,
 )
+from d_brain.services.vault_lock import vault_write_lock
 
 DashboardScreen = Literal[
     "home",
@@ -41,6 +51,7 @@ DashboardScreen = Literal[
     "queue_item",
     "brief_type",
     "weekly",
+    "jobhealth",
 ]
 CAPTURE_TYPES: tuple[str, ...] = ("voice", "text", "photo", "document", "forward")
 TYPE_META: tuple[tuple[str, str, str], ...] = (
@@ -196,6 +207,9 @@ def build_home_keyboard() -> InlineKeyboardMarkup:
                 ("📝 Бриф", "menu:brief"),
                 ("📅 Сводка недели", "menu:weekly"),
             ],
+            [
+                ("⛔ Отключённые шаги", "menu:jobhealth"),
+            ],
         ]
     )
 
@@ -208,6 +222,72 @@ def build_stats_keyboard() -> InlineKeyboardMarkup:
             [("🏠 Домой", "menu:home")],
         ]
     )
+
+
+def _disabled_job_steps(vault_path: Path | str) -> dict[str, dict[str, Any]]:
+    """Steps the scheduled cycle has self-disabled (see processor.py)."""
+    health = load_job_health(Path(vault_path))
+    return {
+        name: entry
+        for name, entry in health.items()
+        if isinstance(entry, dict) and entry.get("disabled")
+    }
+
+
+def build_disabled_steps_text(vault_path: Path | str) -> str:
+    """Build the screen listing scheduled-cycle steps that self-disabled."""
+    disabled = _disabled_job_steps(vault_path)
+    if not disabled:
+        return (
+            "**Отключённые шаги**\n\n"
+            "Сейчас все шаги ночного цикла работают без сбоев."
+        )
+
+    lines = [
+        "**Отключённые шаги**",
+        "",
+        f"Шаг отключается сам после {JOB_HEALTH_DISABLE_THRESHOLD} сбоев подряд "
+        "и пропускается, пока его не включат снова.",
+    ]
+    for name, entry in sorted(disabled.items()):
+        lines.append("")
+        lines.append(f"⛔ **{cycle_step_label(name)}**")
+        error = str(entry.get("last_error") or "").strip()
+        if error:
+            lines.append(f"`{error}`")
+    return "\n".join(lines)
+
+
+def build_disabled_steps_keyboard(vault_path: Path | str) -> InlineKeyboardMarkup:
+    """Build the disabled-steps screen keyboard: one re-enable button per step."""
+    disabled_names = sorted(_disabled_job_steps(vault_path))
+    rows: list[list[tuple[str, str]]] = [
+        [(f"▶️ Включить снова: {name}", f"menu:jobhealthenable:{name}")]
+        for name in disabled_names
+    ]
+    rows.append([("🔄 Обновить", "menu:jobhealth"), ("🏠 Домой", "menu:home")])
+    return _keyboard(rows)
+
+
+def reenable_job_step(vault_path: Path | str, step_name: str) -> bool:
+    """Reset one disabled step's failure streak; return True if it was disabled."""
+    vault_path = Path(vault_path)
+    # vault_write_lock (an exclusive file lock under vault/.locks/) covers the
+    # whole read-modify-write sequence so this can't interleave with the
+    # nightly cycle's own read-modify-write of the same job-health.json (see
+    # processor.py's _record_job_step_health).
+    with vault_write_lock(vault_path):
+        health = load_job_health(vault_path)
+        entry = health.get(step_name)
+        if not isinstance(entry, dict) or not entry.get("disabled"):
+            return False
+        health[step_name] = {
+            **entry,
+            "disabled": False,
+            "consecutive_failures": 0,
+        }
+        save_job_health(vault_path, health)
+    return True
 
 
 def build_file_roots_text(roots: list[BrowserRoot]) -> str:
@@ -447,6 +527,9 @@ def build_brief_type_keyboard() -> InlineKeyboardMarkup:
     return _keyboard(rows)
 
 
+_SCREEN_TRUNCATION_SUFFIX = "\n\n… (показаны первые строки, экран обрезан)"
+
+
 async def render_dashboard(
     bot: Bot,
     *,
@@ -464,6 +547,34 @@ async def render_dashboard(
         payload_text = f"ℹ️ _{notice}_\n\n{text}"
     payload_markdown = normalize_markdown_input(payload_text)
     payload_message = markdown_to_markdown_v2(payload_markdown)
+    if len(payload_message) > TELEGRAM_TEXT_LIMIT:
+        # A screen this long (e.g. a weekly review with 40+ changes) blows
+        # past Telegram's message limit. Left alone, the edit below fails
+        # and the ``send_text`` fallback ships an HTML document with no
+        # keyboard -- ``session.dashboard_message_id`` then points at that
+        # document forever, and every later edit on this screen fails too.
+        # MarkdownV2 escaping grows the text (every '.', '-', '(' becomes
+        # two characters), so trimming the raw text to the limit once is
+        # not enough: shrink the raw budget by the observed overshoot until
+        # the escaped payload fits.
+        source_text = payload_text
+        raw_budget = TELEGRAM_TEXT_LIMIT
+        for _ in range(8):
+            overshoot = len(payload_message)
+            raw_budget = max(1, raw_budget * TELEGRAM_TEXT_LIMIT // overshoot)
+            if raw_budget <= len(_SCREEN_TRUNCATION_SUFFIX) + 200:
+                # Nothing readable would survive; leave the oversized text
+                # to the document fallback below instead of a bare suffix.
+                break
+            payload_text = truncate_plain_text_for_edit(
+                source_text,
+                max_length=raw_budget,
+                suffix=_SCREEN_TRUNCATION_SUFFIX,
+            )
+            payload_markdown = normalize_markdown_input(payload_text)
+            payload_message = markdown_to_markdown_v2(payload_markdown)
+            if len(payload_message) <= TELEGRAM_TEXT_LIMIT:
+                break
 
     if target_message_id:
         try:
@@ -536,6 +647,28 @@ async def render_stats(
     )
 
 
+async def render_disabled_steps(
+    bot: Bot,
+    *,
+    chat_id: int,
+    vault_path: Path | str,
+    preferred_message_id: int | None = None,
+    notice: str | None = None,
+) -> None:
+    """Render the self-disabled scheduled-cycle steps screen."""
+    session = get_dashboard_session(chat_id)
+    session.current_screen = "jobhealth"
+    await render_dashboard(
+        bot,
+        chat_id=chat_id,
+        session=session,
+        text=build_disabled_steps_text(vault_path),
+        keyboard=build_disabled_steps_keyboard(vault_path),
+        preferred_message_id=preferred_message_id,
+        notice=notice,
+    )
+
+
 async def render_file_roots(
     bot: Bot,
     *,
@@ -577,7 +710,8 @@ async def render_file_directory(
 ) -> None:
     """Render one directory inside the file browser."""
     browser = FileBrowserService(vault_path)
-    root, normalized_dir, entries = browser.list_entries(
+    root, normalized_dir, entries = await asyncio.to_thread(
+        browser.list_entries,
         root_id=root_id,
         current_dir=current_dir,
     )
@@ -632,7 +766,7 @@ async def render_queue(
     a response applied to one item is reflected the moment the list is
     reopened, with no separate cache to invalidate.
     """
-    all_items = list_queue_items(Path(vault_path))
+    all_items = await asyncio.to_thread(list_queue_items, Path(vault_path))
     total_items = len(all_items)
     total_pages = max(1, (total_items + QUEUE_PAGE_SIZE - 1) // QUEUE_PAGE_SIZE)
     safe_page = min(max(page, 0), total_pages - 1)
@@ -796,7 +930,9 @@ async def render_weekly_review(
     """Render the "Сводка недели" screen (задача N, missed acceptance
     criterion). Collected fresh from ``collect_weekly_review`` on every
     render, same convention as ``render_queue``."""
-    review = collect_weekly_review(Path(vault_path), date.today())
+    review = await asyncio.to_thread(
+        collect_weekly_review, Path(vault_path), date.today()
+    )
 
     session = get_dashboard_session(chat_id)
     session.current_screen = "weekly"

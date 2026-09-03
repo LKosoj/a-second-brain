@@ -24,13 +24,53 @@ if [[ ! -f "$ENV_FILE" ]]; then
     exit 66
 fi
 
-# auto-export every assignment so the child sees every key without us
-# having to enumerate them in the plist. dotenv-style files use # for
-# comments and `export` is optional; the `set -a` switch handles both.
-set -a
-# shellcheck disable=SC1090
-source "$ENV_FILE"
-set +a
+# Parse the .env file ourselves instead of sourcing it. `source` runs every
+# line as bash: an unquoted space in a value (OWNER_FULL_NAME=John Smith)
+# becomes "Smith: command not found", and characters like $$ or $HOME get
+# shell-expanded -- unlike python-dotenv, which is what the rest of the
+# project uses to read the same file and only expands explicit ${VAR}
+# references. This loop copies python-dotenv's basic semantics instead:
+#   - blank lines and lines starting with '#' (leading whitespace allowed)
+#     are skipped
+#   - a leading "export" followed by whitespace is accepted and stripped;
+#     "export=1" is a plain key named "export", as in python-dotenv
+#   - a line whose key is not a valid identifier is skipped with a warning
+#     on stderr instead of aborting the wrapped command
+#   - key/value are split on the first '='
+#   - a value wrapped in matching single or double quotes has the quotes
+#     stripped; anything else is taken literally, with no expansion
+# Limitations (unlike python-dotenv): no inline comments, no line
+# continuation, no escape sequences (\n, \t, ...) inside double-quoted
+# values, and no multi-line values.
+while IFS= read -r _line || [[ -n "$_line" ]]; do
+    _trimmed="${_line#"${_line%%[![:space:]]*}"}"
+    [[ -z "$_trimmed" || "$_trimmed" == \#* ]] && continue
+    [[ "$_trimmed" != *=* ]] && continue
+
+    _key="${_trimmed%%=*}"
+    _value="${_trimmed#*=}"
+    if [[ "$_key" == export[[:space:]]* ]]; then
+        _key="${_key#export}"
+    fi
+    _key="${_key#"${_key%%[![:space:]]*}"}"
+    _key="${_key%"${_key##*[![:space:]]}"}"
+    if [[ ! "$_key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        echo "run_with_env: skipping malformed .env line: ${_trimmed%%=*}=..." >&2
+        continue
+    fi
+
+    _value="${_value#"${_value%%[![:space:]]*}"}"
+    _value="${_value%"${_value##*[![:space:]]}"}"
+    if [[ ${#_value} -ge 2 ]]; then
+        if [[ "$_value" == \"*\" && "$_value" == *\" ]]; then
+            _value="${_value:1:${#_value}-2}"
+        elif [[ "$_value" == \'*\' && "$_value" == *\' ]]; then
+            _value="${_value:1:${#_value}-2}"
+        fi
+    fi
+    export "$_key=$_value"
+done <"$ENV_FILE"
+unset _line _trimmed _key _value
 
 # launchd runs jobs with a minimal PATH (only /usr/bin:/bin and a few
 # Apple-internal locations). That is fine for ``uv`` because the plist

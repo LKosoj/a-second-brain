@@ -10,6 +10,19 @@ from pathlib import Path, PurePosixPath
 
 from d_brain.manifest import VaultManifest, load_manifest_for_vault
 
+# vault-graph.json is written by analyze.py as a flat dict at the JSON root
+# (no "stats" nesting). Each entry maps the label used in the hygiene
+# summary to the producer's real key(s), tried in order; the first present
+# key wins. Some keys (e.g. "broken_links") are lists of records in the
+# current producer, so a list value is reported by its length.
+_HYGIENE_GRAPH_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("health_score", ("health_score",)),
+    ("broken_links", ("broken_link_count", "broken_links")),
+    ("orphan_files", ("orphan_count", "orphans")),
+    ("weak_links", ("weakly_connected_count", "weakly_connected")),
+    ("daily_files", ("malformed_daily_count", "malformed_daily_notes")),
+)
+
 
 @dataclass(frozen=True)
 class ContextSection:
@@ -238,17 +251,17 @@ class ContextPackBuilder:
         if graph:
             try:
                 payload = json.loads(graph)
-                values = [
-                    f"{key}={payload[key]}"
-                    for key in (
-                        "health_score",
-                        "broken_links",
-                        "orphan_files",
-                        "weak_links",
-                        "daily_files",
+                values = []
+                for label, source_keys in _HYGIENE_GRAPH_FIELDS:
+                    value = next(
+                        (payload[key] for key in source_keys if key in payload),
+                        None,
                     )
-                    if key in payload
-                ]
+                    if value is None:
+                        continue
+                    if isinstance(value, list):
+                        value = len(value)
+                    values.append(f"{label}={value}")
                 if values:
                     snapshots.append("vault graph: " + ", ".join(values))
             except json.JSONDecodeError:

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import subprocess
 import time
@@ -20,7 +19,7 @@ import httpx
 from d_brain.control_plane.contracts import WorkflowSpec
 from d_brain.control_plane.registry import get_workflow
 from d_brain.manifest import VaultManifest, load_manifest_for_vault
-from d_brain.services.cli_runner import CliRunner
+from d_brain.services.cli_runner import CliRunner, build_subprocess_env
 from d_brain.services.compiled_briefings import CompiledBriefingService
 from d_brain.services.entry_status import (
     ENTRY_STATUS_ALREADY_PROCESSED,
@@ -40,6 +39,7 @@ from d_brain.services.frontmatter import (
 from d_brain.services.json_normalizer import extract_first_json_dict
 from d_brain.services.localization import normalize_language, translate
 from d_brain.services.qmd import QmdService
+from d_brain.services.secrets import scrub_secrets
 from d_brain.services.source_links import (
     build_plaud_source_info,
     collapse_to_single_line,
@@ -56,6 +56,10 @@ PLAUD_TIMEOUT = 30.0
 PLAUD_PAGE_SIZE = 100
 PLAUD_TASK_WINDOW_DAYS = 7
 PLAUD_TASK_TIMEOUT = 1200
+PLAUD_PENDING_SUMMARY_MAX_AGE_DAYS = 7
+PLAUD_PENDING_SUMMARY_RESYNC_LIMIT = 50
+PLAUD_PENDING_SUMMARY_GIVE_UP_DAYS = 60
+PLAUD_SUMMARY_UNAVAILABLE_NOTE = "Саммари недоступно, импортирован транскрипт"
 
 
 class PlaudAuthError(RuntimeError):
@@ -123,7 +127,15 @@ def _safe_text(value: Any) -> str:
 
 def _content_blob_to_text(value: Any) -> str:
     if isinstance(value, str):
-        return value.strip()
+        stripped = value.strip()
+        if stripped and stripped[:1] in "{[":
+            try:
+                parsed = json.loads(stripped)
+            except ValueError:
+                return stripped
+            if isinstance(parsed, (dict, list)):
+                return _content_blob_to_text(parsed)
+        return stripped
     if isinstance(value, dict):
         for key in ("summary", "ai_content", "content", "text", "markdown"):
             text = _content_blob_to_text(value.get(key))
@@ -145,6 +157,76 @@ def _content_blob_to_text(value: Any) -> str:
                     parts.append(text)
         return "\n".join(parts).strip()
     return _safe_text(value)
+
+
+def _stable_detail_view(detail: Mapping[str, Any]) -> dict[str, Any]:
+    """Canonical, hash-stable subset of a PLAUD detail payload.
+
+    PLAUD wraps every content item in a presigned S3 URL
+    (``data_link``) carrying ``X-Amz-Date``/``X-Amz-Signature``/security-token
+    query parameters that change on every request even when the underlying
+    recording is unchanged. Hashing the raw detail therefore never settles on
+    a stable value, so the ``unchanged`` status is unreachable. Hash only the
+    fields that actually describe the recording's content instead.
+
+    Note: records imported before this fix have ``content_hash`` computed
+    from the raw payload, which will never match this narrower view. The
+    first ``--backfill`` run after deploying this change will therefore
+    re-import (and rewrite the note for) every existing recording once.
+    """
+    return {
+        "file_id": _safe_text(detail.get("file_id") or detail.get("id")),
+        "title": _safe_text(detail.get("title") or detail.get("file_name")),
+        "record_time": _safe_text(
+            detail.get("record_time") or detail.get("start_time")
+        ),
+        "duration": _safe_text(detail.get("duration")),
+        "transcript": _content_blob_to_text(detail.get("trans_result")),
+        "summary": _content_blob_to_text(detail.get("ai_content")),
+    }
+
+
+def _redact_data_link_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value.split("?", 1)[0]
+    return "<redacted>"
+
+
+def _is_signed_link_value(key: Any, value: Any) -> bool:
+    """True for any string that carries a presigned-URL query string.
+
+    PLAUD does not only expose this under ``data_link``: any key ending in
+    ``_link``/``_url`` (e.g. an unfamiliar ``audio_url``) or any string whose
+    query already contains an ``X-Amz-`` credential parameter must be treated
+    the same way, since new fields can appear without warning.
+    """
+    if not isinstance(value, str):
+        return False
+    if isinstance(key, str) and (key.endswith("_link") or key.endswith("_url")):
+        return True
+    return "X-Amz-" in value
+
+
+def _redact_detail_for_storage(detail: Mapping[str, Any]) -> dict[str, Any]:
+    """Strip presigned-URL query strings before a detail payload hits disk.
+
+    Signed URLs carry temporary AWS credentials
+    (``X-Amz-Date``/``X-Amz-Signature``/``X-Amz-Security-Token``) that must
+    not be persisted into ``imports/plaud/raw/``.
+    """
+
+    def _redact(key: Any, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                item_key: _redact(item_key, item) for item_key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [_redact(key, item) for item in value]
+        if _is_signed_link_value(key, value):
+            return _redact_data_link_value(value)
+        return value
+
+    return cast(dict[str, Any], _redact(None, dict(detail)))
 
 
 def _parse_timestamp(value: Any) -> datetime | None:
@@ -486,11 +568,15 @@ class PlaudSyncService:
             extra_env=self._cli_extra_env(),
         )
 
-    def _recorded_at(self, payload: Mapping[str, Any]) -> datetime:
+    def _recorded_at(
+        self, payload: Mapping[str, Any], *, fallback: datetime | None = None
+    ) -> datetime:
         for key in ("record_time", "create_time", "created_at", "updated_at"):
             parsed = _parse_timestamp(payload.get(key))
             if parsed is not None:
                 return parsed.astimezone()
+        if fallback is not None:
+            return fallback.astimezone()
         return _utc_now().astimezone()
 
     def _file_paths(self, file_id: str, recorded_at: datetime) -> tuple[Path, Path]:
@@ -576,7 +662,13 @@ class PlaudSyncService:
                     continue
 
                 counters["checked"] += 1
-                recorded_at = self._recorded_at(detail)
+                recording_state = state["recordings"].get(file_id)
+                if not isinstance(recording_state, dict):
+                    recording_state = {}
+                recorded_at = self._recorded_at(
+                    detail,
+                    fallback=_parse_timestamp(recording_state.get("recorded_at")),
+                )
                 canonical_note_path, _ = self._file_paths(file_id, recorded_at)
                 note_candidates = self._find_note_candidates(file_id)
                 if not note_candidates:
@@ -611,12 +703,15 @@ class PlaudSyncService:
                 canonical_rel_path = canonical_note_path.relative_to(
                     self.vault_path
                 ).as_posix()
-                recording_state = state.get("recordings", {}).get(file_id)
-                if (
-                    isinstance(recording_state, dict)
-                    and recording_state.get("note_path") != canonical_rel_path
-                ):
+                state_entry_changed = False
+                if recording_state.get("note_path") != canonical_rel_path:
                     recording_state["note_path"] = canonical_rel_path
+                    state_entry_changed = True
+                if recording_state.get("recorded_at") != recorded_at.isoformat():
+                    recording_state["recorded_at"] = recorded_at.isoformat()
+                    state_entry_changed = True
+                if state_entry_changed:
+                    state["recordings"][file_id] = recording_state
                     counters["state_updates"] += 1
 
                 title = _safe_text(detail.get("title")) or f"PLAUD {file_id}"
@@ -655,11 +750,20 @@ class PlaudSyncService:
         imported_at: datetime,
         context_type: str,
         raw_rel_path: str,
+        summary_override: str = "",
     ) -> str:
         file_id = str(detail.get("file_id") or detail.get("id") or "unknown")
         title = _safe_text(detail.get("title")) or f"PLAUD {file_id}"
         transcript = _safe_text(detail.get("trans_result"))
-        summary = _content_blob_to_text(detail.get("ai_content"))
+        summary = summary_override or _content_blob_to_text(detail.get("ai_content"))
+        transcript, transcript_scrub_count = scrub_secrets(transcript)
+        summary, summary_scrub_count = scrub_secrets(summary)
+        if transcript_scrub_count or summary_scrub_count:
+            logger.info(
+                "scrub_secrets: %d replacement(s) in %s",
+                transcript_scrub_count + summary_scrub_count,
+                f"plaud note:{file_id}",
+            )
         source = build_plaud_source_info(file_id, language=self.content_language)
         frontmatter = [
             "---",
@@ -753,12 +857,18 @@ class PlaudSyncService:
         self,
         *,
         detail: Mapping[str, Any],
+        summary: str,
+        transcript: str,
         recorded_at: datetime,
         retro_todo_allowed: bool,
     ) -> str:
+        # ``summary``/``transcript`` are the scrubbed copies from ``_sync_one``
+        # (code review): reading them back out of ``detail`` here sent a
+        # secret dictated in the recording to the AI CLI even though the
+        # vault note was already clean.
         reference = self._load_reference()
-        summary_text = _safe_text(detail.get("ai_content"))
-        transcript_text = _clip_prompt_text(_safe_text(detail.get("trans_result")))
+        summary_text = summary
+        transcript_text = _clip_prompt_text(transcript)
         metadata = {
             "file_id": detail.get("file_id") or detail.get("id"),
             "title": detail.get("title"),
@@ -766,7 +876,7 @@ class PlaudSyncService:
             "age_days": (_utc_now().astimezone().date() - recorded_at.date()).days,
             "retro_todo_allowed": retro_todo_allowed,
             "summary_length": len(summary_text),
-            "transcript_length": len(_safe_text(detail.get("trans_result"))),
+            "transcript_length": len(transcript),
         }
         return (
             "Read the PLAUD reference and classify the recording.\n\n"
@@ -855,7 +965,7 @@ class PlaudSyncService:
                     capture_output=True,
                     text=True,
                     check=False,
-                    env={**os.environ, **env},
+                    env=build_subprocess_env(env),
                     timeout=3600,
                 )
             except subprocess.TimeoutExpired:
@@ -963,14 +1073,18 @@ class PlaudSyncService:
         if not file_id:
             return {"status": "skipped", "reason": "missing-file-id"}
 
-        recorded_at = self._recorded_at(detail)
+        recording_state = dict(state["recordings"].get(file_id, {}))
+        recorded_at = self._recorded_at(
+            detail, fallback=_parse_timestamp(recording_state.get("recorded_at"))
+        )
         note_path, raw_path = self._file_paths(file_id, recorded_at)
 
         detail_hash = sha256(
-            json.dumps(detail, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            json.dumps(
+                _stable_detail_view(detail), ensure_ascii=False, sort_keys=True
+            ).encode("utf-8")
         ).hexdigest()
         source = build_plaud_source_info(file_id, language=self.content_language)
-        recording_state = dict(state["recordings"].get(file_id, {}))
         raw_previous_task_ids = recording_state.get("task_ids")
         previous_task_ids = (
             list(raw_previous_task_ids)
@@ -988,16 +1102,39 @@ class PlaudSyncService:
 
         summary = _safe_text(detail.get("ai_content"))
         transcript = _safe_text(detail.get("trans_result"))
+        summary, summary_scrub_count = scrub_secrets(summary)
+        transcript, transcript_scrub_count = scrub_secrets(transcript)
+        if summary_scrub_count or transcript_scrub_count:
+            logger.info(
+                "scrub_secrets: %d replacement(s) in %s",
+                summary_scrub_count + transcript_scrub_count,
+                f"plaud note:{file_id}",
+            )
+        pending_summary_note = ""
         if not summary:
-            state["recordings"][file_id] = {
-                **recording_state,
-                "status": "pending_summary",
-                "content_hash": detail_hash,
-                "recorded_at": recorded_at.isoformat(),
-                "last_synced_at": imported_at.isoformat(),
-            }
-            self._save_state(state)
-            return {"status": "pending_summary", "file_id": file_id}
+            first_seen_at = (
+                _parse_timestamp(recording_state.get("first_seen_at"))
+                or _parse_timestamp(recording_state.get("recorded_at"))
+                or imported_at
+            )
+            pending_age_days = max(
+                (imported_at.date() - recorded_at.date()).days,
+                (imported_at.date() - first_seen_at.astimezone().date()).days,
+            )
+            if transcript and pending_age_days > PLAUD_PENDING_SUMMARY_MAX_AGE_DAYS:
+                pending_summary_note = PLAUD_SUMMARY_UNAVAILABLE_NOTE
+                summary = pending_summary_note
+            else:
+                state["recordings"][file_id] = {
+                    **recording_state,
+                    "status": "pending_summary",
+                    "content_hash": detail_hash,
+                    "recorded_at": recorded_at.isoformat(),
+                    "first_seen_at": first_seen_at.isoformat(),
+                    "last_synced_at": imported_at.isoformat(),
+                }
+                self._save_state(state)
+                return {"status": "pending_summary", "file_id": file_id}
 
         record_age_days = (_utc_now().astimezone().date() - recorded_at.date()).days
         within_window = record_age_days <= PLAUD_TASK_WINDOW_DAYS
@@ -1011,6 +1148,8 @@ class PlaudSyncService:
                     self._run_prompt(
                         self._build_classification_prompt(
                             detail=detail,
+                            summary=summary,
+                            transcript=transcript,
                             recorded_at=recorded_at,
                             retro_todo_allowed=retro_todo_allowed,
                         )
@@ -1053,10 +1192,19 @@ class PlaudSyncService:
         context_type = _safe_text(verdict.get("context_type")) or "unknown"
         note_rel_path = note_path.relative_to(self.vault_path).as_posix()
         raw_rel_path = raw_path.relative_to(self.vault_path).as_posix()
+        raw_text, raw_scrub_count = scrub_secrets(
+            _dump_json(_redact_detail_for_storage(detail)) + "\n"
+        )
+        if raw_scrub_count:
+            logger.info(
+                "scrub_secrets: %d replacement(s) in %s",
+                raw_scrub_count,
+                f"plaud raw:{file_id}",
+            )
         write_vault_file_text(
             self.vault_path,
             raw_path,
-            _dump_json(detail) + "\n",
+            raw_text,
         )
         try:
             expected_note_hash = sha256(
@@ -1073,6 +1221,7 @@ class PlaudSyncService:
                 imported_at=imported_at,
                 context_type=context_type,
                 raw_rel_path=raw_rel_path,
+                summary_override=pending_summary_note,
             ),
             manifest=self._manifest_for_writes(),
             expected_full_sha256=expected_note_hash,
@@ -1106,10 +1255,14 @@ class PlaudSyncService:
             and bool(self.todoist_api_key)
             and bool(tasks)
         )
-        task_already_created = recording_state.get(
-            "todoist_fingerprint"
-        ) == tasks_fp and bool(recording_state.get("task_ids"))
+        task_already_created = bool(recording_state.get("task_ids"))
         if task_already_created:
+            if recording_state.get("todoist_fingerprint") != tasks_fp:
+                logger.debug(
+                    "PLAUD Todoist dedup: %s already has task_ids, skipping "
+                    "recreation despite fingerprint drift",
+                    file_id,
+                )
             pending_tasks_fp = ""
         task_creation_pending = bool(pending_tasks_fp)
         task_creation_unknown = False
@@ -1201,6 +1354,12 @@ class PlaudSyncService:
             "todoist_fingerprint": stored_tasks_fp,
             "task_ids": stored_task_ids,
             "last_synced_at": imported_at.isoformat(),
+            "summary_placeholder": bool(pending_summary_note),
+            **(
+                {"first_seen_at": recording_state.get("first_seen_at")}
+                if recording_state.get("first_seen_at")
+                else {}
+            ),
             **(
                 {"todoist_pending_fingerprint": pending_tasks_fp}
                 if pending_tasks_fp
@@ -1215,6 +1374,83 @@ class PlaudSyncService:
             "file_id": file_id,
             "tasks_created": len(created_task_ids),
         }
+
+    def _pending_summary_file_ids(self, state: Mapping[str, Any]) -> list[str]:
+        """Oldest-first ids awaiting a real summary, bounded for one sync call.
+
+        Incremental syncs only page through the newest recordings, so a
+        record stuck in ``pending_summary`` falls off the fetched page and is
+        never looked at again until the next ``--backfill``. Records already
+        imported with the "summary unavailable" placeholder have the same
+        problem: PLAUD may deliver the real summary later, but nothing would
+        ever recheck them once they age off the page. Revisiting both groups
+        explicitly closes that gap.
+
+        Records past ``PLAUD_PENDING_SUMMARY_GIVE_UP_DAYS`` are excluded from
+        the selection (their state is left untouched). Otherwise, once more
+        than ``PLAUD_PENDING_SUMMARY_RESYNC_LIMIT`` records are stuck forever
+        (summary never arrives, or the recording was deleted on PLAUD's side
+        and ``get_recording`` keeps failing), they would permanently occupy
+        every slot and newer pending/placeholder records would never be
+        checked at all.
+        """
+        now = _utc_now().astimezone()
+        pending: list[tuple[datetime, str]] = []
+        for file_id, record in state.get("recordings", {}).items():
+            if not isinstance(record, dict):
+                continue
+            status = record.get("status")
+            is_placeholder_import = status == "imported" and bool(
+                record.get("summary_placeholder")
+            )
+            if status != "pending_summary" and not is_placeholder_import:
+                continue
+            first_seen = (
+                _parse_timestamp(record.get("first_seen_at"))
+                or _parse_timestamp(record.get("recorded_at"))
+                or now
+            )
+            age_days = (now.date() - first_seen.astimezone().date()).days
+            if age_days > PLAUD_PENDING_SUMMARY_GIVE_UP_DAYS:
+                continue
+            pending.append((first_seen, file_id))
+        pending.sort(key=lambda entry: entry[0])
+        return [file_id for _, file_id in pending[:PLAUD_PENDING_SUMMARY_RESYNC_LIMIT]]
+
+    def _fetch_and_sync(
+        self,
+        *,
+        file_id: str,
+        state: dict[str, Any],
+        allow_retro_todo: bool,
+        counters: dict[str, int],
+        errors: list[str],
+    ) -> None:
+        """Fetch one recording and merge its outcome into the sync counters."""
+        try:
+            detail = self.client.get_recording(file_id)
+            result = self._sync_one(
+                detail=detail,
+                state=state,
+                allow_retro_todo=allow_retro_todo,
+            )
+        except PlaudAuthError:
+            raise
+        except Exception as exc:
+            logger.warning("PLAUD sync failed for %s: %s", file_id, exc)
+            errors.append(f"{file_id}: {exc}")
+            return
+
+        status = result.get("status")
+        if status == "imported":
+            counters["imported"] += 1
+            counters["tasks_created"] += int(result.get("tasks_created", 0))
+        elif status == "pending_summary":
+            counters["pending_summary"] += 1
+        elif status == "unchanged":
+            counters["unchanged"] += 1
+
+        self._save_state(state)
 
     def sync(
         self,
@@ -1239,13 +1475,26 @@ class PlaudSyncService:
                 max_pages if max_pages is not None else (None if backfill else 1)
             )
 
+            processed_ids: set[str] = set()
+            if not backfill:
+                for file_id in self._pending_summary_file_ids(state):
+                    processed_ids.add(file_id)
+                    counters["seen"] += 1
+                    self._fetch_and_sync(
+                        file_id=file_id,
+                        state=state,
+                        allow_retro_todo=allow_retro_todo,
+                        counters=counters,
+                        errors=errors,
+                    )
+
             for item in self.client.iter_recordings(
                 limit=PLAUD_PAGE_SIZE,
                 max_pages=page_limit,
             ):
                 counters["seen"] += 1
                 file_id = _safe_text(item.get("file_id") or item.get("id"))
-                if not file_id:
+                if not file_id or file_id in processed_ids:
                     continue
                 record_state = state["recordings"].get(file_id, {})
                 if (
@@ -1254,30 +1503,13 @@ class PlaudSyncService:
                     and not record_state.get("owner_eval_pending")
                 ):
                     continue
-                try:
-                    detail = self.client.get_recording(file_id)
-                    result = self._sync_one(
-                        detail=detail,
-                        state=state,
-                        allow_retro_todo=allow_retro_todo,
-                    )
-                except PlaudAuthError:
-                    raise
-                except Exception as exc:
-                    logger.warning("PLAUD sync failed for %s: %s", file_id, exc)
-                    errors.append(f"{file_id}: {exc}")
-                    continue
-
-                status = result.get("status")
-                if status == "imported":
-                    counters["imported"] += 1
-                    counters["tasks_created"] += int(result.get("tasks_created", 0))
-                elif status == "pending_summary":
-                    counters["pending_summary"] += 1
-                elif status == "unchanged":
-                    counters["unchanged"] += 1
-
-                self._save_state(state)
+                self._fetch_and_sync(
+                    file_id=file_id,
+                    state=state,
+                    allow_retro_todo=allow_retro_todo,
+                    counters=counters,
+                    errors=errors,
+                )
 
             state["last_sync_at"] = _utc_now().astimezone().isoformat()
             self._save_state(state)

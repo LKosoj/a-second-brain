@@ -551,7 +551,9 @@ def test_plaud_migrate_note_path_drift_updates_note_state_and_daily(
 
     recorded_utc = datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC)
     recorded_local = recorded_utc.astimezone(timezone(timedelta(hours=3)))
-    monkeypatch.setattr(service, "_recorded_at", lambda payload: recorded_local)
+    monkeypatch.setattr(
+        service, "_recorded_at", lambda payload, **kwargs: recorded_local
+    )
     legacy_note_path, _ = service._file_paths("file-legacy", recorded_utc)
     canonical_note_path, _ = service._file_paths("file-legacy", recorded_local)
     legacy_note_rel = legacy_note_path.relative_to(vault_path).as_posix()

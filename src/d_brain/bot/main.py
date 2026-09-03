@@ -1,5 +1,7 @@
 """Telegram bot initialization and polling."""
 
+import asyncio
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -34,6 +36,7 @@ def create_dispatcher() -> Dispatcher:
         menu,
         photo,
         process,
+        reminders,
         text,
         voice,
         why,
@@ -53,6 +56,7 @@ def create_dispatcher() -> Dispatcher:
     dp.include_router(photo.router)
     dp.include_router(document.router)
     dp.include_router(forward.router)
+    dp.include_router(reminders.router)  # Before text.router (catch-all for text)
     dp.include_router(text.router)  # Must be last (catch-all for text)
     return dp
 
@@ -118,6 +122,7 @@ async def configure_bot_commands(bot: Bot) -> None:
             BotCommand(command="start", description="показать справку"),
             BotCommand(command="menu", description="открыть меню"),
             BotCommand(command="do", description="произвольный запрос"),
+            BotCommand(command="reminders", description="список напоминаний"),
             BotCommand(command="why", description="почему страница так говорит"),
             BotCommand(command="help", description="справка"),
             BotCommand(command="stats", description="статистика"),
@@ -130,6 +135,8 @@ async def configure_bot_commands(bot: Bot) -> None:
 
 async def run_bot(settings: Settings) -> None:
     """Run the bot with polling."""
+    from d_brain.bot.handlers.reminders import run_reminder_ticker
+
     bot = create_bot(settings)
     dp = create_dispatcher()
 
@@ -137,8 +144,15 @@ async def run_bot(settings: Settings) -> None:
     dp.update.middleware(create_auth_middleware(settings))
     await configure_bot_commands(bot)
 
+    reminder_ticker_task = asyncio.create_task(
+        run_reminder_ticker(bot, settings.vault_path)
+    )
+
     logger.info("Starting bot polling...")
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        reminder_ticker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reminder_ticker_task
         await bot.session.close()

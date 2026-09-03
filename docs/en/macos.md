@@ -20,14 +20,13 @@ LaunchAgents — one plist per service, all in
 
 ```bash
 # 1. Clone and install Python deps
-mkdir -p ~/second-brain ~/second-brain-data
+mkdir -p ~/second-brain
 git clone https://github.com/LKosoj/a-second-brain.git ~/second-brain/repo
 cd ~/second-brain/repo
 uv sync --frozen --no-dev
 
-# 2. Create .env (chmod 600 is set by init, but be explicit if you hand-craft it)
-cp .env.example .env
-chmod 600 .env
+# 2. Create the private vault and .env (mode 0600 is set by init)
+uv run --frozen --no-dev a-second-brain init ~/second-brain/repo
 $EDITOR .env
 # Required: TELEGRAM_BOT_TOKEN, DEEPGRAM_API_KEY, OWNER_TELEGRAM_ID
 # Pick your brain: AI_CLI=opencode (default in .env.example is claude)
@@ -46,12 +45,13 @@ bash scripts/install-launchd-user.sh --enable
 sudo pmset -a sleep 0 disksleep 0 displaysleep 0
 ```
 
-The `--enable` step renders four plists from `deploy/*.plist.in`:
+The `--enable` step renders up to five plists from `deploy/*.plist.in`:
 
 | Label | Schedule | Command |
 | --- | --- | --- |
 | `com.second-brain.bot` | `RunAtLoad` + `KeepAlive` | `a-second-brain run` |
 | `com.second-brain.process` | daily 21:00 | `python -m d_brain.run_daily_process --mode scheduled` |
+| `com.second-brain.morning-brief` | daily 08:00 | `python -m d_brain.run_morning_brief` |
 | `com.second-brain.plaud-sync` | hourly (only if `PLAUD_BEARER_TOKEN` is set) | `python -m d_brain.run_plaud_sync` |
 | `com.second-brain.qmd-maintenance` | weekly Sun 03:30 (only if `qmd` is on `PATH`) | `a-second-brain qmd cleanup` |
 

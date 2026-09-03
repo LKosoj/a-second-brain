@@ -203,6 +203,7 @@ updated: YYYY-MM-DD
 last_accessed: YYYY-MM-DD
 relevance: 0.85
 tier: active
+access_count: 0
 ---
 ```
 

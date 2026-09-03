@@ -43,16 +43,68 @@ if [[ ! -x "$WRAPPER" ]]; then
     exit 1
 fi
 
+# The complete set of labels this script can ever install, independent of
+# the *current* .env/qmd state. Uninstall must sweep all of them: a plist
+# rendered during a previous run (e.g. PLAUD_BEARER_TOKEN was set then, or
+# qmd was on PATH then) would otherwise be left orphaned in $AGENT_DIR if
+# that condition no longer holds at uninstall time.
+ALL_LABELS=(
+    "com.second-brain.bot"
+    "com.second-brain.process"
+    "com.second-brain.morning-brief"
+    "com.second-brain.plaud-sync"
+    "com.second-brain.qmd-maintenance"
+)
+
+uninstall_all() {
+    for label in "${ALL_LABELS[@]}"; do
+        if launchctl list | grep -q "$label"; then
+            launchctl unload "$AGENT_DIR/$label.plist" 2>/dev/null || true
+        fi
+        rm -f "$AGENT_DIR/$label.plist"
+    done
+    echo "Uninstalled LaunchAgents for ${ALL_LABELS[*]}"
+}
+
+if [[ "$UNINSTALL" -eq 1 ]]; then
+    mkdir -p "$AGENT_DIR"
+    uninstall_all
+    exit 0
+fi
+
+# Non-empty check for PLAUD_BEARER_TOKEN: a bare grep for
+# '^PLAUD_BEARER_TOKEN=.+' also matches a quoted-empty value
+# (PLAUD_BEARER_TOKEN="") or one that is only whitespace, which would wire
+# up the PLAUD sync agent with nothing to authenticate with.
+has_plaud_token() {
+    local env_file="$1" line value
+    line="$(grep -E '^(export[[:space:]]+)?PLAUD_BEARER_TOKEN=' "$env_file" | tail -n1)" || true
+    [[ -z "$line" ]] && return 1
+    value="${line#*=}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ ${#value} -ge 2 ]]; then
+        if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+            value="${value:1:${#value}-2}"
+        elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+            value="${value:1:${#value}-2}"
+        fi
+    fi
+    [[ -n "$value" ]]
+}
+
 LABELS=(
     "com.second-brain.bot"
     "com.second-brain.process"
+    "com.second-brain.morning-brief"
 )
 PLIST_BASES=(
     "com.second-brain.bot"
     "com.second-brain.process"
+    "com.second-brain.morning-brief"
 )
 
-if [[ -f "$PROJECT_DIR/.env" ]] && grep -Eq '^PLAUD_BEARER_TOKEN=.+$' "$PROJECT_DIR/.env"; then
+if [[ -f "$PROJECT_DIR/.env" ]] && has_plaud_token "$PROJECT_DIR/.env"; then
     LABELS+=("com.second-brain.plaud-sync")
     PLIST_BASES+=("com.second-brain.plaud-sync")
 fi
@@ -74,22 +126,6 @@ project_value="$(escape_sed "$PROJECT_DIR")"
 uv_value="$(escape_sed "$UV_BIN")"
 wrapper_value="$(escape_sed "$WRAPPER")"
 log_value="$(escape_sed "$LOG_DIR")"
-
-uninstall_all() {
-    for label in "${LABELS[@]}"; do
-        if launchctl list | grep -q "$label"; then
-            launchctl unload "$AGENT_DIR/$label.plist" 2>/dev/null || true
-        fi
-        rm -f "$AGENT_DIR/$label.plist"
-    done
-    echo "Uninstalled LaunchAgents for ${LABELS[*]}"
-}
-
-if [[ "$UNINSTALL" -eq 1 ]]; then
-    mkdir -p "$AGENT_DIR"
-    uninstall_all
-    exit 0
-fi
 
 if [[ ! -f "$PROJECT_DIR/.env" || ! -d "$PROJECT_DIR/vault" ]]; then
     echo "Run ./install.sh before installing LaunchAgents." >&2

@@ -7,6 +7,7 @@ When the target is ambiguous, the owner is asked to pick -- one button per
 candidate -- rather than have the bot guess (ТЗ 7.3 "не гадай, спроси").
 """
 
+import asyncio
 import hashlib
 import logging
 from pathlib import Path
@@ -22,9 +23,11 @@ from aiogram.types import (
     Message,
 )
 
+from d_brain.bot.handlers.do import build_save_answer_keyboard, handle_answer_save
 from d_brain.bot.replies import answer_rich_text, answer_text
 from d_brain.bot.states import WhyCommandState
 from d_brain.config import get_settings
+from d_brain.services.answers import AnswerPayload, register_pending_answer
 from d_brain.services.compiled_why import (
     WhyChoice,
     WhyResult,
@@ -35,6 +38,15 @@ from d_brain.services.qmd import QmdService
 
 router = Router(name="why")
 logger = logging.getLogger(__name__)
+
+# Shared with do.router (аудит 2026-09-03, п.24): both /do and /why answers
+# use the identical ``answer:save:<id>`` callback_data, backed by one
+# in-memory store in ``services/answers.py`` keyed by id, not by which
+# command produced the answer -- so the same handler is registered on both
+# routers rather than duplicated. With the current router order in
+# ``bot/main.py`` (do.router before why.router) the do.router copy handles
+# every press; this registration only matters if that order ever changes.
+router.callback_query(F.data.startswith("answer:save:"))(handle_answer_save)
 
 
 async def start_why_flow(message: Message, state: FSMContext) -> None:
@@ -144,7 +156,7 @@ async def process_why_request(message: Message, query: str, state: FSMContext) -
     settings = get_settings()
     vault_path = Path(settings.vault_path)
     try:
-        outcome = build_why(vault_path, query)
+        outcome = await asyncio.to_thread(build_why, vault_path, query)
     except Exception:
         # ``build_why`` re-reads every ``compiled/**`` page, which the
         # nightly pass can be rewriting or archiving underneath it. Letting
@@ -177,21 +189,46 @@ async def process_why_request(message: Message, query: str, state: FSMContext) -
         return
 
     assert outcome.result is not None
-    await deliver_why_result(message, vault_path, outcome.result)
+    await deliver_why_result(message, vault_path, outcome.result, query=query)
 
 
 async def deliver_why_result(
-    message: Message, vault_path: Path, result: WhyResult
+    message: Message, vault_path: Path, result: WhyResult, *, query: str | None = None
 ) -> None:
     """Send the /why answer and touch the resolved page -- the same
     best-effort ``QmdService.touch_notes`` promotion ``run_compiled_brief.py``
-    already applies to a brief's source page (задача L)."""
+    already applies to a brief's source page (задача L).
+
+    ``query`` is the owner's original free-text search, when there is one --
+    the disambiguation-button path (``handle_why_choice``) has none, since
+    only the chosen candidate's ``rel_path``/``title`` survive in state, so
+    it falls back to a question framed around the resolved page's title.
+    """
     try:
-        QmdService(vault_path).touch_notes([result.rel_path])
+        await asyncio.to_thread(
+            QmdService(vault_path).touch_notes, [result.rel_path]
+        )
     except Exception as exc:  # pragma: no cover - best-effort touch
         logger.warning("Failed to touch /why source %s: %s", result.rel_path, exc)
+
+    # Сохранить (аудит 2026-09-03, п.24): WhyResult carries no separate
+    # sources list of its own -- the per-claim provenance already lives
+    # inside its own rendered markdown (see compiled_why._sources_block) --
+    # so the one structured source here is the compiled page /why is about.
+    answer_id = register_pending_answer(
+        AnswerPayload(
+            question=query or f"Почему «{result.title}» так говорит?",
+            answer_markdown=result.markdown,
+            sources=(result.rel_path,),
+            kind="why",
+        )
+    )
     try:
-        await answer_rich_text(message, result.markdown)
+        await answer_rich_text(
+            message,
+            result.markdown,
+            reply_markup=build_save_answer_keyboard(answer_id),
+        )
     except Exception:
         # The parity this module claims in its own header -- "modeled
         # directly on ``do.py``" -- was missing exactly here (code review):
@@ -252,7 +289,7 @@ async def handle_why_choice(query: CallbackQuery, state: FSMContext) -> None:
     # itself is a separate message, so nothing is lost by conceding it early.
     await query.answer()
     try:
-        result = build_why_for_path(vault_path, rel_path)
+        result = await asyncio.to_thread(build_why_for_path, vault_path, rel_path)
     except Exception:
         # Same guard, for the same reason, as ``process_why_request``'s
         # around ``build_why``: both re-read ``compiled/**`` pages the

@@ -36,11 +36,36 @@ escape_sed() {
   printf '%s' "$value"
 }
 
+# Non-empty check for PLAUD_BEARER_TOKEN: a bare grep for
+# '^PLAUD_BEARER_TOKEN=.+' also matches a quoted-empty value
+# (PLAUD_BEARER_TOKEN="") or one that is only whitespace, which would wire
+# up the PLAUD sync timer with nothing to authenticate with.
+has_plaud_token() {
+  local env_file="$1" line value
+  line="$(grep -E '^(export[[:space:]]+)?PLAUD_BEARER_TOKEN=' "$env_file" | tail -n1)" || true
+  [[ -z "$line" ]] && return 1
+  value="${line#*=}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  if [[ ${#value} -ge 2 ]]; then
+    if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+      value="${value:1:${#value}-2}"
+    elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+      value="${value:1:${#value}-2}"
+    fi
+  fi
+  [[ -n "$value" ]]
+}
+
 project_value="$(escape_sed "$PROJECT_DIR")"
 uv_value="$(escape_sed "$UV_BIN")"
 mkdir -p "$UNIT_DIR"
 
-for template in "$PROJECT_DIR"/deploy/*.in; do
+# Only *.service.in and *.timer.in are systemd unit templates; *.plist.in
+# under deploy/ is the macOS launchd counterpart and must not be rendered
+# into a systemd user-unit directory.
+for template in "$PROJECT_DIR"/deploy/*.service.in "$PROJECT_DIR"/deploy/*.timer.in; do
+  [[ -f "$template" ]] || continue
   destination="$UNIT_DIR/$(basename "${template%.in}")"
   sed \
     -e "s|@PROJECT_DIR@|$project_value|g" \
@@ -56,8 +81,9 @@ if [[ "$ENABLE" -eq 1 ]]; then
   units=(
     a-second-brain.service
     a-second-brain-process.timer
+    a-second-brain-morning-brief.timer
   )
-  if grep -Eq '^PLAUD_BEARER_TOKEN=.+$' "$PROJECT_DIR/.env"; then
+  if has_plaud_token "$PROJECT_DIR/.env"; then
     units+=(a-second-brain-plaud-sync.timer)
   fi
   if command -v qmd >/dev/null 2>&1; then

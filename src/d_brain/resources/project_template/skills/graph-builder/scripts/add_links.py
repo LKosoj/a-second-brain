@@ -24,6 +24,7 @@ from d_brain.services.compiled_briefings import (  # noqa: E402
     HUMAN_ZONE_START,
     human_zone_markers_look_corrupted,
 )
+from d_brain.services.frontmatter import write_validated_vault_markdown  # noqa: E402
 
 # Sentinel span meaning "this file's human-zone markers are ambiguous".
 AMBIGUOUS_HUMAN_ZONE = (-1, -1)
@@ -191,7 +192,9 @@ def analyze_and_suggest(vault_path: Path) -> dict:
     return dict(suggestions)
 
 
-def apply_link(file_path: Path, target: str, dry_run: bool = True) -> bool:
+def apply_link(
+    vault_path: Path, file_path: Path, target: str, dry_run: bool = True
+) -> bool:
     """Add a link to a note's related section."""
     # Bytes, not read_text: this function rewrites the whole file, and
     # read_text translates every "\r\n"/"\r" it reads into "\n". A note the
@@ -245,7 +248,7 @@ def apply_link(file_path: Path, target: str, dry_run: bool = True) -> bool:
         print(f"[DRY RUN] Would add [[{target}]] to {file_path.name}")
         return True
 
-    file_path.write_bytes(new_content.encode("utf-8"))
+    write_validated_vault_markdown(vault_path, file_path, new_content.encode("utf-8"))
     print(f"Added [[{target}]] to {file_path.name}")
     return True
 
@@ -330,7 +333,7 @@ def main():
             note_path = vault_path / f"{note}.md"
             if note_path.exists():
                 for item in items:
-                    if apply_link(note_path, item["target"], dry_run):
+                    if apply_link(vault_path, note_path, item["target"], dry_run):
                         applied += 1
 
         print(f"\n{'[DRY RUN] Would apply' if dry_run else 'Applied'} {applied} links")

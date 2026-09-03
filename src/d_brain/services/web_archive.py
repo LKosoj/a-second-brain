@@ -6,7 +6,7 @@ import hashlib
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -22,6 +22,7 @@ from d_brain.services.frontmatter import (
 )
 from d_brain.services.localization import normalize_language, translate
 from d_brain.services.qmd import QmdService
+from d_brain.services.secrets import scrub_secrets
 from d_brain.services.source_links import SourceInfo, format_source_markdown
 from d_brain.services.web_content import WebContentResult
 
@@ -99,6 +100,24 @@ class WebArchiveService:
         content = page.content.strip()
         if not content:
             raise ValueError("Cannot archive an empty web source")
+
+        content, content_scrub_count = scrub_secrets(content)
+        summary, summary_scrub_count = scrub_secrets(summary)
+        original_url, url_scrub_count = scrub_secrets(original_url)
+        final_url, final_url_scrub_count = scrub_secrets(page.url)
+        page = replace(page, url=final_url)
+        scrub_count = (
+            content_scrub_count
+            + summary_scrub_count
+            + url_scrub_count
+            + final_url_scrub_count
+        )
+        if scrub_count:
+            logger.info(
+                "scrub_secrets: %d replacement(s) in %s",
+                scrub_count,
+                f"web_archive:{original_url}",
+            )
 
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
         stem = self._source_stem(page.url or original_url, digest)

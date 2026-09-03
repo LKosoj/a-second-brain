@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import logging
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -27,6 +28,9 @@ DEFAULT_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 DEFAULT_TIMEOUT = 20.0
+MAX_CONTENT_BYTES = 10 * 1024 * 1024
+MAX_DIRECT_REDIRECTS = 5
+DIRECT_STREAM_DEADLINE_SECONDS = 60.0
 JINA_READER_URL = "https://r.jina.ai"
 BOILERPLATE_MARKERS = (
     "enable javascript",
@@ -171,6 +175,14 @@ def _normalize_url(url: str) -> str:
     return value.rstrip(")").strip('"').strip("'").strip()
 
 
+def _content_length_too_large(value: str) -> bool:
+    try:
+        declared_size = int(value)
+    except ValueError:
+        return False
+    return declared_size > MAX_CONTENT_BYTES
+
+
 def _direct_extract(
     url: str,
     *,
@@ -179,42 +191,99 @@ def _direct_extract(
 ) -> WebContentResult:
     final_url = url
     try:
-        with httpx.stream(
-            "GET",
-            url,
+        with httpx.Client(
+            follow_redirects=False,
             timeout=timeout,
-            follow_redirects=True,
             headers=DEFAULT_HEADERS,
-        ) as response:
-            response.raise_for_status()
-            final_url = str(response.url)
-            if allowed_url is not None and not allowed_url(final_url):
+        ) as client:
+            request = client.build_request("GET", url)
+            for _ in range(MAX_DIRECT_REDIRECTS + 1):
+                response = client.send(request, stream=True)
+                if response.next_request is not None:
+                    next_request = response.next_request
+                    response.close()
+                    next_url = str(next_request.url)
+                    if allowed_url is not None and not allowed_url(next_url):
+                        return WebContentResult(
+                            url=next_url,
+                            title="",
+                            content="",
+                            source="blocked-url",
+                        )
+                    request = next_request
+                    continue
+
+                try:
+                    response.raise_for_status()
+                    final_url = str(response.url)
+                    if allowed_url is not None and not allowed_url(final_url):
+                        return WebContentResult(
+                            url=final_url,
+                            title="",
+                            content="",
+                            source="blocked-url",
+                        )
+                    content_length = response.headers.get("content-length")
+                    if content_length is not None and _content_length_too_large(
+                        content_length
+                    ):
+                        return WebContentResult(
+                            url=final_url,
+                            title="",
+                            content="",
+                            source="too-large",
+                        )
+                    content_type = response.headers.get("content-type", "").lower()
+                    is_text_content = content_type.startswith("text/")
+                    if (
+                        content_type
+                        and "html" not in content_type
+                        and not is_text_content
+                    ):
+                        return WebContentResult(
+                            url=final_url,
+                            title="",
+                            content="",
+                            source="direct",
+                        )
+
+                    chunks: list[bytes] = []
+                    total_bytes = 0
+                    deadline = time.monotonic() + DIRECT_STREAM_DEADLINE_SECONDS
+                    for chunk in response.iter_bytes():
+                        if not chunk:
+                            continue
+                        total_bytes += len(chunk)
+                        if total_bytes > MAX_CONTENT_BYTES:
+                            return WebContentResult(
+                                url=final_url,
+                                title="",
+                                content="",
+                                source="too-large",
+                            )
+                        if time.monotonic() > deadline:
+                            return WebContentResult(
+                                url=final_url,
+                                title="",
+                                content="",
+                                source="timeout",
+                            )
+                        chunks.append(chunk)
+                    raw_bytes = b"".join(chunks)
+                    raw_text = raw_bytes.decode(
+                        response.encoding or "utf-8",
+                        errors="replace",
+                    )
+                finally:
+                    response.close()
+                break
+            else:
                 return WebContentResult(
-                    url=final_url,
-                    title="",
-                    content="",
-                    source="blocked-url",
-                )
-            content_type = response.headers.get("content-type", "").lower()
-            is_text_content = content_type.startswith("text/")
-            if content_type and "html" not in content_type and not is_text_content:
-                return WebContentResult(
-                    url=final_url,
+                    url=str(request.url),
                     title="",
                     content="",
                     source="direct",
                 )
-
-            chunks: list[bytes] = []
-            for chunk in response.iter_bytes():
-                if not chunk:
-                    continue
-                chunks.append(chunk)
-            raw_bytes = b"".join(chunks)
-            raw_text = raw_bytes.decode(
-                response.encoding or "utf-8",
-                errors="replace",
-            )
     except httpx.HTTPError as exc:
         logger.warning("Direct content fetch failed for %s: %s", url, exc)
         return WebContentResult(url=url, title="", content="", source="direct")

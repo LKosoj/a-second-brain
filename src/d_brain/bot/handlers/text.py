@@ -16,6 +16,7 @@ from d_brain.services.link_summary import (
     format_link_summary_message,
 )
 from d_brain.services.processor import TEXT_INTENT_QUESTION, CliProcessor
+from d_brain.services.secrets import scrub_secrets
 from d_brain.services.session import SessionStore
 from d_brain.services.source_links import build_telegram_source_info
 from d_brain.services.storage import VaultStorage
@@ -238,13 +239,20 @@ async def handle_text(message: Message) -> None:
                 "refresh_qmd": False,
             },
         )
+        content, scrub_count = scrub_secrets(result.content)
+        if scrub_count:
+            logger.info(
+                "scrub_secrets: %d replacement(s) in %s",
+                scrub_count,
+                f"text:{message.from_user.id}",
+            )
         _, status_message = await _run_to_thread_with_status(
             message,
             status_message,
             storage.append_to_daily,
             branch=branch,
             step="сохраняю запись в daily",
-            args=(result.content, timestamp, "[text]"),
+            args=(content, timestamp, "[text]"),
             kwargs={"source": source},
         )
 
@@ -252,7 +260,7 @@ async def handle_text(message: Message) -> None:
         session.append(
             message.from_user.id,
             "text",
-            text=result.content,
+            text=content,
             youtube_urls=[item.url for item in result.transcripts],
             msg_id=message.message_id,
             source_ref=source.ref,

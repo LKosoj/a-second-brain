@@ -1,5 +1,6 @@
 """Inline dashboard and file browser handlers."""
 
+import asyncio
 import logging
 from contextlib import suppress
 from datetime import date
@@ -17,7 +18,9 @@ from d_brain.bot.dashboard import (
     file_browser_parent_dir,
     get_dashboard_session,
     page_fingerprint,
+    reenable_job_step,
     render_brief_type,
+    render_disabled_steps,
     render_file_directory,
     render_file_roots,
     render_home,
@@ -105,7 +108,8 @@ async def _deliver_daily_digest(message: Message, *, vault_path: str | Path) -> 
     today = date.today()
 
     try:
-        digest = build_daily_digest(
+        digest = await asyncio.to_thread(
+            build_daily_digest,
             resolved_vault_path,
             today,
             pass_status=_read_enrich_pass_status(resolved_vault_path),
@@ -265,6 +269,36 @@ async def handle_menu_callback(
             vault_path=settings.vault_path,
             user_id=query.from_user.id,
             preferred_message_id=message_id,
+        )
+        await query.answer()
+        return
+
+    if data == "menu:jobhealth":
+        await render_disabled_steps(
+            bot,
+            chat_id=chat_id,
+            vault_path=settings.vault_path,
+            preferred_message_id=message_id,
+        )
+        await query.answer()
+        return
+
+    if data.startswith("menu:jobhealthenable:"):
+        step_name = data.removeprefix("menu:jobhealthenable:")
+        was_disabled = await asyncio.to_thread(
+            reenable_job_step, settings.vault_path, step_name
+        )
+        notice = (
+            "Шаг снова включён."
+            if was_disabled
+            else "Шаг уже был включён или не найден."
+        )
+        await render_disabled_steps(
+            bot,
+            chat_id=chat_id,
+            vault_path=settings.vault_path,
+            preferred_message_id=message_id,
+            notice=notice,
         )
         await query.answer()
         return
@@ -580,7 +614,9 @@ async def handle_menu_callback(
             return
 
         try:
-            outcome = apply_response(Path(settings.vault_path), item, action_id)
+            outcome = await asyncio.to_thread(
+                apply_response, Path(settings.vault_path), item, action_id
+            )
         except ValueError:
             await query.answer("Действие недоступно для этого пункта.", show_alert=True)
             return
@@ -654,7 +690,9 @@ async def handle_menu_callback(
             return
 
         try:
-            outcome = mark_page_human_reviewed(Path(settings.vault_path), rel_path)
+            outcome = await asyncio.to_thread(
+                mark_page_human_reviewed, Path(settings.vault_path), rel_path
+            )
         except Exception:
             logger.exception("Weekly review mark failed for %s", rel_path)
             await query.answer(_QUEUE_ACTION_FAILED_MESSAGE, show_alert=True)

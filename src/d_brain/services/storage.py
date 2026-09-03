@@ -112,6 +112,18 @@ class VaultStorage:
         try:
             document = parse_frontmatter_bytes(source)
         except FrontmatterError:
+            # A single malformed block (duplicate key, a tab, an unquoted
+            # colon) is a corrupted file, not a legacy layout -- repairing
+            # it here would silently drop whatever the strict parser could
+            # not read (a YAML list under ``tags:``, a nested mapping) and
+            # leave every message for the day. Only the specific doubled
+            # legacy shape below is safe to rewrite; anything else must
+            # surface to the caller the same way any other write failure
+            # does (Telegram handlers, the plaud sync loop and the daily
+            # cycle all already convert an uncaught ValueError into a
+            # user-visible error rather than crashing).
+            if not cls._is_doubled_legacy_frontmatter(current, expected_heading):
+                raise
             return cls._repair_legacy_daily_content(day, current)
 
         if document.has_frontmatter:
@@ -173,11 +185,50 @@ class VaultStorage:
             insertion += newline
         return (prefix + insertion + document.body).decode("utf-8")
 
+    @staticmethod
+    def _leading_legacy_block_count(current: str, expected_heading: str) -> int:
+        """Count ``---``-delimited blocks stacked at the top of ``current``.
+
+        Shared by the doubled-frontmatter detector and the repair below, so
+        both agree on what counts as one block: a standalone heading line is
+        skipped, not counted, matching the loop's own tolerance for a stray
+        heading sitting between two frontmatter blocks.
+        """
+        working = current.replace("\r\n", "\n").replace("\r", "\n").lstrip()
+        frontmatter_re = re.compile(r"\A---\n(.*?)\n---\n*", re.DOTALL)
+        blocks = 0
+        while working:
+            match = frontmatter_re.match(working)
+            if match is not None:
+                blocks += 1
+                working = working[match.end() :].lstrip()
+                continue
+            line, _, rest = working.partition("\n")
+            if line.strip() == expected_heading:
+                working = rest.lstrip()
+                continue
+            break
+        return blocks
+
+    @classmethod
+    def _is_doubled_legacy_frontmatter(
+        cls, current: str, expected_heading: str
+    ) -> bool:
+        """Detect the doubled-frontmatter shape the repair below unwinds.
+
+        A single malformed block (duplicate key, tabs, an unquoted colon) is
+        corruption, not this legacy shape -- it always counts as one block
+        here, so it is never mistaken for the two-or-more-blocks case a past
+        writer bug is known to have produced.
+        """
+        return cls._leading_legacy_block_count(current, expected_heading) >= 2
+
     @classmethod
     def _repair_legacy_daily_content(cls, day: date, current: str) -> str:
         """Repair explicitly malformed legacy daily preamble layouts."""
         expected_heading = f"# {day.isoformat()}"
-        remaining = current.lstrip()
+        newline = b"\r\n" if "\r\n" in current else b"\n"
+        remaining = current.replace("\r\n", "\n").replace("\r", "\n").lstrip()
         merged_fields: dict[str, str] = {}
         frontmatter_re = re.compile(r"\A---\n(.*?)\n---\n*", re.DOTALL)
 
@@ -204,8 +255,10 @@ class VaultStorage:
         body = remaining.lstrip()
         preamble = f"{cls._daily_frontmatter(day, merged_fields)}\n\n{expected_heading}"
         if not body:
-            return preamble + "\n"
-        return f"{preamble}\n\n{body.rstrip()}\n"
+            repaired = preamble + "\n"
+        else:
+            repaired = f"{preamble}\n\n{body.rstrip()}\n"
+        return cls._render_with_newline(repaired, newline).decode("utf-8")
 
     def _post_daily_write(
         self,

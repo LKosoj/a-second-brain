@@ -7,13 +7,13 @@ public code repository.
 
 ## Requirements
 
-- Linux and Python 3.12 or newer
+- Linux or macOS (see [macOS deployment](macos.md)) and Python 3.12 or newer
 - `uv` and `jq`
 - a Telegram bot token from BotFather
 - a Deepgram API key for voice transcription
-- one supported AI CLI: Claude Code, Codex CLI, Qwen Code, Gemini CLI, or
-  Kimi Code
-- an unprivileged Linux account
+- one supported AI CLI: Claude Code, Codex CLI, Qwen Code, Gemini CLI, Kimi
+  Code, Grok CLI, or opencode
+- an unprivileged account
 
 Optional integrations add their own requirements. See
 [Integrations](integrations.md).

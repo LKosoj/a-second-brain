@@ -20,14 +20,13 @@
 
 ```bash
 # 1. Клон и зависимости
-mkdir -p ~/second-brain ~/second-brain-data
+mkdir -p ~/second-brain
 git clone https://github.com/LKosoj/a-second-brain.git ~/second-brain/repo
 cd ~/second-brain/repo
 uv sync --frozen --no-dev
 
-# 2. .env (init сам ставит 0600, но и руками не помешает)
-cp .env.example .env
-chmod 600 .env
+# 2. Создать приватный vault и .env (0600 ставит init)
+uv run --frozen --no-dev a-second-brain init ~/second-brain/repo
 $EDITOR .env
 # Обязательно: TELEGRAM_BOT_TOKEN, DEEPGRAM_API_KEY, OWNER_TELEGRAM_ID
 # Движок: AI_CLI=opencode (в .env.example по умолчанию claude)
@@ -46,12 +45,13 @@ bash scripts/install-launchd-user.sh --enable
 sudo pmset -a sleep 0 disksleep 0 displaysleep 0
 ```
 
-`--enable` рендерит четыре plist-а из `deploy/*.plist.in`:
+`--enable` рендерит до пяти plist-ов из `deploy/*.plist.in`:
 
 | Label | Расписание | Команда |
 | --- | --- | --- |
 | `com.second-brain.bot` | `RunAtLoad` + `KeepAlive` | `a-second-brain run` |
 | `com.second-brain.process` | ежедневно в 21:00 | `python -m d_brain.run_daily_process --mode scheduled` |
+| `com.second-brain.morning-brief` | ежедневно в 08:00 | `python -m d_brain.run_morning_brief` |
 | `com.second-brain.plaud-sync` | каждый час (только при `PLAUD_BEARER_TOKEN`) | `python -m d_brain.run_plaud_sync` |
 | `com.second-brain.qmd-maintenance` | воскресенье 03:30 (только при `qmd` в `PATH`) | `a-second-brain qmd cleanup` |
 

@@ -1,14 +1,24 @@
-"""CLI entrypoint for unified daily processing."""
+"""CLI entrypoint for unified daily processing.
+
+Scheduled catch-up: systemd's ``Persistent=true`` can fire this process late
+(e.g. at 09:00 the next morning for a missed 21:00 run). Without ``--date``,
+a ``--mode scheduled`` run observed before the scheduled hour is treated as a
+delayed catch-up and processes yesterday instead of today. The scheduled
+hour is read from the ``SCHEDULED_PROCESS_HOUR`` env var (default
+``DEFAULT_SCHEDULED_PROCESS_HOUR`` below); pass ``--date`` to override.
+"""
 
 import argparse
 import json
 import logging
+import os
 import sys
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
 from d_brain.config import get_settings
+from d_brain.services.frontmatter import ensure_run_identity
 from d_brain.services.processor import (
     INTERACTIVE_MODE,
     SCHEDULED_MODE,
@@ -24,6 +34,58 @@ def _parse_date(value: str | None) -> date | None:
     if not value:
         return None
     return date.fromisoformat(value)
+
+
+DEFAULT_SCHEDULED_PROCESS_HOUR = 21
+"""Fallback scheduled run hour (local time, 24h) used to detect a delayed
+systemd ``Persistent=true`` catch-up run when ``SCHEDULED_PROCESS_HOUR`` is
+unset."""
+
+
+def _resolve_processing_day(mode: str) -> date:
+    """Pick the day to process when ``--date`` is not given.
+
+    A systemd timer with ``Persistent=true`` can fire late -- e.g. at 09:00
+    the next morning for a missed 21:00 run. ``date.today()`` would then pick
+    the new day and leave yesterday's entries unprocessed. For
+    ``--mode scheduled`` runs, a run observed before the scheduled hour
+    (``SCHEDULED_PROCESS_HOUR`` env var, default
+    ``DEFAULT_SCHEDULED_PROCESS_HOUR``) is treated as a delayed catch-up for
+    yesterday.
+    """
+    now = datetime.now()
+    if mode != SCHEDULED_MODE:
+        return now.date()
+    hour = _read_scheduled_process_hour()
+    if now.hour < hour:
+        return now.date() - timedelta(days=1)
+    return now.date()
+
+
+def _read_scheduled_process_hour() -> int:
+    """Read ``SCHEDULED_PROCESS_HOUR``, falling back to the default on any
+    unparseable or out-of-range value instead of crashing before the owner
+    is notified."""
+    raw_hour = os.environ.get("SCHEDULED_PROCESS_HOUR")
+    if raw_hour is None:
+        return DEFAULT_SCHEDULED_PROCESS_HOUR
+    try:
+        hour = int(raw_hour)
+    except ValueError:
+        logger.warning(
+            "Invalid SCHEDULED_PROCESS_HOUR=%r, using default %s",
+            raw_hour,
+            DEFAULT_SCHEDULED_PROCESS_HOUR,
+        )
+        return DEFAULT_SCHEDULED_PROCESS_HOUR
+    if not 0 <= hour <= 23:
+        logger.warning(
+            "SCHEDULED_PROCESS_HOUR=%s out of range 0..23, using default %s",
+            hour,
+            DEFAULT_SCHEDULED_PROCESS_HOUR,
+        )
+        return DEFAULT_SCHEDULED_PROCESS_HOUR
+    return hour
 
 
 def _load_execute_payload(vault_path: Path) -> dict[str, Any]:
@@ -62,6 +124,7 @@ def _build_scheduled_digest(
     execute_payload: dict[str, Any],
     *,
     takeaways: list[str] | None = None,
+    takeaways_error: str | None = None,
 ) -> str:
     """Build one short always-sent Telegram digest for scheduled processing."""
     heading = f"**🧠 D-Brain — {day.isoformat()}**"
@@ -125,6 +188,9 @@ def _build_scheduled_digest(
     ):
         lines.extend(["", "По результатам сегодняшнего дня ничего нового."])
         return "\n".join(lines)
+
+    if takeaways_error:
+        lines.extend(["", f"⚠️ выводы не сформированы: {takeaways_error}"])
 
     takeaway_lines = [
         f"- {' '.join(item.split())}"
@@ -238,12 +304,14 @@ def _build_digest_takeaways(
     )
 
 
+
 def _notify_scheduled_digest(
     day: date,
     vault_path: Path,
     result: dict[str, Any],
     *,
     takeaways: list[str] | None = None,
+    takeaways_error: str | None = None,
 ) -> None:
     """Always notify the owner after one scheduled daily processing attempt."""
     digest = _build_scheduled_digest(
@@ -251,7 +319,14 @@ def _notify_scheduled_digest(
         result,
         _load_execute_payload(vault_path),
         takeaways=takeaways,
+        takeaways_error=takeaways_error,
     )
+    run_id = os.environ.get("D_BRAIN_RUN_ID")
+    if run_id:
+        digest = (
+            f"{digest}\n\nrun_id: {run_id} "
+            f"(откат: a-second-brain recover {run_id} --vault {vault_path})"
+        )
     send_telegram_text_sync(digest, rich="error" not in result)
 
 
@@ -263,6 +338,7 @@ def _run_processor_cycle(processor: Any, day: date, mode: str) -> dict[str, Any]
 
 
 def main() -> int:
+    ensure_run_identity("daily-process", "daily-process")
     parser = argparse.ArgumentParser(description="Run daily processing")
     parser.add_argument(
         "--mode",
@@ -282,7 +358,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    day = _parse_date(args.day) or date.today()
+    day = _parse_date(args.day) or _resolve_processing_day(args.mode)
     settings = get_settings()
     processor = CliProcessor(
         settings.vault_path,
@@ -313,13 +389,20 @@ def main() -> int:
                 sys.stdout.write("\n")
 
     if args.mode == SCHEDULED_MODE and not args.skip_notify:
+        takeaways: list[str] = []
+        takeaways_error: str | None = None
         try:
             takeaways = _build_digest_takeaways(settings, day, result)
+        except Exception as exc:
+            logger.warning("Failed to build digest takeaways: %s", exc)
+            takeaways_error = str(exc)[:200]
+        try:
             _notify_scheduled_digest(
                 day,
                 settings.vault_path,
                 result,
                 takeaways=takeaways,
+                takeaways_error=takeaways_error,
             )
         except Exception as exc:  # pragma: no cover - notification boundary
             logger.warning("Failed to send scheduled digest: %s", exc)

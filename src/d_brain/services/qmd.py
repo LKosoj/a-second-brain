@@ -916,7 +916,7 @@ class QmdService:
     def run(
         self,
         *args: str,
-        timeout: float | None = None,
+        timeout: float | None = _EMBED_PROCESS_TIMEOUT,
     ) -> subprocess.CompletedProcess[str]:
         """Execute qmd against the project-local index."""
         return subprocess.run(
@@ -932,7 +932,18 @@ class QmdService:
     def cleanup(self) -> subprocess.CompletedProcess[str]:
         """Remove stale qmd data while excluding concurrent index writers."""
         with self._exclusive_lock():
-            return self.run("cleanup")
+            try:
+                return self.run("cleanup")
+            except subprocess.TimeoutExpired as exc:
+                return subprocess.CompletedProcess(
+                    args=["qmd", "--index", self._manifest.qmd_index, "cleanup"],
+                    returncode=124,
+                    stdout=_normalize_subprocess_output(exc.stdout),
+                    stderr=(
+                        _normalize_subprocess_output(exc.stderr)
+                        + f"\nqmd cleanup timed out after {_EMBED_PROCESS_TIMEOUT}s"
+                    ),
+                )
 
     def refresh(self, *, with_embeddings: bool) -> dict[str, Any]:
         """Low-level qmd refresh helper for update-only or update+embed flows."""
@@ -944,7 +955,13 @@ class QmdService:
         }
         try:
             with self._exclusive_lock():
-                update_proc = self.run("update")
+                try:
+                    update_proc = self.run("update")
+                except subprocess.TimeoutExpired:
+                    result["errors"].append(
+                        f"qmd update timed out after {_EMBED_PROCESS_TIMEOUT}s"
+                    )
+                    return result
                 if update_proc.returncode != 0:
                     result["errors"].append(
                         update_proc.stderr.strip() or update_proc.stdout.strip()
@@ -1028,12 +1045,19 @@ class QmdService:
                     capture_output=True,
                     text=True,
                     check=False,
+                    timeout=60,
                 )
             except FileNotFoundError:
                 logger.warning(
                     "Failed to touch memory note %s: uv executable not found: %s",
                     relative,
                     uv_bin,
+                )
+                continue
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    "Failed to touch memory note %s: uv run timed out after 60s",
+                    relative,
                 )
                 continue
             if result.returncode != 0:

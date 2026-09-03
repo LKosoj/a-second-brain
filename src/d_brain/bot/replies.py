@@ -226,7 +226,9 @@ async def answer_text(message: Message, text: str, **kwargs: Any) -> Message:
         _render_html_document(text, parse_mode=parse_mode),
         filename="d-brain-message.html",
     )
-    return await _answer_document(message, document, caption=None)
+    return await _answer_document(
+        message, document, caption=None, reply_markup=kwargs.get("reply_markup")
+    )
 
 
 async def answer_rich_text(message: Message, text: str, **kwargs: Any) -> Message:
@@ -280,6 +282,7 @@ async def send_text(bot: Bot, *, chat_id: int, text: str, **kwargs: Any) -> Mess
         chat_id=chat_id,
         document=document,
         caption=None,
+        reply_markup=kwargs.get("reply_markup"),
     )
 
 

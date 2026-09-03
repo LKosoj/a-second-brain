@@ -44,6 +44,7 @@ units:
 |---|---|
 | `a-second-brain.service` | Telegram-бот |
 | `a-second-brain-process.timer` | Ежедневная обработка в 21:00 |
+| `a-second-brain-morning-brief.timer` | Утренний бриф в 08:00 |
 | `a-second-brain-plaud-sync.timer` | Ежечасная синхронизация PLAUD, если она настроена |
 | `a-second-brain-qmd-maintenance.timer` | Еженедельная очистка QMD при наличии `qmd` |
 
@@ -89,10 +90,12 @@ Telegram ID и ошибок провайдеров с чувствительны
 ```bash
 for unit in \
   a-second-brain-process.timer \
+  a-second-brain-morning-brief.timer \
   a-second-brain-plaud-sync.timer \
   a-second-brain-qmd-maintenance.timer \
   a-second-brain.service \
   a-second-brain-process.service \
+  a-second-brain-morning-brief.service \
   a-second-brain-plaud-sync.service \
   a-second-brain-qmd-maintenance.service
 do
@@ -117,6 +120,11 @@ uv run --frozen --no-dev python -m d_brain.run_vault_backup
 ```
 
 Ручные команды используют тот же `.env` и рабочий каталог, что и сервисы.
+
+Чтобы откатить записи одного прогона в vault, используйте
+`a-second-brain recover <run_id>`; чтобы вручную подрезать журнал операций,
+`a-second-brain ops-prune` (см. `docs/ru/cli.md`). Перед обеими командами
+остановите бота и убедитесь, что ночная обработка не идёт.
 
 ## Работа после выхода из системы
 
