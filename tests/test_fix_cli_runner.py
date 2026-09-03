@@ -154,6 +154,7 @@ def test_processor_create_todoist_tasks_env_is_allowlisted(
     assert "TELEGRAM_BOT_TOKEN" not in captured
     assert captured["TODOIST_API_KEY"] == "todoist-secret"
     assert captured["PATH"] == "/usr/bin"
+    assert captured["NPM_CONFIG_CACHE"].endswith("vault/.session/npm-cache")
 
 
 def test_run_uv_script_env_is_allowlisted(

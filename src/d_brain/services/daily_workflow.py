@@ -176,6 +176,15 @@ class DailyWorkflow:
             phase_name="execute",
             retry_on_parse_error=False,
         )
+        self._host._reconcile_capture_todoist_tasks(capture_data, execute_data)
+        pending_count = len(self._host._json_dict_list(execute_data, "tasks_pending"))
+        execute_data["entry_counts"] = {
+            "reviewed": len(self._host._json_dict_list(capture_data, "entries")),
+            "processed": max(
+                0,
+                self._host._count_processed_entries(capture_data) - pending_count,
+            ),
+        }
         self._host._write_session_json("execute.json", execute_data)
         self._host._normalize_saved_thoughts(execute_data, day=day)
         return execute_data

@@ -70,6 +70,32 @@ def _compiled_service(vault_path: Path) -> CompiledBriefingService:
     return CompiledBriefingService(vault_path)
 
 
+def test_atomic_writers_create_group_accessible_files(tmp_path: Path) -> None:
+    text_path = tmp_path / "state.json"
+    bytes_path = tmp_path / "snapshot.bin"
+
+    compiled_briefings._atomic_write_text(text_path, "{}\n")
+    compiled_briefings._atomic_write_bytes(bytes_path, b"snapshot")
+
+    assert text_path.stat().st_mode & 0o777 == 0o660
+    assert bytes_path.stat().st_mode & 0o777 == 0o660
+
+
+def test_atomic_writers_preserve_existing_modes(tmp_path: Path) -> None:
+    text_path = tmp_path / "state.json"
+    bytes_path = tmp_path / "snapshot.bin"
+    text_path.write_text("old\n", encoding="utf-8")
+    bytes_path.write_bytes(b"old")
+    text_path.chmod(0o640)
+    bytes_path.chmod(0o640)
+
+    compiled_briefings._atomic_write_text(text_path, "new\n")
+    compiled_briefings._atomic_write_bytes(bytes_path, b"new")
+
+    assert text_path.stat().st_mode & 0o777 == 0o640
+    assert bytes_path.stat().st_mode & 0o777 == 0o640
+
+
 def _stub_adjudicator(
     monkeypatch: pytest.MonkeyPatch,
     service: CompiledBriefingService,

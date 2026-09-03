@@ -71,6 +71,9 @@ logger = logging.getLogger(__name__)
 STALE_REVISIT_DAYS = 90
 # ТЗ 7.1: "Стоит посмотреть. Одна-две давно не открывавшиеся страницы".
 MAX_REVISIT_PAGES = 2
+# Keep the Telegram digest scannable while preserving honest totals.
+MAX_DECISIONS_SHOWN = 5
+MAX_CHANGES_SHOWN = 5
 # ТЗ 6.1 "Уровень памяти управляет бюджетом обогащения" / 6.5 "Повторное
 # всплытие": only these two tiers are eligible to resurface -- "core",
 # "active", and "warm" pages are in active use and are not what the owner
@@ -908,9 +911,15 @@ def _render_digest(
     today_str = day.isoformat()
     today_decisions = [item for item in decisions if item.since == today_str]
     carryover_decisions = [item for item in decisions if item.since != today_str]
+    shown_decisions = today_decisions[:MAX_DECISIONS_SHOWN]
     decision_lines.extend(
-        f"- [[{item.page}]] — {item.summary}" for item in today_decisions
+        f"- [[{item.page}]] — {item.summary}" for item in shown_decisions
     )
+    hidden_today_decisions = len(today_decisions) - len(shown_decisions)
+    if hidden_today_decisions:
+        decision_lines.append(
+            f"- Ещё решений за сегодня: {hidden_today_decisions} — см. «Очередь»."
+        )
     if carryover_decisions:
         decision_lines.append(
             _CARRYOVER_SUMMARY_TEMPLATE.format(count=len(carryover_decisions))
@@ -918,7 +927,11 @@ def _render_digest(
     if decision_lines:
         lines += ["", "**Требует решения**", *decision_lines]
 
-    change_lines = [_render_change_line(item) for item in changes]
+    shown_changes = changes[:MAX_CHANGES_SHOWN]
+    change_lines = [_render_change_line(item) for item in shown_changes]
+    hidden_changes = len(changes) - len(shown_changes)
+    if hidden_changes:
+        change_lines.append(f"- Ещё изменённых страниц: {hidden_changes}.")
     if pass_status.auto_decisions > 0:
         change_lines.append(
             f"- Очередь решений: {pass_status.auto_decisions} пункт(ов) "

@@ -138,7 +138,7 @@ class CliSpec:
     stdin_prefix: tuple[str, ...] = field(default=())
     structured_output: bool = False
     # Alternate prefix used only when a caller asks for ``restricted``
-    # execution (the unattended scheduled cycle: no shell, no network).
+    # execution (the unattended scheduled cycle: bounded filesystem access).
     # ``None`` means this backend has no known tool-restriction flag, so
     # ``restricted=True`` silently falls back to the normal prefix instead
     # of inventing one.
@@ -218,15 +218,18 @@ CLI_SPECS: dict[AiCliName, CliSpec] = {
         # sandboxing outright, so restricted mode must drop it rather than
         # add to it. `--sandbox workspace-write` (verified against `codex
         # exec --help`) still allows writes under the vault, and per
-        # Codex's docs that sandbox keeps outbound network access off
-        # unless `sandbox_workspace_write.network_access` is set in config,
-        # which this runner never does.
+        # Codex's workspace-write sandbox disables outbound network by
+        # default. The nightly workflow needs network access for configured
+        # integrations, so enable that capability while retaining the
+        # filesystem boundary.
         restricted_argv_prefix=(
             "codex",
             "exec",
             "--skip-git-repo-check",
             "--sandbox",
             "workspace-write",
+            "-c",
+            "sandbox_workspace_write.network_access=true",
             "--json",
         ),
         restricted_stdin_prefix=(
@@ -235,6 +238,8 @@ CLI_SPECS: dict[AiCliName, CliSpec] = {
             "--skip-git-repo-check",
             "--sandbox",
             "workspace-write",
+            "-c",
+            "sandbox_workspace_write.network_access=true",
             "--json",
         ),
     ),

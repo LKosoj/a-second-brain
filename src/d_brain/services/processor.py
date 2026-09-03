@@ -103,6 +103,7 @@ from d_brain.services.vault_lock import VaultWriteLock, vault_write_lock
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 2400  # 40 minutes
+TODOIST_TASK_TIMEOUT = 30
 DAILY_ENTRY_HEADER_RE = re.compile(r"^##\s+\d{2}:\d{2}\s+\[[^\]]+\]\s*$", re.MULTILINE)
 REFLECT_DAILY_START_MARKER = "<!-- d-brain:reflect:start -->"
 REFLECT_DAILY_END_MARKER = "<!-- d-brain:reflect:end -->"
@@ -142,6 +143,7 @@ HANDOFF_SECTION_RE = re.compile(
 HANDOFF_FRONTMATTER_RE = re.compile(r"\A\ufeff?---\n.*?\n---\n*", re.DOTALL)
 THOUGHT_FRONTMATTER_KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*):(?:\s*(.*))?$")
 PROCESS_AUDIT_STATE_TTL_DAYS = 7
+TODOIST_RETRY_RELATIVE_PATH = Path(".session") / "todoist-retry.json"
 # Block-boundary splitter for _insert_after_first_paragraph (ТЗ 7.4 code
 # review defect 1): keeps the blank-line separators so the text can be
 # reassembled byte-for-byte around the inserted warning.
@@ -450,6 +452,11 @@ class CliProcessor:
         extra_env: dict[str, str] = {}
         if self.todoist_api_key:
             extra_env["TODOIST_API_KEY"] = self.todoist_api_key
+            # Nightly Codex runs keep filesystem writes inside the vault.
+            # npx needs a writable cache to start the Todoist MCP package.
+            extra_env["NPM_CONFIG_CACHE"] = str(
+                self.vault_path / ".session" / "npm-cache"
+            )
         if self._openai_api_key:
             extra_env["OPENAI_API_KEY"] = self._openai_api_key
         if self._openai_base_url:
@@ -2166,6 +2173,9 @@ WORKFLOW:
         source_context: str = "",
     ) -> list[dict[str, str]]:
         """Create routed Todoist tasks and return created ids with titles."""
+        tasks = self._dedupe_todoist_tasks(
+            [*self._load_pending_todoist_tasks(), *tasks]
+        )
         if not tasks or not self.todoist_api_key:
             return []
 
@@ -2218,10 +2228,10 @@ WORKFLOW:
                     text=True,
                     check=False,
                     env=build_subprocess_env(self._cli_extra_env()),
-                    timeout=3600,
+                    timeout=TODOIST_TASK_TIMEOUT,
                 )
             except subprocess.TimeoutExpired:
-                errors.append("timeout after 3600s")
+                errors.append(f"timeout after {TODOIST_TASK_TIMEOUT}s")
                 continue
             if result.returncode == 0:
                 try:
@@ -2230,6 +2240,9 @@ WORKFLOW:
                         error_context="Processor Todoist MCP output",
                     )
                 except ValueError:
+                    # The request may already have succeeded. Repeating an
+                    # ambiguous successful response could create duplicates.
+                    self._save_pending_todoist_tasks([])
                     return []
                 task_items = parsed.get("tasks")
                 if not isinstance(task_items, list):
@@ -2254,10 +2267,110 @@ WORKFLOW:
                             or fallback,
                         }
                     )
+                self._save_pending_todoist_tasks([])
                 return created
             errors.append(result.stderr.strip() or result.stdout.strip())
+        self._save_pending_todoist_tasks(tasks)
         logger.warning("Todoist creation failed after retries: %s", " | ".join(errors))
         return []
+
+    def _todoist_retry_path(self) -> Path:
+        return self.vault_path / TODOIST_RETRY_RELATIVE_PATH
+
+    @staticmethod
+    def _dedupe_todoist_tasks(
+        tasks: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        deduped: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            content = " ".join(str(task.get("content") or "").split())
+            if not content:
+                continue
+            normalized = {**task, "content": content}
+            key = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(normalized)
+        return deduped
+
+    def _load_pending_todoist_tasks(self) -> list[dict[str, Any]]:
+        try:
+            payload = json.loads(
+                self._todoist_retry_path().read_text(encoding="utf-8")
+            )
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return []
+        if not isinstance(payload, dict) or not isinstance(payload.get("tasks"), list):
+            return []
+        return self._dedupe_todoist_tasks(
+            [task for task in payload["tasks"] if isinstance(task, dict)]
+        )
+
+    def _save_pending_todoist_tasks(self, tasks: list[dict[str, Any]]) -> None:
+        path = self._todoist_retry_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(f"{path.suffix}.tmp-{os.getpid()}")
+        tmp_path.write_text(
+            json.dumps(
+                {"tasks": self._dedupe_todoist_tasks(tasks)},
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(tmp_path, path)
+
+    def _retry_pending_todoist_tasks(self) -> list[dict[str, str]]:
+        """Retry durable Todoist tasks before processing new daily entries."""
+        if not self._load_pending_todoist_tasks():
+            return []
+        return self._create_todoist_tasks([])
+
+    def _reconcile_capture_todoist_tasks(
+        self,
+        capture_data: dict[str, Any],
+        execute_data: dict[str, Any],
+    ) -> None:
+        """Create capture tasks missing from the execute phase result."""
+        created = self._json_dict_list(execute_data, "tasks_created")
+        created_contents = {
+            " ".join(str(item.get("content") or "").split()).casefold()
+            for item in created
+            if str(item.get("content") or "").strip()
+        }
+        missing: list[dict[str, Any]] = []
+        for entry in self._json_dict_list(capture_data, "entries"):
+            if str(entry.get("classification") or "").strip() != "task":
+                continue
+            content = " ".join(str(entry.get("task_content") or "").split())
+            if not content or content.casefold() in created_contents:
+                continue
+            task: dict[str, Any] = {
+                "content": content,
+                "priority": entry.get("task_priority") or 1,
+                "due_hint": entry.get("task_due") or "",
+            }
+            entities = entry.get("entities")
+            if isinstance(entities, list) and entities:
+                task["project_hint"] = str(entities[0])
+            missing.append(task)
+
+        if not missing:
+            return
+        newly_created = self._create_todoist_tasks(
+            missing,
+            source_context=json.dumps(capture_data, ensure_ascii=False),
+        )
+        if newly_created:
+            execute_data["tasks_created"] = [*created, *newly_created]
+        else:
+            execute_data["tasks_pending"] = missing
 
     def _process_audit_state_path(self) -> Path:
         """Cache path for short-lived dedupe of auto-created audit tasks."""
@@ -2891,6 +3004,8 @@ or recent vault notes before answering instead of guessing.
             f"{links_reference}\n"
             "=== END LINKS REFERENCE ===\n\n"
             "Read .session/capture.json and .session/execute.json for input data.\n"
+            "In handoff Last Session, report reviewed entries and processed "
+            "entries as separate counts from execute.json entry_counts.\n"
             "Read .graph/health-history.json, .session/creative-recall.txt and "
             ".session/memory-audit.md "
             "when they exist.\n"
@@ -4711,10 +4826,6 @@ EXECUTION:
             report_markdown = summary_markdown or (
                 f"📅 **{copy['weekly_digest_title']}**"
             )
-            freshness_report = self._freshness_lint_report()
-            if freshness_report:
-                report_markdown = f"{report_markdown}\n\n{freshness_report}"
-
             summary_path: Path | None = None
             try:
                 summary_path = self._save_weekly_summary(summary_markdown, today)
@@ -5250,6 +5361,10 @@ YEARLY REVIEW RULES:
         # call signature. A long-running nightly cycle can cross midnight,
         # so those entrypoints must not fall back to ``date.today()``.
         self._scheduled_cycle_day = today
+        try:
+            self._retry_pending_todoist_tasks()
+        except Exception:
+            logger.warning("Todoist pending-task retry failed", exc_info=True)
         daily_result = self.process_daily(today, mode=SCHEDULED_MODE)
         reports = [
             self._strip_vault_health_report_section(
@@ -5436,6 +5551,10 @@ YEARLY REVIEW RULES:
             prune_ops_journal(self.vault_path)
         except Exception:
             logger.warning("Ops journal prune failed", exc_info=True)
+
+        freshness_report = self._freshness_lint_report()
+        if freshness_report:
+            reports.append(freshness_report)
 
         self._refresh_qmd_index()
 

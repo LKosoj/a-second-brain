@@ -907,7 +907,7 @@ def _atomic_write_at(
     published = False
     durable_commit = False
     preserve_stage_contents = False
-    mode = 0o600
+    mode = 0o660
     # The candidate below is created inside a private staging directory whose
     # setgid bit is deliberately cleared, so it is born with the *writing
     # process's* group rather than the group the target directory hands out.

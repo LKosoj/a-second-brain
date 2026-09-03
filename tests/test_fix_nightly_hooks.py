@@ -1,5 +1,5 @@
-"""Tests for the two nightly/weekly hooks added after the audit:
-``prune_ops_journal`` runs once per scheduled cycle, and the weekly digest
+"""Tests for the two nightly hooks added after the audit:
+``prune_ops_journal`` runs once per scheduled cycle, and the final report
 carries a compiled-page freshness summary from ``freshness_lint.py``.
 """
 
@@ -147,38 +147,25 @@ def test_freshness_report_survives_broken_script(
     assert any("Freshness lint failed" in r.getMessage() for r in caplog.records)
 
 
-def test_weekly_digest_report_includes_freshness_summary(tmp_path: Path) -> None:
+def test_scheduled_cycle_checks_freshness_after_compiled_updates(
+    tmp_path: Path,
+) -> None:
     vault_path = tmp_path / "vault"
-    _write_vault_manifest(vault_path)
-    _install_freshness_lint(tmp_path)
-    _write_stale_compiled_page(vault_path)
-    day = date.today()
-    iso_year, iso_week, _ = day.isocalendar()
-    goals_path = vault_path / "goals"
-    goals_path.mkdir(parents=True)
-    (vault_path / "MEMORY.md").write_text("memory\n", encoding="utf-8")
-    (goals_path / "2-monthly.md").write_text("monthly\n", encoding="utf-8")
-    (goals_path / "1-yearly.md").write_text("yearly\n", encoding="utf-8")
-    (goals_path / "3-weekly.md").write_text(
-        f"---\nweek: {iso_year}-W{iso_week:02d}\n---\n\n# Weekly Focus\n",
-        encoding="utf-8",
-    )
+    day = date(2026, 4, 6)
+    _setup_daily_processing_vault(vault_path, day)
     processor = CliProcessor(vault_path)
-    saved: list[str] = []
+    _stub_scheduled_cycle(processor)
+    events: list[str] = []
+    processor._run_control_plane_maintenance_workflow = (  # type: ignore[method-assign]
+        lambda name: events.append(name)
+        or {"report": "", "processed_entries": 0}
+    )
+    processor._freshness_lint_report = (  # type: ignore[method-assign]
+        lambda: events.append("freshness") or "freshness-report"
+    )
 
-    def fake_save(report_markdown: str, week_date: date) -> Path:
-        saved.append(report_markdown)
-        return vault_path / "summaries" / f"{week_date.isoformat()}-summary.md"
+    result = processor.run_scheduled_cycle(day)
 
-    processor._save_weekly_summary = fake_save  # type: ignore[method-assign]
-    processor._update_weekly_moc = lambda summary_path: None  # type: ignore[method-assign]
-    processor._log_periodic_summary = lambda **kwargs: None  # type: ignore[method-assign]
-    processor._refresh_qmd_index = lambda: None  # type: ignore[method-assign]
-    processor._run_prompt = lambda prompt: "📅 **Недельный дайджест**"  # type: ignore[method-assign]
-
-    result = processor.generate_weekly_digest(refresh_qmd=False)
-
-    assert result["report"].startswith("📅 **Недельный дайджест**")
-    assert "## 🕰 Свежесть compiled-страниц" in result["report"]
-    # The Telegram report carries the summary; the saved vault note does not.
-    assert saved == ["📅 **Недельный дайджест**"]
+    assert events[-1] == "freshness"
+    assert "maintenance.compiled-nightly" in events[:-1]
+    assert "freshness-report" in result["report"]

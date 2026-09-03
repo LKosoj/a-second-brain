@@ -487,12 +487,14 @@ ARCHIVE_TIER_IDLE_DAYS = 180
 def _atomic_write_text(path: Path, payload: str) -> None:
     """Write text atomically via tempfile + os.replace to survive crashes."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o660
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
         suffix=".tmp",
         dir=str(path.parent),
     )
     try:
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(payload)
             handle.flush()
@@ -514,12 +516,14 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
     is for the rest of this module's text handling.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o660
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
         suffix=".tmp",
         dir=str(path.parent),
     )
     try:
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "wb") as handle:
             handle.write(payload)
             handle.flush()

@@ -25,6 +25,8 @@ from d_brain import run_compiled_digest
 from d_brain.manifest import load_manifest_for_vault
 from d_brain.services.compiled_briefings import CompiledBriefingCandidate
 from d_brain.services.compiled_enrich_report import (
+    MAX_CHANGES_SHOWN,
+    MAX_DECISIONS_SHOWN,
     STALE_REVISIT_DAYS,
     PassStatus,
     _ChangeItem,
@@ -43,6 +45,46 @@ from d_brain.services.decisions_queue import (
 from d_brain.services.frontmatter import parse_frontmatter_bytes, validate_document
 
 DAY = date(2026, 8, 5)
+
+
+def test_daily_digest_limits_decisions_and_changes(
+    tmp_path, write_vault_manifest
+) -> None:
+    vault = tmp_path / "vault"
+    write_vault_manifest(vault)
+    decisions = []
+    for index in range(MAX_DECISIONS_SHOWN + 2):
+        decisions.append(
+            {
+                "kind": "drift",
+                "page": f"compiled/topics/decision-{index}.md",
+                "summary": f"решение {index}",
+                "since": DAY.isoformat(),
+            }
+        )
+    _write_queue(vault, decisions)
+    for index in range(MAX_CHANGES_SHOWN + 2):
+        _write_page(
+            vault,
+            f"compiled/topics/change-{index}.md",
+            domain="topics",
+            title=f"Изменение {index}",
+            created=DAY.isoformat(),
+            last_accessed=DAY.isoformat(),
+            sources_rows=[
+                (DAY.isoformat(), f"daily/source-{index}.md", f"факт {index}")
+            ],
+        )
+
+    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="success"))
+
+    assert digest is not None
+    assert "Ещё решений за сегодня: 2" in digest
+    assert "Ещё изменённых страниц: 2" in digest
+    assert "решение 4" in digest
+    assert "решение 5" not in digest
+    assert "Изменение 4" in digest
+    assert "Изменение 5" not in digest
 
 
 def _compiled_page_text(

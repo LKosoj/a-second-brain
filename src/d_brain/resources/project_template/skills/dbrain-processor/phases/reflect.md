@@ -94,6 +94,8 @@ If problems occurred during processing, append to `.session/handoff.md` under `#
 
 Update session context:
 - Last Session: what was processed
+- In Last Session, keep two explicit counts from `execute.json.entry_counts`:
+  entries reviewed and entries processed. Do not call reviewed entries processed.
 - Key Decisions: if any
 - In Progress: incomplete items
 - Next Steps: what to do next

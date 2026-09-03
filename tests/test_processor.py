@@ -33,6 +33,110 @@ from d_brain.services.processor import (
 from d_brain.services.vault_lock import vault_write_lock
 
 
+def test_todoist_failure_is_saved_and_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    processor = CliProcessor(vault_path, todoist_api_key="token")
+    processor._project_catalog.get_catalog = lambda **kwargs: {  # type: ignore[method-assign]
+        "available": False,
+        "catalog": None,
+        "errors": [],
+    }
+    processor._project_router.route_task = lambda *args, **kwargs: {}  # type: ignore[method-assign]
+    calls = {"count": 0}
+
+    def fake_run(*args, **kwargs):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        if calls["count"] <= 3:
+            return subprocess.CompletedProcess(args[0], 1, "", "timeout")
+        return subprocess.CompletedProcess(
+            args[0], 0, '{"tasks": [{"id": "42", "content": "Позвонить"}]}', ""
+        )
+
+    monkeypatch.setattr("d_brain.services.processor.subprocess.run", fake_run)
+    monkeypatch.setattr("d_brain.services.processor.time.sleep", lambda _: None)
+
+    assert processor._create_todoist_tasks([{"content": "Позвонить"}]) == []
+    assert processor._load_pending_todoist_tasks() == [{"content": "Позвонить"}]
+
+    assert processor._retry_pending_todoist_tasks() == [
+        {"id": "42", "content": "Позвонить"}
+    ]
+    assert processor._load_pending_todoist_tasks() == []
+
+
+def test_reconcile_capture_saves_missing_todoist_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = CliProcessor(tmp_path / "vault", todoist_api_key="token")
+    pending: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        processor,
+        "_create_todoist_tasks",
+        lambda tasks, **kwargs: pending.extend(tasks) or [],
+    )
+    execute_data: dict[str, object] = {"tasks_created": []}
+
+    processor._reconcile_capture_todoist_tasks(
+        {
+            "entries": [
+                {
+                    "classification": "task",
+                    "task_content": "Позвонить",
+                    "task_priority": 2,
+                    "task_due": "tomorrow",
+                }
+            ]
+        },
+        execute_data,
+    )
+
+    assert pending == [
+        {"content": "Позвонить", "priority": 2, "due_hint": "tomorrow"}
+    ]
+    assert execute_data["tasks_pending"] == pending
+
+
+def test_execute_counts_reviewed_separately_from_processed_when_task_is_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = CliProcessor(tmp_path / "vault")
+    written: dict[str, object] = {}
+    capture_data = {
+        "entries": [
+            {"classification": "task"},
+            {"classification": "project"},
+            {"classification": "skip"},
+        ]
+    }
+    monkeypatch.setattr(processor, "_build_execute_prompt", lambda day: "execute")
+    monkeypatch.setattr(
+        processor,
+        "_run_json_phase",
+        lambda *args, **kwargs: {"tasks_created": [], "thoughts_saved": []},
+    )
+    monkeypatch.setattr(
+        processor,
+        "_write_session_json",
+        lambda name, payload: written.update({name: payload}),
+    )
+    monkeypatch.setattr(
+        processor,
+        "_reconcile_capture_todoist_tasks",
+        lambda capture, execute: execute.update(
+            {"tasks_pending": [{"content": "Позвонить"}]}
+        ),
+    )
+    monkeypatch.setattr(processor, "_normalize_saved_thoughts", lambda *a, **k: None)
+
+    result = processor._daily_workflow._execute(date(2026, 4, 4), capture_data)
+
+    assert result["entry_counts"] == {"reviewed": 3, "processed": 1}
+    assert written["execute.json"] == result
+
+
 def test_process_daily_facade_signature_and_timeout_mapping(tmp_path: Path) -> None:
     signature = inspect.signature(CliProcessor.process_daily)
     parameters = list(signature.parameters.values())
@@ -1568,6 +1672,9 @@ def test_process_daily_scheduled_preserves_side_effect_order(tmp_path: Path) -> 
     processor._write_session_json = (  # type: ignore[method-assign]
         lambda file_name, payload: events.append(f"write:{file_name}")
     )
+    processor._reconcile_capture_todoist_tasks = (  # type: ignore[method-assign]
+        lambda capture_data, execute_data: events.append("reconcile-todoist")
+    )
     processor._normalize_saved_thoughts = (  # type: ignore[method-assign]
         lambda execute_data, day: events.append("normalize-thoughts")
     )
@@ -1601,6 +1708,8 @@ def test_process_daily_scheduled_preserves_side_effect_order(tmp_path: Path) -> 
         "count",
         "write:capture.json",
         "execute:retry=False:raw=True",
+        "reconcile-todoist",
+        "count",
         "write:execute.json",
         "normalize-thoughts",
         "memory-decay",

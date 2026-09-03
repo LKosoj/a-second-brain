@@ -87,6 +87,7 @@ def test_build_command_restricted_swaps_sandbox_flag_for_codex() -> None:
     assert "--dangerously-bypass-approvals-and-sandbox" not in restricted
     assert "--sandbox" in restricted
     assert "workspace-write" in restricted
+    assert "sandbox_workspace_write.network_access=true" in restricted
 
 
 def test_build_command_restricted_is_noop_for_backend_without_a_flag() -> None:
