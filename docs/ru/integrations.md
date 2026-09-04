@@ -21,6 +21,7 @@ AI_CLI=claude
 | Claude Code | `claude auth login` |
 | Claude Code в tmux (`claude-tmux`) | `claude auth login` |
 | Codex CLI | `codex login` |
+| Codex в tmux (`codex-tmux`) | `codex login` |
 | Qwen Code | `qwen auth qwen-oauth` |
 | Gemini CLI | настройте поддерживаемые учётные данные Google/Gemini |
 | Kimi Code | `kimi login` |
@@ -55,6 +56,10 @@ tmux (терминальный мультиплексор: запускает п
 вариант на случай, если headless-режим перестанет поддерживаться. Требуется
 установленный `tmux`; каждый запуск создаёт отдельный tmux-сервер и удаляет
 его после ответа.
+
+Backend `codex-tmux` так же запускает интерактивный Codex. Он ждёт завершения
+загрузки, вставляет запрос через буфер tmux и читает чистый ответ из rollout
+Codex, а не с экрана терминала.
 
 ## Deepgram
 

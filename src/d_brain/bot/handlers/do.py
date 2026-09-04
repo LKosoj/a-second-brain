@@ -18,7 +18,7 @@ from aiogram.types import (
 
 from d_brain.bot.formatters import format_process_report
 from d_brain.bot.progress import wait_for_task_with_progress
-from d_brain.bot.replies import answer_rich_text, answer_text, edit_text
+from d_brain.bot.replies import answer_files, answer_rich_text, answer_text, edit_text
 from d_brain.bot.states import DoCommandState
 from d_brain.config import get_settings
 from d_brain.services.answers import (
@@ -247,6 +247,12 @@ async def process_request(message: Message, prompt: str, user_id: int = 0) -> No
         await final_sender(message, formatted, **send_kwargs)
     except Exception:
         logger.exception("Failed to send /do final reply")
+    artifact_paths = report.get("artifact_paths")
+    if isinstance(artifact_paths, list):
+        try:
+            await answer_files(message, [str(path) for path in artifact_paths])
+        except Exception:
+            logger.exception("Failed to send /do artifacts")
 
 
 def build_save_answer_keyboard(answer_id: str) -> InlineKeyboardMarkup:

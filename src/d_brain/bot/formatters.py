@@ -18,10 +18,21 @@ def format_process_report(report: dict[str, Any]) -> str:
         return f"❌ **Ошибка:** {str(report['error']).strip()}"
 
     raw_report = str(report.get("report") or "").strip()
-    if raw_report:
-        return normalize_markdown_input(raw_report)
-
-    return "✅ **Обработка завершена**"
+    formatted = (
+        normalize_markdown_input(raw_report)
+        if raw_report
+        else "✅ **Обработка завершена**"
+    )
+    artifact_paths = [
+        str(path).strip()
+        for path in report.get("artifact_paths", [])
+        if str(path).strip()
+    ]
+    if artifact_paths:
+        formatted += "\n\n**Файлы:**\n" + "\n".join(
+            f"- `{path}`" for path in artifact_paths
+        )
+    return formatted
 
 
 def format_error(error: str) -> str:

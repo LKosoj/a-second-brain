@@ -9,7 +9,7 @@ from aiogram import Router
 from aiogram.types import Message
 
 from d_brain.bot.formatters import format_process_report
-from d_brain.bot.replies import answer_rich_text, answer_text, edit_text
+from d_brain.bot.replies import answer_files, answer_rich_text, answer_text, edit_text
 from d_brain.config import get_settings
 from d_brain.services.link_summary import (
     LinkSummaryService,
@@ -209,6 +209,12 @@ async def handle_text(message: Message) -> None:
                 await final_sender(message, formatted)
             except Exception:
                 logger.exception("Failed to send direct answer")
+            artifact_paths = report.get("artifact_paths")
+            if isinstance(artifact_paths, list):
+                try:
+                    await answer_files(message, [str(path) for path in artifact_paths])
+                except Exception:
+                    logger.exception("Failed to send direct-answer artifacts")
             logger.info("Text message routed to direct answer")
             return
 

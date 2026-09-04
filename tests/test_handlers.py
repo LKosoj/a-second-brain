@@ -128,6 +128,7 @@ def test_handle_text_routes_questions_to_answer_path(
     status_updates: list[str] = []
     session_entries: list[tuple[int, str, dict]] = []
     deleted = {"value": False}
+    delivered_files: list[str] = []
 
     class FakeStatusMessage:
         async def delete(self) -> None:
@@ -151,6 +152,9 @@ def test_handle_text_routes_questions_to_answer_path(
     ):
         answers.append(text)
         return SimpleNamespace(text=text)
+
+    async def fake_answer_files(_message, paths: list[str]) -> None:  # noqa: ANN001
+        delivered_files.extend(paths)
 
     class FakeStorage:
         def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
@@ -185,6 +189,7 @@ def test_handle_text_routes_questions_to_answer_path(
                     "2. Example Studio"
                 ),
                 "processed_entries": 1,
+                "artifact_paths": [str(tmp_path / "attachments" / "plan.xml")],
             }
 
     class FakeSessionStore:
@@ -222,17 +227,20 @@ def test_handle_text_routes_questions_to_answer_path(
     monkeypatch.setattr(text_handler, "SessionStore", FakeSessionStore)
     monkeypatch.setattr(text_handler, "answer_text", fake_answer_text)
     monkeypatch.setattr(text_handler, "answer_rich_text", fake_answer_rich_text)
+    monkeypatch.setattr(text_handler, "answer_files", fake_answer_files)
     monkeypatch.setattr(text_handler, "edit_text", fake_edit_text)
 
     asyncio.run(text_handler.handle_text(FakeMessage()))
 
     assert len(answers) == 1
     assert "Приоритеты недели" in answers[0]
+    assert str(tmp_path / "attachments" / "plan.xml") in answers[0]
     assert any("прямой ответ / question" in item for item in status_updates)
     assert any("готовлю прямой ответ" in item for item in status_updates)
     assert any("отправляю ответ" in item for item in status_updates)
     assert deleted["value"] is True
     assert session_entries[0][1] == "question"
+    assert delivered_files == [str(tmp_path / "attachments" / "plan.xml")]
 
 
 def test_process_command_falls_back_to_new_message_when_status_edit_fails(

@@ -1997,6 +1997,50 @@ def test_answer_question_uses_creative_recall_and_touches_core_memory(
     )
 
 
+def test_answer_question_returns_generated_attachment_paths(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _setup_daily_processing_vault(vault_path, day)
+    processor = CliProcessor(vault_path)
+    processor._capture_creative_recall = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    processor._touch_memory_paths = lambda *paths: None  # type: ignore[method-assign]
+
+    def fake_run(_prompt: str) -> str:
+        artifact = vault_path / "attachments" / "migration-plan.xml"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text("<Project />", encoding="utf-8")
+        return "Файл создан."
+
+    processor._run_assistant_prompt = fake_run  # type: ignore[method-assign]
+
+    result = processor.answer_question("Создай проект в MS Project", user_id=42)
+
+    assert result["artifact_paths"] == [
+        str((vault_path / "attachments" / "migration-plan.xml").resolve())
+    ]
+
+
+def test_answer_question_returns_existing_attachment_named_in_answer(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _setup_daily_processing_vault(vault_path, day)
+    artifact = vault_path / "attachments" / "migration-plan.xml"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("<Project />", encoding="utf-8")
+    processor = CliProcessor(vault_path)
+    processor._capture_creative_recall = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    processor._touch_memory_paths = lambda *paths: None  # type: ignore[method-assign]
+    processor._run_assistant_prompt = (  # type: ignore[method-assign]
+        lambda _prompt: "Отправляю `attachments/migration-plan.xml`."
+    )
+
+    result = processor.answer_question("Пришли этот файл", user_id=42)
+
+    assert result["artifact_paths"] == [str(artifact.resolve())]
+
+
 def test_answer_question_does_not_depend_on_uv_for_memory_steps(
     tmp_path: Path,
 ) -> None:

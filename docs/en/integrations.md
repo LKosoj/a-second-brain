@@ -21,6 +21,7 @@ Supported values and common authentication commands:
 | Claude Code | `claude auth login` |
 | Claude Code in tmux (`claude-tmux`) | `claude auth login` |
 | Codex CLI | `codex login` |
+| Codex in tmux (`codex-tmux`) | `codex login` |
 | Qwen Code | `qwen auth qwen-oauth` |
 | Gemini CLI | configure a supported Google/Gemini credential |
 | Kimi Code | `kimi login` |
@@ -52,6 +53,10 @@ read from the session transcript Claude Code writes to
 `~/.claude/projects/<project>/<session-id>.jsonl`. It exists as a fallback for
 the day headless mode goes away. It requires `tmux`; every run starts a private
 tmux server and removes it once the answer arrives.
+
+The `codex-tmux` backend does the same for the interactive Codex interface.
+It waits until Codex finishes loading, pastes the prompt through a tmux buffer,
+and reads the clean answer from the Codex rollout instead of the terminal pane.
 
 ## Deepgram
 

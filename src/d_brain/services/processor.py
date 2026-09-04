@@ -427,6 +427,40 @@ class CliProcessor:
         """Execute a vault-scoped assistant prompt via the configured CLI."""
         return self._run_vault_prompt(prompt)
 
+    def _attachment_snapshot(self) -> dict[Path, tuple[int, int]]:
+        """Return size and modification time for files under attachments/."""
+        root = self.vault_path / "attachments"
+        if not root.exists():
+            return {}
+
+        snapshot: dict[Path, tuple[int, int]] = {}
+        for path in root.rglob("*"):
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                stat = path.stat()
+            except OSError:
+                continue
+            snapshot[path] = (stat.st_mtime_ns, stat.st_size)
+        return snapshot
+
+    def _run_assistant_prompt_with_artifacts(
+        self,
+        prompt: str,
+    ) -> tuple[str, list[str]]:
+        """Return attachments created, changed, or named in the answer."""
+        before = self._attachment_snapshot()
+        output = self._run_assistant_prompt(prompt)
+        after = self._attachment_snapshot()
+        artifact_paths = sorted(
+            str(path.resolve())
+            for path, fingerprint in after.items()
+            if before.get(path) != fingerprint
+            or path.relative_to(self.vault_path).as_posix() in output
+            or str(path.resolve()) in output
+        )
+        return output, artifact_paths
+
     @staticmethod
     def _inject_prompt_block(prompt: str, marker: str, block: str) -> str:
         """Insert one context block before the first marker occurrence."""
@@ -2927,6 +2961,9 @@ CONTEXT:
 
 If `.session/question-creative-recall.txt` exists and is useful, read it too.
 
+If the request creates or asks for an existing user-facing file, save or locate
+it under `attachments/` and include its exact vault-relative path in the answer.
+
 If a QUESTION ROUTE block is provided, follow its read order and escalation
 rules. That route overrides the generic defaults below when they conflict.
 
@@ -3598,7 +3635,7 @@ or recent vault notes before answering instead of guessing.
             )
             prompt = self._build_question_answer_prompt(question, user_id)
             prompt = self._inject_question_context_blocks(prompt, question)
-            output = self._run_assistant_prompt(prompt)
+            output, artifact_paths = self._run_assistant_prompt_with_artifacts(prompt)
             normalized = self._normalize_owner_report_markdown(output)
             normalized = self._append_question_provenance(normalized, question)
             self._file_output_artifact_if_useful(
@@ -3609,6 +3646,7 @@ or recent vault notes before answering instead of guessing.
             return {
                 "report": normalized,
                 "processed_entries": 1,
+                "artifact_paths": artifact_paths,
             }
         except TimeoutError:
             logger.error("%s question answering timed out", self.ai_cli)
@@ -4269,6 +4307,9 @@ history exists.
 USER REQUEST:
 {user_prompt}
 
+If the request creates or asks for an existing user-facing file, save or locate
+it under `attachments/` and include its exact vault-relative path in the report.
+
 {
             self._telegram_markdown_output_rules(
                 opening_line="Start with emoji and a short heading."
@@ -4290,7 +4331,7 @@ EXECUTION:
                     purpose="assistant_request",
                 ),
             )
-            output = self._run_assistant_prompt(prompt)
+            output, artifact_paths = self._run_assistant_prompt_with_artifacts(prompt)
             normalized = self._normalize_owner_report_markdown(output)
             self._file_output_artifact_if_useful(
                 request=user_prompt,
@@ -4300,6 +4341,7 @@ EXECUTION:
             return {
                 "report": normalized,
                 "processed_entries": 1,
+                "artifact_paths": artifact_paths,
             }
         except TimeoutError:
             logger.error("%s execution timed out", self.ai_cli)

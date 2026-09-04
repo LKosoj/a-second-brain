@@ -7,6 +7,7 @@ and semantic versioning.
 
 ### Added
 
+- Interactive `codex-tmux` backend with rollout-based answer extraction.
 - Reminders: "напомни завтра в 9 позвонить" is parsed without an AI call,
   stored in `vault/.session/reminders.jsonl`, delivered by a ticker in the
   bot, and listed by `/reminders`.

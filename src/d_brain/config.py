@@ -70,6 +70,7 @@ class Settings(BaseSettings):
         "claude",
         "claude-tmux",
         "codex",
+        "codex-tmux",
         "qwen",
         "gemini",
         "kimi",

@@ -11,6 +11,7 @@ from aiogram.types import (
 
 from d_brain.bot.replies import (
     RICH_TEXT_LIMIT,
+    answer_files,
     answer_rich_text,
     edit_rich_text,
     edit_text,
@@ -118,6 +119,22 @@ async def test_send_text_sends_long_plain_message_as_html_file() -> None:
     assert _chat_id == 42
     assert document.filename == "d-brain-message.html"
     assert text in document.data.decode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_answer_files_sends_each_generated_artifact(tmp_path) -> None:
+    first = tmp_path / "plan.xml"
+    second = tmp_path / "diagram.png"
+    first.write_text("<Project />", encoding="utf-8")
+    second.write_bytes(b"png")
+    message = _FakeMessage()
+
+    await answer_files(message, [str(first), str(second)])
+
+    assert [document.filename for document in message.documents] == [
+        "plan.xml",
+        "diagram.png",
+    ]
 
 
 @pytest.mark.asyncio

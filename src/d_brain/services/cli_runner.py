@@ -17,6 +17,7 @@ from d_brain.services.cli_json_stream import (
     recover_cli_error_from_raw_stream,
     recover_cli_text_from_raw_stream,
 )
+from d_brain.services.codex_tmux import run_codex_tmux
 from d_brain.services.kimi_acp import run_kimi_acp
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,7 @@ AiCliName = Literal[
     "claude",
     "claude-tmux",
     "codex",
+    "codex-tmux",
     "qwen",
     "gemini",
     "kimi",
@@ -243,6 +245,17 @@ CLI_SPECS: dict[AiCliName, CliSpec] = {
             "--json",
         ),
     ),
+    "codex-tmux": CliSpec(
+        name="codex-tmux",
+        # The prompt never reaches argv here: it is pasted into a TUI session.
+        argv_prefix=(
+            "codex",
+            "--no-alt-screen",
+            "-c",
+            "check_for_update_on_startup=false",
+            "--dangerously-bypass-approvals-and-sandbox",
+        ),
+    ),
     "qwen": CliSpec(
         name="qwen",
         argv_prefix=(
@@ -318,6 +331,7 @@ _EXTERNAL_RUNNERS: dict[
 ] = {
     "kimi": run_kimi_acp,
     "claude-tmux": run_claude_tmux,
+    "codex-tmux": run_codex_tmux,
 }
 
 
@@ -477,9 +491,9 @@ class CliRunner:
         in the backend's shell/network-denying prefix when one is declared
         (see ``CliSpec.restricted_argv_prefix``). Only claude and codex
         currently declare one; every other backend (qwen, gemini, kimi, grok,
-        opencode, claude-tmux) has no such flag, so ``restricted=True`` is a
-        no-op for them and logs a warning instead of silently running
-        unrestricted.
+        opencode, claude-tmux, codex-tmux) has no such flag, so
+        ``restricted=True`` is a no-op for them and logs a warning instead of
+        silently running unrestricted.
         """
 
         if self.ai_cli in _EXTERNAL_RUNNERS:
@@ -538,9 +552,10 @@ class CliRunner:
 
         ``restricted=True`` is for the unattended scheduled cycle -- see
         ``build_command`` for which backends (claude, codex) actually declare
-        a restricted-mode flag. External runners (kimi, claude-tmux) and the
-        remaining backends (qwen, gemini, grok, opencode) have no argv to
-        restrict here, are left untouched, and log a warning instead.
+        a restricted-mode flag. External runners (kimi, claude-tmux,
+        codex-tmux) and the remaining backends (qwen, gemini, grok, opencode)
+        have no argv to restrict here, are left untouched, and log a warning
+        instead.
         """
 
         env = build_subprocess_env(extra_env)

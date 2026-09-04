@@ -85,6 +85,7 @@ async def test_process_request_sends_rich_final_after_deleting_status(
     monkeypatch,
 ) -> None:
     fallback_answers: list[tuple[str, str | None]] = []
+    delivered_files: list[str] = []
     status_messages: list[object] = []
     class FakeStatusMessage:
         deleted = False
@@ -99,7 +100,11 @@ async def test_process_request_sends_rich_final_after_deleting_status(
         def execute_prompt(self, prompt: str, user_id: int = 0) -> dict[str, object]:
             assert prompt == "Проверить статус"
             assert user_id == 42
-            return {"report": "**Готово**", "processed_entries": 1}
+            return {
+                "report": "**Готово**",
+                "processed_entries": 1,
+                "artifact_paths": ["/vault/attachments/plan.xml"],
+            }
 
     async def fake_answer_text(message, text: str, **kwargs):  # noqa: ANN001, ANN003
         if text == "⏳ Выполняю...":
@@ -120,8 +125,12 @@ async def test_process_request_sends_rich_final_after_deleting_status(
     async def fake_to_thread(func, *args, **kwargs):  # noqa: ANN001, ANN003
         return func(*args, **kwargs)
 
+    async def fake_answer_files(message, paths: list[str]) -> None:  # noqa: ANN001
+        delivered_files.extend(paths)
+
     monkeypatch.setattr(do_handler, "answer_text", fake_answer_text)
     monkeypatch.setattr(do_handler, "answer_rich_text", fake_answer_rich_text)
+    monkeypatch.setattr(do_handler, "answer_files", fake_answer_files)
     monkeypatch.setattr(do_handler, "CliProcessor", FakeProcessor)
     monkeypatch.setattr(
         do_handler,
@@ -149,4 +158,10 @@ async def test_process_request_sends_rich_final_after_deleting_status(
 
     assert len(status_messages) == 1
     assert status_messages[0].deleted is True
-    assert fallback_answers == [("**Готово**", None)]
+    assert fallback_answers == [
+        (
+            "**Готово**\n\n**Файлы:**\n- `/vault/attachments/plan.xml`",
+            None,
+        )
+    ]
+    assert delivered_files == ["/vault/attachments/plan.xml"]

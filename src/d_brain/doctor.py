@@ -21,10 +21,20 @@ from d_brain.manifest import ManifestValidationError, VaultManifest, load_manife
 
 CheckLevel = Literal["OK", "INFO", "WARN", "ERR"]
 SUPPORTED_AI_CLIS = frozenset(
-    {"claude", "claude-tmux", "codex", "qwen", "gemini", "kimi", "grok", "opencode"}
+    {
+        "claude",
+        "claude-tmux",
+        "codex",
+        "codex-tmux",
+        "qwen",
+        "gemini",
+        "kimi",
+        "grok",
+        "opencode",
+    }
 )
 # Backends whose executable name differs from the AI_CLI value.
-AI_CLI_BINARIES = {"claude-tmux": "claude"}
+AI_CLI_BINARIES = {"claude-tmux": "claude", "codex-tmux": "codex"}
 # Setting names doctor looks up. pydantic-settings reads .env keys
 # case-insensitively; a lowercase variant of one of these still works at
 # runtime, but is worth flagging since not every consumer of .env
@@ -329,10 +339,10 @@ class ProjectDoctor:
             self.report.add("ERR", f"AI CLI '{self.ai_cli}' is missing")
             return
         self.report.add("OK", f"AI CLI '{self.ai_cli}' is installed")
-        if self.ai_cli == "claude-tmux" and not shutil.which("tmux"):
+        if self.ai_cli in {"claude-tmux", "codex-tmux"} and not shutil.which("tmux"):
             self.ai_cli_installed = False
             self.report.add(
-                "ERR", "AI CLI 'claude-tmux' requires tmux, which is missing"
+                "ERR", f"AI CLI '{self.ai_cli}' requires tmux, which is missing"
             )
             return
         if self._auth_ready():
@@ -426,6 +436,7 @@ class ProjectDoctor:
             "claude": (["claude", "auth", "status"], '"loggedIn": true'),
             "claude-tmux": (["claude", "auth", "status"], '"loggedIn": true'),
             "codex": (["codex", "login", "status"], "Logged in"),
+            "codex-tmux": (["codex", "login", "status"], "Logged in"),
             "qwen": (["qwen", "auth", "status"], "Authentication Method"),
         }
         command, marker = commands[self.ai_cli]
@@ -447,6 +458,7 @@ class ProjectDoctor:
             "claude": "claude auth login",
             "claude-tmux": "claude auth login",
             "codex": "codex login",
+            "codex-tmux": "codex login",
             "qwen": "qwen auth qwen-oauth",
             "gemini": "configure GOOGLE_API_KEY or GEMINI_API_KEY",
             "kimi": "kimi login",
@@ -463,7 +475,7 @@ class ProjectDoctor:
             return
 
         # The TUI backend spends its first seconds booting claude's interface.
-        timeout = 60 if self.ai_cli == "claude-tmux" else 20
+        timeout = 60 if self.ai_cli in {"claude-tmux", "codex-tmux"} else 20
         command = [
             sys.executable,
             "-m",

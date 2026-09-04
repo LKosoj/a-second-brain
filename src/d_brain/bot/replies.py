@@ -5,11 +5,12 @@ from __future__ import annotations
 import html
 import logging
 import re
+from pathlib import Path
 from typing import Any, cast
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import BufferedInputFile, InputRichMessage, Message
+from aiogram.types import BufferedInputFile, FSInputFile, InputRichMessage, Message
 
 from d_brain.bot.formatters import (
     TELEGRAM_TEXT_LIMIT,
@@ -229,6 +230,13 @@ async def answer_text(message: Message, text: str, **kwargs: Any) -> Message:
     return await _answer_document(
         message, document, caption=None, reply_markup=kwargs.get("reply_markup")
     )
+
+
+async def answer_files(message: Message, paths: list[str]) -> None:
+    """Send user-facing files produced by an assistant request."""
+    for raw_path in paths:
+        path = Path(raw_path)
+        await message.answer_document(FSInputFile(path, filename=path.name))
 
 
 async def answer_rich_text(message: Message, text: str, **kwargs: Any) -> Message:
