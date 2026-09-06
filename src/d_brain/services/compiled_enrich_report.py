@@ -74,6 +74,7 @@ MAX_REVISIT_PAGES = 2
 # Keep the Telegram digest scannable while preserving honest totals.
 MAX_DECISIONS_SHOWN = 5
 MAX_CHANGES_SHOWN = 5
+MAX_CHANGE_FACTS_SHOWN = 5
 # ТЗ 6.1 "Уровень памяти управляет бюджетом обогащения" / 6.5 "Повторное
 # всплытие": only these two tiers are eligible to resurface -- "core",
 # "active", and "warm" pages are in active use and are not what the owner
@@ -395,14 +396,29 @@ _FACT_SENTENCE_END = (".", "!", "?", "…", ":")
 
 
 def _join_change_facts(facts: Iterable[str]) -> str:
-    """Join per-source facts into one digest line without doubling punctuation."""
-    joined = ""
+    """Deduplicate, cap, and join facts without doubling punctuation."""
+    unique_facts: list[str] = []
+    seen: set[str] = set()
     for fact in facts:
+        cleaned = re.sub(r"\s+", " ", fact).strip()
+        key = _TRAILING_PUNCT_RE.sub("", cleaned).casefold()
+        if not cleaned or not key or key in seen:
+            continue
+        seen.add(key)
+        unique_facts.append(cleaned)
+
+    shown_facts = unique_facts[:MAX_CHANGE_FACTS_SHOWN]
+    joined = ""
+    for fact in shown_facts:
         if not joined:
             joined = fact
             continue
         separator = " " if joined.endswith(_FACT_SENTENCE_END) else "; "
         joined = f"{joined}{separator}{fact}"
+    hidden_count = len(unique_facts) - len(shown_facts)
+    if hidden_count:
+        separator = " " if joined.endswith(_FACT_SENTENCE_END) else "; "
+        joined = f"{joined}{separator}Ещё пунктов: {hidden_count}."
     return joined
 
 

@@ -25,20 +25,16 @@ Before writing anything:
 - prefer updating an existing durable note over creating a near-duplicate;
 - if uncertainty stays high, keep it in `observations` instead of forcing a task/note/CRM write.
 
-### 1. Create Todoist tasks
+### 1. Leave captured Todoist tasks to the runtime
 
 For each entry with `classification: "task"`:
-- Choose `projectId` from the provided live Todoist project catalog when the fit is clear.
-- Inbox is fallback only.
-- Personal tasks may still belong to named personal projects.
-- Create the owner's controllable next step, not a vague outcome statement.
-- If the note implies a reusable cadence, prefer a process-goal style recurring task.
-
-```bash
-mcp-cli call todoist add-tasks '{"tasks": [{"content": "...", "dueString": "...", "priority": "p2"}]}'
-```
-
-Record created task IDs.
+- Do not call `todoist add-tasks` for captured entries.
+- Do not rephrase or create these tasks yourself. The Python runtime creates
+  each one once from `task_content` after this phase.
+- The runtime passes a deadline only when capture returned a non-empty
+  `task_due`; never invent or infer another deadline.
+- Leave capture-created items out of `tasks_created`; the runtime adds the
+  exact created IDs there after this phase.
 
 ### 2. Check process goals
 
@@ -119,9 +115,7 @@ Print ONLY valid JSON:
 
 ```json
 {
-  "tasks_created": [
-    {"id": "8501234567", "content": "Follow-up Acme Corp", "priority": 2, "due": "tomorrow"}
-  ],
+  "tasks_created": [],
   "thoughts_saved": [
     {"path": "thoughts/ideas/2026-02-19-layered-memory.md", "title": "AI agents need layered memory", "category": "ideas"}
   ],

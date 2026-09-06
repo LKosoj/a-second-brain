@@ -25,6 +25,7 @@ from d_brain import run_compiled_digest
 from d_brain.manifest import load_manifest_for_vault
 from d_brain.services.compiled_briefings import CompiledBriefingCandidate
 from d_brain.services.compiled_enrich_report import (
+    MAX_CHANGE_FACTS_SHOWN,
     MAX_CHANGES_SHOWN,
     MAX_DECISIONS_SHOWN,
     STALE_REVISIT_DAYS,
@@ -2075,6 +2076,42 @@ def test_collect_changes_does_not_glue_a_separator_onto_a_finished_sentence():
     assert changes[0].what_added == (
         "Первый факт. Второй факт. Третий факт без точки; Четвёртый факт."
     )
+
+
+def test_collect_changes_deduplicates_and_limits_facts():
+    rows = [
+        f"| {DAY.isoformat()} | [[daily/{index}.md]] | Факт {index}. |"
+        for index in range(MAX_CHANGE_FACTS_SHOWN + 2)
+    ]
+    rows.insert(
+        1,
+        f"| {DAY.isoformat()} | [[daily/duplicate.md]] |  факт 0  |",
+    )
+    candidate = CompiledBriefingCandidate(
+        rel_path="compiled/topics/aurora.md",
+        domain="topics",
+        slug="aurora",
+        title="Проект Аврора",
+        description="",
+        freshness_state="",
+        confidence="",
+        relevance=0.0,
+        tier="active",
+        text=(
+            "---\ncreated: 2026-08-01\n---\n\n# Проект Аврора\n\n"
+            "## Sources That Shaped This Page\n\n"
+            "| Date | Source | What Added |\n| --- | --- | --- |\n"
+            + "\n".join(rows)
+            + "\n"
+        ),
+    )
+
+    changes = _collect_changes([candidate], DAY, DAY)
+
+    assert changes[0].what_added.count("Факт 0") == 1
+    assert f"Факт {MAX_CHANGE_FACTS_SHOWN - 1}." in changes[0].what_added
+    assert f"Факт {MAX_CHANGE_FACTS_SHOWN}." not in changes[0].what_added
+    assert "Ещё пунктов: 2." in changes[0].what_added
 
 
 # --- _collect_revisit: limit parameter (задача N) -------------------------

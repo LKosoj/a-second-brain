@@ -5964,9 +5964,18 @@ class CompiledBriefingService:
             return None
         changed_sources = sorted(
             source
-            for source in set(current_sources) | set(stored_sources)
-            if current_sources.get(source) != stored_sources.get(source)
+            for source, digest in current_sources.items()
+            if digest != stored_sources.get(source)
         )
+        changed_sources.extend(
+            sorted(
+                source
+                for source, digest in stored_sources.items()
+                if source not in current_sources and digest != "missing"
+            )
+        )
+        if not changed_sources:
+            changed_sources = sorted(set(current_sources) | set(stored_sources))
         return {
             "path": candidate.rel_path,
             "issue": "source-changed",

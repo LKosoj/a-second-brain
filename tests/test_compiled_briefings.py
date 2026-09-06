@@ -655,6 +655,43 @@ def test_compiled_briefings_source_snapshot_ignores_memory_touch(
     assert service.freshness_issues() == []
 
 
+def test_changed_sources_omits_replaced_missing_path(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    compiled_root = vault_path / "compiled" / "concepts"
+    compiled_root.mkdir(parents=True)
+    note_path = compiled_root / "demo.md"
+    old_path = "imports/youtube/transcripts/2026/06/video.txt"
+    new_path = "imports/youtube/transcripts/2026-06-08/video.txt"
+    note_path.write_text(
+        (
+            "---\ndomain: concepts\nfreshness_state: fresh\n---\n\n"
+            f"## Sources\n- [[{old_path}]]\n"
+        ),
+        encoding="utf-8",
+    )
+    service = _compiled_service(vault_path)
+    service.initialize_source_state()
+
+    source_path = vault_path / new_path
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("Transcript.\n", encoding="utf-8")
+    note_path.write_text(
+        (
+            "---\ndomain: concepts\nfreshness_state: fresh\n---\n\n"
+            f"## Sources\n- [[{new_path}]]\n"
+        ),
+        encoding="utf-8",
+    )
+
+    assert service.freshness_issues() == [
+        {
+            "path": "compiled/concepts/demo.md",
+            "issue": "source-changed",
+            "detail": f"changed_sources={new_path}",
+        }
+    ]
+
+
 def test_compiled_briefings_backfill_targets_changed_candidate(
     tmp_path: Path,
     monkeypatch,

@@ -30,6 +30,10 @@ Read one daily file, classify each entry conservatively, and output structured J
 5. Detect only real entities that are strongly supported by the vault context.
 6. Prefer conservative output:
    - if there is no clear next action, do not force a `task`
+   - set `task_due` only when the source explicitly gives this task a deadline;
+     otherwise use `null`
+   - do not turn a project period, milestone date, or processing date into a
+     task deadline unless the source explicitly connects them
    - if a company is mentioned casually, do not force `crm_update`
    - if an entity match is weak, leave `entities` empty
 

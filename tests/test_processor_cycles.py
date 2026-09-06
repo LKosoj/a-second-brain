@@ -82,6 +82,16 @@ def test_periodic_summary_uses_derived_profile(tmp_path: Path) -> None:
     assert "tier: active" in content
 
 
+def test_weekly_summary_description_is_localized(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    summary_path = CliProcessor(
+        vault_path, content_language="ru"
+    )._save_weekly_summary("# Неделя\n", date(2026, 4, 3))
+
+    content = summary_path.read_text(encoding="utf-8")
+    assert "description: Недельный дайджест за 2026-W14" in content
+
+
 def test_generate_weekly_prompt_reads_core_context_and_forbids_goal_rewrites(
     tmp_path: Path,
 ) -> None:
@@ -275,6 +285,10 @@ def test_rollover_weekly_goals_updates_russian_template(tmp_path: Path) -> None:
             "## Неделя в целом\n\n"
             "**Неделя:** 29 из 53\n\n"
             "---\n\n"
+            "## План по дням\n\n"
+            "### Пятница\n\n"
+            "- [ ] Подвести статус W29: что подтверждено.\n\n"
+            "---\n\n"
             "## Итоги недели\n\n"
             "### Фокус следующей недели\n\n"
             "> Новый фокус следующей недели.\n\n"
@@ -303,6 +317,7 @@ def test_rollover_weekly_goals_updates_russian_template(tmp_path: Path) -> None:
     assert "> Новый фокус следующей недели." in content
     assert "> Старый фокус недели." not in content
     assert "**Неделя:** 30 из 53" in content
+    assert "- [ ] Подвести статус W30: что подтверждено." in content
     assert "- Предыдущая неделя: 2026-W29" in content
     assert "*Неделя началась: 2026-07-20*" in content
 

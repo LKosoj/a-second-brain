@@ -284,6 +284,31 @@ def test_process_prompts_include_content_language_rule(tmp_path: Path) -> None:
     assert "Keep at most 10 observation bullets in handoff" in reflect_prompt
 
 
+def test_capture_and_execute_prompts_keep_task_creation_and_due_dates_deterministic(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _setup_daily_processing_vault(vault_path, day)
+    phases_path = vault_path.parent / "skills/dbrain-processor/phases"
+    for phase_name in ("capture", "execute"):
+        source = SKILLS_TEMPLATE_ROOT / f"dbrain-processor/phases/{phase_name}.md"
+        (phases_path / f"{phase_name}.md").write_text(
+            source.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+    processor = CliProcessor(vault_path)
+
+    capture_prompt = processor._build_capture_prompt(day)
+    execute_prompt = processor._build_execute_prompt(day)
+
+    assert "set `task_due` only when the source explicitly gives" in capture_prompt
+    assert "otherwise use `null`" in capture_prompt
+    assert "Do not call `todoist add-tasks` for captured entries" in execute_prompt
+    assert "Do not create Todoist tasks for entries from capture.json" in execute_prompt
+    assert "uses only explicit task_due values" in execute_prompt
+
+
 def test_vault_retrieval_skill_is_injected_only_into_vault_write_and_answer_prompts(
     tmp_path: Path,
 ) -> None:
@@ -1440,7 +1465,9 @@ def test_process_daily_scheduled_persists_phase_files_and_runs_maintenance(
         encoding="utf-8"
     )
     assert "<!-- d-brain:reflect:start -->" in daily_content
-    assert "**Tasks created:** 1" in daily_content
+    assert "**Создано задач:** 1" in daily_content
+    assert "**Сохранено мыслей:** 0" in daily_content
+    assert "**Обновлено CRM:** 0" in daily_content
     assert maintenance == {
         "creative": True,
         "health": True,
@@ -1583,7 +1610,7 @@ def test_reflect_daily_block_keeps_a_zero_priority_visible(
         },
     )
 
-    assert "priority: 0" in captured["block"]
+    assert "приоритет: 0" in captured["block"]
 
 
 def test_reflect_daily_block_repeat_does_not_duplicate_heading(
@@ -1613,7 +1640,7 @@ def test_reflect_daily_block_repeat_does_not_duplicate_heading(
     assert len(reflect_headings) == 1
     assert content.count("<!-- d-brain:reflect:start -->") == 1
     assert content.count("<!-- d-brain:reflect:end -->") == 1
-    assert content.count("d-brain processing") == 1
+    assert content.count("Обработка d-brain") == 1
 
 
 def test_process_daily_scheduled_preserves_side_effect_order(tmp_path: Path) -> None:

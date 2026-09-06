@@ -928,6 +928,8 @@ class CliProcessor:
     ) -> None:
         """Write a searchable periodic summary through the derived profile."""
         description = f"{summary_type.replace('-', ' ')} for {period_value}"
+        if self.content_language == "ru" and summary_type == "weekly-summary":
+            description = f"Недельный дайджест за {period_value}"
         content = str(report_markdown or "").strip()
         rendered = (
             "---\n"
@@ -1164,6 +1166,10 @@ class CliProcessor:
             (
                 r"^\*\*Неделя:\*\*\s*\d+\s+из\s+\d+\s*$",
                 f"**Неделя:** {iso_week} из {total_weeks}",
+            ),
+            (
+                r"^(- \[[ xX]\] Подвести статус )W\d{2}(:.*)$",
+                rf"\g<1>W{iso_week:02d}\g<2>",
             ),
             (
                 r"^- Previous:\s*[0-9]{4}-W[0-9]{2}\s*$",
@@ -2891,7 +2897,9 @@ WORKFLOW:
             "Read business/crm.md, business/network.md, business/events.md, "
             "projects/clients.md, "
             "projects/leads.md, and projects/projects.md for context.\n"
-            "Create tasks in Todoist, save thoughts, update CRM. "
+            "Do not create Todoist tasks for entries from capture.json; the Python "
+            "runtime creates them once after this phase and uses only explicit "
+            "task_due values. Save thoughts, update CRM. "
             "Return ONLY JSON."
         )
 
@@ -3482,6 +3490,11 @@ or recent vault notes before answering instead of guessing.
         tasks_created = self._json_dict_list(execute_data, "tasks_created")
         thoughts_saved = self._json_dict_list(execute_data, "thoughts_saved")
         crm_updated = self._json_dict_list(execute_data, "crm_updated")
+        is_russian = self.content_language == "ru"
+        processing_title = "Обработка d-brain" if is_russian else "d-brain processing"
+        tasks_label = "Создано задач" if is_russian else "Tasks created"
+        thoughts_label = "Сохранено мыслей" if is_russian else "Thoughts saved"
+        crm_label = "Обновлено CRM" if is_russian else "CRM updated"
 
         # Not "[text]": that is an own-entry marker (OWN_ENTRY_MARK_RE in
         # compiled_briefings.py), and this block is not the owner typing.
@@ -3494,9 +3507,9 @@ or recent vault notes before answering instead of guessing.
         lines = [
             f"\n## {timestamp:%H:%M} [d-brain]",
             REFLECT_DAILY_START_MARKER,
-            "d-brain processing",
+            processing_title,
             "",
-            f"**Tasks created:** {len(tasks_created)}",
+            f"**{tasks_label}:** {len(tasks_created)}",
         ]
         # Every value below is execute-phase output, i.e. what a model read
         # off the day's entries -- forwarded ones included -- and each lands
@@ -3506,34 +3519,38 @@ or recent vault notes before answering instead of guessing.
         # markers, and a forged or duplicated marker there wedges every
         # later write for the day.
         for task in tasks_created:
-            content = collapse_to_single_line(task.get("content")) or "Untitled task"
+            content = collapse_to_single_line(task.get("content")) or (
+                "Задача без названия" if is_russian else "Untitled task"
+            )
             details: list[str] = []
             task_id = collapse_to_single_line(task.get("id"))
             if task_id:
                 details.append(f"id: {task_id}")
             priority = task.get("priority")
             if priority not in {None, ""}:
-                details.append(f"priority: {collapse_to_single_line(priority)}")
+                priority_label = "приоритет" if is_russian else "priority"
+                details.append(f"{priority_label}: {collapse_to_single_line(priority)}")
             due_value = collapse_to_single_line(
                 task.get("due") or task.get("due_hint")
             )
             if due_value:
-                details.append(f"due: {due_value}")
+                due_label = "срок" if is_russian else "due"
+                details.append(f"{due_label}: {due_value}")
             suffix = f" ({', '.join(details)})" if details else ""
             lines.append(f'- "{content}"{suffix}')
 
-        lines.extend(["", f"**Thoughts saved:** {len(thoughts_saved)}"])
+        lines.extend(["", f"**{thoughts_label}:** {len(thoughts_saved)}"])
         for thought in thoughts_saved:
             path = collapse_to_single_line(thought.get("path"))
             title = collapse_to_single_line(thought.get("title")) or path or (
-                "Untitled note"
+                "Заметка без названия" if is_russian else "Untitled note"
             )
             category = collapse_to_single_line(thought.get("category"))
             link = f"[[{path}|{title}]]" if path else title
             suffix = f" — {category}" if category else ""
             lines.append(f"- {link}{suffix}")
 
-        lines.extend(["", f"**CRM updated:** {len(crm_updated)}"])
+        lines.extend(["", f"**{crm_label}:** {len(crm_updated)}"])
         for change in crm_updated:
             path = collapse_to_single_line(change.get("path")) or "business/crm.md"
             description = collapse_to_single_line(change.get("change"))
