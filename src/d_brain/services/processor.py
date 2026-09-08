@@ -483,7 +483,11 @@ class CliProcessor:
 
     def _cli_extra_env(self) -> dict[str, str]:
         """Environment shared by project and vault CLI runs."""
-        extra_env: dict[str, str] = {}
+        project_bin = self.vault_path.parent / ".venv" / "bin"
+        extra_env: dict[str, str] = {
+            "PATH": os.pathsep.join((str(project_bin), os.environ.get("PATH", ""))),
+            "VAULT_PATH": str(self.vault_path.resolve()),
+        }
         if self.todoist_api_key:
             extra_env["TODOIST_API_KEY"] = self.todoist_api_key
             # Nightly Codex runs keep filesystem writes inside the vault.
@@ -3049,6 +3053,8 @@ or recent vault notes before answering instead of guessing.
             f"{links_reference}\n"
             "=== END LINKS REFERENCE ===\n\n"
             "Read .session/capture.json and .session/execute.json for input data.\n"
+            "The current working directory is the vault root: read memory "
+            "configuration from .memory-config.json, not vault/.memory-config.json.\n"
             "In handoff Last Session, report reviewed entries and processed "
             "entries as separate counts from execute.json entry_counts.\n"
             "Read .graph/health-history.json, .session/creative-recall.txt and "

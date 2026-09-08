@@ -1,6 +1,7 @@
 import fcntl
 import inspect
 import json
+import os
 import subprocess
 import threading
 from datetime import date
@@ -208,6 +209,10 @@ def test_do_processor_uses_vault_scoped_runner(tmp_path: Path) -> None:
     assert processor._cli_extra_env()["MCP_CONFIG_PATH"] == str(
         tmp_path / "mcp-config.json"
     )
+    assert processor._cli_extra_env()["VAULT_PATH"] == str(vault_path.resolve())
+    assert processor._cli_extra_env()["PATH"].split(os.pathsep)[0] == str(
+        tmp_path / ".venv" / "bin"
+    )
 
 
 def test_processor_cli_extra_env_forwards_model_gateway_settings(
@@ -278,6 +283,8 @@ def test_process_prompts_include_content_language_rule(tmp_path: Path) -> None:
     assert "in English" in capture_prompt
     assert "in English" in reflect_prompt
     assert ".session/memory-audit.md" in reflect_prompt
+    assert "read memory configuration from .memory-config.json" in reflect_prompt
+    assert "not vault/.memory-config.json" in reflect_prompt
     assert "Default to NO edit when unsure" in reflect_prompt
     assert "keep it in `daily` or `.session/handoff.md` instead" in reflect_prompt
     assert "Keep exactly one instance of each heading" in reflect_prompt

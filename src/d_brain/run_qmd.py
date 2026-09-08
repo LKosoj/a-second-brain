@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 from d_brain.config import get_settings
 from d_brain.services.qmd import QmdService
@@ -87,8 +89,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    settings = get_settings()
-    service = QmdService(settings.vault_path)
+    configured_vault = os.environ.get("VAULT_PATH", "").strip()
+    vault_path = (
+        Path(configured_vault) if configured_vault else get_settings().vault_path
+    )
+    service = QmdService(vault_path)
     qmd_args = args.qmd_args or ["status"]
 
     try:

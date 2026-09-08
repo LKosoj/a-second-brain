@@ -25,6 +25,26 @@ def _qmd_service(vault_path: Path, *, qmd_index: str = "dbrain") -> QmdService:
     return QmdService(vault_path)
 
 
+def test_qmd_cli_uses_vault_path_without_full_bot_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault_path = tmp_path / "vault"
+    _write_vault_manifest(vault_path)
+    monkeypatch.setenv("VAULT_PATH", str(vault_path))
+    monkeypatch.setattr(
+        run_qmd,
+        "get_settings",
+        lambda: (_ for _ in ()).throw(AssertionError("full settings loaded")),
+    )
+    monkeypatch.setattr(
+        QmdService,
+        "run",
+        lambda self, *args: SimpleNamespace(returncode=0, stdout="ok", stderr=""),
+    )
+
+    assert run_qmd.main(["status"]) == 0
+
+
 def test_qmd_build_env_reads_project_remote_embedding_settings(tmp_path: Path) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text(
