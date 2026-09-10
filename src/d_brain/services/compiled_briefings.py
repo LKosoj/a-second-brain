@@ -1412,6 +1412,7 @@ class CompiledBriefingService:
                         break
                     time.sleep(min(max(0.1, poll_seconds), remaining_idle))
 
+                updated_paths = list(dict.fromkeys(updated_paths))
                 if updated_paths and refresh_qmd:
                     self._refresh_qmd_index()
                 self._finish_queue_worker_journal(
@@ -1569,11 +1570,13 @@ class CompiledBriefingService:
                     )
                 break
             processed += 1
-            event_updated = [
-                str(path).strip()
-                for path in result.get("updated", [])
-                if str(path).strip()
-            ]
+            event_updated = list(
+                dict.fromkeys(
+                    str(path).strip()
+                    for path in result.get("updated", [])
+                    if str(path).strip()
+                )
+            )
             event_errors = [
                 str(item) for item in result.get("errors", []) if str(item)
             ]
@@ -1722,7 +1725,7 @@ class CompiledBriefingService:
 
         return {
             "drained": processed,
-            "updated": updated_paths,
+            "updated": list(dict.fromkeys(updated_paths)),
             "errors": errors,
             "consolidations": consolidation_paths,
         }
@@ -2403,7 +2406,7 @@ class CompiledBriefingService:
                         max_updates=max_updates,
                     )
                 continue
-            if upsert_result.written:
+            if upsert_result.written and upsert_result.path not in updated:
                 updated.append(upsert_result.path)
             elif upsert_result.requeueable:
                 # Code review defect 2: at least one target this source
@@ -7281,14 +7284,11 @@ class CompiledBriefingService:
         existing_meta: dict[str, str],
         signal: dict[str, Any] | None,
     ) -> float:
-        existing = self._float_value(existing_meta.get("relevance"), default=0.0)
-        if signal is None:
-            return max(existing, 0.72)
-        try:
-            source_relevance = float(signal.get("relevance", 0) or 0)
-        except (TypeError, ValueError):
-            source_relevance = 0.0
-        return max(existing, source_relevance, 0.72)
+        del existing_meta, signal
+        # The render below also sets last_accessed to today. At age zero the
+        # memory decay formula yields full relevance, so keeping an older
+        # value here would make those two fields contradict each other.
+        return 1.0
 
     def _merged_tier(
         self,

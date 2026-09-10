@@ -464,27 +464,35 @@ def _collect_changes(
             continue
 
         history_rows = CompiledBriefingService._claim_history_rows(candidate.text)
-        superseded_by_source: dict[str, tuple[str, str]] = {}
+        superseded_by_source: dict[str, list[tuple[str, str]]] = {}
         for _, old_source, old_claim, superseded_by in history_rows:
-            superseded_by_source.setdefault(superseded_by, (old_claim, old_source))
+            replaced = (old_claim, old_source)
+            replacements = superseded_by_source.setdefault(superseded_by, [])
+            if replaced not in replacements:
+                replacements.append(replaced)
 
         fields = _page_fields(candidate.text)
         created = _parse_date_field(fields.get("created"))
 
         what_parts: list[str] = []
-        for _, source, what in window_rows:
+        for _, _source, what in window_rows:
             what = what.strip()
             if not what:
                 continue
-            replaced = superseded_by_source.get(source)
-            if replaced is not None:
-                old_claim, old_source = replaced
-                what_parts.append(
-                    f"{what} (замена: было «{old_claim}» из [[{old_source}]])"
-                )
-            else:
-                what_parts.append(what)
+            what_parts.append(what)
         what_added = _join_change_facts(dict.fromkeys(what_parts))
+
+        window_sources = tuple(
+            dict.fromkeys(source for _, source, _ in window_rows)
+        )
+        replacement_parts = [
+            f"«{old_claim}» из [[{old_source}]]"
+            for source in window_sources
+            for old_claim, old_source in superseded_by_source.get(source, [])
+        ]
+        if replacement_parts:
+            replacement_note = "Замена: было " + "; ".join(replacement_parts) + "."
+            what_added = f"{what_added} {replacement_note}".strip()
 
         sources = tuple(
             dict.fromkeys(

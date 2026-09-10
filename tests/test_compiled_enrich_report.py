@@ -502,7 +502,10 @@ def test_enriched_change_shows_replacement_not_plain_addition(
         last_accessed=DAY.isoformat(),
         # The superseded row was already moved out of the sources table by
         # the compile pass -- only the new (winning) claim remains here.
-        sources_rows=[(DAY.isoformat(), "daily/2026-08-05.md", "бюджет 150k")],
+        sources_rows=[
+            (DAY.isoformat(), "daily/2026-08-05.md", "бюджет 150k"),
+            (DAY.isoformat(), "daily/2026-08-05.md", "срок согласования — пятница"),
+        ],
         claim_history_rows=[
             (
                 "2026-07-01",
@@ -517,8 +520,9 @@ def test_enriched_change_shows_replacement_not_plain_addition(
 
     assert digest is not None
     assert "бюджет 150k" in digest
+    assert "срок согласования — пятница" in digest
     assert "бюджет 100k" in digest
-    assert "замена" in digest
+    assert digest.count("Замена: было") == 1
 
 
 def test_created_field_parsed_as_date_not_raw_string(tmp_path, write_vault_manifest):

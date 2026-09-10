@@ -1099,6 +1099,65 @@ def test_compiled_briefings_run_queue_worker_drains_burst_until_queue_empty(
     ]
 
 
+def test_compiled_briefings_queue_worker_counts_each_updated_page_once(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    for day in ("04", "05"):
+        service.enqueue_refresh(
+            source_path=f"daily/2026-04-{day}.md",
+            source_excerpt=day,
+            debounce_seconds=0,
+        )
+
+    monkeypatch.setattr(service, "is_available", lambda: True)
+    monkeypatch.setattr(
+        service,
+        "refresh_after_write",
+        lambda **_kwargs: {
+            "updated": ["compiled/projects/demo.md", "compiled/projects/demo.md"],
+            "errors": [],
+        },
+    )
+
+    result = service.run_queue_worker(
+        force=True,
+        max_events=1,
+        refresh_qmd=False,
+        idle_seconds=0,
+        poll_seconds=0.0,
+    )
+
+    assert result["updated"] == ["compiled/projects/demo.md"]
+    journal_path = next((vault_path / ".compiled" / "queue-history").glob("*.json"))
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert journal["totals"]["updated"] == 1
+    assert all(
+        event["updated"] == ["compiled/projects/demo.md"]
+        for event in journal["events"]
+    )
+
+
+def test_compiled_briefings_render_recalculates_relevance_after_update(
+    tmp_path: Path,
+) -> None:
+    service = _compiled_service(tmp_path / "vault")
+
+    rendered = service._render_briefing(
+        target=_demo_target(),
+        payload=_minimal_compile_payload(),
+        source_rel_path="daily/2026-04-04.md",
+        existing_text="",
+        existing_meta={"relevance": "0.25"},
+        signal={"relevance": 0.40},
+    )
+
+    assert f"last_accessed: {date.today().isoformat()}" in rendered
+    assert "relevance: 1.00" in rendered
+
+
 def test_compiled_briefings_queue_worker_keeps_ten_latest_journals(
     tmp_path: Path,
 ) -> None:
