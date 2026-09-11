@@ -124,6 +124,9 @@ def test_generate_weekly_prompt_reads_core_context_and_forbids_goal_rewrites(
     assert "goals/1-yearly.md" in prompt
     assert ".session/handoff.md" in prompt
     assert "find-tasks-by-date" in prompt
+    assert '"overdueOption": "overdue-only"' in prompt
+    assert "Process goals are already included; do not add them again." in prompt
+    assert '"overdueOption": "exclude-overdue"' in prompt
     assert "Do not rewrite goal files automatically." in prompt
     assert "Return ONLY markdown, not HTML." in prompt
     assert "Start with one short markdown heading for the digest." in prompt
@@ -178,6 +181,9 @@ def test_generate_weekly_prompt_is_localized_for_russian(
     prompt = captured["prompt"]
     assert "ПРАВИЛА НЕДЕЛЬНОГО РАЗБОРА:" in prompt
     assert "ПРАВИЛА РАБОТЫ С TODOIST:" in prompt
+    assert '"overdueOption": "overdue-only"' in prompt
+    assert "не прибавляй их отдельно" in prompt
+    assert '"overdueOption": "exclude-overdue"' in prompt
     assert "ПОРЯДОК РАБОТЫ:" in prompt
     assert "WEEKLY REVIEW RULES" not in prompt
 

@@ -1312,8 +1312,20 @@ class CliProcessor:
 - Прочитай daily-файлы за релевантную ISO-неделю.
 - Если это добавляет сигнал о трении или риске переноса, прочитай `.session/handoff.md`.
 - Используй завершённые задачи как подтверждение, а не вместо осмысленного вывода.
-- Если риск переноса неясен, проверь открытые и ближайшие задачи командой
-  `mcp-cli call todoist find-tasks-by-date '{{"startDate": "today", "daysCount": 7}}'`.
+- Для единого подсчёта просрочек всегда выполни команду:
+  ```bash
+  mcp-cli call todoist find-tasks-by-date '{{
+    "startDate": "today",
+    "overdueOption": "overdue-only",
+    "daysCount": 1,
+    "limit": 100,
+    "responsibleUserFiltering": "unassignedOrMe"
+  }}'
+  ```
+- Бери общее число просрочек только из `totalCount` этого ответа. Цели-процессы
+  уже входят в это число; не прибавляй их отдельно.
+- Если риск переноса неясен, проверь открытые и ближайшие задачи той же командой,
+  но с `"overdueOption": "exclude-overdue"` и `"daysCount": 7`.
 - Предпочитай синтез простому перечислению.
 - Говори прямо, если неделя была в основном операционной.
 - Не создавай и не редактируй файлы сам. Канонический weekly summary и обновление
@@ -1350,8 +1362,20 @@ WEEKLY REVIEW RULES:
 - Read the daily files for the relevant ISO week.
 - If it adds signal about friction or carry-over risk, read `.session/handoff.md`.
 - Use completed tasks as evidence, not as a substitute for synthesis.
-- If carry-over risk is unclear, inspect upcoming/open work with
-  `mcp-cli call todoist find-tasks-by-date '{{"startDate": "today", "daysCount": 7}}'`.
+- For one consistent overdue count, always run:
+  ```bash
+  mcp-cli call todoist find-tasks-by-date '{{
+    "startDate": "today",
+    "overdueOption": "overdue-only",
+    "daysCount": 1,
+    "limit": 100,
+    "responsibleUserFiltering": "unassignedOrMe"
+  }}'
+  ```
+- Take the total overdue count only from that response's `totalCount`.
+  Process goals are already included; do not add them again.
+- If carry-over risk is unclear, inspect upcoming/open work with the same command,
+  but use `"overdueOption": "exclude-overdue"` and `"daysCount": 7`.
 - Prefer synthesis over raw enumeration.
 - Say directly when the week was mostly operational.
 - Do not create or edit files yourself. The Python runtime saves the canonical
