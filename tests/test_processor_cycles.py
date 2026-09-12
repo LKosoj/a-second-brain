@@ -1094,6 +1094,7 @@ def test_audit_cycle_result_deduplicates_recent_followup_tasks(
                 "severity": "high",
                 "evidence": "Carry forward says 1 while report says no signals.",
                 "action": "Починить weekly system reflection logging",
+                "due": "2026-04-06",
                 "project_hint": "Inbox",
             }
         ],
@@ -1105,6 +1106,7 @@ def test_audit_cycle_result_deduplicates_recent_followup_tasks(
         source_context: str = "",
     ) -> list[dict[str, str]]:
         del source_context
+        assert not tasks or tasks[0]["due_hint"] == "2026-04-06"
         created_batches.append([task["content"] for task in tasks])
         return [{"id": "1", "content": task["content"]} for task in tasks]
 
@@ -1128,6 +1130,40 @@ def test_audit_cycle_result_deduplicates_recent_followup_tasks(
     assert second["task_candidates"] == []
     assert second["tasks_created"] == []
     assert created_batches == [["Починить weekly system reflection logging"], []]
+
+
+def test_audit_cycle_result_does_not_create_task_without_confirmed_due(
+    tmp_path: Path,
+) -> None:
+    processor = CliProcessor(tmp_path / "vault", todoist_api_key="todoist-token")
+    created_batches: list[list[dict[str, Any]]] = []
+    processor._run_json_phase = lambda prompt, phase_name: {  # type: ignore[method-assign]
+        "summary": "Found one problem",
+        "issues": [
+            {
+                "title": "Digest needs verification",
+                "severity": "high",
+                "evidence": "The digest result is incomplete.",
+                "action": "Проверить следующий недельный дайджест",
+                "due": None,
+                "project_hint": "Inbox",
+            }
+        ],
+    }
+    processor._create_todoist_tasks = (  # type: ignore[method-assign]
+        lambda tasks, **kwargs: created_batches.append(tasks) or []
+    )
+
+    result = processor.audit_cycle_result(
+        cycle_name="weekly_digest",
+        day=date(2026, 4, 5),
+        result={"report": "ok"},
+    )
+
+    assert result["issues"]
+    assert result["task_candidates"] == []
+    assert result["tasks_created"] == []
+    assert created_batches == [[]]
 
 
 def test_clear_session_phase_artifacts_removes_stale_audit_raw_outputs(
@@ -1983,10 +2019,8 @@ def test_run_compiled_digest_cycle_writes_and_sends_on_changed_day(
     tmp_path: Path, monkeypatch
 ) -> None:
     """On a day with a real compiled-page change, the cycle writes the
-    digest file (path surfaced via ``summary_path`` for the existing
-    periodic-cycle line renderer) and also sends the digest text directly
-    over Telegram, as a separate message from the combined scheduled
-    report -- see this method's docstring for why that's deliberate.
+    digest file, returns the text in ``report``, and also sends that text
+    directly over Telegram.
     ``write_validated_vault_markdown`` is monkeypatched because the real one
     cannot run in this sandbox (see ``test_compiled_enrich_report.py``'s
     module docstring for the confirmed environment limitation)."""
@@ -2010,6 +2044,7 @@ def test_run_compiled_digest_cycle_writes_and_sends_on_changed_day(
 
     assert result["processed_entries"] == 1
     assert result["searchable_write"] is True
+    assert result["report"] == send_calls[0]
     assert result["summary_path"] == f"summaries/compile/{today.isoformat()}.md"
     assert write_calls == [
         vault_path / "summaries" / "compile" / f"{today.isoformat()}.md"

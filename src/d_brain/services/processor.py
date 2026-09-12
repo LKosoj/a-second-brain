@@ -104,7 +104,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 2400  # 40 minutes
 TODOIST_TASK_TIMEOUT = 30
-DAILY_ENTRY_HEADER_RE = re.compile(r"^##\s+\d{2}:\d{2}\s+\[[^\]]+\]\s*$", re.MULTILINE)
 REFLECT_DAILY_START_MARKER = "<!-- d-brain:reflect:start -->"
 REFLECT_DAILY_END_MARKER = "<!-- d-brain:reflect:end -->"
 TEXT_INTENT_CAPTURE = "capture"
@@ -1952,11 +1951,15 @@ WORKFLOW:
             logger.warning("vault-graph.json is %s days old", graph_age_days)
 
     def _daily_has_processable_entries(self, daily_file: Path) -> bool:
-        """Check whether the daily file contains at least one canonical entry header."""
+        """Check whether the daily file contains an unprocessed owner entry."""
         if not daily_file.exists():
             return False
         content = daily_file.read_text(encoding="utf-8")
-        return bool(DAILY_ENTRY_HEADER_RE.search(content))
+        return any(
+            entry.entry_type != "d-brain"
+            and ENTRY_STATUS_ALREADY_PROCESSED not in entry.statuses
+            for entry in parse_daily_entry_statuses(content)
+        )
 
     def _get_yearly_goals_name(self) -> str:
         """Select the latest yearly goals file."""
@@ -4186,17 +4189,9 @@ or recent vault notes before answering instead of guessing.
         ``maintenance.compiled-fact-check`` may have just added to, so it
         must run after both).
 
-        Unlike this cycle's siblings, the digest text itself is delivered
-        to the owner as its own Telegram message (``send_telegram_text_sync``)
-        instead of being folded into the combined scheduled report -- it is
-        a decision-focused artifact, not routine cycle status, so ``report``
-        is left empty here (nothing to add to the combined report) and the
-        written file's path is surfaced via ``summary_path`` instead, which
-        ``run_daily_process.py``'s periodic-cycle line renderer already
-        picks up. This means the owner receives two Telegram messages at
-        21:00 on a day with something to report -- accepted deliberately so
-        the digest stays a distinct message instead of being buried inside
-        the general summary.
+        The digest text is both delivered to the owner as its own Telegram
+        message (``send_telegram_text_sync``) and returned in ``report`` so
+        callers retain the generated content.
 
         A vault with no project manifest yet (e.g. a fresh vault before its
         first nightly pass, or a temp vault in a test that does not build
@@ -4264,7 +4259,7 @@ or recent vault notes before answering instead of guessing.
             logger.warning("Failed to send compiled digest: %s", exc)
 
         return {
-            "report": "",
+            "report": digest,
             "processed_entries": 1,
             "summary_path": path.relative_to(self.vault_path).as_posix(),
             "searchable_write": True,
@@ -4720,6 +4715,9 @@ EXECUTION:
             "inspected files.\n"
             "- `action` must be a short concrete engineering follow-up task title "
             "suitable for Todoist.\n"
+            "- Set `due` only when an exact deadline is explicitly confirmed in "
+            "the result JSON or an inspected file; otherwise set it to null. An "
+            "issue without a confirmed deadline must not create a control task.\n"
             "- If no actionable problems are found, return an empty `issues` list.\n\n"
             "Return exactly one JSON object:\n"
             "{\n"
@@ -4730,6 +4728,7 @@ EXECUTION:
             '      "severity": "high|medium|low",\n'
             '      "evidence": "Concrete evidence",\n'
             '      "action": "Concrete follow-up task",\n'
+            '      "due": "YYYY-MM-DD or null",\n'
             '      "project_hint": "Inbox"\n'
             "    }\n"
             "  ]\n"
@@ -4759,6 +4758,7 @@ EXECUTION:
                     "severity": severity,
                     "evidence": " ".join(str(item.get("evidence") or "").split()),
                     "action": action,
+                    "due": " ".join(str(item.get("due") or "").split()),
                     "project_hint": " ".join(
                         str(item.get("project_hint") or "").split()
                     ),
@@ -4816,12 +4816,13 @@ EXECUTION:
             payload = fallback_payload
 
         issues = self._normalize_audit_issues(payload)
-        new_issues = self._filter_new_audit_issues(cycle_name, issues)
+        taskable_issues = [issue for issue in issues if issue["due"]]
+        new_issues = self._filter_new_audit_issues(cycle_name, taskable_issues)
         task_candidates = [
             {
                 "content": issue["action"],
                 "priority": {"high": 4, "medium": 3, "low": 2}[issue["severity"]],
-                "due_hint": "today" if issue["severity"] == "high" else "",
+                "due_hint": issue["due"],
                 "project_hint": issue["project_hint"] or "Inbox",
             }
             for issue in new_issues

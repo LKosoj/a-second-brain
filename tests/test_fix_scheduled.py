@@ -493,9 +493,12 @@ def test_second_scheduled_run_of_the_same_day_does_not_recreate_tasks(
 
     processor = CliProcessor(vault_path)
     created_tasks: list[str] = []
+    capture_calls = 0
 
     def fake_run(prompt: str) -> str:
+        nonlocal capture_calls
         if "capture.md" in prompt:
+            capture_calls += 1
             return json.dumps(
                 {
                     "date": day.isoformat(),
@@ -538,6 +541,7 @@ def test_second_scheduled_run_of_the_same_day_does_not_recreate_tasks(
     processor._capture_creative_recall = lambda *a, **k: None  # type: ignore[method-assign]
     processor._run_vault_health_maintenance = lambda: None  # type: ignore[method-assign]
     processor._capture_memory_audit = lambda: None  # type: ignore[method-assign]
+    processor._rebuild_graph = lambda: None  # type: ignore[method-assign]
 
     first_result = processor.process_daily(day, mode=SCHEDULED_MODE)
     assert first_result["processed_entries"] == 1
@@ -550,8 +554,10 @@ def test_second_scheduled_run_of_the_same_day_does_not_recreate_tasks(
 
     second_result = processor.process_daily(day, mode=SCHEDULED_MODE)
     assert second_result["processed_entries"] == 0
+    assert second_result["empty_daily"] is True
     # No second task got created for the same entry.
     assert created_tasks == ["Send follow-up"]
+    assert capture_calls == 1
 
 
 def test_new_entry_added_after_marked_entries_is_processed_alone_on_rerun(
