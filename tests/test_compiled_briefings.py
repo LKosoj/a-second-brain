@@ -8940,7 +8940,7 @@ def test_compiled_briefings_pass_budget_constants_and_dataclass_defaults(
     defaults every field a journal entry (G6) needs."""
     assert MAX_PAGES_PER_PASS == 40
     assert MAX_MODEL_CALLS_PER_PASS == 200
-    assert MAX_ENRICHMENTS_PER_PAGE_PER_MONTH == 35
+    assert MAX_ENRICHMENTS_PER_PAGE_PER_MONTH == 60
     assert SNAPSHOT_RETENTION_DAYS == 14
 
     service = _compiled_service(tmp_path / "vault")

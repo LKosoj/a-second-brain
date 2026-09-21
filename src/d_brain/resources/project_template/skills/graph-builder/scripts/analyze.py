@@ -343,7 +343,11 @@ def analyze_vault(vault_path: Path) -> dict[str, Any]:
             # report. Tracked separately so the fact still shows up.
             if incoming == 0 and outgoing == 0:
                 archived_isolated.append(note_key)
-        elif incoming == 0 and outgoing == 0 and domain not in {"MOC", "root"}:
+        elif incoming == 0 and outgoing == 0 and domain not in {
+            "MOC",
+            "root",
+            "daily",
+        }:
             orphans.append(note_key)
         elif info["total_links"] < 2 and domain not in {"MOC", "root", "daily"}:
             weakly_connected.append(note_key)
@@ -361,7 +365,7 @@ def analyze_vault(vault_path: Path) -> dict[str, Any]:
                         "issue": daily_issue,
                     }
                 )
-        else:
+        elif info["domain"] != "imports":
             description_candidates += 1
             if info["has_description"]:
                 described_notes += 1

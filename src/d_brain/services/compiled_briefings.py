@@ -427,7 +427,7 @@ MAX_MODEL_CALLS_PER_PASS = 200
 # ТЗ 5.6 "Максимум обогащений одной страницы за календарный месяц": beyond
 # this, further source material for the page waits for the owner's decision
 # queue instead of compounding unattended drift onto one page.
-MAX_ENRICHMENTS_PER_PAGE_PER_MONTH = 35
+MAX_ENRICHMENTS_PER_PAGE_PER_MONTH = 60
 # ТЗ 5.5 inv 8 / 5.6 "Хранение снимков для отката": how long a pass's
 # pre-write snapshots stay on disk before cleanup, so a delayed manual
 # rollback stays possible without snapshots accumulating forever.
