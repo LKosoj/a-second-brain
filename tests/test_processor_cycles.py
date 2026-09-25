@@ -1310,10 +1310,13 @@ def test_run_scheduled_cycle_triggers_due_periodic_reviews_and_audits(
         "maintenance.compiled-nightly",
         "maintenance.vault-health",
         "maintenance.compiled-fact-check",
+        "maintenance.compiled-wiki-care",
         "maintenance.compiled-digest",
     ]
     # daily 2 + weekly/monthly/yearly 1 each + digest 1; the same digest write
     # that used to fail with "vault Markdown parent does not exist" now lands.
+    # wiki-care runs for real against an empty vault here (nothing due),
+    # contributing 0.
     assert result["processed_entries"] == 6
     assert result["audit_task_candidates"] == [
         "todo:weekly_digest",
@@ -1322,6 +1325,7 @@ def test_run_scheduled_cycle_triggers_due_periodic_reviews_and_audits(
         "todo:maintenance.compiled-nightly",
         "todo:maintenance.vault-health",
         "todo:maintenance.compiled-fact-check",
+        "todo:maintenance.compiled-wiki-care",
         "todo:maintenance.compiled-digest",
     ]
     assert "📊 **Daily**" in result["report"]
@@ -1610,11 +1614,13 @@ def test_run_scheduled_cycle_runs_compiled_nightly_maintenance(
         "maintenance.compiled-nightly",
         "maintenance.vault-health",
         "maintenance.compiled-fact-check",
+        "maintenance.compiled-wiki-care",
         "maintenance.compiled-digest",
     ]
     assert "## 🧩 Compiled Maintenance" in result["report"]
     assert "## 🩺 Vault Health" in result["report"]
-    # daily 1 + compiled-nightly 1 + vault-health 0 + fact-check 0 + digest 1.
+    # daily 1 + compiled-nightly 1 + vault-health 0 + fact-check 0
+    # + wiki-care 0 (real run against an empty vault) + digest 1.
     # This asserted 2 while the digest was contributing 0 with the error "vault
     # Markdown parent does not exist" -- the vault writer needed
     # CAP_DAC_READ_SEARCH, so the digest never got to write anything. The
@@ -1663,6 +1669,7 @@ def test_run_scheduled_cycle_survives_one_maintenance_workflow_raising(
         "maintenance.compiled-nightly",
         "maintenance.vault-health",
         "maintenance.compiled-fact-check",
+        "maintenance.compiled-wiki-care",
         "maintenance.compiled-digest",
     ]
     results_by_name = {
@@ -1670,6 +1677,7 @@ def test_run_scheduled_cycle_survives_one_maintenance_workflow_raising(
     }
     assert results_by_name["maintenance.vault-health"]["error"] == "boom"
     assert "error" not in results_by_name["maintenance.compiled-fact-check"]
+    assert "error" not in results_by_name["maintenance.compiled-wiki-care"]
     assert "error" not in results_by_name["maintenance.compiled-digest"]
     # Surviving the crash is only half of it (code review): the combined
     # report is what actually reaches the owner at 21:00, and a workflow
@@ -1707,6 +1715,7 @@ def test_run_scheduled_cycle_uses_control_plane_labels_for_maintenance(
         "Поддержка compiled-слоя",
         "Здоровье vault",
         "Проверка фактов compiled",
+        "Уход за вики",
         "Дайджест обогащения compiled",
     ]
 
@@ -2238,3 +2247,62 @@ def test_run_vault_health_cycle_reports_daily_structure_issues_in_russian(
     assert result["malformed_daily_count"] == 1
     assert "## 🩺 Здоровье vault" in result["report"]
     assert "- Нарушения структуры daily: 1" in result["report"]
+
+
+def test_compiled_wiki_care_cycle_reports_changes_as_vault_links(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = CliProcessor(tmp_path / "vault")
+    monkeypatch.setattr(
+        "d_brain.services.processor.run_weekly_wiki_care",
+        lambda *args, **kwargs: {
+            "status": "ok",
+            "links_added": 2,
+            "pages_created": 1,
+            "questions_answered": 0,
+            "articles_imported": 1,
+            "changed_paths": ["compiled/topics/aurora.md"],
+            "errors": [],
+        },
+    )
+
+    result = processor._run_compiled_wiki_care_cycle()
+
+    assert "Связей добавлено: 2" in result["report"]
+    assert "- [[compiled/topics/aurora]]" in result["report"]
+    assert result["processed_entries"] == 4
+
+
+@pytest.mark.parametrize("status", ["skipped-interval", "no-work"])
+def test_compiled_wiki_care_cycle_quiet_run_has_empty_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+) -> None:
+    processor = CliProcessor(tmp_path / "vault")
+    monkeypatch.setattr(
+        "d_brain.services.processor.run_weekly_wiki_care",
+        lambda *args, **kwargs: {"status": status, "errors": []},
+    )
+
+    result = processor._run_compiled_wiki_care_cycle()
+
+    assert result["report"] == ""
+    assert result["processed_entries"] == 0
+
+
+def test_compiled_wiki_care_cycle_survives_an_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = CliProcessor(tmp_path / "vault")
+
+    def _boom(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("wiki care exploded")
+
+    monkeypatch.setattr("d_brain.services.processor.run_weekly_wiki_care", _boom)
+
+    result = processor._run_compiled_wiki_care_cycle()
+
+    assert result == {"error": "wiki care exploded", "processed_entries": 0}

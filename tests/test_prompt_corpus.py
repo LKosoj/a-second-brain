@@ -64,6 +64,7 @@ def test_vault_retrieval_skill_is_the_single_retrieval_and_touch_contract() -> N
     assert "It does not apply `tier`, `relevance`" in retrieval_skill
     assert "a-second-brain qmd get <vault-relative-path>" in retrieval_skill
     assert "qmd-local" not in retrieval_skill
+    assert "MOC/compiled-index.md" in retrieval_skill
     assert "memory-engine.py touch vault/<file>" in retrieval_skill
     assert "FULLTEXT FOLLOW-UP" in retrieval_skill
     assert processor.count("=== VAULT RETRIEVAL SKILL ===") == 4
@@ -459,12 +460,14 @@ def test_control_plane_registry_exposes_scheduled_post_maintenance_workflows() -
         "maintenance.compiled-nightly",
         "maintenance.vault-health",
         "maintenance.compiled-fact-check",
+        "maintenance.compiled-wiki-care",
         "maintenance.compiled-digest",
     ]
     assert [workflow.display_name for workflow in workflows] == [
         "Compiled Maintenance",
         "Vault Health",
         "Compiled Fact Check",
+        "Wiki Care",
         "Compiled Digest",
     ]
 

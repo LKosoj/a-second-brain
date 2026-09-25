@@ -457,6 +457,28 @@ def test_execute_prompt_injects_vault_retrieval_skill(
     ].index("USER REQUEST:")
 
 
+def test_execute_prompt_instructs_matplotlib_chart_for_numbers_over_time(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _setup_daily_processing_vault(vault_path, day)
+    processor = CliProcessor(vault_path)
+    captured: dict[str, str] = {}
+    processor._run_assistant_prompt = (  # type: ignore[method-assign]
+        lambda prompt: captured.setdefault("prompt", prompt) and "готово"
+    )
+
+    processor.execute_prompt("Сравни расходы за последние месяцы")
+
+    prompt = captured["prompt"]
+    assert "matplotlib.use(\"Agg\")" in prompt
+    assert "attachments/charts/" in prompt
+    assert "DejaVu Sans" in prompt
+    assert "into the report" in prompt
+    assert "Skip the chart when there is no time series or comparison" in prompt
+
+
 def test_run_json_phase_retries_with_stricter_contract_and_persists_raw_output(
     tmp_path: Path,
 ) -> None:
@@ -1141,6 +1163,26 @@ def test_question_prompt_reads_core_business_and_projects_context(
     assert "Do not collapse a long-running project into a very short answer" in prompt
     assert "SOURCE FOOTER POLICY: OPTIONAL" in prompt
     assert "Источники:" in prompt
+
+
+def test_question_prompt_instructs_matplotlib_chart_for_numbers_over_time(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _setup_daily_processing_vault(vault_path, day)
+    processor = CliProcessor(vault_path)
+
+    prompt = processor._build_question_answer_prompt(
+        "Какие приоритеты на эту неделю?",
+        user_id=0,
+    )
+
+    assert "matplotlib.use(\"Agg\")" in prompt
+    assert "attachments/charts/" in prompt
+    assert "DejaVu Sans" in prompt
+    assert "into the answer" in prompt
+    assert "Skip the chart when there is no time series or comparison" in prompt
 
 
 def test_telegram_output_rules_use_adaptive_answer_depth() -> None:
@@ -2788,3 +2830,105 @@ def test_normalize_owner_report_markdown_supports_english_output(
     assert "Here is the final digest" not in markdown_body
     assert "- **One**" in markdown_body
     assert "- *Two*" in markdown_body
+
+
+class _FakeNightlyCompiledService:
+    """Stand-in for ``CompiledBriefingService`` in
+    ``_run_compiled_nightly_maintenance`` tests (T4): only
+    ``run_nightly_maintenance`` is exercised by that method, so this avoids
+    building a real vault/queue just to check the new "Импорты"/"Imports"
+    summary line."""
+
+    def __init__(self, result: dict) -> None:
+        self._result = result
+
+    def run_nightly_maintenance(self) -> dict:
+        return dict(self._result)
+
+
+def _base_nightly_result(**overrides: object) -> dict:
+    result: dict = {
+        "queued_drained": 0,
+        "consolidations": [],
+        "archived": [],
+        "lint_issues": [],
+        "freshness_issues": [],
+        "queue_busy": False,
+        "queue_errors": [],
+        "imports_used": 0,
+        "imports_nothing": 0,
+        "imports_failed": 0,
+        "import_sweep": {},
+    }
+    result.update(overrides)
+    return result
+
+
+def test_run_compiled_nightly_maintenance_adds_imports_line_ru(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = CliProcessor(tmp_path / "vault")
+    fake_result = _base_nightly_result(
+        imports_used=2, imports_nothing=1, imports_failed=0
+    )
+    monkeypatch.setattr(
+        "d_brain.services.processor.CompiledBriefingService",
+        lambda *args, **kwargs: _FakeNightlyCompiledService(fake_result),  # noqa: ARG005
+    )
+
+    result = processor._run_compiled_nightly_maintenance()
+
+    assert "- Импорты: обработано 2, пусто 1, ошибок 0" in result["report"]
+
+
+def test_run_compiled_nightly_maintenance_adds_imports_line_en(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = CliProcessor(tmp_path / "vault", content_language="en")
+    fake_result = _base_nightly_result(
+        imports_used=0, imports_nothing=0, imports_failed=1
+    )
+    monkeypatch.setattr(
+        "d_brain.services.processor.CompiledBriefingService",
+        lambda *args, **kwargs: _FakeNightlyCompiledService(fake_result),  # noqa: ARG005
+    )
+
+    result = processor._run_compiled_nightly_maintenance()
+
+    assert "- Imports: processed 0, empty 0, errors 1" in result["report"]
+
+
+def test_run_compiled_nightly_maintenance_omits_imports_line_when_all_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = CliProcessor(tmp_path / "vault")
+    fake_result = _base_nightly_result()
+    monkeypatch.setattr(
+        "d_brain.services.processor.CompiledBriefingService",
+        lambda *args, **kwargs: _FakeNightlyCompiledService(fake_result),  # noqa: ARG005
+    )
+
+    result = processor._run_compiled_nightly_maintenance()
+
+    assert "Импорты" not in result["report"]
+    assert "Imports" not in result["report"]
+
+
+def test_run_compiled_nightly_maintenance_adds_imports_line_for_sweep_only_activity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sweep can post/mark import notes on a night the queue drain
+    itself touches none (T4) -- the summary line must still show up, gated
+    on ``import_sweep``'s own counters, not only the drain-derived ones."""
+    processor = CliProcessor(tmp_path / "vault")
+    fake_result = _base_nightly_result(
+        import_sweep={"marked_used": 0, "requeued": 3, "skipped": 5}
+    )
+    monkeypatch.setattr(
+        "d_brain.services.processor.CompiledBriefingService",
+        lambda *args, **kwargs: _FakeNightlyCompiledService(fake_result),  # noqa: ARG005
+    )
+
+    result = processor._run_compiled_nightly_maintenance()
+
+    assert "- Импорты: обработано 0, пусто 0, ошибок 0" in result["report"]

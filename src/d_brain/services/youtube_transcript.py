@@ -27,6 +27,7 @@ from d_brain.services.frontmatter import (
     write_vault_file_text,
 )
 from d_brain.services.localization import normalize_language, translate
+from d_brain.services.ops_log import append_ops_log
 from d_brain.services.qmd import QmdService
 from d_brain.services.secrets import scrub_secrets
 from d_brain.services.source_links import SourceInfo, format_source_markdown
@@ -520,6 +521,9 @@ class YouTubeArchiveService:
                 transcript=transcript,
                 summary=summary,
             ),
+        )
+        append_ops_log(
+            self.vault_path, "ingest", f"{transcript.title} → {note_rel_path}"
         )
         if refresh_qmd:
             self._refresh_qmd_index()

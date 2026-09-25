@@ -1,15 +1,38 @@
 """Report formatters for Telegram messages."""
 
+from pathlib import PurePosixPath
 from typing import Any
 
 from d_brain.services.telegram_markup import (
     TELEGRAM_TEXT_LIMIT,
     contains_legacy_telegram_html,
+    extract_attachment_image_refs,
     html_to_markdown,
     markdown_to_plain_text,
     normalize_markdown_input,
     truncate_plain_text_for_edit,
 )
+
+
+def inline_artifact_image_paths(
+    report_text: str, artifact_paths: list[str]
+) -> set[str]:
+    """Artifact paths already embedded inline as attachment images.
+
+    Those images are delivered only inside the HTML document body (as base64
+    data URIs), never as separate files, so callers must exclude them from
+    any "Files:" listing or document attachment.
+    """
+    refs = extract_attachment_image_refs(report_text)
+    if not refs:
+        return set()
+    return {
+        path
+        for path in artifact_paths
+        if any(
+            PurePosixPath(path).as_posix().endswith(f"/{ref}") for ref in refs
+        )
+    }
 
 
 def format_process_report(report: dict[str, Any]) -> str:
@@ -28,9 +51,11 @@ def format_process_report(report: dict[str, Any]) -> str:
         for path in report.get("artifact_paths", [])
         if str(path).strip()
     ]
-    if artifact_paths:
+    inline_paths = inline_artifact_image_paths(formatted, artifact_paths)
+    listed_paths = [path for path in artifact_paths if path not in inline_paths]
+    if listed_paths:
         formatted += "\n\n**Файлы:**\n" + "\n".join(
-            f"- `{path}`" for path in artifact_paths
+            f"- `{path}`" for path in listed_paths
         )
     return formatted
 
@@ -55,6 +80,7 @@ __all__ = [
     "format_error",
     "format_process_report",
     "html_to_markdown",
+    "inline_artifact_image_paths",
     "markdown_to_plain_text",
     "normalize_markdown_input",
     "truncate_plain_text_for_edit",

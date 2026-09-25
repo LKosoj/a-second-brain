@@ -13,8 +13,6 @@ and semantic versioning.
   bot, and listed by `/reminders`.
 - Morning brief at 08:00 (systemd timer and LaunchAgent): open checkboxes
   from yesterday, this week's ONE Big Thing, pages with open conflicts.
-- "👍 Сохранить" button under `/do` and `/why` answers writes a card to
-  `vault/answers/` and a line to `vault/.session/log.md`.
 - Ops journal for frontmatter writes (`vault/.session/ops.jsonl` with
   snapshots), CLI `a-second-brain recover <run_id>` / `ops-prune`, and a
   nightly prune to a 30-day window at the end of the scheduled cycle.
@@ -30,6 +28,18 @@ and semantic versioning.
   screen to re-enable, `already_processed` markers for idempotent reruns and
   a VERIFY phase that checks expected artifacts.
 - Dependabot, OSV audit, ruff for skill scripts and shellcheck in CI.
+- Question and `/do` answers draw a matplotlib chart under
+  `attachments/charts/` when the answer has numbers over time or a
+  comparison; attachment images referenced in a reply are delivered inline
+  (base64) inside one HTML document, never as separate files.
+- Import notes are marked `compile_state`/`compile_checked` once their
+  compile-enrich pass finishes; a nightly sweep posts stale unmarked ones
+  and `run_compiled_import_sweep.py --no-limit` clears the pre-existing
+  backlog once.
+- Weekly wiki care (`run_compiled_wiki_care.py [--no-limit]`): fills
+  missing cross-links and missing pages, answers vault-gap questions and
+  runs a Tavily-backed web search for weak compiled topics, gated by its
+  own 7-day interval and model-call budget.
 
 ### Changed
 
@@ -63,8 +73,7 @@ and semantic versioning.
   audit.
 - PLAUD classification prompt receives the redacted summary and transcript;
   the PLAUD Todoist call uses the allowlisted environment too.
-- `recover <run_id>` reports restored, removed and skipped files separately;
-  "👍 Сохранить" cannot overwrite a card written concurrently.
+- `recover <run_id>` reports restored, removed and skipped files separately.
 - Photo analysis (description and OCR text) is redacted before it reaches
   the daily note and the session log.
 - "напомни сегодня ..." with a time already gone asks for a clearer time

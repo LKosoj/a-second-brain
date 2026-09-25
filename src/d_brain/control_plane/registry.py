@@ -247,7 +247,13 @@ CONTROL_PLANE_REGISTRY: tuple[WorkflowSpec, ...] = (
         # regenerates the owner-readable mirror at
         # ``summaries/compile/decisions-queue.md`` -- see
         # ``decisions_queue._regenerate_queue_document_after_append``.
-        allowed_writes=("compiled", "qmd", ".session", "summaries"),
+        # "moc" because the pass also refreshes the compiled-pages catalog
+        # at ``MOC/compiled-index.md`` (T3, ``compiled_index.py``).
+        # "imports" because the pass also patches ``compile_state``/
+        # ``compile_checked`` onto import notes (T4,
+        # ``CompiledBriefingService._on_source_finished``/
+        # ``sweep_unmarked_imports``).
+        allowed_writes=("compiled", "qmd", ".session", "summaries", "moc", "imports"),
         fallback_behavior=(
             "Best-effort nightly drain, lint, and source-aware backfill for "
             "compiled briefings, plus the automated pass over the owner's "
@@ -292,6 +298,38 @@ CONTROL_PLANE_REGISTRY: tuple[WorkflowSpec, ...] = (
         notes=(
             "Scheduled compiled fact-check (ТЗ 6.6) after compiled maintenance "
             "and vault health."
+        ),
+    ),
+    WorkflowSpec(
+        name="maintenance.compiled-wiki-care",
+        kind=WORKFLOW_KIND_MAINTENANCE,
+        entrypoint=(
+            "d_brain.services.processor.CliProcessor."
+            "_run_compiled_wiki_care_cycle"
+        ),
+        owner="processor",
+        display_name="Wiki Care",
+        triggers=("scheduled-post",),
+        # "imports" for the web-search action's own archived pages
+        # (``imports/web/auto/``, T5); "summaries" for filed vault-gap
+        # question answers (``summaries/answers/``); "moc" because a
+        # successful run also best-effort refreshes the compiled-pages
+        # catalog at ``MOC/compiled-index.md`` (T3), same as
+        # ``run_compiled_import_sweep.py`` does after its own sweep.
+        allowed_writes=("compiled", "imports", "summaries", ".session", "moc"),
+        fallback_behavior=(
+            "Best-effort weekly-cadence enrichment of the compiled layer: "
+            "skipped outright when fewer than 7 days passed since the "
+            "previous successful run, and any of its four sub-actions that "
+            "runs out of its own 10-model-call budget is skipped for this "
+            "run rather than left half-applied."
+        ),
+        notes=(
+            "Scheduled weekly wiki care (T5): missing cross-links, missing "
+            "pages, vault-gap questions, and Tavily-backed web search -- "
+            "runs after compiled fact-check (needs a settled compiled layer "
+            "to scan) and before compiled digest (so its own changes appear "
+            "in that digest run)."
         ),
     ),
     WorkflowSpec(
@@ -353,6 +391,9 @@ CONTROL_PLANE_REGISTRY: tuple[WorkflowSpec, ...] = (
             # run touches -- and because no *child* declares it either, the
             # parent/child walk in ``test_prompt_corpus.py`` could not see it.
             "goals",
+            # Inherited from ``maintenance.compiled-nightly`` (T4): its
+            # import-note ``compile_state`` marking.
+            "imports",
         ),
         fallback_behavior="Daily scheduled stack with mandatory final qmd refresh.",
         notes="Top-level scheduled processing workflow.",

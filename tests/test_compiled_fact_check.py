@@ -703,6 +703,72 @@ def test_run_monthly_fact_check_advances_and_patches_only_last_verified(
     assert updates == {"last_verified": DAY.isoformat()}
 
 
+def test_run_monthly_fact_check_logs_fact_check_ops_entry(
+    tmp_path, write_vault_manifest, monkeypatch
+):
+    vault = tmp_path / "vault"
+    write_vault_manifest(vault)
+    (vault / "daily").mkdir(parents=True)
+    (vault / "daily" / "2026-07-01.md").write_text("# ok\n", encoding="utf-8")
+    _write_page(
+        vault,
+        "compiled/topics/aurora.md",
+        last_verified="2026-06-01",
+        confidence="high",
+        sources_rows=[
+            ("2026-07-01", "daily/2026-07-01.md", "Клиент подтвердил статус"),
+        ],
+    )
+    monkeypatch.setattr(
+        compiled_fact_check,
+        "patch_validated_vault_frontmatter",
+        lambda vault_path, path, updates, *, manifest=None, existing_lock=None: None,
+    )
+
+    result = run_monthly_fact_check(vault, today=DAY)
+
+    assert result["pages_checked"] == 1
+    assert result["pages_patched"] == 1
+    assert result["pages_flagged"] == 0
+    log_line = (vault / ".session" / "log.md").read_text(encoding="utf-8").strip()
+    assert log_line.endswith(
+        "[fact-check] страниц 1, исправлено 1, помечено 0, ошибок 0"
+    )
+
+
+def test_run_monthly_fact_check_logs_ops_entry_on_failure(
+    tmp_path, write_vault_manifest, monkeypatch
+):
+    """T2 code review: the ops-log call used to sit after the try/finally
+    entirely, so a run that raised out of the try body never reached it.
+    ``finally`` must still append a line, with an "ошибка: <тип>" summary
+    instead of the usual counters."""
+    vault = tmp_path / "vault"
+    write_vault_manifest(vault)
+    (vault / "daily").mkdir(parents=True)
+    (vault / "daily" / "2026-07-01.md").write_text("# ok\n", encoding="utf-8")
+    _write_page(
+        vault,
+        "compiled/topics/aurora.md",
+        last_verified="2026-06-01",
+        confidence="high",
+        sources_rows=[
+            ("2026-07-01", "daily/2026-07-01.md", "Клиент подтвердил статус"),
+        ],
+    )
+
+    def _boom_manifest(*args, **kwargs):
+        raise RuntimeError("manifest exploded")
+
+    monkeypatch.setattr(compiled_fact_check, "load_manifest_for_vault", _boom_manifest)
+
+    with pytest.raises(RuntimeError, match="manifest exploded"):
+        run_monthly_fact_check(vault, today=DAY)
+
+    log_line = (vault / ".session" / "log.md").read_text(encoding="utf-8").strip()
+    assert log_line.endswith("[fact-check] ошибка: RuntimeError")
+
+
 def test_run_monthly_fact_check_queues_and_holds_when_gate_fails(
     tmp_path, write_vault_manifest, monkeypatch
 ):

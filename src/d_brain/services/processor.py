@@ -55,6 +55,7 @@ from d_brain.services.compiled_enrich_report import (
 )
 from d_brain.services.compiled_fact_check import run_monthly_fact_check
 from d_brain.services.compiled_question_provenance import build_question_provenance
+from d_brain.services.compiled_wiki_care import run_weekly_wiki_care
 from d_brain.services.context_pack import ContextPackBuilder, select_yearly_goals_name
 from d_brain.services.decisions_queue import write_queue_document
 
@@ -215,6 +216,7 @@ def cycle_step_label(cycle_name: str, *, content_language: str = "ru") -> str:
         "maintenance.compiled-nightly": "Поддержка compiled-слоя",
         "maintenance.vault-health": "Здоровье vault",
         "maintenance.compiled-fact-check": "Проверка фактов compiled",
+        "maintenance.compiled-wiki-care": "Уход за вики",
         "maintenance.compiled-digest": "Дайджест обогащения compiled",
     }
     labels_en = {
@@ -227,6 +229,7 @@ def cycle_step_label(cycle_name: str, *, content_language: str = "ru") -> str:
         "maintenance.compiled-nightly": "Compiled Maintenance",
         "maintenance.vault-health": "Vault Health",
         "maintenance.compiled-fact-check": "Compiled Fact Check",
+        "maintenance.compiled-wiki-care": "Wiki Care",
         "maintenance.compiled-digest": "Compiled Digest",
     }
     labels = labels_ru if content_language == "ru" else labels_en
@@ -246,6 +249,7 @@ class CliProcessor:
         openai_api_key: str = "",
         openai_base_url: str = "",
         openai_model: str = "",
+        tavily_api_key: str = "",
     ) -> None:
         self.vault_path = Path(vault_path)
         self.todoist_api_key = todoist_api_key
@@ -255,6 +259,7 @@ class CliProcessor:
         self._openai_api_key = openai_api_key.strip()
         self._openai_base_url = openai_base_url.strip()
         self._openai_model = openai_model.strip()
+        self.tavily_api_key = tavily_api_key.strip()
         self._recall_planner_config = RecallPlannerConfig(
             model=self._openai_model,
             api_key=self._openai_api_key,
@@ -3003,6 +3008,13 @@ If `.session/question-creative-recall.txt` exists and is useful, read it too.
 If the request creates or asks for an existing user-facing file, save or locate
 it under `attachments/` and include its exact vault-relative path in the answer.
 
+If the answer includes numbers over time or a comparison, draw one chart
+yourself: write and run matplotlib code (`matplotlib.use("Agg")`, a font that
+supports Cyrillic such as DejaVu Sans, run `python3` from PATH), save it as
+`attachments/charts/YYYY-MM-DD-<slug>.png`, and insert
+`![description](attachments/charts/YYYY-MM-DD-<slug>.png)` into the answer.
+Skip the chart when there is no time series or comparison to show.
+
 If a QUESTION ROUTE block is provided, follow its read order and escalation
 rules. That route overrides the generic defaults below when they conflict.
 
@@ -3688,7 +3700,7 @@ or recent vault notes before answering instead of guessing.
             output, artifact_paths = self._run_assistant_prompt_with_artifacts(prompt)
             normalized = self._normalize_owner_report_markdown(output)
             normalized = self._append_question_provenance(normalized, question)
-            self._file_output_artifact_if_useful(
+            filed_artifact_path = self._file_output_artifact_if_useful(
                 request=question,
                 output_markdown=normalized,
                 artifact_type="question-answer",
@@ -3697,6 +3709,7 @@ or recent vault notes before answering instead of guessing.
                 "report": normalized,
                 "processed_entries": 1,
                 "artifact_paths": artifact_paths,
+                "filed_artifact_path": filed_artifact_path,
             }
         except TimeoutError:
             logger.error("%s question answering timed out", self.ai_cli)
@@ -3944,6 +3957,32 @@ or recent vault notes before answering instead of guessing.
                 report_lines.append(
                     f"- Queue errors: {len(result.get('queue_errors', []))}"
                 )
+        # T4 "Импорты доводятся до конца": only shown when this pass actually
+        # touched an import note or its sweep did -- a quiet night for
+        # imports specifically should not add a zeroed line to every single
+        # nightly report, matching the ``queue_busy``/``queue_errors``
+        # conditional lines above rather than the unconditional core five.
+        imports_used = int(result.get("imports_used") or 0)
+        imports_nothing = int(result.get("imports_nothing") or 0)
+        imports_failed = int(result.get("imports_failed") or 0)
+        import_sweep = result.get("import_sweep") or {}
+        if (
+            imports_used
+            or imports_nothing
+            or imports_failed
+            or import_sweep.get("requeued")
+            or import_sweep.get("marked_used")
+        ):
+            if self.content_language == "ru":
+                report_lines.append(
+                    f"- Импорты: обработано {imports_used}, "
+                    f"пусто {imports_nothing}, ошибок {imports_failed}"
+                )
+            else:
+                report_lines.append(
+                    f"- Imports: processed {imports_used}, "
+                    f"empty {imports_nothing}, errors {imports_failed}"
+                )
         if budget_exhausted:
             if self.content_language == "ru":
                 report_lines.append(
@@ -4037,6 +4076,83 @@ or recent vault notes before answering instead of guessing.
                 )
         result["report"] = "\n".join(report_lines)
         result["processed_entries"] = int(result.get("pages_patched") or 0)
+        return result
+
+    def _run_compiled_wiki_care_cycle(self) -> dict[str, Any]:
+        """Weekly-cadence enrichment of the compiled layer (T5 "Еженедельный
+        уход за вики"): missing cross-links, missing pages, vault-gap
+        questions, and Tavily-backed web search.
+
+        Its own 7-day interval and its own 10-model-call budget, both
+        tracked inside ``compiled_wiki_care.py`` -- see that module's
+        docstring for why neither reuses ``CompileEnrichPass``. A
+        "skipped-interval" run, and a clean run that changed nothing, get an
+        empty report so they never land in
+        the scheduled-cycle digest (``_run_scheduled_cycle_locked`` only
+        keeps non-empty reports meaningfully).
+        """
+        try:
+            result = run_weekly_wiki_care(
+                self.vault_path,
+                content_language=self.content_language,
+                ai_cli=self.ai_cli,
+                answer_question=self.answer_question,
+                tavily_api_key=self.tavily_api_key,
+            )
+        except Exception as exc:
+            logger.warning("Compiled wiki-care failed: %s", exc)
+            return {"error": str(exc), "processed_entries": 0}
+
+        if result.get("status") == "skipped-interval" or (
+            result.get("status") == "no-work" and not result.get("errors")
+        ):
+            result["report"] = ""
+            result["processed_entries"] = 0
+            return result
+
+        changed_lines = [
+            f"- [[{path[:-3] if path.endswith('.md') else path}]]"
+            for path in result.get("changed_paths") or []
+        ]
+        if self.content_language == "ru":
+            report_lines = [
+                "## 🧹 Уход за вики",
+                "",
+                f"- Связей добавлено: {int(result.get('links_added') or 0)}",
+                (
+                    "- Страниц поставлено в очередь: "
+                    f"{int(result.get('pages_created') or 0)}"
+                ),
+                (
+                    "- Вопросов зафиксировано: "
+                    f"{int(result.get('questions_answered') or 0)}"
+                ),
+                f"- Статей импортировано: {int(result.get('articles_imported') or 0)}",
+            ]
+            if changed_lines:
+                report_lines.extend(["", "Изменённые страницы:", *changed_lines])
+            if result.get("errors"):
+                report_lines.append(f"- Ошибок: {len(result.get('errors', []))}")
+        else:
+            report_lines = [
+                "## 🧹 Wiki Care",
+                "",
+                f"- Links added: {int(result.get('links_added') or 0)}",
+                f"- Pages queued: {int(result.get('pages_created') or 0)}",
+                f"- Questions answered: {int(result.get('questions_answered') or 0)}",
+                f"- Articles imported: {int(result.get('articles_imported') or 0)}",
+            ]
+            if changed_lines:
+                report_lines.extend(["", "Changed pages:", *changed_lines])
+            if result.get("errors"):
+                report_lines.append(f"- Errors: {len(result.get('errors', []))}")
+        result["report"] = "\n".join(report_lines)
+        result["processed_entries"] = (
+            int(result.get("links_added") or 0)
+            + int(result.get("pages_created") or 0)
+            + int(result.get("questions_answered") or 0)
+            + int(result.get("articles_imported") or 0)
+        )
         return result
 
     def _freshness_lint_report(self) -> str:
@@ -4351,6 +4467,13 @@ USER REQUEST:
 
 If the request creates or asks for an existing user-facing file, save or locate
 it under `attachments/` and include its exact vault-relative path in the report.
+
+If the report includes numbers over time or a comparison, draw one chart
+yourself: write and run matplotlib code (`matplotlib.use("Agg")`, a font that
+supports Cyrillic such as DejaVu Sans, run `python3` from PATH), save it as
+`attachments/charts/YYYY-MM-DD-<slug>.png`, and insert
+`![description](attachments/charts/YYYY-MM-DD-<slug>.png)` into the report.
+Skip the chart when there is no time series or comparison to show.
 
 {
             self._telegram_markdown_output_rules(

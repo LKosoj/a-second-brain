@@ -35,6 +35,7 @@ from d_brain.services.localization import (
     prompt_language_name,
     translate,
 )
+from d_brain.services.ops_log import append_ops_log
 from d_brain.services.qmd import QmdService
 from d_brain.services.secrets import scrub_secrets
 from d_brain.services.source_links import SourceInfo, format_source_markdown
@@ -301,6 +302,7 @@ class DocumentArchiveService:
             note_path=note_path,
             source_excerpt=self._clip_compiled_excerpt(summary, extraction.plain_text),
         )
+        append_ops_log(self.vault_path, "ingest", f"{extraction.title} → {note_path}")
         if refresh_qmd:
             self._refresh_qmd_index()
         return DocumentArchiveResult(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import re
+from collections.abc import Callable
 from html.parser import HTMLParser
 
 import markdown as markdown_lib
@@ -14,6 +15,16 @@ EDIT_TRUNCATION_SUFFIX = " ✂️"
 LEGACY_TELEGRAM_HTML_RE = re.compile(
     r"</?(?:b|i|code|pre|s|u|a)(?:\s[^>]*)?>",
     re.IGNORECASE,
+)
+# svg is deliberately excluded: it can embed scripts, unlike the raster
+# formats below.
+ATTACHMENT_IMAGE_EXTENSIONS = frozenset({"png", "jpg", "jpeg", "gif", "webp"})
+_URI_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
+# A CommonMark image destination: either `<...>` or a run of non-whitespace,
+# optionally followed by a title in `"..."`, `'...'`, or `(...)` form.
+_IMAGE_HREF_RE = re.compile(
+    r'^(?:<(?P<angle>[^<>]*)>|(?P<plain>\S+))'
+    r'(?:\s+(?:"[^"]*"|\'[^\']*\'|\([^()]*\)))?$'
 )
 
 
@@ -85,6 +96,80 @@ def _extract_markdown_links(text: str) -> list[tuple[int, int, str, str]]:
             links.append((start, position + 1, label, href))
         index = position + 1
     return links
+
+
+def _image_href_path(href: str) -> str | None:
+    """Strip an optional CommonMark title and angle brackets from an image href.
+
+    Supports `![alt](path "Title")`, `![alt](path 'Title')`,
+    `![alt](path (Title))`, and `![alt](<path>)`. Returns None if `href`
+    isn't a single destination with an optional trailing title.
+    """
+    value = str(href or "").strip()
+    if not value:
+        return None
+    match = _IMAGE_HREF_RE.match(value)
+    if not match:
+        return None
+    path = match.group("angle")
+    return path if path is not None else match.group("plain")
+
+
+def _is_attachment_image_ref(path: str) -> bool:
+    """Whether an image destination path points at a local vault attachment image."""
+    value = str(path or "").strip()
+    if not value or _URI_SCHEME_RE.match(value) or value.startswith("/"):
+        return False
+    segments = value.split("/")
+    if ".." in segments or "" in segments or segments[0] != "attachments":
+        return False
+    name = segments[-1]
+    if "." not in name:
+        return False
+    return name.rsplit(".", 1)[1].lower() in ATTACHMENT_IMAGE_EXTENSIONS
+
+
+def extract_attachment_image_refs(markdown: str) -> list[str]:
+    """Return attachment-image paths referenced as markdown images (`![...]`)."""
+    value = str(markdown or "")
+    refs: list[str] = []
+    for start, _end, _label, href in _extract_markdown_links(value):
+        if not (start > 0 and value[start - 1] == "!"):
+            continue
+        path = _image_href_path(href)
+        if path is None or not _is_attachment_image_ref(path):
+            continue
+        refs.append(path)
+    return refs
+
+
+def replace_markdown_image_links(
+    markdown: str,
+    resolve: Callable[[str], str | None],
+) -> str:
+    """Inline attachment-image markdown links via `resolve`, else keep alt text.
+
+    Everything else (regular links, non-attachment images) is left unchanged.
+    """
+    value = str(markdown or "")
+    links = _extract_markdown_links(value)
+    if not links:
+        return value
+
+    pieces: list[str] = []
+    cursor = 0
+    for start, end, label, href in links:
+        if not (start > 0 and value[start - 1] == "!"):
+            continue
+        path = _image_href_path(href)
+        if path is None or not _is_attachment_image_ref(path):
+            continue
+        pieces.append(value[cursor : start - 1])
+        resolved = resolve(path)
+        pieces.append(f"![{label}]({resolved})" if resolved else label)
+        cursor = end
+    pieces.append(value[cursor:])
+    return "".join(pieces)
 
 
 def _markdown_links_to_html_placeholders(text: str) -> tuple[str, list[str]]:

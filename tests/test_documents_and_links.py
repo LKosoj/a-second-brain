@@ -256,6 +256,32 @@ def test_document_archive_service_persists_original_text_and_summary_note(
     _assert_valid_import_note(vault_path, result.note_path, "# Header")
 
 
+def test_document_archive_service_logs_ingest_ops_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault_path = tmp_path / "vault"
+    _reject_direct_markdown_write(monkeypatch)
+    service = DocumentArchiveService(vault_path)
+    source = SourceInfo(kind="telegram", ref="telegram:1:2", url="", label="")
+
+    result = service.archive_document(
+        data=b"# Header\n\nBody line one.\nBody line two.\n",
+        file_name="notes.md",
+        mime_type="text/markdown",
+        file_size=39,
+        timestamp=datetime(2026, 4, 4, 19, 50),
+        source=source,
+        name_hint="42",
+        caption="Важный файл",
+        refresh_qmd=False,
+    )
+
+    log_line = (vault_path / ".session" / "log.md").read_text(encoding="utf-8").strip()
+    assert log_line.endswith(
+        f"[ingest] {result.extraction.title} → {result.note_path}"
+    )
+
+
 def test_document_archive_service_forwarded_note_lands_under_forwarded_prefix(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -610,6 +636,61 @@ def test_web_archive_service_exposes_control_plane_workflow(tmp_path: Path) -> N
     service = WebArchiveService(tmp_path / "vault")
 
     assert service.workflow_name == "integration.web.archive"
+
+
+def test_web_archive_service_logs_ingest_ops_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from d_brain.services.web_archive import WebArchiveService
+
+    vault_path = tmp_path / "vault"
+    service = WebArchiveService(vault_path)
+    monkeypatch.setattr(service, "_refresh_compiled_briefings", lambda **kwargs: None)
+
+    result = service.archive_page(
+        WebContentResult(
+            url="https://example.com/article",
+            title="Example Page",
+            content="source content",
+            source="direct",
+        ),
+        original_url="https://example.com/article",
+        timestamp=datetime(2026, 7, 29, 12, 0),
+        refresh_qmd=False,
+    )
+
+    log_line = (vault_path / ".session" / "log.md").read_text(encoding="utf-8").strip()
+    assert log_line.endswith(f"[ingest] Example Page → {result.note_path}")
+
+
+def test_web_archive_service_writes_under_imports_web_auto_when_configured(
+    tmp_path: Path,
+) -> None:
+    """ПОПРАВКА 4 (T5 plan): the weekly wiki-care web-search action archives
+    pages under ``imports/web/auto/`` via ``notes_subdir="auto"``, distinct
+    from the default ``imports/web/notes/``. ``route_profile`` only checks
+    the leading ``imports`` path segment, so this must be accepted by the
+    manifest's ``import`` profile like any other import note."""
+    from d_brain.services.web_archive import WebArchiveService
+
+    vault_path = tmp_path / "vault"
+    service = WebArchiveService(vault_path, notes_subdir="auto")
+    service._refresh_compiled_briefings = lambda **kwargs: None  # type: ignore[method-assign]
+
+    result = service.archive_page(
+        WebContentResult(
+            url="https://example.com/aurora",
+            title="Aurora Rollout",
+            content="source content",
+            source="direct",
+        ),
+        original_url="https://example.com/aurora",
+        timestamp=datetime(2026, 7, 29, 12, 0),
+        refresh_qmd=False,
+    )
+
+    assert result.note_path.startswith("imports/web/auto/")
+    _assert_valid_import_note(vault_path, result.note_path, "# Aurora Rollout")
 
 
 def test_web_archive_rejects_symlinked_vault_parent_before_sidecars(
@@ -1053,6 +1134,32 @@ def test_youtube_archive_service_persists_note_and_sidecars(
     assert "YouTube: https://youtu.be/demo1234567" in note_text
     assert "[[imports/youtube/raw/" in note_text
     _assert_valid_import_note(vault_path, result.note_path, "# Demo video")
+
+
+def test_youtube_archive_service_logs_ingest_ops_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault_path = tmp_path / "vault"
+    _reject_direct_markdown_write(monkeypatch)
+    service = YouTubeArchiveService(vault_path, "ru")
+
+    result = service.archive_transcript(
+        YouTubeTranscript(
+            url="https://youtu.be/demo1234567",
+            title="Demo video",
+            transcript="line one\nline two",
+            source="manual subtitles",
+            video_id="demo1234567",
+            metadata={"id": "demo1234567"},
+        ),
+        timestamp=datetime(2026, 4, 4, 12, 30, 45),
+        summary="Коротко: полезный воркшоп.\n- Есть детали.",
+        source=SourceInfo(kind="telegram", ref="telegram:1:2"),
+        refresh_qmd=False,
+    )
+
+    log_line = (vault_path / ".session" / "log.md").read_text(encoding="utf-8").strip()
+    assert log_line.endswith(f"[ingest] Demo video → {result.note_path}")
 
 
 def test_youtube_archive_service_refreshes_qmd_by_default(

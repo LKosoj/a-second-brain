@@ -243,6 +243,99 @@ def test_handle_text_routes_questions_to_answer_path(
     assert delivered_files == [str(tmp_path / "attachments" / "plan.xml")]
 
 
+def test_handle_text_excludes_inline_chart_image_from_answer_files(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    answers: list[str] = []
+    delivered_files: list[str] = []
+    chart_path = str(tmp_path / "attachments" / "charts" / "2026-04-04-x.png")
+    plan_path = str(tmp_path / "attachments" / "plan.xml")
+
+    async def fake_answer_text(_message, text: str, **kwargs):  # noqa: ANN001, ARG001
+        if not text.startswith("⏳"):
+            answers.append(text)
+        return SimpleNamespace(text=text)
+
+    async def fake_edit_text(_message, text: str, **kwargs):  # noqa: ANN001, ARG001
+        return SimpleNamespace(text=text)
+
+    async def fake_answer_rich_text(_message, text: str, **kwargs):  # noqa: ANN001, ARG001
+        answers.append(text)
+        return SimpleNamespace(text=text)
+
+    async def fake_answer_files(_message, paths: list[str]) -> None:  # noqa: ANN001
+        delivered_files.extend(paths)
+
+    class FakeStorage:
+        def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            pass
+
+    class FakeLinkSummaryService:
+        def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            pass
+
+    class FakeProcessor:
+        def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            pass
+
+        def classify_text_intent(self, text: str) -> dict[str, str]:
+            return {
+                "intent": "question",
+                "confidence": "high",
+                "reason": "direct answer expected",
+            }
+
+        def answer_question(self, question: str, user_id: int) -> dict[str, object]:
+            return {
+                "report": "Итог: ![chart](attachments/charts/2026-04-04-x.png)",
+                "processed_entries": 1,
+                "artifact_paths": [chart_path, plan_path],
+            }
+
+    class FakeSessionStore:
+        def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            pass
+
+        def append(self, user_id: int, entry_type: str, **kwargs) -> None:  # noqa: ANN003
+            pass
+
+    class FakeUser:
+        id = 42
+
+    FakeDate = lambda: datetime(2026, 4, 4, 12, 0, 0)  # noqa: E731
+
+    class FakeMessage:
+        text = "Какие приоритеты на эту неделю?"
+        from_user = FakeUser()
+        date = FakeDate()
+        message_id = 100
+
+    monkeypatch.setattr(
+        text_handler,
+        "get_settings",
+        lambda: SimpleNamespace(
+            vault_path=tmp_path,
+            content_language="ru",
+            ai_cli="codex",
+            todoist_api_key="",
+            owner_full_name="Иван Иванов",
+        ),
+    )
+    monkeypatch.setattr(text_handler, "VaultStorage", FakeStorage)
+    monkeypatch.setattr(text_handler, "LinkSummaryService", FakeLinkSummaryService)
+    monkeypatch.setattr(text_handler, "CliProcessor", FakeProcessor)
+    monkeypatch.setattr(text_handler, "SessionStore", FakeSessionStore)
+    monkeypatch.setattr(text_handler, "answer_text", fake_answer_text)
+    monkeypatch.setattr(text_handler, "answer_rich_text", fake_answer_rich_text)
+    monkeypatch.setattr(text_handler, "answer_files", fake_answer_files)
+    monkeypatch.setattr(text_handler, "edit_text", fake_edit_text)
+
+    asyncio.run(text_handler.handle_text(FakeMessage()))
+
+    assert delivered_files == [plan_path]
+
+
 def test_process_command_falls_back_to_new_message_when_status_edit_fails(
     monkeypatch,
     tmp_path: Path,

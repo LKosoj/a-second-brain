@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 from uuid import uuid4
 
 from d_brain.manifest import VaultManifest, load_manifest_for_vault
@@ -35,10 +35,12 @@ from d_brain.services.frontmatter import (
     FrontmatterError,
     parse_frontmatter_bytes,
     patch_frontmatter_bytes,
+    patch_validated_vault_frontmatter,
     write_validated_vault_markdown,
 )
 from d_brain.services.json_normalizer import extract_first_json_dict
 from d_brain.services.localization import normalize_language, prompt_language_name
+from d_brain.services.ops_log import append_ops_log
 from d_brain.services.qmd import QmdService
 from d_brain.services.vault_lock import VaultWriteLock, vault_write_lock
 
@@ -235,6 +237,40 @@ IMPORTS_PLAUD_PREFIX = "imports/plaud/"
 # imports/ rule below would let a stranger's forwarded file clear
 # CONSEQUENTIAL_ACTION_TRUST_LEVELS and supersede the owner's own facts.
 IMPORTS_DOCUMENTS_FORWARDED_PREFIX = "imports/documents/forwarded/"
+# T5 "Еженедельный уход за вики": pages the wiki-care web-search action (4)
+# archives on its own initiative. Same cap as PLAUD/forwarded documents --
+# the owner never wrote or vetted these, so they must not outrank the
+# owner's own facts either.
+IMPORTS_WEB_AUTO_PREFIX = "imports/web/auto/"
+# T4 "Импорты доводятся до конца": every vault-relative directory an
+# importer actually passes to ``enqueue_refresh`` as ``source_path`` --
+# confirmed against each service's own notes-root attribute
+# (``web_archive.WebArchiveService.notes_root``,
+# ``documents.DocumentArchiveService.notes_root``/``forwarded_notes_root``,
+# ``youtube_transcript.YouTubeArchiveService.notes_root``,
+# ``plaud.PlaudSyncService._notes_root``), not guessed from the ``imports/``
+# layout in general. Raw/content sibling files those same importers write
+# (``imports/*/raw/``, ``imports/*/content/``) are never queue sources, so
+# they are deliberately excluded here.
+IMPORT_NOTE_ROOTS = (
+    "imports/web/notes",
+    "imports/documents/notes",
+    "imports/documents/forwarded",
+    "imports/youtube/notes",
+    "imports/plaud/notes",
+    "imports/web/auto",
+)
+
+
+def _is_import_note(rel_path: str) -> bool:
+    """Whether ``rel_path`` is one import note the T4 frontmatter marking
+    (``compile_state``/``compile_checked``) applies to."""
+    return any(
+        rel_path == root or rel_path.startswith(f"{root}/")
+        for root in IMPORT_NOTE_ROOTS
+    )
+
+
 CLAIM_KIND_VALUES = {"fact", "opinion", "commitment"}
 CONFLICT_TYPE_VALUES = {"temporal", "factual", "contextual"}
 # What the model may answer when it adjudicates one conflict
@@ -386,6 +422,14 @@ SOURCE_STATE_IGNORED_FRONTMATTER_FIELDS = {
     "last_accessed",
     "relevance",
     "tier",
+    # T4: ``_on_source_finished``/``sweep_unmarked_imports`` patch these two
+    # onto an import note after it is compiled. Without this, that patch
+    # changes the note's own semantic digest, and the note reads as a
+    # changed source on its own next compile pass -- a false
+    # freshness/source-changed signal caused entirely by this feature
+    # marking its own outcome.
+    "compile_state",
+    "compile_checked",
 }
 SOURCE_STATE_IGNORED_PATH_PREFIXES = (
     "compiled/",
@@ -472,6 +516,14 @@ MAX_DRIFT_JUDGEMENTS_PER_PASS = 5
 # logic again. These are the kinds that used to wait for a tap that never
 # came -- ``decisions_queue.AUTO_DECIDABLE_KINDS``.
 MAX_QUEUE_DECISIONS_PER_PASS = 5
+# T4 "Импорты доводятся до конца": how many stale, never-marked import
+# notes one nightly pass may re-``enqueue_refresh`` via
+# ``sweep_unmarked_imports``. Marking a note already cited by a compiled
+# page costs no model call and is not limited by this; only fresh
+# postings are. The one-off catch-up CLI (``run_compiled_import_sweep.py
+# --no-limit``) passes ``limit=None`` instead, for the first pass over
+# every pre-existing import.
+NIGHTLY_IMPORT_SWEEP_LIMIT = 20
 # How many times the automated path will send one page back for another
 # Verify attempt before it stops trying. A retry re-queues the source, so a
 # page Verify keeps rejecting for a structural reason would otherwise come
@@ -1076,6 +1128,30 @@ class CompileEnrichPass:
     # page never calls the model again on its own and would otherwise stay
     # silently stuck until the owner happens to notice the broken marker.
     human_zone_ambiguous_pages: set[str] = field(default_factory=set)
+    # T4 "Импорты доводятся до конца": how many import notes this pass's
+    # queue drain (``_on_source_finished``) marked ``compile_state`` for,
+    # by outcome. ``imports_used`` covers both a real page update and a
+    # ``no_changes`` outcome the wiki already cites; ``imports_failed``
+    # covers both ``dropped`` and ``rejected``. Journalled next to the
+    # other per-pass counters so a night that only finished importing old
+    # notes still shows work done.
+    imports_used: int = 0
+    imports_nothing: int = 0
+    imports_failed: int = 0
+    # T4 code review defect 2: ``_on_source_finished`` buffers this pass's
+    # marks here instead of patching the import note's frontmatter right
+    # away -- the ТЗ 5.5 inv 5 effectiveness gate below can still roll this
+    # pass's compiled/ page writes back, and a mark written before that
+    # decision would tell the note ``used``/``nothing``/``failed`` for a
+    # contribution that no longer exists. ``run_nightly_maintenance``
+    # applies (survived) or drops (rolled back) the whole buffer once the
+    # gate has run -- see ``_apply_pending_import_marks``.
+    pending_import_marks: dict[str, Literal["used", "nothing", "failed"]] = field(
+        default_factory=dict
+    )
+    # The result of this pass's own ``sweep_unmarked_imports`` call, kept
+    # verbatim for the pass journal -- see ``run_nightly_maintenance``.
+    import_sweep: dict[str, int] = field(default_factory=dict)
 
 
 class CompiledBriefingService:
@@ -1628,13 +1704,22 @@ class CompiledBriefingService:
                         backoff=True,
                     )
                 else:
+                    finished_outcome: Literal["updated", "no_changes"] = (
+                        "updated" if event_updated else "no_changes"
+                    )
                     self._record_queue_worker_event(
                         event,
-                        outcome="updated" if event_updated else "no_changes",
+                        outcome=finished_outcome,
                         updated=event_updated,
                         errors=[],
                     )
                     self._ack_claimed_queue_event(event)
+                    self._on_source_finished(
+                        source_rel_path,
+                        finished_outcome,
+                        tuple(event_updated),
+                        targets_empty=bool(result.get("targets_empty")),
+                    )
                     # This source made it all the way through, so any earlier
                     # "gave up on it" trace is stale -- see
                     # ``_record_dropped_queue_source``. The pages it wrote
@@ -1694,6 +1779,11 @@ class CompiledBriefingService:
                         attempts=attempts,
                     )
                     self._ack_claimed_queue_event(event)
+                    self._on_source_finished(
+                        str(event.get("source_path") or ""),
+                        "dropped",
+                        tuple(event_updated),
+                    )
                 errors.extend(event_errors)
                 continue
 
@@ -1717,6 +1807,9 @@ class CompiledBriefingService:
                 attempts=int(event.get("attempts") or 0) + 1,
             )
             self._ack_claimed_queue_event(event)
+            self._on_source_finished(
+                str(event.get("source_path") or ""), "rejected", tuple(event_updated)
+            )
 
         consolidation_paths: list[str] = []
         consolidation_path = self._write_batch_consolidation(consolidation_events)
@@ -1757,7 +1850,27 @@ class CompiledBriefingService:
         status = "ok"
         gate_error = ""
         rollback_report: dict[str, Any] | None = None
+        # Set only in the ``except`` below (code review): empty means the
+        # try body ran to completion (success, or a gate failure that
+        # returns rather than raises), which is exactly when
+        # ``drain_result``/``archived``/``conflicts_resolved``/
+        # ``lint_issues``/``errors`` below are guaranteed to be assigned.
+        nightly_exc_type = ""
         try:
+            # T4: swept before the drain so anything it enqueues here still
+            # gets marked by this same pass's drain below. Best-effort --
+            # a sweep bug must not take down the rest of a normal nightly
+            # pass, so a failure here is logged and treated as no sweep
+            # work done rather than raised.
+            try:
+                import_sweep = self.sweep_unmarked_imports(
+                    limit=NIGHTLY_IMPORT_SWEEP_LIMIT
+                )
+            except Exception as sweep_exc:  # noqa: BLE001 - best-effort (T4)
+                logger.warning("Import sweep failed: %s", sweep_exc)
+                import_sweep = {"marked_used": 0, "requeued": 0, "skipped": 0}
+            self._active_pass.import_sweep = import_sweep
+
             drain_result = self.drain_queue(
                 force=True, max_events=50, refresh_qmd=False
             )
@@ -1905,6 +2018,30 @@ class CompiledBriefingService:
                 # so it must not collapse into the same status as one.
                 status = "no-work"
 
+            # T4 code review defect 2: apply this pass's buffered import
+            # compile_state marks now that the gates above have decided
+            # whether this pass survives -- a rollback report means one of
+            # them fired and reverted this pass's own compiled/ page
+            # writes, so the marks buffered for it must be dropped, not
+            # written (see ``_apply_pending_import_marks``).
+            self._apply_pending_import_marks(rolled_back=rollback_report is not None)
+
+            # T3: refresh the MOC/compiled-index.md catalog last, once status
+            # is final. Its own try/except keeps a catalog-building bug from
+            # turning an otherwise fine compile-enrich pass into a "failed"
+            # one -- the local import avoids a module-level import cycle
+            # (compiled_index imports COMPILED_BRIEFING_DOMAINS from this
+            # module).
+            compiled_index_written = False
+            try:
+                from d_brain.services.compiled_index import refresh_compiled_index
+
+                compiled_index_written = refresh_compiled_index(self.vault_path)
+            except Exception as index_exc:  # noqa: BLE001
+                logger.warning(
+                    "Compiled index catalog refresh failed: %s", index_exc
+                )
+
             return {
                 "queued_drained": int(drain_result.get("drained") or 0),
                 "queue_updated": list(drain_result.get("updated", [])),
@@ -1927,6 +2064,11 @@ class CompiledBriefingService:
                     or compressed
                     or conflicts_resolved
                 ),
+                "compiled_index_written": compiled_index_written,
+                "import_sweep": import_sweep,
+                "imports_used": self._active_pass.imports_used,
+                "imports_nothing": self._active_pass.imports_nothing,
+                "imports_failed": self._active_pass.imports_failed,
                 "errors": errors,
             }
         except Exception as exc:
@@ -1938,6 +2080,12 @@ class CompiledBriefingService:
             # consequence, so the owner's digest reported a full disk for a
             # pass that failed the inv-5 gate.
             gate_error = f"{gate_error}; then: {exc}" if gate_error else str(exc)
+            nightly_exc_type = type(exc).__name__
+            # A pass that crashed before the gate never applied its buffered
+            # import marks; drop them like a rollback so the journal does not
+            # count marks that were never written.
+            if self._active_pass is not None and self._active_pass.pending_import_marks:
+                self._apply_pending_import_marks(rolled_back=True)
             raise
         finally:
             try:
@@ -1961,6 +2109,23 @@ class CompiledBriefingService:
                 # whatever was propagating -- including nothing at all, so a
                 # clean pass was reported to the caller as a failure.
                 logger.warning("Failed to write compile-enrich pass journal: %s", exc)
+            # Moved here from right before the try's own ``return`` (code
+            # review): that spot was skipped whenever the body above raised,
+            # so a failed pass never made it into the ops log at all. Placed
+            # next to the unconditional pass-journal write above rather than
+            # wrapped in its own try/except: ``append_ops_log`` is already
+            # best-effort and does not raise on its own account.
+            if nightly_exc_type:
+                nightly_summary = f"ошибка: {nightly_exc_type}"
+            else:
+                nightly_summary = (
+                    f"источников {int(drain_result.get('drained') or 0)}, "
+                    f"архивировано {len(archived)}, "
+                    f"конфликтов {len(conflicts_resolved)}, "
+                    f"lint {len(lint_issues)}, "
+                    f"ошибок {len(errors)}"
+                )
+            append_ops_log(self.vault_path, "nightly", nightly_summary)
             # The drains that ran a previously given-up source to a
             # conclusion get to retire its trace -- see
             # ``_clear_dropped_queue_source`` for why this waits until here.
@@ -2141,6 +2306,7 @@ class CompiledBriefingService:
                 max_updates=2,
             )
         self.spawn_background_drain()
+        append_ops_log(self.vault_path, "answer", f"{title} → {rel_path}")
         return rel_path
 
     @staticmethod
@@ -2352,7 +2518,20 @@ class CompiledBriefingService:
             return {"available": False, "updated": [], "errors": [str(exc)]}
 
         if not targets:
-            return {"available": True, "updated": [], "errors": []}
+            # T4 code review defect 1: the model itself found nowhere to
+            # put this source (empty/invalid ``updates``, or a noisy
+            # ``source_shape`` -- see ``_resolve_targets``). This is the
+            # one "no changes" reason ``_on_source_finished`` may turn into
+            # a permanent ``compile_state: nothing`` -- every other empty-
+            # ``updated`` reason below (ambiguous human zone, verify
+            # rejection, trust block, ...) leaves a non-empty ``targets``
+            # and must not set this flag.
+            return {
+                "available": True,
+                "updated": [],
+                "errors": [],
+                "targets_empty": True,
+            }
 
         updated: list[str] = []
         errors: list[str] = []
@@ -3399,6 +3578,10 @@ class CompiledBriefingService:
             "human_zone_ambiguous_pages": (
                 sorted(pass_obj.human_zone_ambiguous_pages) if pass_obj else []
             ),
+            "imports_used": pass_obj.imports_used if pass_obj else 0,
+            "imports_nothing": pass_obj.imports_nothing if pass_obj else 0,
+            "imports_failed": pass_obj.imports_failed if pass_obj else 0,
+            "import_sweep": dict(pass_obj.import_sweep) if pass_obj else {},
             "rollback": rollback,
         }
         journal_path = self.vault_path / ".session" / "compile-enrich.json"
@@ -4549,6 +4732,11 @@ class CompiledBriefingService:
         # verified claim becomes its own row instead (see
         # _apply_claims_and_conflicts).
         shaped_rows = self._sources_shaped_rows(existing_text)
+        # "Related Pages" (T5 "Еженедельный уход за вики") is a code-owned
+        # section written only by the wiki-care pass, not by this compile
+        # path -- carried over untouched across every regeneration so a
+        # nightly refresh never drops the links wiki-care added.
+        related_pages = self._section_bullets(existing_text, "Related Pages")
         claim_history_rows = self._claim_history_rows(existing_text)
         open_conflict_rows_before = self._open_conflicts_rows(existing_text)
         open_conflict_rows = open_conflict_rows_before
@@ -4820,6 +5008,22 @@ class CompiledBriefingService:
                 "## Next Check",
                 next_check or "Review after the next meaningful update.",
                 "",
+            ]
+        )
+        # "Related Pages" (T5) is only ever written by the wiki-care pass, so
+        # it is only rendered once that pass has actually populated it --
+        # an empty placeholder here would otherwise land on every compiled
+        # page's next nightly regeneration and change its rendered text.
+        if related_pages:
+            lines.extend(
+                [
+                    "## Related Pages",
+                    *self._render_bullets(related_pages, empty="(none yet)"),
+                    "",
+                ]
+            )
+        lines.extend(
+            [
                 "## Sources",
                 *self._render_sources(all_sources),
                 "",
@@ -5820,6 +6024,222 @@ class CompiledBriefingService:
                 self._save_queue(updated)
 
         self._with_queue_lock(ack_event)
+
+    def _on_source_finished(
+        self,
+        source_rel_path: str,
+        outcome: Literal["updated", "no_changes", "dropped", "rejected"],
+        pages: tuple[str, ...],
+        *,
+        targets_empty: bool = False,
+    ) -> None:
+        """Single completion point for one compile-enrich queue source --
+        called from every branch of ``_drain_queue_once`` where an event
+        finally leaves the queue (``_ack_claimed_queue_event``), whether
+        that is success, a no-op, or rejection. Import marking (T4) reuses
+        this same point later to flag the source note without duplicating
+        the conditions ``_drain_queue_once`` already used to decide its
+        fate.
+
+        ``targets_empty`` (code review defect 1): threaded through from
+        ``refresh_after_write``'s own ``targets_empty`` flag, itself set
+        only when ``_resolve_targets`` (the model's Impact stage) returned
+        no target at all for this source. A ``no_changes`` outcome can also
+        come from a non-empty target list that never got written -- an
+        ambiguous human-zone marker, a trust block, a rejected Verify --
+        and none of those mean the model found nothing to import, so they
+        must not turn into a permanent ``nothing``.
+        """
+        if outcome == "updated":
+            summary = f"{source_rel_path} → {len(pages)} стр."
+        elif outcome == "no_changes":
+            summary = f"{source_rel_path} → ничего"
+        else:
+            summary = f"{source_rel_path} → ошибка ({outcome})"
+        append_ops_log(self.vault_path, "compile", summary)
+
+        if not _is_import_note(source_rel_path):
+            return
+        # T4: cheapest check first -- ``updated`` already proves the source
+        # affected a compiled page, no wikilink scan needed. ``no_changes``
+        # needs the wikilink scan (the source may still be cited by a page
+        # an earlier pass wrote it into) and, failing that, the model's own
+        # verdict: only ``targets_empty`` means it genuinely found nowhere
+        # to put this source. Every other empty-``updated`` reason is left
+        # unmarked (``import_state = None``) so ``sweep_unmarked_imports``
+        # gives this same note another look later instead of freezing it.
+        import_state: Literal["used", "nothing", "failed"] | None
+        if outcome == "updated":
+            import_state = "used"
+        elif outcome == "no_changes":
+            if source_rel_path in self._referenced_import_targets():
+                import_state = "used"
+            elif targets_empty:
+                import_state = "nothing"
+            else:
+                import_state = None
+        else:
+            import_state = "failed"
+
+        if import_state is None:
+            return
+
+        if self._active_pass is not None:
+            # T4 code review defect 2: a pass's ТЗ 5.5 inv 5 effectiveness
+            # gate can still roll this pass's compiled/ page writes back
+            # after this call returns -- buffer the mark instead of writing
+            # it now, and let run_nightly_maintenance apply or discard the
+            # whole buffer once it knows whether the gate fired (see
+            # _apply_pending_import_marks). Outside a pass (background
+            # worker, manual drain, the one-off sweep CLI) there is no gate
+            # to wait for, so mark immediately like before.
+            self._active_pass.pending_import_marks[source_rel_path] = import_state
+            if import_state == "used":
+                self._active_pass.imports_used += 1
+            elif import_state == "nothing":
+                self._active_pass.imports_nothing += 1
+            else:
+                self._active_pass.imports_failed += 1
+        else:
+            self._mark_import_compile_state(source_rel_path, import_state)
+
+    def _apply_pending_import_marks(self, *, rolled_back: bool) -> None:
+        """Apply or drop this pass's buffered T4 import ``compile_state``
+        marks (see ``_on_source_finished``), now that
+        ``run_nightly_maintenance``'s ТЗ 5.5 inv 5 effectiveness gate has
+        decided whether this pass survives.
+
+        A rollback reverted this pass's own compiled/ page writes, so marks
+        buffered for it would tell an import note ``used``/``nothing``/
+        ``failed`` for a contribution that no longer exists -- drop them
+        and zero the per-pass counters instead, leaving those notes
+        unmarked so ``sweep_unmarked_imports`` revisits them later. A pass
+        that survived writes them exactly as ``_on_source_finished`` would
+        have outside a pass. ``_mark_import_compile_state`` is already
+        best-effort (never raises), so a marking failure here cannot change
+        this pass's own status.
+        """
+        pass_obj = self._active_pass
+        if pass_obj is None:
+            return
+        pending = pass_obj.pending_import_marks
+        if rolled_back:
+            pending.clear()
+            pass_obj.imports_used = 0
+            pass_obj.imports_nothing = 0
+            pass_obj.imports_failed = 0
+            return
+        for rel_path, state in pending.items():
+            self._mark_import_compile_state(rel_path, state)
+        pending.clear()
+
+    def _referenced_import_targets(self) -> set[str]:
+        """Vault-relative note paths any compiled page currently links to.
+
+        Recomputed on every call rather than cached across a pass: a stale
+        hit here would mark a note ``nothing`` it should have marked
+        ``used``, and since ``sweep_unmarked_imports`` only ever revisits
+        notes with no ``compile_state`` at all, that one mistake would
+        never get a second look.
+        """
+        referenced: set[str] = set()
+        for candidate in self._iter_candidates():
+            for match in WIKILINK_RE.finditer(candidate.text):
+                target = match.group(1).strip().split("#", 1)[0].strip()
+                if not target:
+                    continue
+                if target.startswith("vault/"):
+                    target = target[len("vault/") :]
+                if not target.endswith(".md"):
+                    target = f"{target}.md"
+                referenced.add(target)
+        return referenced
+
+    def _mark_import_compile_state(
+        self, rel_path: str, state: Literal["used", "nothing", "failed"]
+    ) -> None:
+        """Best-effort ``compile_state``/``compile_checked`` frontmatter
+        patch for one import note (T4). Never raises: a marking failure
+        must not undo or fail the compile-enrich work that already
+        finished for real."""
+        try:
+            patch_validated_vault_frontmatter(
+                self.vault_path,
+                self.vault_path / rel_path,
+                {
+                    "compile_state": state,
+                    "compile_checked": date.today().isoformat(),
+                },
+                manifest=self._manifest(),
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort marking (T4)
+            logger.warning(
+                "Failed to mark compile_state for import note %s: %s",
+                rel_path,
+                exc,
+            )
+
+    def sweep_unmarked_imports(self, limit: int | None) -> dict[str, int]:
+        """Nightly tail-sweep (T4) for import notes ``_on_source_finished``
+        never got to mark: notes imported before this feature shipped, or
+        whose queue event was lost. Runs at the start of
+        ``run_nightly_maintenance``, before the queue drain, so anything
+        it enqueues here still gets marked by this same pass's drain.
+
+        ``limit`` bounds how many *new* ``enqueue_refresh`` postings this
+        sweep makes (``None`` -- unbounded, used by the one-off
+        ``run_compiled_import_sweep.py --no-limit`` catch-up pass).
+        Marking a note already cited by a compiled page costs no model
+        call and is never limited. A note with any existing
+        ``compile_state`` (``used``/``nothing``/``failed``) is left alone.
+        """
+        marked_used = 0
+        requeued = 0
+        skipped = 0
+
+        queued_sources = {
+            str(event.get("source_path") or "") for event in self._load_queue()
+        }
+        referenced = self._referenced_import_targets()
+        stale_cutoff = datetime.now().astimezone().timestamp() - 86400
+
+        for root in IMPORT_NOTE_ROOTS:
+            root_path = self.vault_path / root
+            if not root_path.exists():
+                continue
+            for path in sorted(root_path.glob("**/*.md")):
+                rel_path = path.relative_to(self.vault_path).as_posix()
+                fields = self._frontmatter_fields(self._read_page_text(path))
+                if str(fields.get("compile_state") or "").strip():
+                    continue
+                if rel_path in referenced:
+                    self._mark_import_compile_state(rel_path, "used")
+                    marked_used += 1
+                    continue
+                if rel_path in queued_sources:
+                    skipped += 1
+                    continue
+                try:
+                    mtime = path.stat().st_mtime
+                except OSError:
+                    skipped += 1
+                    continue
+                if mtime >= stale_cutoff:
+                    skipped += 1
+                    continue
+                if limit is not None and requeued >= limit:
+                    skipped += 1
+                    continue
+                self.enqueue_refresh(
+                    source_path=rel_path, source_excerpt="", debounce_seconds=0
+                )
+                requeued += 1
+
+        return {
+            "marked_used": marked_used,
+            "requeued": requeued,
+            "skipped": skipped,
+        }
 
     def _release_claimed_queue_event(
         self,
@@ -7363,16 +7783,19 @@ class CompiledBriefingService:
         would let a morning ``[voice]`` entry lend its "own" trust to a
         message someone else forwarded that afternoon.
 
-        PLAUD meeting recordings (``imports/plaud/``) and documents the owner
-        forwarded (``imports/documents/forwarded/``) are capped at
-        ``"forwarded"`` rather than the general ``imports/`` rule -- see
-        ``IMPORTS_PLAUD_PREFIX`` above.
+        PLAUD meeting recordings (``imports/plaud/``), documents the owner
+        forwarded (``imports/documents/forwarded/``), and pages the T5
+        wiki-care web-search action archived on its own initiative
+        (``imports/web/auto/``) are capped at ``"forwarded"`` rather than the
+        general ``imports/`` rule -- see ``IMPORTS_PLAUD_PREFIX`` above.
         """
         if source_rel_path.startswith("thoughts/"):
             return "own"
         if source_rel_path.startswith(IMPORTS_PLAUD_PREFIX):
             return "forwarded"
         if source_rel_path.startswith(IMPORTS_DOCUMENTS_FORWARDED_PREFIX):
+            return "forwarded"
+        if source_rel_path.startswith(IMPORTS_WEB_AUTO_PREFIX):
             return "forwarded"
         if source_rel_path.startswith("imports/"):
             return "integration"

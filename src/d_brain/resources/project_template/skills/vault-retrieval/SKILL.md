@@ -32,6 +32,9 @@ they are relevant to the user's request and allowed by the runtime scope.
 
 ## Route the retrieval
 
+- For an overview question (what exists on a topic/project/person, list of
+  projects), read `MOC/compiled-index.md` first — it is the catalog of every
+  `compiled/` page grouped by domain.
 - For a semantic question, run `a-second-brain qmd recall "<query>"`.
 - For long-running, old, or exhaustive history, run
   `a-second-brain qmd deep-recall "<query>"`.

@@ -2,32 +2,17 @@
 
 import asyncio
 import logging
-from datetime import datetime
-from pathlib import Path
-from typing import cast
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-)
+from aiogram.types import Message
 
-from d_brain.bot.formatters import format_process_report
+from d_brain.bot.formatters import format_process_report, inline_artifact_image_paths
 from d_brain.bot.progress import wait_for_task_with_progress
 from d_brain.bot.replies import answer_files, answer_rich_text, answer_text, edit_text
 from d_brain.bot.states import DoCommandState
 from d_brain.config import get_settings
-from d_brain.services.answers import (
-    AnswerPayload,
-    append_log,
-    pop_pending_answer,
-    register_pending_answer,
-    save_answer,
-)
 from d_brain.services.processor import CliProcessor
 from d_brain.services.transcription import DeepgramTranscriber
 
@@ -191,6 +176,7 @@ async def process_request(message: Message, prompt: str, user_id: int = 0) -> No
         getattr(settings, "openai_api_key", ""),
         getattr(settings, "openai_base_url", ""),
         getattr(settings, "openai_model", ""),
+        getattr(settings, "tavily_api_key", ""),
     )
 
     async def run_with_progress() -> dict[str, object]:
@@ -226,100 +212,18 @@ async def process_request(message: Message, prompt: str, user_id: int = 0) -> No
     except Exception:
         logger.exception("Failed to delete /do status message before final reply")
 
-    # A save button only makes sense for a real answer -- an error message
-    # has nothing worth filing (аудит 2026-09-03, п.24).
-    send_kwargs: dict[str, object] = {}
-    if "error" not in report:
-        answer_id = register_pending_answer(
-            AnswerPayload(
-                question=prompt,
-                answer_markdown=formatted,
-                # /do's report carries no structured source list -- inventing
-                # one here would misattribute claims that were never sourced.
-                sources=(),
-                kind="do",
-            )
-        )
-        send_kwargs["reply_markup"] = build_save_answer_keyboard(answer_id)
-
     final_sender = answer_text if "error" in report else answer_rich_text
     try:
-        await final_sender(message, formatted, **send_kwargs)
+        await final_sender(message, formatted)
     except Exception:
         logger.exception("Failed to send /do final reply")
     artifact_paths = report.get("artifact_paths")
     if isinstance(artifact_paths, list):
+        paths = [str(path) for path in artifact_paths]
+        inline_paths = inline_artifact_image_paths(formatted, paths)
         try:
-            await answer_files(message, [str(path) for path in artifact_paths])
+            await answer_files(
+                message, [path for path in paths if path not in inline_paths]
+            )
         except Exception:
             logger.exception("Failed to send /do artifacts")
-
-
-def build_save_answer_keyboard(answer_id: str) -> InlineKeyboardMarkup:
-    """One "Сохранить" button for a /do or /why answer (аудит 2026-09-03,
-    п.24). Both flows use this same builder and ``callback_data`` shape --
-    ``why.py`` registers ``handle_answer_save`` on its own router too, since
-    the callback carries no ``do``/``why`` prefix of its own."""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="👍 Сохранить", callback_data=f"answer:save:{answer_id}"
-                )
-            ]
-        ]
-    )
-
-
-@router.callback_query(F.data.startswith("answer:save:"))
-async def handle_answer_save(query: CallbackQuery) -> None:
-    """File an owner-approved /do or /why answer under ``vault/answers/``
-    (аудит 2026-09-03, п.24). Registered on both ``do.router`` and
-    ``why.router`` (see ``why.py``) since a single shared in-memory store in
-    ``services/answers.py`` -- keyed by ``answer_id``, not by which command
-    produced the answer -- backs both buttons.
-    """
-    if query.message is None:
-        await query.answer()
-        return
-    message = cast(Message, query.message)
-
-    answer_id = (query.data or "").removeprefix("answer:save:")
-    payload = pop_pending_answer(answer_id)
-    if payload is None:
-        await query.answer("Ответ устарел, задай вопрос заново.", show_alert=True)
-        return
-
-    # Acknowledged before the write, not after (same reasoning as
-    # why.py's handle_why_choice): the write below can block or blow up,
-    # and until this call returns the button keeps its spinner.
-    await query.answer()
-
-    settings = get_settings()
-    vault_path = Path(settings.vault_path)
-    now = datetime.now()
-    try:
-        saved_path = await asyncio.to_thread(
-            save_answer,
-            vault_path,
-            question=payload.question,
-            answer_markdown=payload.answer_markdown,
-            sources=list(payload.sources),
-            kind=payload.kind,
-            now=now,
-        )
-        await asyncio.to_thread(
-            append_log, vault_path, payload.kind, payload.question, now
-        )
-    except Exception:
-        logger.exception("Failed to save /%s answer", payload.kind)
-        await answer_text(message, "❌ Не удалось сохранить ответ.")
-        return
-
-    try:
-        await message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        logger.exception("Failed to remove save button after saving answer")
-
-    rel_path = saved_path.relative_to(vault_path).with_suffix("").as_posix()
-    await answer_text(message, f"Сохранено: [[{rel_path}]]")

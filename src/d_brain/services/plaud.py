@@ -38,6 +38,7 @@ from d_brain.services.frontmatter import (
 )
 from d_brain.services.json_normalizer import extract_first_json_dict
 from d_brain.services.localization import normalize_language, translate
+from d_brain.services.ops_log import append_ops_log
 from d_brain.services.qmd import QmdService
 from d_brain.services.secrets import scrub_secrets
 from d_brain.services.source_links import (
@@ -1232,11 +1233,13 @@ class PlaudSyncService:
             summary=summary,
             transcript=transcript,
         )
+        title = _safe_text(detail.get("title")) or f"PLAUD {file_id}"
+        append_ops_log(self.vault_path, "ingest", f"{title} → {note_rel_path}")
         self._upsert_daily_stub(
             file_id=file_id,
             recorded_at=recorded_at,
             note_rel_path=note_rel_path,
-            title=_safe_text(detail.get("title")) or f"PLAUD {file_id}",
+            title=title,
             summary=summary or transcript,
         )
 

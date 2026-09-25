@@ -385,6 +385,60 @@ def _tavily_extract(url: str, *, config: WebContentConfig) -> WebContentResult |
     )
 
 
+def tavily_search(
+    query: str,
+    *,
+    api_key: str,
+    max_results: int = 5,
+    timeout: float = 20.0,
+) -> list[dict[str, str]]:
+    """Best-effort Tavily web search (T5 "Еженедельный уход за вики", action
+    4: find sources for a page that barely has any). Modeled on
+    ``_tavily_extract`` above -- a missing key or any network/parse failure
+    is not the caller's problem, so this never raises and just returns an
+    empty list instead.
+    """
+    if not api_key:
+        return []
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    payload = {"query": query, "max_results": max_results}
+    try:
+        with httpx.Client() as client:
+            resp = client.post(
+                "https://api.tavily.com/search",
+                headers=headers,
+                json=payload,
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json() or {}
+    except Exception as exc:
+        logger.warning("Tavily search failed for %r: %s", query, exc)
+        return []
+
+    results = data.get("results") or []
+    if not isinstance(results, list):
+        return []
+    found: list[dict[str, str]] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+        found.append(
+            {
+                "url": url,
+                "title": str(item.get("title") or "").strip(),
+                "content": str(item.get("content") or "").strip(),
+            }
+        )
+    return found
+
+
 def _jina_extract(url: str, *, config: WebContentConfig) -> WebContentResult | None:
     if not config.jina_api_key:
         return None

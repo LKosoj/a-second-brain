@@ -21,6 +21,7 @@ from d_brain.services.frontmatter import (
     write_vault_file_text,
 )
 from d_brain.services.localization import normalize_language, translate
+from d_brain.services.ops_log import append_ops_log
 from d_brain.services.qmd import QmdService
 from d_brain.services.secrets import scrub_secrets
 from d_brain.services.source_links import SourceInfo, format_source_markdown
@@ -51,6 +52,7 @@ class WebArchiveService:
         *,
         content_language: str = "ru",
         ai_cli: str = "claude",
+        notes_subdir: str = "notes",
     ) -> None:
         self.vault_path = Path(vault_path).absolute()
         self.content_language = normalize_language(content_language)
@@ -59,7 +61,7 @@ class WebArchiveService:
         self.web_root = self.vault_path / "imports" / "web"
         self.raw_root = self.web_root / "raw"
         self.content_root = self.web_root / "content"
-        self.notes_root = self.web_root / "notes"
+        self.notes_root = self.web_root / notes_subdir
         self._workflow = self._load_control_plane_workflow()
 
     @classmethod
@@ -190,6 +192,7 @@ class WebArchiveService:
                 part for part in (summary.strip(), content[:3500]) if part
             ),
         )
+        append_ops_log(self.vault_path, "ingest", f"{page.title} → {note_rel}")
         if refresh_qmd:
             self._refresh_qmd_index()
 

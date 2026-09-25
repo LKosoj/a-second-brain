@@ -109,6 +109,15 @@ before adding new flags here; do not invent a signature:
 - `src/d_brain/run_compiled_brief.py` -- `--type` (required) / `--query`
   (required) / `--dry-run`
 - `src/d_brain/run_compiled_monthly_verify.py` -- `--page-limit`
+- `src/d_brain/run_compiled_import_sweep.py` -- T4 owner-run catch-up over
+  import notes with no `compile_state` yet: posts and drains without a
+  posting limit with `--no-limit` (no flags mirrors the nightly pass's own
+  bounded sweep, `NIGHTLY_IMPORT_SWEEP_LIMIT`)
+- `src/d_brain/run_compiled_wiki_care.py [--no-limit]` -- T5 weekly wiki
+  care: missing cross-links, missing pages, vault-gap questions and a
+  Tavily-backed web search, gated by its own 7-day interval and
+  model-call budget (`--no-limit` ignores both and drains the refresh
+  queue to completion afterwards)
 
 ### Bot surface (owner layer)
 

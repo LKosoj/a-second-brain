@@ -8,7 +8,7 @@ from typing import Any
 from aiogram import Router
 from aiogram.types import Message
 
-from d_brain.bot.formatters import format_process_report
+from d_brain.bot.formatters import format_process_report, inline_artifact_image_paths
 from d_brain.bot.replies import answer_files, answer_rich_text, answer_text, edit_text
 from d_brain.config import get_settings
 from d_brain.services.link_summary import (
@@ -142,6 +142,7 @@ async def handle_text(message: Message) -> None:
         getattr(settings, "openai_api_key", ""),
         getattr(settings, "openai_base_url", ""),
         getattr(settings, "openai_model", ""),
+        getattr(settings, "tavily_api_key", ""),
     )
     status_message = await _upsert_status_message(
         message,
@@ -211,8 +212,12 @@ async def handle_text(message: Message) -> None:
                 logger.exception("Failed to send direct answer")
             artifact_paths = report.get("artifact_paths")
             if isinstance(artifact_paths, list):
+                paths = [str(path) for path in artifact_paths]
+                inline_paths = inline_artifact_image_paths(formatted, paths)
                 try:
-                    await answer_files(message, [str(path) for path in artifact_paths])
+                    await answer_files(
+                        message, [path for path in paths if path not in inline_paths]
+                    )
                 except Exception:
                     logger.exception("Failed to send direct-answer artifacts")
             logger.info("Text message routed to direct answer")

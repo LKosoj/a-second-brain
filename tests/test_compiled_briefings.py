@@ -545,6 +545,99 @@ def test_compiled_briefings_nightly_lints_after_archive_and_separates_freshness(
     assert refreshed["count"] == 1
 
 
+def test_compiled_briefings_run_nightly_maintenance_logs_nightly_ops_entry(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    compiled_root = vault_path / "compiled" / "projects"
+    daily_root = vault_path / "daily"
+    compiled_root.mkdir(parents=True)
+    daily_root.mkdir(parents=True)
+    service = _compiled_service(vault_path)
+
+    monkeypatch.setattr(
+        service,
+        "drain_queue",
+        lambda **kwargs: {  # noqa: ANN001
+            "drained": 2,
+            "updated": [],
+            "consolidations": [],
+            "errors": [],
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "_archive_stale_notes",
+        lambda **kwargs: ["compiled/archive/projects/demo.md"],  # noqa: ARG005
+    )
+    monkeypatch.setattr(service, "_backfill_freshness_notes", lambda **kwargs: [])  # noqa: ARG005
+    monkeypatch.setattr(service, "_compress_cooled_pages", lambda **kwargs: [])  # noqa: ARG005
+    monkeypatch.setattr(
+        service,
+        "_resolve_open_conflicts",
+        lambda **kwargs: ["compiled/projects/demo.md"],  # noqa: ARG005
+    )
+    monkeypatch.setattr(service, "_adjudicate_drift_entries", lambda **kwargs: [])  # noqa: ARG005
+    monkeypatch.setattr(service, "_auto_answer_queue_items", lambda **kwargs: [])  # noqa: ARG005
+    monkeypatch.setattr(
+        service,
+        "lint_notes",
+        lambda: [{"path": "compiled/projects/other.md", "issue": "missing-sections"}],
+    )
+    monkeypatch.setattr(service, "freshness_issues", lambda: [])
+    monkeypatch.setattr(service, "_refresh_qmd_index", lambda: None)
+
+    service.run_nightly_maintenance()
+
+    log_line = (vault_path / ".session" / "log.md").read_text(encoding="utf-8").strip()
+    assert log_line.endswith(
+        "[nightly] источников 2, архивировано 1, конфликтов 1, lint 1, ошибок 0"
+    )
+
+
+def test_compiled_briefings_run_nightly_maintenance_logs_ops_entry_on_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """T2 code review: the ops-log call used to sit right before the try's
+    own ``return``, so a pass that raised never made it into the journal at
+    all. Reproduced by making an internal step blow up; ``finally`` must
+    still append a line, with an "ошибка: <тип>" summary instead of the
+    usual counters (not all of which are safely known once the body raised
+    partway through)."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+
+    monkeypatch.setattr(
+        service,
+        "drain_queue",
+        lambda **kwargs: {  # noqa: ANN001
+            "drained": 0,
+            "updated": [],
+            "consolidations": [],
+            "errors": [],
+        },
+    )
+    monkeypatch.setattr(service, "_archive_stale_notes", lambda **kwargs: [])  # noqa: ARG005
+    monkeypatch.setattr(service, "_backfill_freshness_notes", lambda **kwargs: [])  # noqa: ARG005
+    monkeypatch.setattr(service, "_compress_cooled_pages", lambda **kwargs: [])  # noqa: ARG005
+    monkeypatch.setattr(service, "_resolve_open_conflicts", lambda **kwargs: [])  # noqa: ARG005
+    monkeypatch.setattr(service, "_adjudicate_drift_entries", lambda **kwargs: [])  # noqa: ARG005
+    monkeypatch.setattr(service, "_auto_answer_queue_items", lambda **kwargs: [])  # noqa: ARG005
+
+    def _explode():  # noqa: ANN202
+        raise RuntimeError("lint stage exploded")
+
+    monkeypatch.setattr(service, "lint_notes", _explode)
+
+    with pytest.raises(RuntimeError, match="lint stage exploded"):
+        service.run_nightly_maintenance()
+
+    log_line = (vault_path / ".session" / "log.md").read_text(encoding="utf-8").strip()
+    assert log_line.endswith("[nightly] ошибка: RuntimeError")
+
+
 def test_compiled_briefings_source_snapshot_ignores_age_and_detects_change(
     tmp_path: Path,
 ) -> None:
@@ -849,6 +942,550 @@ def test_compiled_briefings_drain_queue_reports_non_retriable_errors(
     result = service.drain_queue(force=True, refresh_qmd=False)
 
     assert result["errors"] == ["unsupported-path"]
+
+
+def test_compiled_briefings_drain_queue_logs_compile_ops_entry_on_update(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    monkeypatch.setattr(service, "is_available", lambda: True)
+    service.refresh_after_write = lambda **kwargs: {  # type: ignore[method-assign]
+        "updated": ["compiled/topics/demo.md"],
+        "errors": [],
+    }
+    service.enqueue_refresh(
+        source_path="daily/2026-04-04.md",
+        source_excerpt="body",
+        debounce_seconds=0,
+    )
+
+    service.drain_queue(force=True, refresh_qmd=False)
+
+    log_line = (vault_path / ".session" / "log.md").read_text(encoding="utf-8").strip()
+    assert log_line.endswith("[compile] daily/2026-04-04.md → 1 стр.")
+
+
+def test_compiled_briefings_drain_queue_logs_compile_ops_entry_on_no_changes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    monkeypatch.setattr(service, "is_available", lambda: True)
+    service.refresh_after_write = lambda **kwargs: {  # type: ignore[method-assign]
+        "updated": [],
+        "errors": [],
+    }
+    service.enqueue_refresh(
+        source_path="daily/2026-04-04.md",
+        source_excerpt="body",
+        debounce_seconds=0,
+    )
+
+    service.drain_queue(force=True, refresh_qmd=False)
+
+    log_line = (vault_path / ".session" / "log.md").read_text(encoding="utf-8").strip()
+    assert log_line.endswith("[compile] daily/2026-04-04.md → ничего")
+
+
+def test_compiled_briefings_drain_queue_logs_compile_ops_entry_on_rejected(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    monkeypatch.setattr(service, "is_available", lambda: True)
+    service.refresh_after_write = lambda **kwargs: {  # type: ignore[method-assign]
+        "updated": [],
+        "errors": ["unsupported-path"],
+    }
+    service.enqueue_refresh(
+        source_path="daily/2026-04-04.md",
+        source_excerpt="body",
+        debounce_seconds=0,
+    )
+
+    service.drain_queue(force=True, refresh_qmd=False)
+
+    log_line = (vault_path / ".session" / "log.md").read_text(encoding="utf-8").strip()
+    assert log_line.endswith("[compile] daily/2026-04-04.md → ошибка (rejected)")
+
+
+def test_compiled_briefings_drain_queue_logs_compile_ops_entry_on_dropped(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    monkeypatch.setattr(service, "is_available", lambda: True)
+    service.refresh_after_write = lambda **kwargs: {  # type: ignore[method-assign]
+        "updated": [],
+        "errors": ["backend-refused"],
+    }
+    service.enqueue_refresh(
+        source_path="daily/2026-04-04.md",
+        source_excerpt="body",
+        debounce_seconds=0,
+    )
+
+    for _ in range(3):
+        service.drain_queue(force=True, refresh_qmd=False)
+
+    log_lines = (
+        (vault_path / ".session" / "log.md").read_text(encoding="utf-8").splitlines()
+    )
+    assert log_lines[-1].endswith("[compile] daily/2026-04-04.md → ошибка (dropped)")
+
+
+def _import_note_text(body: str = "Imported content.") -> str:
+    return (
+        "---\n"
+        "type: import\n"
+        "last_accessed: 2026-01-01\n"
+        "relevance: 0.5\n"
+        "tier: warm\n"
+        "---\n\n"
+        f"{body}\n"
+    )
+
+
+def test_compiled_briefings_on_source_finished_marks_import_note_used_on_update(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    note_path = vault_path / "imports" / "web" / "notes" / "article.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text(_import_note_text(), encoding="utf-8")
+    monkeypatch.setattr(service, "is_available", lambda: True)
+    service.refresh_after_write = lambda **kwargs: {  # type: ignore[method-assign]
+        "updated": ["compiled/topics/demo.md"],
+        "errors": [],
+    }
+    service.enqueue_refresh(
+        source_path="imports/web/notes/article.md",
+        source_excerpt="body",
+        debounce_seconds=0,
+    )
+
+    service.drain_queue(force=True, refresh_qmd=False)
+
+    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    assert fields["compile_state"] == "used"
+    assert fields["compile_checked"] == date.today().isoformat()
+
+
+def test_compiled_briefings_on_source_finished_marks_import_note_nothing_unreferenced(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    note_path = vault_path / "imports" / "web" / "notes" / "article.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text(_import_note_text(), encoding="utf-8")
+    monkeypatch.setattr(service, "is_available", lambda: True)
+    # ``targets_empty`` is what makes this the "model genuinely found
+    # nowhere to put it" case (code review defect 1) -- the Impact stage
+    # (``_resolve_targets``) returned no target at all.
+    service.refresh_after_write = lambda **kwargs: {  # type: ignore[method-assign]
+        "updated": [],
+        "errors": [],
+        "targets_empty": True,
+    }
+    service.enqueue_refresh(
+        source_path="imports/web/notes/article.md",
+        source_excerpt="body",
+        debounce_seconds=0,
+    )
+
+    service.drain_queue(force=True, refresh_qmd=False)
+
+    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    assert fields["compile_state"] == "nothing"
+
+
+def test_compiled_briefings_on_source_finished_skips_mark_when_not_targets_empty(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Code review defect 1: a ``no_changes`` outcome is not always the
+    model deciding there is nothing to import -- an ambiguous human-zone
+    marker, a trust block, or a rejected Verify can all leave ``updated``
+    empty for a source the model *did* find a target for. Without
+    ``targets_empty`` set, ``_on_source_finished`` must leave the note
+    unmarked so ``sweep_unmarked_imports`` gives it another look later,
+    instead of freezing it as ``nothing`` forever."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    note_path = vault_path / "imports" / "web" / "notes" / "article.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text(_import_note_text(), encoding="utf-8")
+    monkeypatch.setattr(service, "is_available", lambda: True)
+    service.refresh_after_write = lambda **kwargs: {  # type: ignore[method-assign]
+        "updated": [],
+        "errors": [],
+    }
+    service.enqueue_refresh(
+        source_path="imports/web/notes/article.md",
+        source_excerpt="body",
+        debounce_seconds=0,
+    )
+
+    service.drain_queue(force=True, refresh_qmd=False)
+
+    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    assert "compile_state" not in fields
+
+
+def test_compiled_briefings_on_source_finished_marks_import_note_used_when_referenced(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    note_path = vault_path / "imports" / "web" / "notes" / "article.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text(_import_note_text(), encoding="utf-8")
+    page_path = vault_path / "compiled" / "topics" / "demo.md"
+    page_path.parent.mkdir(parents=True)
+    page_path.write_text(
+        "---\ndomain: topics\n---\n\n"
+        "Cites [[imports/web/notes/article.md]] directly.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(service, "is_available", lambda: True)
+    service.refresh_after_write = lambda **kwargs: {  # type: ignore[method-assign]
+        "updated": [],
+        "errors": [],
+    }
+    service.enqueue_refresh(
+        source_path="imports/web/notes/article.md",
+        source_excerpt="body",
+        debounce_seconds=0,
+    )
+
+    service.drain_queue(force=True, refresh_qmd=False)
+
+    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    assert fields["compile_state"] == "used"
+
+
+def test_compiled_briefings_on_source_finished_marks_import_note_failed_on_rejected(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    note_path = vault_path / "imports" / "documents" / "notes" / "report.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text(_import_note_text(), encoding="utf-8")
+    monkeypatch.setattr(service, "is_available", lambda: True)
+    service.refresh_after_write = lambda **kwargs: {  # type: ignore[method-assign]
+        "updated": [],
+        "errors": ["unsupported-path"],
+    }
+    service.enqueue_refresh(
+        source_path="imports/documents/notes/report.md",
+        source_excerpt="body",
+        debounce_seconds=0,
+    )
+
+    service.drain_queue(force=True, refresh_qmd=False)
+
+    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    assert fields["compile_state"] == "failed"
+
+
+def test_compiled_briefings_on_source_finished_marks_import_note_failed_on_dropped(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    note_path = vault_path / "imports" / "youtube" / "notes" / "video.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text(_import_note_text(), encoding="utf-8")
+    monkeypatch.setattr(service, "is_available", lambda: True)
+    service.refresh_after_write = lambda **kwargs: {  # type: ignore[method-assign]
+        "updated": [],
+        "errors": ["backend-refused"],
+    }
+    service.enqueue_refresh(
+        source_path="imports/youtube/notes/video.md",
+        source_excerpt="body",
+        debounce_seconds=0,
+    )
+
+    for _ in range(3):
+        service.drain_queue(force=True, refresh_qmd=False)
+
+    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    assert fields["compile_state"] == "failed"
+
+
+def test_compiled_briefings_on_source_finished_does_not_mark_non_import_source(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    note_path = vault_path / "daily" / "2026-04-04.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text(
+        (
+            "---\n"
+            "type: daily\n"
+            "date: 2026-04-04\n"
+            "last_accessed: 2026-04-04\n"
+            "relevance: 0.5\n"
+            "tier: warm\n"
+            "---\n\n"
+            "Body.\n"
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(service, "is_available", lambda: True)
+    service.refresh_after_write = lambda **kwargs: {  # type: ignore[method-assign]
+        "updated": ["compiled/topics/demo.md"],
+        "errors": [],
+    }
+    service.enqueue_refresh(
+        source_path="daily/2026-04-04.md",
+        source_excerpt="body",
+        debounce_seconds=0,
+    )
+
+    service.drain_queue(force=True, refresh_qmd=False)
+
+    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    assert "compile_state" not in fields
+
+
+def test_compiled_briefings_mark_import_compile_state_is_best_effort(
+    tmp_path: Path,
+) -> None:
+    """A missing source file must not raise -- marking is best-effort so a
+    marking failure can never take down the compile-enrich work that
+    already finished for real (see ``_mark_import_compile_state``)."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+
+    service._mark_import_compile_state("imports/web/notes/missing.md", "used")
+
+
+def test_semantic_source_text_ignores_import_compile_state_marking() -> None:
+    marked = (
+        "---\n"
+        "type: import\n"
+        "compile_state: used\n"
+        "compile_checked: 2026-01-01\n"
+        "---\n\n"
+        "Body.\n"
+    )
+    unmarked = "---\ntype: import\n---\n\nBody.\n"
+
+    assert CompiledBriefingService._semantic_source_text(
+        marked
+    ) == CompiledBriefingService._semantic_source_text(unmarked)
+
+
+def test_compiled_briefings_sweep_unmarked_imports_marks_referenced_note_used(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    note_path = vault_path / "imports" / "web" / "notes" / "article.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text(_import_note_text(), encoding="utf-8")
+    page_path = vault_path / "compiled" / "topics" / "demo.md"
+    page_path.parent.mkdir(parents=True)
+    page_path.write_text(
+        "---\ndomain: topics\n---\n\nCites [[imports/web/notes/article.md]].\n",
+        encoding="utf-8",
+    )
+
+    result = service.sweep_unmarked_imports(limit=None)
+
+    assert result == {"marked_used": 1, "requeued": 0, "skipped": 0}
+    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    assert fields["compile_state"] == "used"
+
+
+def test_compiled_briefings_sweep_unmarked_imports_requeues_stale_notes_under_limit(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    old_mtime = (datetime.now() - timedelta(days=2)).timestamp()
+    for name in ("a.md", "b.md"):
+        note_path = vault_path / "imports" / "web" / "notes" / name
+        note_path.parent.mkdir(parents=True, exist_ok=True)
+        note_path.write_text(_import_note_text(), encoding="utf-8")
+        os.utime(note_path, (old_mtime, old_mtime))
+
+    result = service.sweep_unmarked_imports(limit=1)
+
+    assert result == {"marked_used": 0, "requeued": 1, "skipped": 1}
+    queue = json.loads(
+        (vault_path / ".compiled" / "queue.json").read_text(encoding="utf-8")
+    )
+    assert len(queue) == 1
+    assert queue[0]["source_path"] == "imports/web/notes/a.md"
+
+
+def test_compiled_briefings_sweep_unmarked_imports_no_limit_requeues_all_stale(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    old_mtime = (datetime.now() - timedelta(days=2)).timestamp()
+    for name in ("a.md", "b.md"):
+        note_path = vault_path / "imports" / "web" / "notes" / name
+        note_path.parent.mkdir(parents=True, exist_ok=True)
+        note_path.write_text(_import_note_text(), encoding="utf-8")
+        os.utime(note_path, (old_mtime, old_mtime))
+
+    result = service.sweep_unmarked_imports(limit=None)
+
+    assert result == {"marked_used": 0, "requeued": 2, "skipped": 0}
+
+
+def test_compiled_briefings_sweep_unmarked_imports_skips_recent_note(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    note_path = vault_path / "imports" / "web" / "notes" / "fresh.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text(_import_note_text(), encoding="utf-8")
+
+    result = service.sweep_unmarked_imports(limit=None)
+
+    assert result == {"marked_used": 0, "requeued": 0, "skipped": 1}
+
+
+def test_compiled_briefings_sweep_unmarked_imports_skips_already_queued_note(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    note_path = vault_path / "imports" / "web" / "notes" / "queued.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text(_import_note_text(), encoding="utf-8")
+    old_mtime = (datetime.now() - timedelta(days=2)).timestamp()
+    os.utime(note_path, (old_mtime, old_mtime))
+    service.enqueue_refresh(
+        source_path="imports/web/notes/queued.md",
+        source_excerpt="body",
+        debounce_seconds=0,
+    )
+
+    result = service.sweep_unmarked_imports(limit=None)
+
+    assert result == {"marked_used": 0, "requeued": 0, "skipped": 1}
+
+
+def test_compiled_briefings_sweep_unmarked_imports_leaves_already_marked_note_alone(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    note_path = vault_path / "imports" / "web" / "notes" / "done.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text(
+        _import_note_text().replace(
+            "tier: warm\n---",
+            "tier: warm\ncompile_state: nothing\ncompile_checked: 2026-01-01\n---",
+        ),
+        encoding="utf-8",
+    )
+    old_mtime = (datetime.now() - timedelta(days=2)).timestamp()
+    os.utime(note_path, (old_mtime, old_mtime))
+
+    result = service.sweep_unmarked_imports(limit=None)
+
+    assert result == {"marked_used": 0, "requeued": 0, "skipped": 0}
+
+
+def test_compiled_briefings_run_nightly_maintenance_surfaces_import_sweep_counters(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    monkeypatch.setattr(
+        service,
+        "sweep_unmarked_imports",
+        lambda limit: {"marked_used": 1, "requeued": 2, "skipped": 3},  # noqa: ARG005
+    )
+    monkeypatch.setattr(
+        service,
+        "drain_queue",
+        lambda **kwargs: {  # noqa: ANN001, ARG005
+            "drained": 0,
+            "updated": [],
+            "consolidations": [],
+            "errors": [],
+        },
+    )
+    monkeypatch.setattr(service, "_archive_stale_notes", lambda limit=5: [])
+    monkeypatch.setattr(service, "_backfill_freshness_notes", lambda limit=5: [])
+    monkeypatch.setattr(service, "lint_notes", lambda: [])
+    monkeypatch.setattr(service, "freshness_issues", lambda: [])
+    monkeypatch.setattr(service, "_refresh_qmd_index", lambda: None)
+
+    result = service.run_nightly_maintenance()
+
+    assert result["import_sweep"] == {"marked_used": 1, "requeued": 2, "skipped": 3}
+    assert result["imports_used"] == 0
+    assert result["imports_nothing"] == 0
+    assert result["imports_failed"] == 0
+    journal = json.loads(
+        (vault_path / ".session" / "compile-enrich.json").read_text(encoding="utf-8")
+    )
+    assert journal["import_sweep"] == {"marked_used": 1, "requeued": 2, "skipped": 3}
+    assert journal["imports_used"] == 0
+    assert journal["imports_nothing"] == 0
+    assert journal["imports_failed"] == 0
+
+
+def test_compiled_briefings_run_nightly_maintenance_marks_import_note_via_drain(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """End to end (no monkeypatched ``drain_queue``): a real queue drain
+    inside a nightly pass marks the import note it drains and surfaces the
+    per-pass ``imports_used`` counter."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    note_path = vault_path / "imports" / "web" / "notes" / "article.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text(_import_note_text(), encoding="utf-8")
+    service.enqueue_refresh(
+        source_path="imports/web/notes/article.md",
+        source_excerpt="body",
+        debounce_seconds=0,
+    )
+    monkeypatch.setattr(service, "is_available", lambda: True)
+    service.refresh_after_write = lambda **kwargs: {  # type: ignore[method-assign]
+        "updated": ["compiled/topics/demo.md"],
+        "errors": [],
+    }
+    monkeypatch.setattr(service, "_archive_stale_notes", lambda limit=5: [])
+    monkeypatch.setattr(service, "_backfill_freshness_notes", lambda limit=5: [])
+    monkeypatch.setattr(service, "lint_notes", lambda: [])
+    monkeypatch.setattr(service, "freshness_issues", lambda: [])
+    monkeypatch.setattr(service, "_refresh_qmd_index", lambda: None)
+
+    result = service.run_nightly_maintenance()
+
+    assert result["imports_used"] == 1
+    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    assert fields["compile_state"] == "used"
 
 
 def test_compiled_briefings_archives_stale_notes(
@@ -1532,6 +2169,142 @@ def test_compiled_briefings_a_rollback_that_undid_nothing_still_clears(
         )
     )
     assert journal["sources"] == []
+
+
+def test_compiled_briefings_rollback_discards_buffered_import_marks(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Code review defect 2: ``_on_source_finished`` buffers this pass's
+    import ``compile_state`` marks in
+    ``CompileEnrichPass.pending_import_marks`` instead of writing them
+    immediately, because the ТЗ 5.5 inv 5 effectiveness gate can still roll
+    this pass's compiled/ page writes back after the drain already decided
+    the note's fate. A rollback must discard the whole buffer -- and zero
+    ``imports_used``/``imports_nothing``/``imports_failed`` -- so a reverted
+    pass's marks never land on disk and the digest counters do not lie
+    about a contribution that no longer exists."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    note_path = vault_path / "imports" / "web" / "notes" / "article.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text(_import_note_text(), encoding="utf-8")
+    monkeypatch.setattr(service, "is_available", lambda: True)
+    service.enqueue_refresh(
+        source_path="imports/web/notes/article.md",
+        source_excerpt="body",
+        debounce_seconds=0,
+    )
+    # The model found nowhere to put this source -- outside a pass this
+    # would be marked "nothing" right away -- but this pass takes work and
+    # changes zero pages, tripping the "changed zero pages" gate.
+    monkeypatch.setattr(
+        service,
+        "refresh_after_write",
+        lambda **kwargs: {"updated": [], "errors": [], "targets_empty": True},  # type: ignore[no-untyped-def]
+    )
+
+    result = _nightly_pass_with_stubbed_side_work(
+        service, monkeypatch, lint_issues=[]
+    )
+
+    assert any("changed zero pages" in error for error in result["errors"])
+    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    assert "compile_state" not in fields
+    assert result["imports_used"] == 0
+    assert result["imports_nothing"] == 0
+    assert result["imports_failed"] == 0
+
+
+def test_compiled_briefings_a_pass_that_survives_applies_buffered_import_marks(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """The other half of code review defect 2: a pass that survives the
+    ТЗ 5.5 inv 5 gate must still apply the import ``compile_state`` marks it
+    buffered during the drain -- ``_on_source_finished`` only defers the
+    write for the gate's sake, it must not lose it."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    note_path = vault_path / "imports" / "web" / "notes" / "article.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text(_import_note_text(), encoding="utf-8")
+    monkeypatch.setattr(service, "is_available", lambda: True)
+    service.enqueue_refresh(
+        source_path="imports/web/notes/article.md",
+        source_excerpt="body",
+        debounce_seconds=0,
+    )
+    service.enqueue_refresh(
+        source_path="daily/2026-04-04.md", source_excerpt="body", debounce_seconds=0
+    )
+
+    def _refresh_after_write(**kwargs):  # noqa: ANN003, ANN202
+        if kwargs.get("source_path") == "imports/web/notes/article.md":
+            return {"updated": [], "errors": [], "targets_empty": True}
+        # A second, unrelated source this same pass compiles for real, so
+        # the gate sees a changed page and does not roll back.
+        service._active_pass.touched_pages.add("compiled/topics/aurora.md")
+        return {"updated": ["compiled/topics/aurora.md"], "errors": []}
+
+    monkeypatch.setattr(service, "refresh_after_write", _refresh_after_write)
+
+    result = _nightly_pass_with_stubbed_side_work(
+        service, monkeypatch, lint_issues=[]
+    )
+
+    assert result["errors"] == []
+    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    assert fields["compile_state"] == "nothing"
+    assert result["imports_used"] == 0
+    assert result["imports_nothing"] == 1
+    assert result["imports_failed"] == 0
+
+
+def test_compiled_briefings_a_crashed_pass_discards_buffered_import_marks(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A pass that raises before the inv-5 gate never applies its buffered
+    import marks, so its pass journal must not count them either."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    note_path = vault_path / "imports" / "web" / "notes" / "article.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text(_import_note_text(), encoding="utf-8")
+    monkeypatch.setattr(service, "is_available", lambda: True)
+    service.enqueue_refresh(
+        source_path="imports/web/notes/article.md",
+        source_excerpt="body",
+        debounce_seconds=0,
+    )
+    monkeypatch.setattr(
+        service,
+        "refresh_after_write",
+        lambda **kwargs: {"updated": [], "errors": [], "targets_empty": True},  # type: ignore[no-untyped-def]
+    )
+
+    def _explode():  # noqa: ANN202
+        raise RuntimeError("freshness stage exploded")
+
+    monkeypatch.setattr(service, "lint_notes", lambda: [])
+    monkeypatch.setattr(service, "_archive_stale_notes", lambda **kwargs: [])  # noqa: ARG005
+    monkeypatch.setattr(service, "_backfill_freshness_notes", lambda **kwargs: [])  # noqa: ARG005
+    monkeypatch.setattr(service, "_compress_cooled_pages", lambda **kwargs: [])  # noqa: ARG005
+    monkeypatch.setattr(service, "freshness_issues", _explode)
+
+    with pytest.raises(RuntimeError, match="freshness stage exploded"):
+        service.run_nightly_maintenance()
+
+    journal = json.loads(
+        (vault_path / ".session" / "compile-enrich.json").read_text(encoding="utf-8")
+    )
+    assert journal["status"] == "failed"
+    assert journal["imports_used"] == 0
+    assert journal["imports_nothing"] == 0
+    assert journal["imports_failed"] == 0
+    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    assert "compile_state" not in fields
 
 
 def test_compiled_briefings_a_pass_that_crashes_after_the_drain_still_clears(
@@ -2640,6 +3413,35 @@ def test_compiled_briefings_file_output_artifact_persists_note_and_queue(
     )
     assert queue[0]["source_path"] == rel_path
     assert spawned == [True]
+
+
+def test_compiled_briefings_file_output_artifact_logs_answer_ops_entry(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    monkeypatch.setattr(
+        CompiledBriefingService, "spawn_background_drain", lambda self: True
+    )
+
+    rel_path = service.file_output_artifact(
+        request="Статус проекта Alpha",
+        output_markdown=(
+            "Статус по теме.\n\n"
+            "- факт один с деталями и контекстом\n"
+            "- факт два с деталями и контекстом\n"
+            "- факт три с деталями и контекстом\n"
+            "- факт четыре с деталями и контекстом\n"
+            "- факт пять с деталями и контекстом\n"
+            "- факт шесть с деталями и контекстом\n"
+        ),
+        artifact_type="question-answer",
+    )
+
+    assert rel_path is not None
+    log_line = (vault_path / ".session" / "log.md").read_text(encoding="utf-8").strip()
+    assert log_line.endswith(f"[answer] Статус проекта Alpha → {rel_path}")
 
 
 def test_compiled_briefings_impact_prompt_handles_mixed_daily_notes(
@@ -3997,6 +4799,56 @@ def test_compiled_briefings_render_carries_human_zone_byte_for_byte(
     )
 
     assert human_block in rendered
+
+
+def test_compiled_briefings_render_omits_related_pages_section_when_empty(
+    tmp_path: Path,
+) -> None:
+    """T5's ``## Related Pages`` is only ever populated by the wiki-care
+    pass; a page that never went through it must not gain an empty
+    placeholder section on every regeneration (would change every existing
+    compiled page's rendered text -- ПОПРАВКА 8)."""
+    service = _compiled_service(tmp_path / "vault")
+
+    rendered = service._render_briefing(
+        target=_demo_target(),
+        payload=_minimal_compile_payload(),
+        source_rel_path="daily/2026-08-05.md",
+        existing_text="",
+        existing_meta={},
+        signal=None,
+    )
+
+    assert "## Related Pages" not in rendered
+
+
+def test_compiled_briefings_render_carries_related_pages_forward_before_sources(
+    tmp_path: Path,
+) -> None:
+    service = _compiled_service(tmp_path / "vault")
+    existing_text = (
+        "---\n"
+        "domain: projects\n"
+        'description: "Old"\n'
+        "---\n\n"
+        "# Demo Project\n\n"
+        "## Current State\nOld state.\n\n"
+        "## Related Pages\n"
+        "- [[compiled/topics/aurora|Aurora]]\n\n"
+        "## Sources\n- [[daily/2026-08-01.md]]\n\n"
+    )
+
+    rendered = service._render_briefing(
+        target=_demo_target(),
+        payload=_minimal_compile_payload(current_state="New state."),
+        source_rel_path="daily/2026-08-05.md",
+        existing_text=existing_text,
+        existing_meta=service._frontmatter_fields(existing_text),
+        signal=None,
+    )
+
+    assert "## Related Pages\n- [[compiled/topics/aurora|Aurora]]" in rendered
+    assert rendered.index("## Related Pages") < rendered.index("## Sources")
 
 
 def test_compiled_briefings_render_carries_forward_typed_frontmatter_fields(
