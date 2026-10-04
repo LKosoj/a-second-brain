@@ -40,6 +40,70 @@ def _fake_settings(vault_path: Path) -> SimpleNamespace:
     )
 
 
+@pytest.mark.parametrize(
+    ("daily_report", "maintenance_report"),
+    [
+        ("", ""),
+        ("", "Проверка сегодня выявила битые ссылки."),
+        ("Сегодня сохранена новая мысль.", ""),
+        ("Сегодня сохранена новая мысль.", "Проверка сегодня выявила битые ссылки."),
+    ],
+)
+def test_digest_takeaways_excludes_archived_compiled_changes(
+    tmp_path: Path,
+    monkeypatch,
+    daily_report: str,
+    maintenance_report: str,
+) -> None:
+    archive_report = (
+        "Дайджест обогащения — 2026-10-04\n"
+        "Что изменилось: на встрече 13 февраля не выбрали подход к интеграции."
+    )
+    expected = "\n\n".join(
+        part for part in (daily_report, maintenance_report) if part
+    )
+    captured: list[str] = []
+
+    def summarize(self, *, day, report_markdown, execute_payload):  # noqa: ANN001, ANN202, ARG001
+        captured.append(report_markdown)
+        return ["Полезный вывод за сегодня."]
+
+    monkeypatch.setattr(
+        run_daily_process.ReflectionDigestService, "summarize", summarize
+    )
+    result = {
+        "daily": {"report": daily_report, "empty_daily": not daily_report},
+        "report": "\n\n".join(
+            part for part in (daily_report, archive_report, maintenance_report) if part
+        ),
+        "periodic_cycles": [
+            {
+                "name": "maintenance.compiled-digest",
+                "label": "Дайджест обогащения compiled",
+                "result": {
+                    "report": archive_report,
+                    "summary_path": "summaries/compile/2026-10-04.md",
+                },
+            },
+            {
+                "name": "maintenance.vault-health",
+                "result": {"report": maintenance_report},
+            },
+        ],
+    }
+    takeaways = run_daily_process._build_digest_takeaways(
+        _fake_settings(tmp_path), date(2026, 10, 4), result
+    )
+
+    assert captured == ([expected] if expected else [])
+    assert takeaways == (["Полезный вывод за сегодня."] if expected else [])
+    digest = run_daily_process._build_scheduled_digest(
+        date(2026, 10, 4), result, {}, takeaways=takeaways
+    )
+    assert "summaries/compile/2026-10-04.md" in digest
+    assert "13 февраля" not in digest
+
+
 # --- A) takeaways failure must not swallow the owner notification ---------
 
 

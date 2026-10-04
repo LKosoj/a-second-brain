@@ -289,6 +289,17 @@ def _build_digest_takeaways(
     report_markdown = str(result.get("report", "")).strip() or str(
         daily_result.get("report", "")
     ).strip()
+    # Compiled changes are dated by processing time, including archived sources.
+    for cycle in periodic_cycles:
+        if cycle.get("name") != "maintenance.compiled-digest":
+            continue
+        cycle_report = str(cycle.get("result", {}).get("report", "")).strip()
+        if cycle_report:
+            report_markdown = "\n\n".join(
+                part.strip()
+                for part in report_markdown.split(cycle_report)
+                if part.strip()
+            )
     if not report_markdown:
         return []
 
