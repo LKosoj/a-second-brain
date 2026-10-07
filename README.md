@@ -151,6 +151,22 @@ and which paths are runtime infrastructure.
 See the [CLI reference](docs/en/cli.md) for installation and maintenance
 commands and the bot help screen for the complete Telegram command list.
 
+### Continuing a discussion
+
+To continue a discussion, use Telegram's Reply action on the relevant bot
+message and send text or a voice message. This also works for files sent
+alongside the answer: the bot receives the original question, the complete
+answer, and the preceding messages in the selected chain.
+
+History persists across days and bot restarts. Replying to an earlier message
+continues the chain up to that message, without later answers or other
+discussions. Messages without Reply keep their existing behavior; the bot
+does not select a discussion automatically.
+
+Answers sent before this feature was enabled have no recoverable history:
+only the selected message's text or caption is available. For a file without
+a caption, repeat the original question, then reply to the new answer.
+
 ## Requirements
 
 - a dedicated unprivileged Linux account with Python 3.12 or newer (macOS is
