@@ -8,6 +8,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
+from d_brain.bot.conversations import reply_context, save_answer
 from d_brain.bot.formatters import format_process_report, inline_artifact_image_paths
 from d_brain.bot.progress import wait_for_task_with_progress
 from d_brain.bot.replies import answer_files, answer_rich_text, answer_text, edit_text
@@ -180,8 +181,10 @@ async def process_request(message: Message, prompt: str, user_id: int = 0) -> No
     )
 
     async def run_with_progress() -> dict[str, object]:
+        context = reply_context(message, settings.vault_path, user_id)
+        kwargs = {} if context is None else {"conversation_context": context}
         task = asyncio.create_task(
-            asyncio.to_thread(processor.execute_prompt, prompt, user_id)
+            asyncio.to_thread(processor.execute_prompt, prompt, user_id, **kwargs)
         )
 
         async def update_progress(elapsed_seconds: float) -> None:
@@ -214,7 +217,9 @@ async def process_request(message: Message, prompt: str, user_id: int = 0) -> No
 
     final_sender = answer_text if "error" in report else answer_rich_text
     try:
-        await final_sender(message, formatted)
+        sent = await final_sender(message, formatted)
+        if "error" not in report:
+            save_answer(message, sent, settings.vault_path, user_id, prompt, formatted)
     except Exception:
         logger.exception("Failed to send /do final reply")
     artifact_paths = report.get("artifact_paths")
@@ -222,8 +227,18 @@ async def process_request(message: Message, prompt: str, user_id: int = 0) -> No
         paths = [str(path) for path in artifact_paths]
         inline_paths = inline_artifact_image_paths(formatted, paths)
         try:
-            await answer_files(
+            files = await answer_files(
                 message, [path for path in paths if path not in inline_paths]
             )
+            if "error" not in report:
+                for sent_file in files:
+                    save_answer(
+                        message,
+                        sent_file,
+                        settings.vault_path,
+                        user_id,
+                        prompt,
+                        formatted,
+                    )
         except Exception:
             logger.exception("Failed to send /do artifacts")

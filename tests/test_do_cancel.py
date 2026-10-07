@@ -125,8 +125,9 @@ async def test_process_request_sends_rich_final_after_deleting_status(
     async def fake_to_thread(func, *args, **kwargs):  # noqa: ANN001, ANN003
         return func(*args, **kwargs)
 
-    async def fake_answer_files(message, paths: list[str]) -> None:  # noqa: ANN001
+    async def fake_answer_files(message, paths: list[str]) -> list:  # noqa: ANN001
         delivered_files.extend(paths)
+        return []
 
     monkeypatch.setattr(do_handler, "answer_text", fake_answer_text)
     monkeypatch.setattr(do_handler, "answer_rich_text", fake_answer_rich_text)

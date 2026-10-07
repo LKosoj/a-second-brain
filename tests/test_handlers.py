@@ -153,8 +153,9 @@ def test_handle_text_routes_questions_to_answer_path(
         answers.append(text)
         return SimpleNamespace(text=text)
 
-    async def fake_answer_files(_message, paths: list[str]) -> None:  # noqa: ANN001
+    async def fake_answer_files(_message, paths: list[str]) -> list:  # noqa: ANN001
         delivered_files.extend(paths)
+        return []
 
     class FakeStorage:
         def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
@@ -264,8 +265,9 @@ def test_handle_text_excludes_inline_chart_image_from_answer_files(
         answers.append(text)
         return SimpleNamespace(text=text)
 
-    async def fake_answer_files(_message, paths: list[str]) -> None:  # noqa: ANN001
+    async def fake_answer_files(_message, paths: list[str]) -> list:  # noqa: ANN001
         delivered_files.extend(paths)
+        return []
 
     class FakeStorage:
         def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003

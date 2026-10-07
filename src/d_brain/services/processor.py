@@ -4424,13 +4424,23 @@ or recent vault notes before answering instead of guessing.
                 "processed_entries": 0,
             }
 
-    def execute_prompt(self, user_prompt: str, user_id: int = 0) -> dict[str, Any]:
+    def execute_prompt(
+        self,
+        user_prompt: str,
+        user_id: int = 0,
+        *,
+        conversation_context: str | None = None,
+    ) -> dict[str, Any]:
         """Execute arbitrary prompt with the configured CLI."""
         today = date.today()
         core_context = self._build_injected_context(consumer="do", target_day=today)
         todoist_ref = self._load_todoist_reference()
         vault_retrieval_skill = self._load_vault_retrieval_skill()
-        session_context = self._get_session_context(user_id)
+        session_context = (
+            self._get_session_context(user_id)
+            if conversation_context is None
+            else conversation_context
+        )
 
         prompt = f"""Ты - персональный ассистент d-brain.
 

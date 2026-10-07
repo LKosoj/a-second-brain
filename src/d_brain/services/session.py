@@ -150,3 +150,47 @@ class SessionStore:
                 stats[entry_type] = stats.get(entry_type, 0) + 1
 
         return stats
+
+    def save_answer(
+        self,
+        user_id: int,
+        chat_id: int,
+        message_id: int,
+        question: str,
+        answer: str,
+        *,
+        parent_id: int | None = None,
+        quoted_parent: str = "",
+    ) -> None:
+        """Store one delivered answer and its link to the preceding answer."""
+        directory = self._get_user_dir(user_id) / "conversations"
+        directory.mkdir(exist_ok=True)
+        path = directory / f"{chat_id}.jsonl"
+        entry = {
+            "message_id": message_id,
+            "parent_id": parent_id,
+            "question": question,
+            "answer": answer,
+            "quoted_parent": quoted_parent,
+        }
+        with self._session_lock(path, exclusive=True):
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def get_conversation(
+        self, user_id: int, chat_id: int, message_id: int
+    ) -> list[dict[str, str]]:
+        """Read only the chain leading to the selected answer, across days."""
+        path = self._get_user_dir(user_id) / "conversations" / f"{chat_id}.jsonl"
+        if not path.exists():
+            return []
+        answers = {entry["message_id"]: entry for entry in self._read_entries(path)}
+        turns: list[dict[str, str]] = []
+        current = answers.get(message_id)
+        while current is not None:
+            turns.append({"role": "assistant", "text": current["answer"]})
+            turns.append({"role": "user", "text": current["question"]})
+            if current["quoted_parent"]:
+                turns.append({"role": "assistant", "text": current["quoted_parent"]})
+            current = answers.get(current["parent_id"])
+        return list(reversed(turns))

@@ -8,7 +8,9 @@ from typing import Any
 from aiogram import Router
 from aiogram.types import Message
 
+from d_brain.bot.conversations import is_reply_to_bot, save_answer
 from d_brain.bot.formatters import format_process_report, inline_artifact_image_paths
+from d_brain.bot.handlers.do import process_request
 from d_brain.bot.replies import answer_files, answer_rich_text, answer_text, edit_text
 from d_brain.config import get_settings
 from d_brain.services.link_summary import (
@@ -132,6 +134,10 @@ async def handle_text(message: Message) -> None:
     if not message.text or not message.from_user:
         return
 
+    if is_reply_to_bot(message):
+        await process_request(message, message.text, message.from_user.id)
+        return
+
     settings = get_settings()
     processor = CliProcessor(
         settings.vault_path,
@@ -207,7 +213,16 @@ async def handle_text(message: Message) -> None:
             await _safe_delete_status(status_message)
             final_sender = answer_text if "error" in report else answer_rich_text
             try:
-                await final_sender(message, formatted)
+                sent = await final_sender(message, formatted)
+                if "error" not in report:
+                    save_answer(
+                        message,
+                        sent,
+                        settings.vault_path,
+                        message.from_user.id,
+                        message.text,
+                        formatted,
+                    )
             except Exception:
                 logger.exception("Failed to send direct answer")
             artifact_paths = report.get("artifact_paths")
@@ -215,9 +230,19 @@ async def handle_text(message: Message) -> None:
                 paths = [str(path) for path in artifact_paths]
                 inline_paths = inline_artifact_image_paths(formatted, paths)
                 try:
-                    await answer_files(
+                    files = await answer_files(
                         message, [path for path in paths if path not in inline_paths]
                     )
+                    if "error" not in report:
+                        for sent_file in files:
+                            save_answer(
+                                message,
+                                sent_file,
+                                settings.vault_path,
+                                message.from_user.id,
+                                message.text,
+                                formatted,
+                            )
                 except Exception:
                     logger.exception("Failed to send direct-answer artifacts")
             logger.info("Text message routed to direct answer")
@@ -299,7 +324,10 @@ async def handle_text(message: Message) -> None:
         # unguarded failure here would be reported as a failed capture, and
         # told the owner an entry that is on disk had been lost.
         try:
-            await answer_text(message, reply, parse_mode=None)
+            sent = await answer_text(message, reply, parse_mode=None)
+            save_answer(
+                message, sent, settings.vault_path, message.from_user.id, content, reply
+            )
         except Exception:
             logger.exception("Failed to deliver text capture confirmation")
         logger.info("Text message saved: %d chars", len(result.content))

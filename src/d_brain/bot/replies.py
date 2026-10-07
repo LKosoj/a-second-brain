@@ -284,11 +284,15 @@ async def answer_text(message: Message, text: str, **kwargs: Any) -> Message:
     )
 
 
-async def answer_files(message: Message, paths: list[str]) -> None:
+async def answer_files(message: Message, paths: list[str]) -> list[Message]:
     """Send user-facing files produced by an assistant request."""
+    sent: list[Message] = []
     for raw_path in paths:
         path = Path(raw_path)
-        await message.answer_document(FSInputFile(path, filename=path.name))
+        sent.append(
+            await message.answer_document(FSInputFile(path, filename=path.name))
+        )
+    return sent
 
 
 async def answer_rich_text(message: Message, text: str, **kwargs: Any) -> Message:
