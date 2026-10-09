@@ -13874,12 +13874,12 @@ def test_compiled_briefings_upsert_briefing_queues_duplicate_candidate_outside_p
     vault_path = tmp_path / "vault"
     service = _compiled_service(vault_path)
     _bypass_atomic_vault_write(monkeypatch)
-    _existing_domain_page(vault_path, "projects", "phoenix", "Phoenix")
+    _existing_domain_page(vault_path, "topics", "phoenix", "Phoenix")
     monkeypatch.setattr(
         service.qmd,
         "recall",
         _recall_with_results(
-            [{"rel_path": "compiled/projects/phoenix.md", "confidence": 0.9}]
+            [{"rel_path": "compiled/topics/phoenix.md", "confidence": 0.9}]
         ),
     )
     monkeypatch.setattr(
@@ -13890,17 +13890,17 @@ def test_compiled_briefings_upsert_briefing_queues_duplicate_candidate_outside_p
 
     assert service._active_pass is None
     upsert_result = service._upsert_briefing(
-        target=_demo_target(),
+        target=_demo_target(domain="topics"),
         source_rel_path="daily/2026-08-05.md",
         source_excerpt="Demo excerpt.",
         signal=None,
     )
 
-    assert upsert_result.path == "compiled/projects/demo-project.md"
+    assert upsert_result.path == "compiled/topics/demo-project.md"
     assert (vault_path / upsert_result.path).exists()
     # Resolve stage 2 must not have replaced the target -- a new page, not
     # an update to the existing "phoenix" candidate.
-    assert (vault_path / "compiled/projects/phoenix.md").exists()
+    assert (vault_path / "compiled/topics/phoenix.md").exists()
 
     queue = json.loads(
         (vault_path / ".session" / "decisions-queue.json").read_text(encoding="utf-8")
@@ -13908,8 +13908,8 @@ def test_compiled_briefings_upsert_briefing_queues_duplicate_candidate_outside_p
     assert len(queue) == 1
     entry = queue[0]
     assert entry["kind"] == "duplicate-candidate"
-    assert entry["page"] == "compiled/projects/demo-project.md"
-    assert entry["candidate_page"] == "compiled/projects/phoenix.md"
+    assert entry["page"] == "compiled/topics/demo-project.md"
+    assert entry["candidate_page"] == "compiled/topics/phoenix.md"
     assert entry["since"] == date.today().isoformat()
     assert entry["summary"]
 
@@ -13925,13 +13925,13 @@ def test_compiled_briefings_upsert_briefing_queues_duplicate_candidate_during_pa
     vault_path = tmp_path / "vault"
     service = _compiled_service(vault_path)
     _bypass_atomic_vault_write(monkeypatch)
-    _existing_domain_page(vault_path, "projects", "phoenix", "Phoenix")
+    _existing_domain_page(vault_path, "topics", "phoenix", "Phoenix")
     service._active_pass = CompileEnrichPass(pass_id="p1", snapshot_enabled=False)
     monkeypatch.setattr(
         service.qmd,
         "recall",
         _recall_with_results(
-            [{"rel_path": "compiled/projects/phoenix.md", "confidence": 0.9}]
+            [{"rel_path": "compiled/topics/phoenix.md", "confidence": 0.9}]
         ),
     )
     monkeypatch.setattr(
@@ -13941,19 +13941,19 @@ def test_compiled_briefings_upsert_briefing_queues_duplicate_candidate_during_pa
     )
 
     upsert_result = service._upsert_briefing(
-        target=_demo_target(),
+        target=_demo_target(domain="topics"),
         source_rel_path="daily/2026-08-05.md",
         source_excerpt="Demo excerpt.",
         signal=None,
     )
 
-    assert upsert_result.path == "compiled/projects/demo-project.md"
+    assert upsert_result.path == "compiled/topics/demo-project.md"
 
     queue = json.loads(
         (vault_path / ".session" / "decisions-queue.json").read_text(encoding="utf-8")
     )
     assert len(queue) == 1
-    assert queue[0]["candidate_page"] == "compiled/projects/phoenix.md"
+    assert queue[0]["candidate_page"] == "compiled/topics/phoenix.md"
 
 
 def test_compiled_briefings_queue_duplicate_candidate_passes_existing_lock_through(
@@ -13980,12 +13980,12 @@ def test_compiled_briefings_queue_duplicate_candidate_passes_existing_lock_throu
     vault_path = tmp_path / "vault"
     service = _compiled_service(vault_path)
     _bypass_atomic_vault_write(monkeypatch)
-    _existing_domain_page(vault_path, "projects", "phoenix", "Phoenix")
+    _existing_domain_page(vault_path, "topics", "phoenix", "Phoenix")
     monkeypatch.setattr(
         service.qmd,
         "recall",
         _recall_with_results(
-            [{"rel_path": "compiled/projects/phoenix.md", "confidence": 0.9}]
+            [{"rel_path": "compiled/topics/phoenix.md", "confidence": 0.9}]
         ),
     )
     monkeypatch.setattr(
@@ -14022,7 +14022,7 @@ def test_compiled_briefings_queue_duplicate_candidate_passes_existing_lock_throu
     )
 
     service._upsert_briefing(
-        target=_demo_target(),
+        target=_demo_target(domain="topics"),
         source_rel_path="daily/2026-08-05.md",
         source_excerpt="Demo excerpt.",
         signal=None,

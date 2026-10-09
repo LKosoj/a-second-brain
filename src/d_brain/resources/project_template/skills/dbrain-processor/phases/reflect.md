@@ -36,6 +36,9 @@ Build one concise Telegram markdown report. Include:
 
 - ONE Big Thing (from capture.json)
 - Thoughts saved (from execute.json)
+- Directions present in saved thoughts, using their exact `directions` values;
+  distinguish learning, blog and business activity from the work direction.
+  Do not report an entity-card update unless the result proves it was written.
 - Tasks created (with IDs)
 - Process goals status
 - Workload by day

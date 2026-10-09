@@ -2953,6 +2953,10 @@ WORKFLOW:
             "Read business/crm.md, business/network.md, business/events.md, "
             "projects/clients.md, "
             "projects/leads.md, and projects/projects.md for context.\n"
+            "Read directions.md for the editable directions list. "
+            "Primary person/project cards live in compiled/people and "
+            "compiled/projects; link saved thoughts to the matching primary card. "
+            "Do not write inside the automatically maintained entity-index section.\n"
             "Do not create Todoist tasks for entries from capture.json; the Python "
             "runtime creates them once after this phase and uses only explicit "
             "task_due values. Save thoughts, update CRM. "
@@ -3632,6 +3636,11 @@ or recent vault notes before answering instead of guessing.
             category = collapse_to_single_line(thought.get("category"))
             link = f"[[{path}|{title}]]" if path else title
             suffix = f" — {category}" if category else ""
+            directions = thought.get("directions")
+            if isinstance(directions, list):
+                names = [collapse_to_single_line(name) for name in directions if name]
+                if names:
+                    suffix += " · " + ", ".join(names)
             lines.append(f"- {link}{suffix}")
 
         lines.extend(["", f"**{crm_label}:** {len(crm_updated)}"])

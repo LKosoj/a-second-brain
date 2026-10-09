@@ -82,6 +82,15 @@ Infer urgency from:
 
 ## Output Locations
 
+Classification is the type of action or knowledge, not a life direction.
+Read direction names from `directions.md` rather than keeping a fixed
+list here. A learning, decision, person and project can share one direction.
+A source may update BOTH a person and a project: choosing one primary class
+does not make its other supported entity information irrelevant.
+Primary project/person identities live in `compiled/projects/` and
+`compiled/people/`; saved thoughts link to those cards instead of becoming
+additional project identities.
+
 | Category | Destination |
 |----------|-------------|
 | `task` | Todoist |

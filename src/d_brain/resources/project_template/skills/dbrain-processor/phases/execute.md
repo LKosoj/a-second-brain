@@ -47,6 +47,19 @@ If missing or stale, create or refresh them from the current weekly/monthly goal
 
 ### 3. Save thoughts
 
+`compiled/projects/` and `compiled/people/` contain the primary entity cards.
+Read the matching card before saving an update about an existing entity.
+`project` here is the type of a captured thought, not permission to create
+another primary project card. Link the thought to the existing primary project.
+Compiled processing independently updates people and projects from source notes,
+including PLAUD, even when the same source also produces a decision or a task.
+
+Read the editable `directions` list in `directions.md`. Add zero or more
+exact names from that list to the thought's `directions` frontmatter and its
+`thoughts_saved` result. Directions describe areas of activity, independently
+of `idea`, `learning`, `reflection`, or `project`. Do not invent names or force
+personal learning or blog work into the work direction.
+
 For each entry with classification `idea`, `reflection`, `learning`, or `project`:
 - Create a file in `thoughts/{category}/YYYY-MM-DD-slug.md`
 - Use the agent-memory card contract:
@@ -62,6 +75,11 @@ For each entry with classification `idea`, `reflection`, `learning`, or `project
   ```
 
 ### 4. Update CRM
+
+The `Основные карточки` sections in `business/network.md` and
+`projects/projects.md` are maintained by Python from primary compiled cards.
+Do not edit their `d-brain:entities:start/end` blocks. Preserve owner-written
+context outside those blocks; do not copy the full primary card into an index.
 
 For entries with `classification: "crm_update"`:
 - Update the most relevant existing business/project file:

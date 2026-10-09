@@ -38,6 +38,7 @@ from d_brain.services.frontmatter import (
     read_vault_file_bytes,
     write_validated_vault_markdown,
 )
+from d_brain.services.vault_lock import VaultWriteLock, vault_write_lock
 
 _CATALOG_RELATIVE_PATH = Path("MOC/compiled-index.md")
 _CATALOG_DESCRIPTION = "Каталог страниц compiled/ по доменам для быстрой навигации"
@@ -78,6 +79,8 @@ def _collect_pages(vault_path: Path) -> list[_CatalogPage]:
             continue
         text = CompiledBriefingService._read_page_text(path)
         fields = CompiledBriefingService._frontmatter_fields(text)
+        if fields.get("canonical_path"):
+            continue
         title = CompiledBriefingService._title_from_text(text) or path.stem.replace(
             "-", " "
         )
@@ -95,11 +98,15 @@ def _collect_pages(vault_path: Path) -> list[_CatalogPage]:
     return pages
 
 
-def _render_page_line(page: _CatalogPage) -> str:
+def _page_link(page: _CatalogPage) -> str:
     # A title from the page's own H1 could legally contain "|" or "]]"; both
     # would otherwise break out of the wikilink's display-text slot.
     title = page.title.replace("|", "").replace("]]", "").strip()
-    link = f"[[compiled/{page.domain}/{page.slug}|{title}]]"
+    return f"[[compiled/{page.domain}/{page.slug}|{title}]]"
+
+
+def _render_page_line(page: _CatalogPage) -> str:
+    link = _page_link(page)
     segments = [
         page.description,
         f"обновлено {page.updated}" if page.updated else "",
@@ -115,6 +122,73 @@ def _render_domain_section(domain: str, pages: list[_CatalogPage]) -> list[str]:
     lines = [f"## {domain}", "", f"Страниц: {len(ordered)}", ""]
     lines.extend(_render_page_line(page) for page in ordered)
     return lines
+
+
+def write_entity_indexes(
+    vault_path: Path,
+    *,
+    manifest: VaultManifest | None = None,
+    existing_lock: VaultWriteLock | None = None,
+) -> bool:
+    """Maintain primary-card links without replacing the owner's index text."""
+    if existing_lock is None:
+        with vault_write_lock(vault_path) as lock:
+            return write_entity_indexes(
+                vault_path, manifest=manifest, existing_lock=lock
+            )
+    manifest = manifest or load_manifest_for_vault(vault_path)
+    changed = False
+    pages = _collect_pages(vault_path)
+    start = "<!-- d-brain:entities:start -->"
+    end = "<!-- d-brain:entities:end -->"
+    for domain, rel_path in (
+        ("people", "business/network.md"),
+        ("projects", "projects/projects.md"),
+    ):
+        path = vault_path / rel_path
+        if not path.exists():
+            continue
+        old = read_vault_file_bytes(vault_path, path)
+        lines = [start, "## Основные карточки", ""]
+        groups: dict[str, list[_CatalogPage]] = {}
+        for page in pages:
+            if page.domain != domain:
+                continue
+            fields = parse_frontmatter_bytes(
+                (vault_path / "compiled" / domain / f"{page.slug}.md").read_bytes()
+            ).fields
+            names = CompiledBriefingService._normalize_list(fields.get("directions"))
+            for name in names or ["Без направления"]:
+                groups.setdefault(name, []).append(page)
+        for name, entries in sorted(groups.items()):
+            lines.extend([f"### {name}", ""])
+            lines.extend(
+                f"- {_page_link(page)}"
+                for page in sorted(entries, key=lambda page: page.title.casefold())
+            )
+            lines.append("")
+        lines.append(end)
+        block = "\n".join(lines)
+        text = old.decode("utf-8")
+        if start in text and end in text:
+            left = text.index(start)
+            right = text.index(end, left) + len(end)
+            text = text[:left] + block + text[right:]
+        else:
+            text = text.rstrip() + "\n\n" + block + "\n"
+        candidate = text.encode("utf-8")
+        if candidate == old:
+            continue
+        write_validated_vault_markdown(
+            vault_path,
+            path,
+            candidate,
+            manifest=manifest,
+            existing_lock=existing_lock,
+            expected_full_sha256=hashlib.sha256(old).hexdigest(),
+        )
+        changed = True
+    return changed
 
 
 def _render_body(vault_path: Path) -> str:

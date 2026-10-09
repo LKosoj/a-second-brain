@@ -1085,6 +1085,7 @@ def count_logged_responses(vault_path: Path, *, page: str, action_id: str) -> in
 # about the same item.
 
 QUEUE_KIND_LABELS = {
+    "entity-identity": "сопоставление людей и проектов",
     FACT_CHECK_REJECTED_KIND: "проверка фактов",
     CONFLICT_KIND: "конфликт",
     DUPLICATE_CANDIDATE_KIND: "возможный дубликат",

@@ -253,7 +253,8 @@ CONTROL_PLANE_REGISTRY: tuple[WorkflowSpec, ...] = (
         # ``compile_checked`` onto import notes (T4,
         # ``CompiledBriefingService._on_source_finished``/
         # ``sweep_unmarked_imports``).
-        allowed_writes=("compiled", "qmd", ".session", "summaries", "moc", "imports"),
+        allowed_writes=("compiled", "qmd", ".session", "summaries", "moc", "imports",
+                        "business/network.md", "projects/projects.md"),
         fallback_behavior=(
             "Best-effort nightly drain, lint, and source-aware backfill for "
             "compiled briefings, plus the automated pass over the owner's "
