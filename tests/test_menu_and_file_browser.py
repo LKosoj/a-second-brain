@@ -12,6 +12,7 @@ from d_brain.bot.dashboard import (
     build_queue_item_text,
     build_queue_keyboard,
     build_queue_text,
+    build_section_keyboard,
     build_stats_text,
     build_weekly_review_keyboard,
     build_weekly_review_text,
@@ -54,12 +55,12 @@ def test_home_keyboard_has_close_button_and_no_help_button() -> None:
         for button in row
     ]
 
-    assert "❌ Закрыть меню" in labels
+    assert labels[-1] == "Закрыть меню"
     assert all("Помощ" not in label for label in labels)
 
 
-def test_home_keyboard_has_digest_queue_and_brief_buttons() -> None:
-    keyboard = build_home_keyboard()
+def test_summaries_section_has_digest_and_brief_buttons() -> None:
+    keyboard = build_section_keyboard("summaries")
     callback_data = [
         button.callback_data
         for row in keyboard.inline_keyboard
@@ -67,7 +68,6 @@ def test_home_keyboard_has_digest_queue_and_brief_buttons() -> None:
     ]
 
     assert "menu:digest" in callback_data
-    assert "menu:queue" in callback_data
     assert "menu:brief" in callback_data
 
 
@@ -77,8 +77,8 @@ def test_build_queue_text_reports_empty_queue_as_friendly_not_error() -> None:
     assert "пуста" in text.lower()
 
 
-def test_home_keyboard_has_weekly_review_button() -> None:
-    keyboard = build_home_keyboard()
+def test_summaries_section_has_weekly_review_button() -> None:
+    keyboard = build_section_keyboard("summaries")
     callback_data = [
         button.callback_data
         for row in keyboard.inline_keyboard
@@ -157,12 +157,12 @@ def test_build_queue_keyboard_shows_pagination_arrows_at_edges() -> None:
 
     # QUEUE_PAGE_SIZE is 8, so 17 items span 3 pages (0, 1, 2).
     first_page = build_queue_keyboard(items=items, page=0, total_items=17)
-    first_row_data = [button.callback_data for button in first_page.inline_keyboard[-2]]
+    first_row_data = [button.callback_data for button in first_page.inline_keyboard[-3]]
     assert not any(data.startswith("menu:queuepage:-") for data in first_row_data)
     assert any(data == "menu:queuepage:1" for data in first_row_data)
 
     last_page = build_queue_keyboard(items=items, page=2, total_items=17)
-    last_row_data = [button.callback_data for button in last_page.inline_keyboard[-2]]
+    last_row_data = [button.callback_data for button in last_page.inline_keyboard[-3]]
     assert not any(data == "menu:queuepage:3" for data in last_row_data)
     assert any(data == "menu:queuepage:1" for data in last_row_data)
 
@@ -178,10 +178,9 @@ def test_queue_refresh_and_back_buttons_keep_the_current_page() -> None:
     ]
 
     list_keyboard = build_queue_keyboard(items=items, page=2, total_items=17)
-    list_row = list_keyboard.inline_keyboard[-1]
+    list_row = list_keyboard.inline_keyboard[-2]
     assert [button.callback_data for button in list_row] == [
         "menu:queuepage:2",
-        "menu:home",
     ]
 
     item_row = build_queue_item_keyboard(
@@ -190,6 +189,7 @@ def test_queue_refresh_and_back_buttons_keep_the_current_page() -> None:
     assert [button.callback_data for button in item_row] == [
         "menu:queuepage:2",
         "menu:home",
+        "menu:close",
     ]
 
 

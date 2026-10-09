@@ -29,9 +29,14 @@ Before classifying, rely on:
 ## Classification Heuristics
 
 ### Choose `task` when
-- the user or another clearly identified owner has to do something,
+- the assistant owner has to do something, including an explicit follow-up or
+  control obligation for delegated work under the ownership reference,
 - there is an explicit or strongly implied next action,
 - or delaying the note creates operational risk.
+
+All task candidates still require the assistant owner's responsibility.
+Another person's obligation alone belongs in an appropriate informational
+class, not in the owner's Todoist tasks.
 
 ### Choose `idea` when
 - the value is in preserving a concept or possibility,

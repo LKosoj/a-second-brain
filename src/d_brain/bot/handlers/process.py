@@ -41,6 +41,7 @@ def _build_processor() -> CliProcessor:
         getattr(settings, "openai_base_url", ""),
         getattr(settings, "openai_model", ""),
         getattr(settings, "tavily_api_key", ""),
+        settings.owner_telegram_id,
     )
 
 

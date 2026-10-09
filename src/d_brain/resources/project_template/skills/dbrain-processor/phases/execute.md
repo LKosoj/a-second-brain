@@ -6,7 +6,8 @@ tier: archive
 ---
 # Phase 2: EXECUTE
 
-Read capture.json from Phase 1. Create Todoist tasks, save thoughts, update business/project context, and report the exact changes.
+Read capture.json from Phase 1. Leave captured Todoist tasks to the Python
+runtime; save thoughts, update business/project context, and report exact changes.
 
 ## Input
 - `.session/capture.json` — output from Phase 1
@@ -110,6 +111,11 @@ Never claim Todoist is unavailable before the retries are exhausted.
 If it still fails after the third attempt, keep the exact error text in `observations`.
 
 ## Output Format
+
+`tasks_created` contains only tasks actually created by this phase, such as
+explicit process goals, with their exact returned `id` and `content`. Exclude
+capture tasks: Python adds them later. Do not report planned or failed actions
+as completed.
 
 Print ONLY valid JSON:
 

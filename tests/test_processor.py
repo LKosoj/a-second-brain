@@ -476,7 +476,8 @@ def test_execute_prompt_instructs_matplotlib_chart_for_numbers_over_time(
     assert "attachments/charts/" in prompt
     assert "DejaVu Sans" in prompt
     assert "into the report" in prompt
-    assert "Skip the chart when there is no time series or comparison" in prompt
+    assert "Skip the chart for qualitative comparisons" in prompt
+    assert "Never invent values or scores" in prompt
 
 
 def test_run_json_phase_retries_with_stricter_contract_and_persists_raw_output(
@@ -1182,7 +1183,8 @@ def test_question_prompt_instructs_matplotlib_chart_for_numbers_over_time(
     assert "attachments/charts/" in prompt
     assert "DejaVu Sans" in prompt
     assert "into the answer" in prompt
-    assert "Skip the chart when there is no time series or comparison" in prompt
+    assert "Skip the chart for qualitative comparisons" in prompt
+    assert "Never invent values or scores" in prompt
 
 
 def test_telegram_output_rules_use_adaptive_answer_depth() -> None:
@@ -1216,7 +1218,8 @@ def test_question_prompt_requires_source_footer_for_fact_and_history_routes(
 
     assert "SOURCE FOOTER POLICY: REQUIRED" in fact_prompt
     assert "SOURCE FOOTER POLICY: REQUIRED" in history_prompt
-    assert "2-5 фактически использованных vault-relative" in fact_prompt
+    assert "2-5 фактически использованных источников" in fact_prompt
+    assert "telegram:<chat>:<message>" in fact_prompt
     assert "не выдумывай ссылку" in fact_prompt
 
 

@@ -143,6 +143,7 @@ def build_question_provenance(
     *,
     limit: int = QUESTION_CONTEXT_LIMIT,
     candidates: Sequence[CompiledBriefingCandidate] | None = None,
+    source_paths: Sequence[str] = (),
 ) -> QuestionProvenance:
     """Pure, read-only rebuild of ``build_question_context``'s own ranking
     (ТЗ 7.4), used to attach code-determined provenance after the model has
@@ -177,6 +178,9 @@ def build_question_provenance(
     page_lines = [
         _page_line(candidate, trust, conflicts) for candidate, trust, conflicts in rows
     ]
+    for path in dict.fromkeys(source_paths):
+        reference = f"`{path}`" if path.startswith("../") else f"[[{path}]]"
+        page_lines.append(f"- {reference} — первичный источник устаревшей сводки")
     block = "\n".join(["**Источники ответа**", *page_lines])
     warning = _weak_trust_warning(
         folded_trust=folded_trust, any_open_conflicts=any_open_conflicts

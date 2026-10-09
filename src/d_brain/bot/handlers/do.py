@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from typing import cast
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject
@@ -9,6 +10,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from d_brain.bot.conversations import reply_context, save_answer
+from d_brain.bot.dashboard import render_home, render_input
 from d_brain.bot.formatters import format_process_report, inline_artifact_image_paths
 from d_brain.bot.progress import wait_for_task_with_progress
 from d_brain.bot.replies import answer_files, answer_rich_text, answer_text, edit_text
@@ -47,9 +49,23 @@ _KNOWN_COMMANDS = (
 _BOT_COMMAND_RE = rf"^/(?:{'|'.join(_KNOWN_COMMANDS)})(@[A-Za-z0-9_]+)?(\s|$)"
 
 
-async def start_do_flow(message: Message, state: FSMContext) -> None:
+async def start_do_flow(
+    message: Message, state: FSMContext, *, menu_message_id: int | None = None
+) -> None:
     """Prompt the user for the next /do input."""
     await state.set_state(DoCommandState.waiting_for_input)
+    if menu_message_id is not None:
+        await state.update_data(menu_message_id=menu_message_id)
+        await render_input(
+            cast(Bot, message.bot), chat_id=message.chat.id, message_id=menu_message_id,
+            screen="do_input",
+            text=(
+                "**Что сделать?**\n\n"
+                "Отправь вопрос или поручение голосом или текстом.\n"
+                "Для отмены нажми «Назад» или отправь `-`."
+            ),
+        )
+        return
     await answer_text(
         message,
         "🎯 **Что сделать?**\n\n"
@@ -98,7 +114,15 @@ async def handle_do_input(message: Message, bot: Bot, state: FSMContext) -> None
     instead. Voice messages have ``text is None``, which the magic filter
     resolves to ``False`` here, so they still reach this handler unaffected.
     """
+    data = await state.get_data()
     await state.clear()  # Clear state immediately
+    menu_message_id = data.get("menu_message_id")
+    if isinstance(menu_message_id, int):
+        await render_home(
+            bot, chat_id=message.chat.id, vault_path=get_settings().vault_path,
+            user_id=message.from_user.id if message.from_user else message.chat.id,
+            preferred_message_id=menu_message_id,
+        )
 
     prompt = None
 
@@ -181,7 +205,7 @@ async def process_request(message: Message, prompt: str, user_id: int = 0) -> No
     )
 
     async def run_with_progress() -> dict[str, object]:
-        context = reply_context(message, settings.vault_path, user_id)
+        context = await reply_context(message, settings.vault_path, user_id)
         kwargs = {} if context is None else {"conversation_context": context}
         task = asyncio.create_task(
             asyncio.to_thread(processor.execute_prompt, prompt, user_id, **kwargs)
@@ -205,6 +229,8 @@ async def process_request(message: Message, prompt: str, user_id: int = 0) -> No
 
     try:
         report = await run_with_progress()
+    except ValueError as exc:
+        report = {"error": str(exc)}
     except Exception:
         logger.exception("Execute prompt task failed")
         report = {"error": "Execution task crashed unexpectedly"}

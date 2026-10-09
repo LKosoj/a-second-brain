@@ -14,7 +14,8 @@ Read one daily file, classify each entry conservatively, and output structured J
 ## Task
 
 1. Use the injected target daily in chronological order.
-2. Treat each `## HH:MM [type]` block as one entry.
+2. Treat each user `## HH:MM [type]` block as one entry. Exclude `[d-brain]`
+   reports from entries; they are runtime context, not new user input.
 3. Classify every entry into exactly one class:
    - `task`
    - `idea`
@@ -32,6 +33,11 @@ Read one daily file, classify each entry conservatively, and output structured J
    - if there is no clear next action, do not force a `task`
    - set `task_due` only when the source explicitly gives this task a deadline;
      otherwise use `null`
+   - normalize explicit relative deadlines to `YYYY-MM-DD` relative to the
+     source daily date, not the day processing runs; for example, "tomorrow"
+     in the 2026-10-08 daily means `2026-10-09`. Leave unclear dates as `null`.
+   - `task_priority` uses the CLI scale: integer 1–4, where 1 is most urgent
+     and 4 is lowest priority; do not use the reversed Todoist API scale.
    - do not turn a project period, milestone date, or processing date into a
      task deadline unless the source explicitly connects them
    - if a company is mentioned casually, do not force `crm_update`
@@ -53,7 +59,7 @@ Print ONLY valid JSON (no markdown, no explanation).
       "classification": "task",
       "task_content": "Concrete next action",
       "task_priority": 2,
-      "task_due": "tomorrow",
+      "task_due": "2026-02-20",
       "entities": ["Example Studio"],
       "goal_alignment": "weekly"
     }
@@ -73,7 +79,10 @@ Print ONLY valid JSON (no markdown, no explanation).
 Classify semantically, not by keyword triggers.
 
 ### `task`
-- there is a concrete obligation, follow-up, or committed next action
+- there is a concrete obligation, follow-up, or committed next action on the
+  assistant owner, as defined by the supplied ownership reference
+- another person's action is not the owner's task unless the owner explicitly
+  retains follow-up or control; describe that control step instead
 
 ### `idea`
 - the value is in preserving a concept, not immediate execution

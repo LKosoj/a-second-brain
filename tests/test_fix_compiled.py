@@ -53,6 +53,11 @@ def test_upsert_briefing_adjudicates_each_conflict_pair_once(
 
     existing_text = (
         "---\ndomain: projects\n---\n\n# Demo Project\n\n"
+        "## Current State\nOld state.\n\n"
+        "## Recent Changes\n(none)\n\n"
+        "## Open Loops\n(none)\n\n"
+        "## Key Decisions\n(none)\n\n"
+        "## Next Check\nLater.\n\n"
         "## Sources That Shaped This Page\n"
         "| Date | Source | What Added |\n"
         "| --- | --- | --- |\n"
@@ -309,6 +314,11 @@ def test_snapshot_pass_page_refreshes_fingerprint_after_on_repeat_write(
     page_path.parent.mkdir(parents=True, exist_ok=True)
     original_text = (
         "---\ndomain: projects\n---\n\n# Demo Project\n\n"
+        "## Current State\nOld state.\n\n"
+        "## Recent Changes\n(none)\n\n"
+        "## Open Loops\n(none)\n\n"
+        "## Key Decisions\n(none)\n\n"
+        "## Next Check\nLater.\n\n"
         "## Sources\n- [[daily/2026-08-01.md]]\n"
     )
     page_path.write_text(original_text, encoding="utf-8")
@@ -419,6 +429,11 @@ def test_rollback_restores_source_state_for_an_existing_page(
     page_path.parent.mkdir(parents=True, exist_ok=True)
     original_text = (
         "---\ndomain: projects\n---\n\n# Demo Project\n\n"
+        "## Current State\nOld state.\n\n"
+        "## Recent Changes\n(none)\n\n"
+        "## Open Loops\n(none)\n\n"
+        "## Key Decisions\n(none)\n\n"
+        "## Next Check\nLater.\n\n"
         "## Sources\n- [[daily/2026-08-01.md]]\n"
     )
     page_path.write_text(original_text, encoding="utf-8")
@@ -703,6 +718,11 @@ def test_rollback_after_two_upserts_to_same_page_restores_file_and_source_state(
     page_path.parent.mkdir(parents=True, exist_ok=True)
     original_text = (
         "---\ndomain: projects\n---\n\n# Demo Project\n\n"
+        "## Current State\nOld state.\n\n"
+        "## Recent Changes\n(none)\n\n"
+        "## Open Loops\n(none)\n\n"
+        "## Key Decisions\n(none)\n\n"
+        "## Next Check\nLater.\n\n"
         "## Sources\n- [[daily/2026-08-01.md]]\n"
     )
     page_path.write_text(original_text, encoding="utf-8")

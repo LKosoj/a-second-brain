@@ -13,11 +13,13 @@ import logging
 from contextlib import suppress
 from datetime import date
 from pathlib import Path
+from typing import cast
 
-from aiogram import Router
+from aiogram import Bot, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
+from d_brain.bot.dashboard import render_input, render_section
 from d_brain.bot.replies import answer_rich_text, answer_text
 from d_brain.bot.states import BriefCommandState
 from d_brain.config import get_settings
@@ -39,7 +41,8 @@ _BRIEF_TYPE_LABELS = {"decision": "решению", "topic": "теме", "projec
 
 
 async def start_brief_flow(
-    message: Message, state: FSMContext, brief_type: str
+    message: Message, state: FSMContext, brief_type: str,
+    *, menu_message_id: int | None = None,
 ) -> None:
     """Prompt for the brief's target query after a type button was tapped."""
     if brief_type not in BRIEF_TYPES:
@@ -47,9 +50,21 @@ async def start_brief_flow(
     await state.update_data(brief_type=brief_type)
     await state.set_state(BriefCommandState.waiting_for_query)
     label = _BRIEF_TYPE_LABELS[brief_type]
+    if menu_message_id is not None:
+        await state.update_data(menu_message_id=menu_message_id)
+        await render_input(
+            cast(Bot, message.bot), chat_id=message.chat.id, message_id=menu_message_id,
+            screen="brief_input", back="menu:brief",
+            text=(
+                f"**Справка по {label}**\n\n"
+                "Отправь текстом название или вопрос.\n"
+                "Для отмены нажми «Назад» или отправь `-`."
+            ),
+        )
+        return
     await answer_text(
         message,
-        f"📝 **Бриф по {label}**\n\n"
+        f"📝 **Справка по {label}**\n\n"
         "Отправь текстом название или запрос, чтобы найти страницу.\n"
         "Отправь `-`, чтобы отменить.",
     )
@@ -69,9 +84,15 @@ async def handle_brief_query(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     brief_type = data.get("brief_type")
     await state.clear()
+    menu_message_id = data.get("menu_message_id")
+    if isinstance(menu_message_id, int):
+        await render_section(
+            cast(Bot, message.bot), chat_id=message.chat.id, section="summaries",
+            preferred_message_id=menu_message_id,
+        )
 
     if query == "-" or not isinstance(brief_type, str) or brief_type not in BRIEF_TYPES:
-        await answer_text(message, "❌ **Сбор брифа отменён**")
+        await answer_text(message, "Сбор справки отменён. Открыть меню: /menu")
         return
 
     await process_brief_request(message, brief_type, query)
@@ -95,7 +116,7 @@ async def process_brief_request(message: Message, brief_type: str, query: str) -
         # so letting this escape leaves the owner with no reply at all and
         # no flow left to retry in -- just a message that vanished.
         logger.exception("Failed to build brief for %r", query)
-        await answer_text(message, "❌ Не удалось собрать бриф.")
+        await answer_text(message, "❌ Не удалось собрать справку.")
         return
     if result is None:
         await answer_text(
@@ -120,7 +141,7 @@ async def process_brief_request(message: Message, brief_type: str, query: str) -
             )
     except Exception:
         logger.exception("Failed to write brief")
-        await answer_text(message, "❌ Не удалось сохранить бриф.")
+        await answer_text(message, "❌ Не удалось сохранить справку.")
         return
 
     # ТЗ 6.2: a page that reaches a brief counts as "used" -- best-effort,
@@ -150,6 +171,6 @@ async def process_brief_request(message: Message, brief_type: str, query: str) -
             rel_path = Path(path).relative_to(vault_path).as_posix()
             await answer_text(
                 message,
-                f"❌ Бриф сохранён в `{rel_path}`, "
+                f"❌ Справка сохранена в `{rel_path}`, "
                 "но отправить его в чат не удалось.",
             )

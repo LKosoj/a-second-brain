@@ -104,6 +104,7 @@ class DailyWorkflow:
                     target_day,
                 )
                 if mode == SCHEDULED_MODE:
+                    self._learn_from_conversations(target_day)
                     self._host._rebuild_graph()
                     self._host._refresh_qmd_index()
                 return self._empty_result(mode)
@@ -203,9 +204,16 @@ class DailyWorkflow:
         report = self._host._run_vault_prompt(self._host._build_reflect_prompt(day))
         self._host._compact_handoff_file()
         self._host._write_reflect_daily_block(day, execute_data)
+        self._learn_from_conversations(day)
         self._host._refresh_qmd_index()
         return {
             "report": self._host._normalize_owner_report_markdown(report),
             "processed_entries": processed_entries,
             "mode": SCHEDULED_MODE,
         }
+
+    def _learn_from_conversations(self, day: date) -> None:
+        try:
+            self._host._learn_from_conversations(day)
+        except Exception:
+            logger.exception("Conversation learning failed for %s", day)

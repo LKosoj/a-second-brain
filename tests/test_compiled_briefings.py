@@ -125,6 +125,13 @@ def _stub_adjudicator(
 def _minimal_compile_payload(**overrides: Any) -> dict[str, Any]:
     """Minimal COMPILE_JSON_EXAMPLE-shaped payload for direct _render_briefing calls."""
     base: dict[str, Any] = {
+        "changed_sections": [
+            "Current State",
+            "Recent Changes",
+            "Open Loops",
+            "Key Decisions",
+            "Next Check",
+        ],
         "description": "Demo snippet",
         "status": "active",
         "freshness_state": "fresh",
@@ -3908,6 +3915,13 @@ def test_compiled_briefing_does_not_overwrite_cooperative_concurrent_update(
     def payload(current_state: str) -> str:
         return json.dumps(
             {
+                "changed_sections": [
+                    "Current State",
+                    "Recent Changes",
+                    "Open Loops",
+                    "Key Decisions",
+                    "Next Check",
+                ],
                 "description": "Demo snippet",
                 "status": "active",
                 "freshness_state": "fresh",
@@ -7200,7 +7214,10 @@ def test_compiled_briefings_upsert_briefing_skips_recall_on_exact_match(
     vault_path = tmp_path / "vault"
     service = _compiled_service(vault_path)
     _bypass_atomic_vault_write(monkeypatch)
-    _existing_domain_page(vault_path, "projects", "demo-project", "Demo Project")
+    page_path = _existing_domain_page(
+        vault_path, "projects", "demo-project", "Demo Project"
+    )
+    page_path.write_text(_full_compiled_page_text(), encoding="utf-8")
 
     def fail_recall(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
         raise AssertionError("qmd.recall must not be called on an exact match")
@@ -7993,6 +8010,13 @@ def test_compiled_briefings_adjudicated_supersession_overrides_the_compile_label
     claim supersedes -- the supersession is what lands."""
     service = _compiled_service(tmp_path / "vault")
     asked = _stub_adjudicator(monkeypatch, service, ("new_supersedes", ""))
+    (service.vault_path / "daily").mkdir()
+    (service.vault_path / "daily" / "2026-07-01.md").write_text(
+        "event_date: 2026-07-01\nЦена — 100 USD.", encoding="utf-8"
+    )
+    (service.vault_path / "daily" / "2026-08-05.md").write_text(
+        "event_date: 2026-08-05\nЦена — 150 USD.", encoding="utf-8"
+    )
     existing_text = (
         "---\ndomain: projects\n---\n\n# Demo Project\n\n"
         "## Sources That Shaped This Page\n"
@@ -8021,7 +8045,7 @@ def test_compiled_briefings_adjudicated_supersession_overrides_the_compile_label
         existing_text=existing_text,
         existing_meta=service._frontmatter_fields(existing_text),
         signal=None,
-        source_excerpt="## 09:00 [text]\nЦена — 150 USD.",
+        source_excerpt="event_date: 2026-08-05\nЦена — 150 USD.",
         claims=claims,
         conflicts=conflicts,
     )
@@ -8722,12 +8746,10 @@ def test_compiled_briefings_verify_prompt_has_final_merged_page(
     page_path = vault_path / "compiled" / "projects" / "demo-project.md"
     page_path.parent.mkdir(parents=True, exist_ok=True)
     page_path.write_text(
-        "---\ndomain: projects\n---\n\n# Demo Project\n\n"
-        "## Sources That Shaped This Page\n"
-        "| Date | Source | What Added |\n"
-        "| --- | --- | --- |\n"
-        f"| 2026-07-01 | [[thoughts/idea.md]] | {marker} |\n\n"
-        f"## Open Loops\n- 2026-07-01: {old_open_loop}\n",
+        _full_compiled_page_text(
+            shaped_rows=[("2026-07-01", "thoughts/idea.md", marker)],
+            open_loops_rows=[("2026-07-01", old_open_loop, "")],
+        ),
         encoding="utf-8",
     )
     target = _demo_target(description="UNIQUE-TARGET-DESCRIPTION-7ac1e5")
@@ -11144,9 +11166,8 @@ def test_compiled_briefings_rollback_restores_modified_page(
 
     page_path = vault_path / "compiled" / "projects" / "demo-project.md"
     page_path.parent.mkdir(parents=True, exist_ok=True)
-    original_text = (
-        "---\ndomain: projects\n---\n\n# Demo Project\n\n"
-        "## Sources\n- [[daily/2026-08-01.md]]\n"
+    original_text = _full_compiled_page_text(
+        sources=["daily/2026-08-01.md"],
     )
     page_path.write_text(original_text, encoding="utf-8")
 
@@ -14114,6 +14135,13 @@ def test_compiled_briefings_existing_stands_beats_a_newer_source(
     still stands, and that verdict is what the page reflects."""
     service = _compiled_service(tmp_path / "vault")
     asked = _stub_adjudicator(monkeypatch, service, ("existing_stands", ""))
+    (service.vault_path / "daily").mkdir()
+    (service.vault_path / "daily" / "2026-07-01.md").write_text(
+        "event_date: 2026-07-01\nДедлайн — 1 сентября.", encoding="utf-8"
+    )
+    (service.vault_path / "daily" / "2026-08-05.md").write_text(
+        "event_date: 2026-08-05\nДедлайн — 15 сентября.", encoding="utf-8"
+    )
     existing_text = (
         "---\ndomain: projects\n---\n\n# Demo Project\n\n"
         "## Sources That Shaped This Page\n"
@@ -14129,7 +14157,9 @@ def test_compiled_briefings_existing_stands_beats_a_newer_source(
         existing_text=existing_text,
         existing_meta=service._frontmatter_fields(existing_text),
         signal=None,
-        source_excerpt="## 09:00 [text]\nКто-то сказал, что дедлайн 15 сентября.",
+        source_excerpt=(
+            "event_date: 2026-08-05\nКто-то сказал, что дедлайн 15 сентября."
+        ),
         claims=[
             {
                 "text": "Дедлайн — 15 сентября.",
@@ -14222,12 +14252,10 @@ def test_compiled_briefings_adjudication_budget_error_is_not_a_verdict(
         )
 
 
-def test_compiled_briefings_retry_prompt_escalates_and_drops_unclear(
+def test_compiled_briefings_retry_prompt_preserves_unclear_without_new_evidence(
     tmp_path: Path,
 ) -> None:
-    """The retry is not the same question asked twice. The second attempt
-    says outright that this pair has been seen before, and the "unclear"
-    option is gone -- otherwise a pair could bounce between passes forever."""
+    """Repetition alone must not turn an unresolved pair into a known fact."""
     service = _compiled_service(tmp_path / "vault")
     kwargs: dict[str, Any] = {
         "page_rel_path": "compiled/projects/demo-project.md",
@@ -14248,9 +14276,9 @@ def test_compiled_briefings_retry_prompt_escalates_and_drops_unclear(
 
     assert '"unclear"' in first
     assert "ПОВТОРНЫЙ" not in first
-    assert '"unclear"' not in retry
+    assert '"unclear"' in retry
     assert "ПОВТОРНЫЙ ЗАХОД" in retry
-    assert "решение принять" in retry
+    assert "Повтор сам по себе не добавляет" in retry
     # Trust arrives as something the model can reason about, not a bare enum.
     assert "неизвестно, чьи это слова" in retry
 

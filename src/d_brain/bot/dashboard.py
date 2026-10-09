@@ -2,13 +2,21 @@
 
 import asyncio
 import hashlib
+import logging
 from dataclasses import dataclass, field
 from datetime import date
+from html import escape
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
 from aiogram import Bot
-from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import (
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputRichMessage,
+)
 
 from d_brain.bot.replies import send_text
 from d_brain.services.compiled_briefs import BRIEF_TYPES
@@ -36,6 +44,7 @@ from d_brain.services.processor import (
 from d_brain.services.session import SessionStore
 from d_brain.services.telegram_markup import (
     TELEGRAM_TEXT_LIMIT,
+    markdown_to_html,
     markdown_to_markdown_v2,
     normalize_markdown_input,
     truncate_plain_text_for_edit,
@@ -52,7 +61,14 @@ DashboardScreen = Literal[
     "brief_type",
     "weekly",
     "jobhealth",
+    "summaries",
+    "processing",
+    "more",
+    "help",
+    "do_input",
+    "brief_input",
 ]
+logger = logging.getLogger(__name__)
 CAPTURE_TYPES: tuple[str, ...] = ("voice", "text", "photo", "document", "forward")
 TYPE_META: tuple[tuple[str, str, str], ...] = (
     ("voice", "🎤", "Голосовые"),
@@ -126,7 +142,7 @@ def build_help_text() -> str:
         "/help — эта справка\n"
         "/stats — статистика по записям\n"
         "/files — файловый браузер vault\n"
-        "/process — быстрый preview без записи\n"
+        "/process — показать разбор без сохранения\n"
         "/process_full — полный цикл с записью\n"
         "\n"
         "_/start теперь только показывает справку, "
@@ -137,7 +153,6 @@ def build_help_text() -> str:
 def build_home_text(vault_path: Path | str, user_id: int) -> str:
     """Build the dashboard home summary."""
     stats = _collect_usage_stats(vault_path, user_id)
-    today = date.today().isoformat()
 
     if stats["today_total"] == 0:
         today_line = "Сегодня записей пока нет."
@@ -152,11 +167,9 @@ def build_home_text(vault_path: Path | str, user_id: int) -> str:
 
     return (
         "**d-brain**\n\n"
-        f"**Дата:** {today}\n"
-        f"{today_line}\n"
-        f"**За 7 дней:** {stats['week_total']}\n\n"
-        "Выбери действие ниже.\n"
-        "_/help — команды и правила использования._"
+        "Сохраняй мысли голосом или текстом — просто отправь сообщение.\n\n"
+        f"{today_line}\n\n"
+        "Выбери, что сделать."
     )
 
 
@@ -187,30 +200,84 @@ def build_home_keyboard() -> InlineKeyboardMarkup:
     """Build the main inline dashboard keyboard."""
     return _keyboard(
         [
-            [
-                ("📊 Статистика", "menu:stats"),
-                ("📁 Файлы", "menu:files"),
-            ],
-            [
-                ("🔎 Превью", "menu:process"),
-                ("⚙️ Обработать", "menu:processfull"),
-            ],
-            [
-                ("✨ Запрос", "menu:do"),
-                ("❌ Закрыть меню", "menu:close"),
-            ],
-            [
-                ("📰 Дайджест", "menu:digest"),
-                ("🗂 Очередь", "menu:queue"),
-            ],
-            [
-                ("📝 Бриф", "menu:brief"),
-                ("📅 Сводка недели", "menu:weekly"),
-            ],
-            [
-                ("⛔ Отключённые шаги", "menu:jobhealth"),
-            ],
+            [("✨ Задать вопрос или поручение", "menu:do")],
+            [("📋 Сводки", "menu:summaries"), ("🗂 Требуют решения", "menu:queue")],
+            [("📁 Мои файлы", "menu:files"), ("⚙️ Разобрать записи", "menu:processing")],
+            [("⋯ Ещё", "menu:more")],
+            [("Закрыть меню", "menu:close")],
         ]
+    )
+
+
+def navigation_row(back: str = "menu:home") -> list[tuple[str, str]]:
+    rows = [("Назад", back)]
+    if back != "menu:home":
+        rows.append(("Главное меню", "menu:home"))
+    rows.append(("Закрыть", "menu:close"))
+    return rows
+
+
+async def render_input(
+    bot: Bot, *, chat_id: int, message_id: int, text: str,
+    screen: Literal["do_input", "brief_input"], back: str = "menu:home",
+) -> None:
+    session = get_dashboard_session(chat_id)
+    session.current_screen = screen
+    await render_dashboard(
+        bot, chat_id=chat_id, session=session, text=text,
+        keyboard=_keyboard([navigation_row(back)]), preferred_message_id=message_id,
+    )
+
+
+def build_section_keyboard(section: DashboardScreen) -> InlineKeyboardMarkup:
+    rows = {
+        "summaries": [
+            [("📰 Сводка дня", "menu:digest")],
+            [("📅 Обзор недели", "menu:weekly")],
+            [("📝 Собрать справку", "menu:brief")],
+        ],
+        "processing": [
+            [("🔎 Показать разбор", "menu:process")],
+            [("⚙️ Обработать и сохранить", "menu:processfull")],
+        ],
+        "more": [
+            [("📊 Статистика", "menu:stats")],
+            [("⚙️ Автообработка", "menu:jobhealth")],
+            [("❓ Справка", "menu:help")],
+        ],
+        "help": [],
+    }[section]
+    back = "menu:more" if section == "help" else "menu:home"
+    return _keyboard([*rows, navigation_row(back)])
+
+
+async def render_section(
+    bot: Bot, *, chat_id: int, section: DashboardScreen,
+    preferred_message_id: int | None = None,
+) -> None:
+    text = {
+        "summaries": (
+            "**Сводки**\n\nПосмотри итоги дня или недели, "
+            "либо собери справку по решению, теме или проекту."
+        ),
+        "processing": (
+            "**Разобрать записи**\n\n"
+            "**Показать разбор** — без сохранения изменений.\n"
+            "**Обработать и сохранить** — полный разбор "
+            "с созданием задач и обновлением заметок."
+        ),
+        "more": (
+            "**Ещё**\n\nСтатистика записей, "
+            "отключённые шаги автообработки и справка."
+        ),
+        "help": build_help_text(),
+    }[section]
+    session = get_dashboard_session(chat_id)
+    session.current_screen = section
+    await render_dashboard(
+        bot, chat_id=chat_id, session=session, text=text,
+        keyboard=build_section_keyboard(section),
+        preferred_message_id=preferred_message_id,
     )
 
 
@@ -219,7 +286,7 @@ def build_stats_keyboard() -> InlineKeyboardMarkup:
     return _keyboard(
         [
             [("🔄 Обновить", "menu:stats")],
-            [("🏠 Домой", "menu:home")],
+            navigation_row("menu:more"),
         ]
     )
 
@@ -265,7 +332,8 @@ def build_disabled_steps_keyboard(vault_path: Path | str) -> InlineKeyboardMarku
         [(f"▶️ Включить снова: {name}", f"menu:jobhealthenable:{name}")]
         for name in disabled_names
     ]
-    rows.append([("🔄 Обновить", "menu:jobhealth"), ("🏠 Домой", "menu:home")])
+    rows.append([("🔄 Обновить", "menu:jobhealth")])
+    rows.append(navigation_row("menu:more"))
     return _keyboard(rows)
 
 
@@ -312,7 +380,7 @@ def build_file_roots_keyboard(roots: list[BrowserRoot]) -> InlineKeyboardMarkup:
         [(root.label, f"menu:filesroot:{root.id}")]
         for root in roots
     ]
-    rows.append([("🏠 Домой", "menu:home")])
+    rows.append(navigation_row())
     return _keyboard(rows)
 
 
@@ -357,9 +425,6 @@ def build_file_directory_keyboard(
 ) -> InlineKeyboardMarkup:
     """Build the paginated directory keyboard."""
     rows: list[list[tuple[str, str]]] = []
-    if current_dir:
-        rows.append([("⬆️ Вверх", "menu:filesup")])
-
     for index, entry in enumerate(page_entries):
         prefix = "📁" if entry.is_directory else "📄"
         rows.append(
@@ -377,19 +442,16 @@ def build_file_directory_keyboard(
         end = start + len(page_entries) - 1
         pagination_row: list[tuple[str, str]] = []
         if page > 0:
-            pagination_row.append(("⬅️", f"menu:filespage:{page - 1}"))
+            pagination_row.append(("Предыдущие", f"menu:filespage:{page - 1}"))
         pagination_row.append((f"{start}-{end}/{total_entries}", "menu:noop"))
         if page + 1 < total_pages:
-            pagination_row.append(("➡️", f"menu:filespage:{page + 1}"))
+            pagination_row.append(("Следующие", f"menu:filespage:{page + 1}"))
         rows.append(pagination_row)
 
     rows.extend(
         [
             [("🔄 Обновить", "menu:filesrefresh")],
-            [
-                ("🗂 Разделы", "menu:filesroots"),
-                ("🏠 Домой", "menu:home"),
-            ],
+            navigation_row("menu:filesup" if current_dir else "menu:filesroots"),
         ]
     )
     return _keyboard(rows)
@@ -403,7 +465,7 @@ def build_queue_text(
     total_items: int,
 ) -> str:
     """Build one page of the decisions queue list (задача L, ТЗ 7.2)."""
-    lines = ["**Очередь решений**", ""]
+    lines = ["**Требуют решения**", ""]
     if total_items == 0:
         lines.append("Очередь пуста — открытых пунктов нет.")
         return "\n".join(lines)
@@ -447,10 +509,10 @@ def build_queue_keyboard(
         end = start + len(items) - 1
         pagination_row: list[tuple[str, str]] = []
         if page > 0:
-            pagination_row.append(("⬅️", f"menu:queuepage:{page - 1}"))
+            pagination_row.append(("Предыдущие", f"menu:queuepage:{page - 1}"))
         pagination_row.append((f"{start}-{end}/{total_items}", "menu:noop"))
         if page + 1 < total_pages:
-            pagination_row.append(("➡️", f"menu:queuepage:{page + 1}"))
+            pagination_row.append(("Следующие", f"menu:queuepage:{page + 1}"))
         rows.append(pagination_row)
 
     # "Обновить" redraws the page the owner is on, so it reuses the
@@ -458,7 +520,8 @@ def build_queue_keyboard(
     # points* (home, weekly review) use -- that one always opens at page 0,
     # which silently threw an owner working through page 3 back to the top
     # (code review).
-    rows.append([("🔄 Обновить", f"menu:queuepage:{page}"), ("🏠 Домой", "menu:home")])
+    rows.append([("🔄 Обновить", f"menu:queuepage:{page}")])
+    rows.append(navigation_row())
     return _keyboard(rows)
 
 
@@ -502,17 +565,15 @@ def build_queue_item_keyboard(
     ]
     # Back to the page this item was opened from, not to page 0 -- same
     # reason as the "Обновить" button above.
-    rows.append(
-        [("⬅️ К очереди", f"menu:queuepage:{page}"), ("🏠 Домой", "menu:home")]
-    )
+    rows.append(navigation_row(f"menu:queuepage:{page}"))
     return _keyboard(rows)
 
 
 def build_brief_type_text() -> str:
     """Build the brief type-picker screen text (задача L, ТЗ 7.6)."""
     return (
-        "**Собрать бриф**\n\n"
-        "Выбери тип брифа, затем отправь текстом запрос "
+        "**Собрать справку**\n\n"
+        "Выбери тип справки, затем отправь текстом запрос "
         "(название решения, темы или проекта)."
     )
 
@@ -523,11 +584,25 @@ def build_brief_type_keyboard() -> InlineKeyboardMarkup:
         [(_BRIEF_TYPE_BUTTON_LABELS[brief_type], f"menu:brieftype:{brief_type}")]
         for brief_type in BRIEF_TYPES
     ]
-    rows.append([("🏠 Домой", "menu:home")])
+    rows.append(navigation_row("menu:summaries"))
     return _keyboard(rows)
 
 
 _SCREEN_TRUNCATION_SUFFIX = "\n\n… (показаны первые строки, экран обрезан)"
+
+
+def build_rich_menu(text: str, keyboard: InlineKeyboardMarkup) -> InputRichMessage:
+    body = markdown_to_html(normalize_markdown_input(text)).replace("\n", "<br>")
+    content = f"<p>{body}</p>"
+    for row in keyboard.inline_keyboard:
+        buttons = "".join(
+            '<tg-button type="callback_data" '
+            f'data="{escape(button.callback_data or "", quote=True)}" style="link">'
+            f"{escape(button.text)}</tg-button>"
+            for button in row
+        )
+        content += f"<tg-button-row>{buttons}</tg-button-row>"
+    return InputRichMessage(html=content, skip_entity_detection=True)
 
 
 async def render_dashboard(
@@ -575,6 +650,32 @@ async def render_dashboard(
             payload_message = markdown_to_markdown_v2(payload_markdown)
             if len(payload_message) <= TELEGRAM_TEXT_LIMIT:
                 break
+
+    rich_message = build_rich_menu(payload_text, keyboard)
+    try:
+        if target_message_id:
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id, message_id=target_message_id,
+                    rich_message=rich_message, reply_markup=None, parse_mode=None,
+                )
+                session.dashboard_message_id = target_message_id
+                return
+            except TelegramBadRequest as error:
+                description = str(error).lower()
+                if "message is not modified" in description:
+                    session.dashboard_message_id = target_message_id
+                    return
+                if not any(reason in description for reason in (
+                    "message to edit not found", "message can't be edited",
+                    "message cannot be edited",
+                )):
+                    raise
+        sent = await bot.send_rich_message(chat_id=chat_id, rich_message=rich_message)
+        session.dashboard_message_id = sent.message_id
+        return
+    except TelegramBadRequest:
+        logger.warning("Rich menu rejected, using ordinary menu", exc_info=True)
 
     if target_message_id:
         try:
@@ -860,7 +961,7 @@ def build_weekly_review_text(review: WeeklyReview) -> str:
     screen -- no separate pagination here.
     """
     lines = [
-        "**Сводка недели**",
+        "**Обзор недели**",
         "",
         f"**Период:** {review.start.isoformat()} — {review.end.isoformat()}",
         "",
@@ -914,8 +1015,9 @@ def build_weekly_review_keyboard(review: WeeklyReview) -> InlineKeyboardMarkup:
         rows.append(
             [("✅ Подтвердить просмотр", f"menu:weeklyreview:{fingerprint}")]
         )
-    rows.append([("🗂 Очередь целиком", "menu:queue")])
-    rows.append([("🔄 Обновить", "menu:weekly"), ("🏠 Домой", "menu:home")])
+    rows.append([("🗂 Требуют решения", "menu:queue")])
+    rows.append([("🔄 Обновить", "menu:weekly")])
+    rows.append(navigation_row("menu:summaries"))
     return _keyboard(rows)
 
 

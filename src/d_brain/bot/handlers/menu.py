@@ -14,6 +14,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from d_brain.bot.dashboard import (
+    DashboardScreen,
     close_dashboard,
     file_browser_parent_dir,
     get_dashboard_session,
@@ -26,6 +27,7 @@ from d_brain.bot.dashboard import (
     render_home,
     render_queue,
     render_queue_item,
+    render_section,
     render_stats,
     render_weekly_review,
     send_browser_file,
@@ -207,9 +209,10 @@ async def _render_file_directory_or_roots(
 
 
 @router.message(Command("menu"))
-async def cmd_menu(message: Message, bot: Bot) -> None:
+async def cmd_menu(message: Message, bot: Bot, state: FSMContext) -> None:
     """Open or recreate the inline dashboard."""
     settings = get_settings()
+    await state.clear()
     await render_home(
         bot,
         chat_id=message.chat.id,
@@ -219,9 +222,10 @@ async def cmd_menu(message: Message, bot: Bot) -> None:
 
 
 @router.message(Command("files"))
-async def cmd_files(message: Message, bot: Bot) -> None:
+async def cmd_files(message: Message, bot: Bot, state: FSMContext) -> None:
     """Open the file browser root picker."""
     settings = get_settings()
+    await state.clear()
     await render_file_roots(
         bot,
         chat_id=message.chat.id,
@@ -251,7 +255,19 @@ async def handle_menu_callback(
         await query.answer()
         return
 
+    await state.clear()
+
+    if data in {"menu:summaries", "menu:processing", "menu:more", "menu:help"}:
+        await query.answer()
+        await render_section(
+            bot, chat_id=chat_id,
+            section=cast(DashboardScreen, data.removeprefix("menu:")),
+            preferred_message_id=message_id,
+        )
+        return
+
     if data == "menu:home":
+        await query.answer()
         await render_home(
             bot,
             chat_id=chat_id,
@@ -259,10 +275,10 @@ async def handle_menu_callback(
             user_id=query.from_user.id,
             preferred_message_id=message_id,
         )
-        await query.answer()
         return
 
     if data == "menu:stats":
+        await query.answer()
         await render_stats(
             bot,
             chat_id=chat_id,
@@ -270,17 +286,16 @@ async def handle_menu_callback(
             user_id=query.from_user.id,
             preferred_message_id=message_id,
         )
-        await query.answer()
         return
 
     if data == "menu:jobhealth":
+        await query.answer()
         await render_disabled_steps(
             bot,
             chat_id=chat_id,
             vault_path=settings.vault_path,
             preferred_message_id=message_id,
         )
-        await query.answer()
         return
 
     if data.startswith("menu:jobhealthenable:"):
@@ -304,16 +319,17 @@ async def handle_menu_callback(
         return
 
     if data == "menu:files":
+        await query.answer()
         await render_file_roots(
             bot,
             chat_id=chat_id,
             vault_path=settings.vault_path,
             preferred_message_id=message_id,
         )
-        await query.answer()
         return
 
     if data.startswith("menu:filesroot:"):
+        await query.answer()
         root_id = data.removeprefix("menu:filesroot:")
         try:
             await render_file_directory(
@@ -331,20 +347,20 @@ async def handle_menu_callback(
                 preferred_message_id=message_id,
                 notice="Не удалось открыть выбранный раздел.",
             )
-        await query.answer()
         return
 
     if data == "menu:filesroots":
+        await query.answer()
         await render_file_roots(
             bot,
             chat_id=chat_id,
             vault_path=settings.vault_path,
             preferred_message_id=message_id,
         )
-        await query.answer()
         return
 
     if data == "menu:filesrefresh":
+        await query.answer()
         if session.file_root_id is None:
             await render_file_roots(
                 bot,
@@ -363,10 +379,10 @@ async def handle_menu_callback(
                 page=session.file_page,
                 preferred_message_id=message_id,
             )
-        await query.answer()
         return
 
     if data == "menu:filesup":
+        await query.answer()
         if session.file_root_id is None:
             await render_file_roots(
                 bot,
@@ -385,10 +401,10 @@ async def handle_menu_callback(
                 page=0,
                 preferred_message_id=message_id,
             )
-        await query.answer()
         return
 
     if data.startswith("menu:filespage:"):
+        await query.answer()
         if session.file_root_id is None:
             await render_file_roots(
                 bot,
@@ -411,7 +427,6 @@ async def handle_menu_callback(
                 page=page,
                 preferred_message_id=message_id,
             )
-        await query.answer()
         return
 
     if data.startswith("menu:filesentry:"):
@@ -437,6 +452,7 @@ async def handle_menu_callback(
 
         entry = session.file_entries[entry_index]
         if entry.is_directory:
+            await query.answer()
             await _render_file_directory_or_roots(
                 bot,
                 chat_id=chat_id,
@@ -446,9 +462,9 @@ async def handle_menu_callback(
                 page=0,
                 preferred_message_id=message_id,
             )
-            await query.answer()
             return
 
+        await query.answer("Отправляю файл…")
         try:
             file_name = await send_browser_file(
                 bot,
@@ -505,7 +521,7 @@ async def handle_menu_callback(
         return
 
     if data == "menu:process":
-        await query.answer("Запускаю preview...")
+        await query.answer("Показываю разбор без сохранения…")
         await run_interactive_process(message, actor_id=query.from_user.id)
         return
 
@@ -516,25 +532,26 @@ async def handle_menu_callback(
 
     if data == "menu:do":
         await query.answer()
-        await start_do_flow(message, state)
+        await start_do_flow(message, state, menu_message_id=message_id)
         return
 
     if data == "menu:digest":
-        await query.answer("Строю дайджест...")
+        await query.answer("Готовлю сводку дня…")
         await _deliver_daily_digest(message, vault_path=settings.vault_path)
         return
 
     if data == "menu:queue":
+        await query.answer()
         await render_queue(
             bot,
             chat_id=chat_id,
             vault_path=settings.vault_path,
             preferred_message_id=message_id,
         )
-        await query.answer()
         return
 
     if data.startswith("menu:queuepage:"):
+        await query.answer()
         try:
             page = int(data.removeprefix("menu:queuepage:"))
         except ValueError:
@@ -546,7 +563,6 @@ async def handle_menu_callback(
             page=page,
             preferred_message_id=message_id,
         )
-        await query.answer()
         return
 
     if data.startswith("menu:queueitem:"):
@@ -658,13 +674,13 @@ async def handle_menu_callback(
         return
 
     if data == "menu:weekly":
+        await query.answer()
         await render_weekly_review(
             bot,
             chat_id=chat_id,
             vault_path=settings.vault_path,
             preferred_message_id=message_id,
         )
-        await query.answer()
         return
 
     if data.startswith("menu:weeklyreview:"):
@@ -713,26 +729,26 @@ async def handle_menu_callback(
         return
 
     if data == "menu:brief":
+        await query.answer()
         await render_brief_type(
             bot,
             chat_id=chat_id,
             preferred_message_id=message_id,
         )
-        await query.answer()
         return
 
     if data.startswith("menu:brieftype:"):
         brief_type = data.removeprefix("menu:brieftype:")
         if brief_type not in BRIEF_TYPES:
-            await query.answer("Неизвестный тип брифа.", show_alert=True)
+            await query.answer("Неизвестный тип справки.", show_alert=True)
             return
         await query.answer()
-        await start_brief_flow(message, state, brief_type)
+        await start_brief_flow(message, state, brief_type, menu_message_id=message_id)
         return
 
     if data == "menu:close":
-        await close_dashboard(bot, chat_id=chat_id, preferred_message_id=message_id)
         await query.answer("Меню закрыто. Открыть снова: /menu")
+        await close_dashboard(bot, chat_id=chat_id, preferred_message_id=message_id)
         return
 
     await query.answer("Неизвестное действие.", show_alert=False)

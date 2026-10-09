@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 from aiogram import Bot
-from aiogram.types import Chat, Message, User, Voice
+from aiogram.types import Chat, Document, Message, User, Voice
 
 from d_brain.bot.conversations import is_reply_to_bot, reply_context, save_answer
 from d_brain.bot.handlers import do as do_handler
@@ -55,7 +55,7 @@ def test_history_survives_restart_and_follows_selected_branch(tmp_path: Path) ->
     assert restarted.get_stats(42) == {}
 
 
-def test_reply_context_uses_old_discussion_without_unrelated_daily(
+async def test_reply_context_uses_old_discussion_without_unrelated_daily(
     tmp_path: Path,
 ) -> None:
     store = SessionStore(tmp_path)
@@ -65,7 +65,7 @@ def test_reply_context_uses_old_discussion_without_unrelated_daily(
     old = old.model_copy(update={"date": datetime(2026, 10, 6, tzinfo=UTC)})
     followup = message(11, "Доработай", reply=old)
 
-    context = reply_context(followup, tmp_path, 42)
+    context = await reply_context(followup, tmp_path, 42)
 
     assert context is not None
     assert "Вчерашний вопрос" in context
@@ -73,20 +73,22 @@ def test_reply_context_uses_old_discussion_without_unrelated_daily(
     assert "Посторонняя" not in context
 
 
-def test_only_replies_to_this_bot_select_conversation(tmp_path: Path) -> None:
-    assert reply_context(message(1, "Обычный запрос"), tmp_path, 42) is None
+async def test_only_replies_to_this_bot_select_conversation(tmp_path: Path) -> None:
+    assert await reply_context(message(1, "Обычный запрос"), tmp_path, 42) is None
     for sender_id, is_bot in [(42, False), (998, True)]:
         other = message(2, "Другой участник", sender_id=sender_id, is_bot=is_bot)
         followup = message(3, "Ответ", reply=other)
         assert not is_reply_to_bot(followup)
-        assert reply_context(followup, tmp_path, 42) is None
+        assert await reply_context(followup, tmp_path, 42) is None
     assert not (tmp_path / ".sessions").exists()
 
 
-def test_reply_to_unrecorded_answer_keeps_quote_for_next_turn(tmp_path: Path) -> None:
+async def test_reply_to_unrecorded_answer_keeps_quote_for_next_turn(
+    tmp_path: Path,
+) -> None:
     old = message(10, "Ответ до обновления", sender_id=999, is_bot=True)
     followup = message(11, "Продолжи", reply=old)
-    assert "Ответ до обновления" in (reply_context(followup, tmp_path, 42) or "")
+    assert "Ответ до обновления" in (await reply_context(followup, tmp_path, 42) or "")
     sent = message(12, "Новый ответ", sender_id=999, is_bot=True)
     save_answer(followup, sent, tmp_path, 42, "Продолжи", "Новый ответ")
     assert SessionStore(tmp_path).get_conversation(42, 42, 12) == [
@@ -96,13 +98,98 @@ def test_reply_to_unrecorded_answer_keeps_quote_for_next_turn(tmp_path: Path) ->
     ]
 
 
-def test_document_answer_stores_complete_text(tmp_path: Path) -> None:
+async def test_document_answer_stores_complete_text(tmp_path: Path) -> None:
     incoming = message(1, "Подготовь большой отчёт")
     delivered = message(2, None, sender_id=999, is_bot=True)
     complete = "Полный отчёт " * 1000
     save_answer(incoming, delivered, tmp_path, 42, incoming.text or "", complete)
     followup = message(3, "Сократи", reply=delivered)
-    assert complete in (reply_context(followup, tmp_path, 42) or "")
+    assert complete in (await reply_context(followup, tmp_path, 42) or "")
+
+
+async def test_old_html_file_is_downloaded_and_kept_for_next_reply(
+    tmp_path: Path, monkeypatch
+) -> None:
+    old = message(10, None, sender_id=999, is_bot=True).model_copy(
+        update={
+            "document": Document(
+                file_id="report", file_unique_id="report", file_name="report.html"
+            )
+        }
+    )
+    downloads: list[str] = []
+
+    async def download(bot, file):
+        downloads.append(file.file_id)
+        return BytesIO(
+            '<html><head><style>hidden</style></head><body>'
+            '<h1>Анализ проекта</h1><p>Итоги совещаний &amp; решения</p>'
+            '</body></html>'.encode()
+        )
+
+    monkeypatch.setattr(Bot, "download", download)
+    incoming = message(11, "Полный ли анализ?", reply=old)
+    context = await reply_context(incoming, tmp_path, 42)
+    assert context is not None
+    assert "Анализ проекта" in context
+    assert "Итоги совещаний & решения" in context
+    assert "<html>" not in context
+    assert "hidden" not in context
+    assert downloads == ["report"]
+    assert await reply_context(incoming, tmp_path, 42) == context
+    assert downloads == ["report"]
+    sent = message(12, "Проверю историю", sender_id=999, is_bot=True)
+    save_answer(incoming, sent, tmp_path, 42, "Полный ли анализ?", "Проверю историю")
+    next_context = await reply_context(
+        message(13, "Продолжай", reply=sent), tmp_path, 42
+    )
+    assert next_context is not None
+    assert "Анализ проекта" in next_context
+    assert "Полный ли анализ?" in next_context
+    assert "Проверю историю" in next_context
+    assert downloads == ["report"]
+
+
+async def test_saved_history_does_not_download_document(
+    tmp_path: Path, monkeypatch
+) -> None:
+    old = message(10, None, sender_id=999, is_bot=True).model_copy(
+        update={
+            "document": Document(
+                file_id="report", file_unique_id="report", file_name="report.html"
+            )
+        }
+    )
+    SessionStore(tmp_path).save_answer(42, 42, 10, "Исходный вопрос", "Полный ответ")
+
+    async def download(bot, file):
+        pytest.fail("Stored history should be used without downloading")
+
+    monkeypatch.setattr(Bot, "download", download)
+    context = await reply_context(message(11, "Продолжай", reply=old), tmp_path, 42)
+    assert context is not None
+    assert "Исходный вопрос" in context
+    assert "Полный ответ" in context
+
+
+async def test_unreadable_document_does_not_supply_empty_context(
+    tmp_path: Path, monkeypatch
+) -> None:
+    old = message(10, None, sender_id=999, is_bot=True).model_copy(
+        update={
+            "document": Document(
+                file_id="report", file_unique_id="report", file_name="report.html"
+            )
+        }
+    )
+
+    async def download(bot, file):
+        return BytesIO(b"<html><body></body></html>")
+
+    monkeypatch.setattr(Bot, "download", download)
+    with pytest.raises(ValueError, match="не удалось прочитать текст"):
+        await reply_context(message(11, "Продолжай", reply=old), tmp_path, 42)
+    assert SessionStore(tmp_path).get_conversation(42, 42, 10) == []
 
 
 async def test_text_reply_bypasses_capture_classifier(monkeypatch) -> None:
@@ -233,7 +320,7 @@ async def test_reply_to_last_separate_file_restores_whole_discussion(
 
     assert len(delivered) == 2
     followup = message(23, "Все совещания учтены?", reply=delivered[-1])
-    context = reply_context(followup, tmp_path, 42)
+    context = await reply_context(followup, tmp_path, 42)
     assert context is not None
     assert "Подготовь анализ" in context
     assert "Полный анализ" in context

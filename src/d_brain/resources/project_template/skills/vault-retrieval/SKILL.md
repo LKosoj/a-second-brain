@@ -57,11 +57,16 @@ they are relevant to the user's request and allowed by the runtime scope.
 
 - `a-second-brain qmd get` already records access. Do not touch the same note
   again.
-- After reading Markdown directly with `cat`, `sed`, or `rg`, run:
+- Prefer `a-second-brain qmd get <vault-relative-path>` in runtime workflows;
+  it already records access. The following direct-read tracking command is
+  for the project working directory only, when that workflow permits it:
 
   ```bash
   uv run skills/agent-memory/scripts/memory-engine.py touch vault/<file>
   ```
+
+  Do not run this project-relative command from the vault directory or cross
+  a workflow's path/write limits to track access.
 
 ## Runtime recall blocks
 

@@ -27,7 +27,9 @@ from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from conftest import _write_vault_manifest
 
@@ -406,7 +408,7 @@ async def test_handle_menu_callback_queueact_offloads_apply_response_to_a_thread
     )
 
     await asyncio.gather(
-        menu_handler.handle_menu_callback(query, bot=object(), state=object()),
+        menu_handler.handle_menu_callback(query, bot=object(), state=AsyncMock()),
         _tick(order),
     )
 
@@ -455,7 +457,7 @@ async def test_handle_menu_callback_weeklyreview_offloads_mark_reviewed_to_a_thr
     )
 
     await asyncio.gather(
-        menu_handler.handle_menu_callback(query, bot=object(), state=object()),
+        menu_handler.handle_menu_callback(query, bot=object(), state=AsyncMock()),
         _tick(order),
     )
 
@@ -579,8 +581,9 @@ async def test_render_dashboard_truncates_oversized_text_before_editing() -> Non
     )
 
     assert len(edits) == 1
-    assert len(edits[0]["text"]) <= 4096
-    assert edits[0]["reply_markup"] is keyboard
+    assert len(edits[0]["rich_message"].html) < 5000
+    assert edits[0]["reply_markup"] is None
+    assert "menu:home" in edits[0]["rich_message"].html
     assert session.dashboard_message_id == 42
 
 
@@ -605,9 +608,10 @@ async def test_render_dashboard_truncation_accounts_for_markdown_escaping() -> N
     )
 
     assert len(edits) == 1
-    assert len(edits[0]["text"]) <= 4096
-    assert "экран обрезан" in edits[0]["text"]
-    assert edits[0]["reply_markup"] is keyboard
+    assert len(edits[0]["rich_message"].html) < 5000
+    assert "экран обрезан" in edits[0]["rich_message"].html
+    assert edits[0]["reply_markup"] is None
+    assert "menu:home" in edits[0]["rich_message"].html
 
 
 async def test_render_dashboard_truncates_oversized_text_before_sending(
@@ -623,8 +627,12 @@ async def test_render_dashboard_truncates_oversized_text_before_sending(
 
     monkeypatch.setattr(dashboard, "send_text", fake_send_text)
 
+    class FakeBot:
+        async def send_rich_message(self, **kwargs):  # noqa: ANN003
+            raise TelegramBadRequest(method="sendRichMessage", message="Unsupported")
+
     await dashboard.render_dashboard(
-        object(),
+        FakeBot(),
         chat_id=2,
         session=session,
         text="a" * 5000,

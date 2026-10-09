@@ -167,6 +167,7 @@ class SessionStore:
         directory.mkdir(exist_ok=True)
         path = directory / f"{chat_id}.jsonl"
         entry = {
+            "ts": datetime.now().astimezone().isoformat(),
             "message_id": message_id,
             "parent_id": parent_id,
             "question": question,
@@ -189,8 +190,147 @@ class SessionStore:
         current = answers.get(message_id)
         while current is not None:
             turns.append({"role": "assistant", "text": current["answer"]})
-            turns.append({"role": "user", "text": current["question"]})
+            if current["question"]:
+                turns.append({"role": "user", "text": current["question"]})
             if current["quoted_parent"]:
                 turns.append({"role": "assistant", "text": current["quoted_parent"]})
             current = answers.get(current["parent_id"])
         return list(reversed(turns))
+
+    def get_conversation_entries(
+        self, user_id: int, chat_id: int
+    ) -> list[dict[str, Any]]:
+        """Return raw saved records for one user and chat without creating paths."""
+        path = self.sessions_dir / str(user_id) / "conversations" / f"{chat_id}.jsonl"
+        if not path.exists():
+            return []
+        return self._read_entries(path)
+
+    @staticmethod
+    def _conversation_turns(entry: dict[str, Any]) -> list[dict[str, Any]]:
+        """Render one saved record as ordered Telegram turns."""
+        message_id = entry.get("message_id")
+        timestamp = str(entry.get("ts") or "")
+        turns: list[dict[str, Any]] = []
+        quoted_parent = str(entry.get("quoted_parent") or "")
+        question = str(entry.get("question") or "")
+        answer = str(entry.get("answer") or "")
+        if quoted_parent:
+            turns.append(
+                {
+                    "message_id": message_id,
+                    "role": "assistant",
+                    "text": quoted_parent,
+                    "ts": timestamp,
+                }
+            )
+        if question:
+            turns.append(
+                {
+                    "message_id": message_id,
+                    "role": "user",
+                    "text": question,
+                    "ts": timestamp,
+                }
+            )
+        if answer:
+            turns.append(
+                {
+                    "message_id": message_id,
+                    "role": "assistant",
+                    "text": answer,
+                    "ts": timestamp,
+                }
+            )
+        return turns
+
+    def search_conversation_turns(
+        self,
+        user_id: int,
+        query: str,
+        *,
+        before: int = 2,
+        after: int = 2,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Find matching saved turns with bounded context from one branch.
+
+        A context window follows parent links backwards and follows a child only
+        while it is unique. It therefore stops at a fork instead of mixing two
+        Telegram reply branches.
+        """
+        needle = query.casefold().strip()
+        if not needle or limit <= 0:
+            return []
+        before = max(0, before)
+        after = max(0, after)
+        directory = self.sessions_dir / str(user_id) / "conversations"
+        if not directory.exists():
+            return []
+
+        results: list[dict[str, Any]] = []
+        for path in sorted(directory.glob("*.jsonl")):
+            try:
+                chat_id = int(path.stem)
+            except ValueError:
+                continue
+            entries = [
+                entry
+                for entry in self._read_entries(path)
+                if isinstance(entry.get("message_id"), int)
+            ]
+            by_message_id = {entry["message_id"]: entry for entry in entries}
+            children: dict[int, list[dict[str, Any]]] = {}
+            for entry in entries:
+                parent_id = entry.get("parent_id")
+                if isinstance(parent_id, int) and parent_id in by_message_id:
+                    children.setdefault(parent_id, []).append(entry)
+
+            for entry in reversed(entries):
+                matched = next(
+                    (
+                        turn
+                        for turn in self._conversation_turns(entry)
+                        if needle in str(turn["text"]).casefold()
+                    ),
+                    None,
+                )
+                if matched is None:
+                    continue
+
+                earlier: list[dict[str, Any]] = []
+                current = entry
+                for _ in range(before):
+                    parent_id = current.get("parent_id")
+                    parent = by_message_id.get(parent_id)
+                    if parent is None:
+                        break
+                    earlier.append(parent)
+                    current = parent
+                earlier.reverse()
+
+                later: list[dict[str, Any]] = []
+                current = entry
+                for _ in range(after):
+                    successors = children.get(current["message_id"], [])
+                    if len(successors) != 1:
+                        break
+                    current = successors[0]
+                    later.append(current)
+
+                turns: list[dict[str, Any]] = []
+                for context_entry in [*earlier, entry, *later]:
+                    turns.extend(self._conversation_turns(context_entry))
+                results.append(
+                    {
+                        "chat_id": chat_id,
+                        "source_path": path.relative_to(
+                            self.sessions_dir.parent
+                        ).as_posix(),
+                        "matched": matched,
+                        "turns": turns,
+                    }
+                )
+                if len(results) >= limit:
+                    return results
+        return results

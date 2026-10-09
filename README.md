@@ -163,9 +163,11 @@ continues the chain up to that message, without later answers or other
 discussions. Messages without Reply keep their existing behavior; the bot
 does not select a discussion automatically.
 
-Answers sent before this feature was enabled have no recoverable history:
-only the selected message's text or caption is available. For a file without
-a caption, repeat the original question, then reply to the new answer.
+When no saved history exists, the bot uses the selected message's text or
+downloads its attached file and reads the contents, including an HTML report
+without a caption. The extracted text is saved for subsequent replies.
+This allows continuing an older answer, but does not recover conversation
+that is absent from the file itself.
 
 ## Requirements
 

@@ -381,6 +381,7 @@ def main() -> int:
         getattr(settings, "openai_base_url", ""),
         getattr(settings, "openai_model", ""),
         getattr(settings, "tavily_api_key", ""),
+        settings.owner_telegram_id,
     )
     try:
         result = _run_processor_cycle(processor, day, args.mode)

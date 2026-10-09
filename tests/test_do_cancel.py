@@ -22,6 +22,9 @@ class FakeState:
         self.cleared = True
         self.current_state = None
 
+    async def get_data(self) -> dict:
+        return {}
+
 
 class FakeMessage:
     def __init__(self, text: str | None = None) -> None:
