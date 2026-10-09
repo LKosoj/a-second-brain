@@ -99,6 +99,7 @@ from d_brain.services.todoist_projects import (
     TodoistProjectRouter,
 )
 from d_brain.services.vault_lock import VaultWriteLock, vault_write_lock
+from d_brain.services.vault_map import export_vault_map
 
 logger = logging.getLogger(__name__)
 
@@ -2234,6 +2235,7 @@ WORKFLOW:
     def _rebuild_graph(self) -> None:
         """Refresh vault graph artifacts."""
         self._run_uv_script("skills/graph-builder/scripts/analyze.py")
+        export_vault_map(self.vault_path, self._load_graph_stats())
 
     def _load_graph_stats(self) -> dict[str, Any]:
         """Load the latest graph stats from disk."""

@@ -11,7 +11,7 @@ from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, FSInputFile, Message
 
 from d_brain.bot.dashboard import (
     DashboardScreen,
@@ -53,6 +53,7 @@ from d_brain.services.decisions_queue import (
 from d_brain.services.file_browser import FileBrowserError
 from d_brain.services.frontmatter import write_validated_vault_markdown
 from d_brain.services.vault_lock import vault_write_lock
+from d_brain.services.vault_map import export_vault_map
 
 router = Router(name="menu")
 logger = logging.getLogger(__name__)
@@ -326,6 +327,26 @@ async def handle_menu_callback(
             vault_path=settings.vault_path,
             preferred_message_id=message_id,
         )
+        return
+
+    if data == "menu:vaultmap":
+        await query.answer("Собираю карту знаний…")
+        try:
+            path = await asyncio.to_thread(export_vault_map, settings.vault_path)
+            await bot.send_document(
+                chat_id=chat_id,
+                document=FSInputFile(path),
+                parse_mode=None,
+                caption=(
+                    "Карта знаний: названия, описания и связи. "
+                    "Скачайте HTML и откройте в браузере без интернета."
+                ),
+            )
+        except Exception:
+            logger.exception("Failed to build or send vault map")
+            await answer_text(
+                message, "Не удалось отправить карту знаний. Попробуйте ещё раз."
+            )
         return
 
     if data.startswith("menu:filesroot:"):

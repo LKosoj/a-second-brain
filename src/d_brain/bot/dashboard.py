@@ -242,6 +242,7 @@ def build_section_keyboard(section: DashboardScreen) -> InlineKeyboardMarkup:
         ],
         "more": [
             [("📊 Статистика", "menu:stats")],
+            [("🗺 Карта знаний · HTML", "menu:vaultmap")],
             [("⚙️ Автообработка", "menu:jobhealth")],
             [("❓ Справка", "menu:help")],
         ],
@@ -268,7 +269,7 @@ async def render_section(
         ),
         "more": (
             "**Ещё**\n\nСтатистика записей, "
-            "отключённые шаги автообработки и справка."
+            "карта знаний, отключённые шаги автообработки и справка."
         ),
         "help": build_help_text(),
     }[section]
