@@ -30,6 +30,10 @@ def _create_vault(tmp_path: Path, write_vault_manifest) -> Path:
         "daily/2026-07-28.md": "Вчера.\n",
         ".session/handoff.md": "Передача.\n",
     }
+    files["directions.md"] = "Направления и места хранения.\n"
+    for domain in ("family", "hobbies", "finances", "health", "home"):
+        (vault / domain).mkdir()
+        files[f"{domain}/_index.md"] = f"{domain} index.\n"
     for relative, content in files.items():
         (vault / relative).write_text(content, encoding="utf-8")
     write_vault_manifest(

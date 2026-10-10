@@ -7,7 +7,4 @@ tier: active
 ---
 # Finances
 
-- [[accounts]]
-- [[investments]]
-- [[budget]]
-- [[taxes]]
+Здесь перечисляются ссылки на сохранённые заметки этого раздела.

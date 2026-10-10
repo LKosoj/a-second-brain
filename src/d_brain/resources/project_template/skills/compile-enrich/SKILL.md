@@ -70,7 +70,11 @@ way around.
 ### Satellites (pure renderers -- never call a model, and never write except where noted)
 
 - `src/d_brain/services/compiled_enrich_report.py` -- `build_daily_digest`,
-  the owner's daily digest.
+  the owner's daily digest: up to five short page updates, the total number
+  of updated cards, and new `entity-identity` questions requiring an owner
+  answer. Processing budgets, automatic conflicts, carryover questions and
+  revisit suggestions are omitted; days without updates or new questions
+  produce no digest.
 - `src/d_brain/services/compiled_briefs.py` -- `build_brief`, on-demand
   briefs (decision/topic/project).
 - `src/d_brain/services/compiled_why.py` -- `build_why` /

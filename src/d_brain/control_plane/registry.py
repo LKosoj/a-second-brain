@@ -366,6 +366,8 @@ CONTROL_PLANE_REGISTRY: tuple[WorkflowSpec, ...] = (
         allowed_writes=(
             "daily",
             "thoughts",
+            "business", "projects", "family", "hobbies", "finances", "health", "home",
+            "business/network.md", "projects/projects.md",
             "tasks",
             "summaries",
             "compiled",

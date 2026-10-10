@@ -365,15 +365,9 @@ def _write_fact_check_journal(
     purpose: that file is overwritten whole by every enrichment pass, so
     sharing it would erase whichever process ran second.
 
-    ``queue_evictions`` mirrors the field ``compiled_briefings.py``'s own
-    pass journal carries (ТЗ 7.2: "факт вытеснения попадает в дайджест") --
-    this run cannot fold into that pass's ``queue_evictions`` counter (there
-    is no active ``CompileEnrichPass`` here, see ``run_monthly_fact_check``),
-    so it gets its own record here instead, in this run's own journal.
-    ``compiled_enrich_report._with_fact_check_evictions`` reads it back and
-    adds it to the digest's count for the same ``date``, which is what
-    actually closes ТЗ 7.2 for this pass; writing it here without that
-    reader made the whole field an owner-invisible no-op.
+    ``queue_evictions`` is recorded separately because this run has no
+    active ``CompileEnrichPass``. The daily digest omits processing details;
+    the counter remains available in this diagnostic journal.
     """
     payload = {
         "date": today.isoformat(),

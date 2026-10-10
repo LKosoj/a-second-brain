@@ -119,6 +119,12 @@ class ContextPackBuilder:
             ),
             self._file_section("business_index", "business/_index.md", 21),
             self._file_section("projects_index", "projects/_index.md", 20),
+            self._file_section("family_index", "family/_index.md", 20),
+            self._file_section("hobbies_index", "hobbies/_index.md", 20),
+            self._file_section("finances_index", "finances/_index.md", 20),
+            self._file_section("health_index", "health/_index.md", 20),
+            self._file_section("home_index", "home/_index.md", 20),
+            self._file_section("directions", "directions.md", 20),
             self._file_section("handoff", ".session/handoff.md", 30),
             ContextSection(
                 name="listing",

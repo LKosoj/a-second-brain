@@ -91,7 +91,10 @@ Primary project/person identities live in `compiled/projects/` and
 `compiled/people/`; saved thoughts link to those cards instead of becoming
 additional project identities.
 
-| Category | Destination |
+Use the defaults below only when no more specific storage applies in
+`directions.md`. Choose storage by meaning, not by adding new CAPTURE classes.
+
+| Category | Default destination |
 |----------|-------------|
 | `task` | Todoist |
 | `idea` | `thoughts/ideas/` |

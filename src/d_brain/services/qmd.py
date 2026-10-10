@@ -192,6 +192,11 @@ class QmdService:
                 self.vault_path / "finances",
                 "Личные финансы, инвестиции, бюджет, налоги, финансовые цели.",
             ),
+            (
+                "health", self.vault_path / "health",
+                "Здоровье, сон, спорт и самочувствие.",
+            ),
+            ("home", self.vault_path / "home", "Дом, жильё, ремонт и бытовые дела."),
         ]
 
     @staticmethod

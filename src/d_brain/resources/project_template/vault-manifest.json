@@ -17,7 +17,9 @@
     "vault/family",
     "vault/private",
     "vault/hobbies",
-    "vault/finances"
+    "vault/finances",
+    "vault/health",
+    "vault/home"
   ],
   "infrastructure": [
     "vault/.claude",

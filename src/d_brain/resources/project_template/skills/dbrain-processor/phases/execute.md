@@ -17,7 +17,7 @@ runtime; save thoughts, update business/project context, and report exact change
 - `hobbies/<slug>.md` — personal hobbies and interests
 - `finances/<slug>.md` — personal finances, investments, budget
 
-The business, projects, family, hobbies and finances indexes are already in the injected core context.
+The directions-to-storage table in `directions.md` and the business, projects, family, hobbies, finances, health and home indexes are in the injected core context.
 
 ## Task
 
@@ -61,7 +61,7 @@ of `idea`, `learning`, `reflection`, or `project`. Do not invent names or force
 personal learning or blog work into the work direction.
 
 For each entry with classification `idea`, `reflection`, `learning`, or `project`:
-- Create a file in `thoughts/{category}/YYYY-MM-DD-slug.md`
+- First choose its primary storage using the table in `directions.md` and the personal-life rules below. Save it once. Use `thoughts/{category}/YYYY-MM-DD-slug.md` when no more specific storage applies.
 - Use the agent-memory card contract:
   - `description` must read like a retrieval snippet
   - keep tags sparse and meaningful
@@ -94,12 +94,24 @@ For entries with `classification: "crm_update"`:
 
 ### 4a. Update personal-life domains
 
-For entries whose content is about a personal-life area:
-- `family_event`, `family_observation` → `family/events.md`, `family/plans.md`, or `family/notes.md`
-- `hobby`, `interest`, `personal_project_observation` → create or update `hobbies/<slug>.md`
-- `financial_observation`, `investment_observation`, `budget_observation` → create or update `finances/<slug>.md`
-- Prefer updating an existing file. Use the domain's `_index.md` as the linking hub.
-- Do not auto-route to `private/` — `private/` is owner-managed (Obsidian or explicit `/do`), no automatic EXECUTE write path.
+For every captured entry, use its content and the storage table in `directions.md`.
+Do not expect separate classes such as `family_event` or `financial_observation`:
+CAPTURE emits the seven general classes. Meaning and direction select storage,
+independently of class. Personal events, observations and durable plans can be
+saved even when the entry also contains a task; leave Todoist creation to Python.
+For `skip_reason: entry_status:already_processed`, check only whether supported
+personal-life facts are missing from the selected domain. That marker prevents
+repeating tasks and generic processing; it does not prove the personal note
+was saved. Do not repeat a fact already stored with the same source.
+
+- Read the selected domain's `_index.md` and matching notes before writing.
+- Prefer an existing note; otherwise create a descriptively named note under
+  that domain. Save the fact once, with source wikilinks and directions.
+- Update the domain index with a justified link to each saved note.
+- Include these writes in `thoughts_saved` using their actual paths and directions.
+- Articles by other authors are learning, not facts about the owner's life.
+  Corporate budgets are work, not the owner's finances.
+- Do not automatically write to `private/`; explicit owner requests govern it.
 
 ### 5. Build links
 

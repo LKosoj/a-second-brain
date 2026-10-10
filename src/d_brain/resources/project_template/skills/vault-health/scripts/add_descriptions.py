@@ -211,6 +211,10 @@ def generate_description(rel_path: str, content: str, fm: dict) -> str | None:
             return truncate(para)
         return f"Goal: {Path(rel_path).stem.replace('-', ' ')}"
 
+    if rel_path.startswith(("health/", "home/")):
+        para = extract_first_paragraph(get_body_after_frontmatter(content))
+        return truncate(para) if para else Path(rel_path).stem.replace("-", " ")
+
     # Family
     if rel_path.startswith("family/"):
         body = get_body_after_frontmatter(content)
