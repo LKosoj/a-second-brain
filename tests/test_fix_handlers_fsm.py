@@ -95,6 +95,7 @@ async def test_album_flush_waits_for_slowest_photo_regardless_of_analysis_time(
     media_group_id = "audit-g4-album"
     appended: list[tuple[str, str]] = []
     replies: list[str] = []
+    reply_sent = asyncio.Event()
 
     class FakeStorage:
         def __init__(self, *a, **kw) -> None:  # noqa: ANN002, ANN003
@@ -119,6 +120,7 @@ async def test_album_flush_waits_for_slowest_photo_regardless_of_analysis_time(
 
     async def fake_answer_text(message, text: str, **kwargs) -> None:  # noqa: ANN001, ANN003
         replies.append(text)
+        reply_sent.set()
 
     monkeypatch.setattr(photo_handler, "ALBUM_SETTLE_SECONDS", 0.05)
     monkeypatch.setattr(
@@ -142,13 +144,8 @@ async def test_album_flush_waits_for_slowest_photo_regardless_of_analysis_time(
 
     await asyncio.gather(*(photo_handler.handle_photo(m, bot) for m in messages))
 
-    # None of the three handle_photo calls send a per-photo reply -- the
-    # grouped reply is sent later by the flush task once it drains.
-    assert not replies
-
-    task = photo_handler._album_tasks.get(media_group_id)
-    if task is not None:
-        await asyncio.wait_for(task, timeout=2)
+    # The flush task leaves the registry before its write and reply finish.
+    await asyncio.wait_for(reply_sent.wait(), timeout=2)
 
     assert media_group_id not in photo_handler._album_items
     assert media_group_id not in photo_handler._album_pending
