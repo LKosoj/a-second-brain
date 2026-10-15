@@ -251,6 +251,7 @@ class CliProcessor:
         openai_model: str = "",
         tavily_api_key: str = "",
         owner_telegram_id: int = 0,
+        recall_planner_disable_thinking: bool = False,
     ) -> None:
         self.vault_path = Path(vault_path)
         self.todoist_api_key = todoist_api_key
@@ -262,11 +263,13 @@ class CliProcessor:
         self._openai_model = openai_model.strip()
         self.tavily_api_key = tavily_api_key.strip()
         self.owner_telegram_id = owner_telegram_id
+        self._recall_planner_disable_thinking = recall_planner_disable_thinking
         self._recall_planner_config = RecallPlannerConfig(
             model=self._openai_model,
             api_key=self._openai_api_key,
             base_url=self._openai_base_url,
             language=self.content_language,
+            disable_thinking=self._recall_planner_disable_thinking,
         )
         self._project_runner = CliRunner(self.vault_path.parent, ai_cli)
         self._assistant_runner = CliRunner(self.vault_path, ai_cli)

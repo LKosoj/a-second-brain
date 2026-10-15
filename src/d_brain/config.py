@@ -34,6 +34,18 @@ class Settings(BaseSettings):
         validation_alias="MODEL",
         description="Model name used by the recall planner helper",
     )
+    recall_planner_disable_thinking: bool = Field(
+        default=False,
+        description=(
+            "Whether to send extra_body thinking:{\"type\":\"disabled\"} "
+            "on recall planner requests. 1 = send it (provider skips its "
+            "thinking step before answering, if it supports the knob); "
+            "0 = do not send extra_body at all, leaving thinking control "
+            "to the provider default. Honoured only when the provider "
+            "exposes the corresponding knob through the OpenAI-compatible "
+            "API."
+        ),
+    )
     tavily_api_key: str = Field(
         default="",
         description="Tavily Extract API key for hard-to-read web pages",

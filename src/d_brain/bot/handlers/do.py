@@ -202,6 +202,8 @@ async def process_request(message: Message, prompt: str, user_id: int = 0) -> No
         getattr(settings, "openai_base_url", ""),
         getattr(settings, "openai_model", ""),
         getattr(settings, "tavily_api_key", ""),
+        0,
+        getattr(settings, "recall_planner_disable_thinking", False),
     )
 
     async def run_with_progress() -> dict[str, object]:

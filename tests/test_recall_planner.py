@@ -652,3 +652,55 @@ def test_build_qmd_recall_block_uses_planner_history_scope_for_deep_recall(
     ]
     assert "History scope: year" in block
     assert "Analyze history from: 2025-04-01" in block
+
+
+@pytest.mark.parametrize(
+    "disable_thinking, expect_extra_body",
+    [
+        (False, "absent"),
+        (True, {"thinking": {"type": "disabled"}}),
+    ],
+)
+def test_plan_qmd_recall_extra_body_thinking(
+    disable_thinking: bool,
+    expect_extra_body: object,
+) -> None:
+    """Pass extra_body thinking:disabled only when the flag is set."""
+    captured: dict[str, object] = {}
+
+    def fake_create(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"use_recall": false, "query": "", "reason": "x"}',
+                    ),
+                ),
+            ],
+        )
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create)),
+    )
+    config = RecallPlannerConfig(
+        model="test-model",
+        api_key="key",
+        base_url="https://api.test/v1",
+        language="ru",
+        disable_thinking=disable_thinking,
+    )
+
+    plan_qmd_recall(
+        "тест",
+        purpose="question",
+        config=config,
+        client=client,
+    )
+
+    actual = captured.get("extra_body", "absent")
+    assert actual == expect_extra_body
+    # Common shape is preserved either way.
+    assert captured["model"] == "test-model"
+    assert captured["temperature"] == 0
+    assert captured["response_format"] == {"type": "json_object"}
