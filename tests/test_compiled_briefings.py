@@ -8814,6 +8814,35 @@ def test_compiled_briefings_verify_prompt_has_final_merged_page(
     assert "contradictory or ambiguous source statements" in verify_prompt
 
 
+def test_compiled_briefings_verify_does_not_duplicate_large_claim_ledger(
+    tmp_path: Path,
+) -> None:
+    service = _compiled_service(tmp_path / "vault")
+    old_claim = ("Подтверждённый факт проекта. " * 24000).strip()
+    page = _full_compiled_page_text(
+        shaped_rows=[("2026-07-01", "thoughts/idea.md", old_claim)],
+        open_loops_rows=[("2026-07-01", "Уточнить срок проекта.", "")],
+    )
+    existing_claims = service._existing_claims_catalog(page)
+    assert len(page) + len(existing_claims) > 1048576
+
+    prompt = service._build_verify_prompt(
+        claims=[{"text": "Новый факт проекта.", "kind": "fact"}],
+        source_rel_path="daily/2026-08-05.md",
+        source_excerpt="Новый факт проекта.",
+        candidate_payload={"claims": [{"text": "Новый факт проекта."}]},
+        candidate_markdown=page,
+        existing_claims=existing_claims,
+    )
+
+    assert len(prompt) < 1048576
+    assert prompt.count(old_claim) == 1
+    assert existing_claims in prompt
+    assert "Уточнить срок проекта." in prompt
+    assert "[CANDIDATE_PAGE_MARKDOWN]" in prompt
+    assert old_claim in page
+
+
 def test_compiled_briefings_verify_majority_reject_writes_flagged_page(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

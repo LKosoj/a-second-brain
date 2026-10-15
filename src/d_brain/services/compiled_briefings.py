@@ -8666,6 +8666,14 @@ class CompiledBriefingService:
         candidate_markdown: str = "",
         existing_claims: str = "[]",
     ) -> str:
+        candidate_markdown = self._replace_section(
+            candidate_markdown,
+            "Sources That Shaped This Page",
+            [
+                "Existing claims are listed in EXISTING_VERIFIED_CLAIMS; "
+                "new claims are listed in CANDIDATE_PAGE_JSON and CLAIMS."
+            ],
+        )
         claims_payload = [
             {"index": index, "text": claim["text"]}
             for index, claim in enumerate(claims)
