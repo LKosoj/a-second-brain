@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Атлас · Карта знаний</title>
+<style>
+:root{color-scheme:light;--paper:#f4f1e9;--ink:#253b37;--line:#d4d8cd;--accent:#b64e30;--muted:#63756e}
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 "Trebuchet MS",sans-serif}
+header{padding:24px 32px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:20px}
+h1{font:normal 34px Georgia,serif;margin:0;letter-spacing:-1px}header p{margin:0;color:var(--muted);font-size:13px}
+.layout{display:grid;grid-template-columns:300px minmax(0,1fr);min-height:calc(100vh - 100px)}
+aside{border-right:1px solid var(--line);padding:24px;overflow:auto;max-height:calc(100vh - 100px)}
+label,.eyebrow{display:block;font-size:11px;text-transform:uppercase;letter-spacing:1.8px;color:var(--muted);margin-bottom:9px}
+input{width:100%;padding:12px;background:#fffdf7;border:1px solid var(--line);border-radius:4px;color:var(--ink);font:inherit;margin-bottom:20px}
+button{font:inherit;color:inherit;cursor:pointer;border:0;background:none;text-align:left}button:focus-visible,summary:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.note-button{display:block;width:100%;padding:7px 9px;border-radius:3px;overflow-wrap:anywhere}.note-button:hover{background:#e6e8dd}.note-button[aria-current=true]{background:var(--ink);color:var(--paper)}
+details{margin:5px 0}summary{cursor:pointer;color:var(--muted);padding:5px 0;overflow-wrap:anywhere}.branch{padding-left:12px;border-left:1px solid var(--line)}
+main{padding:32px 40px;min-width:0}h2{font:normal 30px Georgia,serif;margin:0 0 8px;overflow-wrap:anywhere}
+.path{color:var(--muted);font-size:12px;overflow-wrap:anywhere}.description{max-width:850px;margin:22px 0;font-size:17px;white-space:pre-wrap;overflow-wrap:anywhere}
+.graph{background:#eeeee4;border:1px solid var(--line);border-radius:6px;margin:24px 0 12px;overflow:hidden}
+svg{display:block;width:100%;height:auto;max-height:580px}svg text{font:12px "Trebuchet MS",sans-serif;fill:var(--ink)}.node{cursor:pointer}.node:hover circle{stroke:var(--accent);stroke-width:3}
+.legend{font-size:12px;color:var(--muted);margin-bottom:24px}.columns{display:grid;grid-template-columns:1fr 1fr;gap:28px;border-top:1px solid var(--line);padding-top:24px}
+h3{font:normal 21px Georgia,serif;margin:0 0 12px}.links{padding:0;list-style:none;margin:0}.links li{margin-bottom:6px}.links button{padding:7px 10px;border-left:2px solid var(--accent);width:100%;overflow-wrap:anywhere}.links button:hover{background:#e6e8dd}
+.empty{color:var(--muted)}footer{margin-top:32px;color:var(--muted);font-size:12px}
+@media(max-width:760px){header{padding:18px;display:block}header p{margin-top:8px}.layout{grid-template-columns:1fr}aside{max-height:320px;border-right:0;border-bottom:1px solid var(--line);padding:18px}main{padding:24px 18px}.columns{grid-template-columns:1fr}h2{font-size:25px}}
+</style>
+</head>
+<body>
+<header><h1>Атлас <span style="color:var(--accent)">/</span> карта знаний</h1><p id="stats"></p></header>
+<div class="layout"><aside><label for="search">Найти заметку</label><input id="search" type="search" placeholder="Название или описание"><nav id="tree" aria-label="Заметки"></nav></aside>
+<main><div class="eyebrow">Выбранная заметка</div><h2 id="title">Выберите заметку</h2><div id="path" class="path"></div><p id="description" class="description"></p>
+<div class="graph"><svg id="graph" viewBox="0 0 900 600" role="img" aria-label="Связи выбранной заметки"></svg></div>
+<div id="legend" class="legend"></div>
+<div class="columns"><section><h3>Ссылается на <span id="out-count"></span></h3><ul id="out" class="links"></ul></section><section><h3>На неё ссылаются <span id="in-count"></span></h3><ul id="in" class="links"></ul></section></div>
+<footer>Локальный снимок базы. Здесь сохранены названия, описания и ссылки; полные тексты заметок и вложения не включены.</footer>
+</main></div>
+<script id="map-data" type="application/json">__VAULT_MAP_DATA__</script>
+<script>
+'use strict';
+const data=JSON.parse(document.getElementById('map-data').textContent);
+const byId=new Map(data.notes.map(n=>[n.id,n])),incoming=new Map(),el=id=>document.getElementById(id);
+for(const [source,targets] of Object.entries(data.links))for(const target of targets){if(!incoming.has(target))incoming.set(target,[]);incoming.get(target).push(source)}
+let selected=null;
+el('stats').textContent=`${data.notes.length.toLocaleString('ru')} заметок · снимок ${new Date(data.built).toLocaleString('ru')}`;
+function button(note){const b=document.createElement('button');b.className='note-button';b.textContent=note.title;b.dataset.note=note.id;b.setAttribute('aria-current',String(note.id===selected));b.onclick=()=>select(note.id);return b}
+function tree(){const query=el('search').value.trim().toLocaleLowerCase('ru');const root={folders:new Map(),notes:[]};
+ const visible=data.notes.filter(n=>`${n.title} ${n.path} ${n.description}`.toLocaleLowerCase('ru').includes(query));
+ for(const note of visible){let folder=root;for(const part of note.path.split('/').slice(0,-1)){if(!folder.folders.has(part))folder.folders.set(part,{folders:new Map(),notes:[]});folder=folder.folders.get(part)}folder.notes.push(note)}
+ el('tree').replaceChildren();
+ function render(folder,parent){for(const [name,child] of [...folder.folders].sort((a,b)=>a[0].localeCompare(b[0],'ru'))){const d=document.createElement('details');d.open=Boolean(query);const s=document.createElement('summary');s.textContent=name;const branch=document.createElement('div');branch.className='branch';render(child,branch);d.append(s,branch);parent.append(d)}for(const note of folder.notes.sort((a,b)=>a.title.localeCompare(b.title,'ru')))parent.append(button(note))}
+ render(root,el('tree'));if(!visible.length)el('tree').textContent='Совпадений нет';
+}
+function list(id,ids){el(id).replaceChildren();const notes=ids.map(key=>byId.get(key)).filter(Boolean).sort((a,b)=>a.title.localeCompare(b.title,'ru'));el(id+'-count').textContent=`(${notes.length})`;
+ for(const note of notes){const li=document.createElement('li');li.append(button(note));el(id).append(li)}if(!notes.length){const li=document.createElement('li');li.className='empty';li.textContent='Нет ссылок';el(id).append(li)}}
+const NS='http://www.w3.org/2000/svg';
+function shape(tag,attrs,text){const e=document.createElementNS(NS,tag);for(const [key,value] of Object.entries(attrs))e.setAttribute(key,String(value));if(text!==undefined)e.textContent=text;return e}
+function graph(id,out,ins){const svg=el('graph');svg.replaceChildren();const neighbors=[...new Set([...out,...ins])].filter(key=>byId.has(key)&&key!==id);const shown=neighbors.slice(0,36);
+ el('legend').textContent=neighbors.length>shown.length?`Показаны ${shown.length} из ${neighbors.length} соседей. Все связи — в списках ниже.`:'Связи выбранной заметки. Нажмите на соседнюю заметку, чтобы перейти к ней.';
+ function node(key,x,y,center=false){const n=byId.get(key),g=shape('g',{'class':'node',role:'button',tabindex:0,'aria-label':n.title});g.append(shape('circle',{cx:x,cy:y,r:center?19:9,fill:center?'#b64e30':'#253b37'}));g.append(shape('text',{x,y:y+(center?40:23),'text-anchor':'middle'},n.title.length>25?n.title.slice(0,24)+'…':n.title));g.append(shape('title',{},n.title));g.onclick=()=>select(key);g.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();select(key)}};svg.append(g)}
+ shown.forEach((key,i)=>{const angle=2*Math.PI*i/shown.length-Math.PI/2,ring=shown.length>18&&i%2===0?0.67:1,x=450+330*ring*Math.cos(angle),y=285+220*ring*Math.sin(angle);svg.append(shape('line',{x1:450,y1:285,x2:x,y2:y,stroke:out.includes(key)?'#b64e30':'#98aaa2','stroke-width':1.4}));node(key,x,y)});node(id,450,285,true);
+}
+function select(id){const note=byId.get(id);if(!note)return;selected=id;el('title').textContent=note.title;el('path').textContent=note.path;el('description').textContent=note.description||'Описание не задано.';const out=(data.links[id]||[]).filter(key=>byId.has(key)),ins=incoming.get(id)||[];list('out',out);list('in',ins);graph(id,out,ins);for(const b of document.querySelectorAll('[data-note]'))b.setAttribute('aria-current',String(b.dataset.note===id))}
+el('search').addEventListener('input',tree);tree();if(data.notes.length)select(byId.has('MEMORY')?'MEMORY':data.notes[0].id);else{el('description').textContent='В базе пока нет заметок.';el('graph').parentElement.hidden=true}
+</script>
+</body></html>

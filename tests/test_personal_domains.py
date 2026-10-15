@@ -23,7 +23,9 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE_ROOT = REPO_ROOT / "src/d_brain/resources"
 
-NEW_DOMAINS: tuple[str, ...] = ("family", "private", "hobbies", "finances")
+NEW_DOMAINS: tuple[str, ...] = (
+    "family", "private", "hobbies", "finances", "health", "home",
+)
 
 
 def _vault_manifest_paths() -> tuple[Path, ...]:

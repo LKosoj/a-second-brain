@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 
@@ -479,7 +480,7 @@ async def test_handle_menu_callback_queueact_mismatched_fingerprint_blocks_actio
         f"menu:queueact:0:{stale_fingerprint}:keep_existing", chat_id, message_id=42
     )
 
-    await menu_handler.handle_menu_callback(query, bot=object(), state=object())
+    await menu_handler.handle_menu_callback(query, bot=object(), state=AsyncMock())
 
     assert apply_calls == []
     assert render_calls == [menu_handler._QUEUE_ITEM_STALE_MESSAGE]
@@ -524,7 +525,7 @@ async def test_handle_menu_callback_queueact_matching_fingerprint_applies_respon
         f"menu:queueact:0:{fingerprint}:keep_existing", chat_id, message_id=42
     )
 
-    await menu_handler.handle_menu_callback(query, bot=object(), state=object())
+    await menu_handler.handle_menu_callback(query, bot=object(), state=AsyncMock())
 
     assert apply_calls == [(Path("vault"), item, "keep_existing")]
     assert render_calls == ["Готово."]
@@ -575,7 +576,7 @@ async def test_handle_menu_callback_queueact_file_not_found_shows_stale_not_cras
         f"menu:queueact:0:{fingerprint}:reject", chat_id, message_id=42
     )
 
-    await menu_handler.handle_menu_callback(query, bot=object(), state=object())
+    await menu_handler.handle_menu_callback(query, bot=object(), state=AsyncMock())
 
     assert render_calls == []
     assert query.answer_calls == [(menu_handler._QUEUE_ITEM_STALE_MESSAGE, True)]
@@ -624,7 +625,7 @@ async def test_handle_menu_callback_weekly_renders_weekly_review_screen(
 
     query = FakeCallbackQuery("menu:weekly", chat_id, message_id=42)
 
-    await menu_handler.handle_menu_callback(query, bot=object(), state=object())
+    await menu_handler.handle_menu_callback(query, bot=object(), state=AsyncMock())
 
     assert render_calls == [
         {
@@ -668,7 +669,7 @@ async def test_handle_menu_callback_weeklyreview_no_open_screen_blocks_gracefull
 
     query = FakeCallbackQuery("menu:weeklyreview:deadbeef", chat_id, message_id=42)
 
-    await menu_handler.handle_menu_callback(query, bot=object(), state=object())
+    await menu_handler.handle_menu_callback(query, bot=object(), state=AsyncMock())
 
     assert mark_calls == []
     assert render_calls == []
@@ -712,7 +713,7 @@ async def test_handle_menu_callback_weeklyreview_mismatched_fingerprint_blocks_a
 
     query = FakeCallbackQuery("menu:weeklyreview:stalefp0", chat_id, message_id=42)
 
-    await menu_handler.handle_menu_callback(query, bot=object(), state=object())
+    await menu_handler.handle_menu_callback(query, bot=object(), state=AsyncMock())
 
     assert mark_calls == []
     assert render_calls == [{"notice": menu_handler._WEEKLY_REVIEW_STALE_MESSAGE}]
@@ -759,7 +760,7 @@ async def test_handle_menu_callback_weeklyreview_matching_fingerprint_marks_revi
         f"menu:weeklyreview:{fingerprint}", chat_id, message_id=42
     )
 
-    await menu_handler.handle_menu_callback(query, bot=object(), state=object())
+    await menu_handler.handle_menu_callback(query, bot=object(), state=AsyncMock())
 
     assert mark_calls == [(Path("vault"), rel_path)]
     assert render_calls == [{"notice": "Отмечено как просмотренное."}]
@@ -807,7 +808,7 @@ async def test_queue_action_write_failure_tells_the_owner_instead_of_hanging(
         f"menu:queueact:0:{fingerprint}:reject", chat_id, message_id=42
     )
 
-    await menu_handler.handle_menu_callback(query, bot=object(), state=object())
+    await menu_handler.handle_menu_callback(query, bot=object(), state=AsyncMock())
 
     assert render_calls == []
     assert query.answer_calls == [(menu_handler._QUEUE_ACTION_FAILED_MESSAGE, True)]
@@ -849,7 +850,7 @@ async def test_weekly_review_mark_failure_tells_the_owner_instead_of_hanging(
         f"menu:weeklyreview:{fingerprint}", chat_id, message_id=42
     )
 
-    await menu_handler.handle_menu_callback(query, bot=object(), state=object())
+    await menu_handler.handle_menu_callback(query, bot=object(), state=AsyncMock())
 
     assert render_calls == []
     assert query.answer_calls == [(menu_handler._QUEUE_ACTION_FAILED_MESSAGE, True)]
@@ -898,7 +899,7 @@ async def test_queue_redraw_failure_still_confirms_the_applied_decision(
         f"menu:queueact:0:{fingerprint}:reject", chat_id, message_id=42
     )
 
-    await menu_handler.handle_menu_callback(query, bot=object(), state=object())
+    await menu_handler.handle_menu_callback(query, bot=object(), state=AsyncMock())
 
     assert applied == ["reject"]
     assert query.answer_calls == [(menu_handler._SCREEN_REDRAW_FAILED_MESSAGE, True)]
@@ -941,7 +942,7 @@ async def test_weekly_review_redraw_failure_still_confirms_the_applied_mark(
         f"menu:weeklyreview:{fingerprint}", chat_id, message_id=42
     )
 
-    await menu_handler.handle_menu_callback(query, bot=object(), state=object())
+    await menu_handler.handle_menu_callback(query, bot=object(), state=AsyncMock())
 
     assert marked == [rel_path]
     assert query.answer_calls == [(menu_handler._SCREEN_REDRAW_FAILED_MESSAGE, True)]
@@ -992,7 +993,7 @@ async def test_handle_menu_callback_queueitem_mismatched_fingerprint_refuses_to_
         f"menu:queueitem:0:{stale_fingerprint}", chat_id, message_id=42
     )
 
-    await menu_handler.handle_menu_callback(query, bot=object(), state=object())
+    await menu_handler.handle_menu_callback(query, bot=object(), state=AsyncMock())
 
     assert rendered == []
     assert query.answer_calls == [(menu_handler._QUEUE_ITEM_STALE_MESSAGE, True)]
@@ -1030,7 +1031,7 @@ async def test_handle_menu_callback_queueitem_matching_fingerprint_opens_the_ite
         f"menu:queueitem:0:{queue_item_fingerprint(item)}", chat_id, message_id=42
     )
 
-    await menu_handler.handle_menu_callback(query, bot=object(), state=object())
+    await menu_handler.handle_menu_callback(query, bot=object(), state=AsyncMock())
 
     assert rendered == [0]
     assert query.answer_calls == [(None, False)]
@@ -1084,7 +1085,7 @@ async def test_handle_menu_callback_filesrefresh_survives_a_folder_that_moved(
     query = FakeCallbackQuery("menu:filesrefresh", chat_id, message_id=42)
 
     await menu_handler.handle_menu_callback(
-        query, bot=FakeBrowserBot(), state=object()
+        query, bot=FakeBrowserBot(), state=AsyncMock()
     )
 
     assert query.answer_calls == [(None, False)]
@@ -1119,9 +1120,11 @@ async def test_handle_menu_callback_filesentry_answers_a_failed_telegram_send(
     )
     query = FakeCallbackQuery("menu:filesentry:0", chat_id, message_id=42)
 
-    await menu_handler.handle_menu_callback(query, bot=bot, state=object())
+    await menu_handler.handle_menu_callback(query, bot=bot, state=AsyncMock())
 
-    assert query.answer_calls == [("Не удалось отправить файл.", True)]
+    assert query.answer_calls == [
+        ("Отправляю файл…", False), ("Не удалось отправить файл.", True),
+    ]
 
 
 async def test_handle_menu_callback_filesentry_sent_file_is_not_reported_as_a_failure(
@@ -1150,7 +1153,10 @@ async def test_handle_menu_callback_filesentry_sent_file_is_not_reported_as_a_fa
     )
     query = FakeCallbackQuery("menu:filesentry:0", chat_id, message_id=42)
 
-    await menu_handler.handle_menu_callback(query, bot=bot, state=object())
+    await menu_handler.handle_menu_callback(query, bot=bot, state=AsyncMock())
 
     assert len(bot.sent) == 1
-    assert query.answer_calls == [(menu_handler._FILE_SENT_REDRAW_FAILED_MESSAGE, True)]
+    assert query.answer_calls == [
+        ("Отправляю файл…", False),
+        (menu_handler._FILE_SENT_REDRAW_FAILED_MESSAGE, True),
+    ]

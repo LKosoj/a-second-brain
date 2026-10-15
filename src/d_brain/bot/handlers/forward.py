@@ -13,6 +13,7 @@ from d_brain.services.link_summary import (
     format_link_summary_message,
 )
 from d_brain.services.qmd import QmdService
+from d_brain.services.secrets import scrub_secrets
 from d_brain.services.session import SessionStore
 from d_brain.services.source_links import (
     build_telegram_source_info,
@@ -110,10 +111,17 @@ async def handle_forward(message: Message) -> None:
                 summaries=[],
                 youtube_summaries=[],
             )
+        content, scrub_count = scrub_secrets(result.content)
+        if scrub_count:
+            logger.info(
+                "scrub_secrets: %d replacement(s) in %s",
+                scrub_count,
+                f"forward:{source_name}",
+            )
         msg_type = f"[forward from: {source_name}]"
         await asyncio.to_thread(
             storage.append_to_daily,
-            result.content,
+            content,
             timestamp,
             msg_type,
             source=source,
@@ -125,7 +133,7 @@ async def handle_forward(message: Message) -> None:
         session.append(
             message.from_user.id,
             "forward",
-            text=result.content,
+            text=content,
             youtube_urls=[item.url for item in result.transcripts],
             source=source_name,
             msg_id=message.message_id,

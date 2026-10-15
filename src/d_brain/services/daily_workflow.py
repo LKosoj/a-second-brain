@@ -104,6 +104,7 @@ class DailyWorkflow:
                     target_day,
                 )
                 if mode == SCHEDULED_MODE:
+                    self._learn_from_conversations(target_day)
                     self._host._rebuild_graph()
                     self._host._refresh_qmd_index()
                 return self._empty_result(mode)
@@ -176,6 +177,15 @@ class DailyWorkflow:
             phase_name="execute",
             retry_on_parse_error=False,
         )
+        self._host._reconcile_capture_todoist_tasks(capture_data, execute_data)
+        pending_count = len(self._host._json_dict_list(execute_data, "tasks_pending"))
+        execute_data["entry_counts"] = {
+            "reviewed": len(self._host._json_dict_list(capture_data, "entries")),
+            "processed": max(
+                0,
+                self._host._count_processed_entries(capture_data) - pending_count,
+            ),
+        }
         self._host._write_session_json("execute.json", execute_data)
         self._host._normalize_saved_thoughts(execute_data, day=day)
         return execute_data
@@ -194,9 +204,16 @@ class DailyWorkflow:
         report = self._host._run_vault_prompt(self._host._build_reflect_prompt(day))
         self._host._compact_handoff_file()
         self._host._write_reflect_daily_block(day, execute_data)
+        self._learn_from_conversations(day)
         self._host._refresh_qmd_index()
         return {
             "report": self._host._normalize_owner_report_markdown(report),
             "processed_entries": processed_entries,
             "mode": SCHEDULED_MODE,
         }
+
+    def _learn_from_conversations(self, day: date) -> None:
+        try:
+            self._host._learn_from_conversations(day)
+        except Exception:
+            logger.exception("Conversation learning failed for %s", day)

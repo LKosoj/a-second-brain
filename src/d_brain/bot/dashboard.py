@@ -1,13 +1,22 @@
 """Inline dashboard rendering and state for the Telegram bot."""
 
+import asyncio
 import hashlib
+import logging
 from dataclasses import dataclass, field
 from datetime import date
+from html import escape
 from pathlib import Path
-from typing import Literal, TypedDict
+from typing import Any, Literal, TypedDict
 
 from aiogram import Bot
-from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import (
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputRichMessage,
+)
 
 from d_brain.bot.replies import send_text
 from d_brain.services.compiled_briefs import BRIEF_TYPES
@@ -26,11 +35,21 @@ from d_brain.services.file_browser import (
     BrowserRoot,
     FileBrowserService,
 )
+from d_brain.services.processor import (
+    JOB_HEALTH_DISABLE_THRESHOLD,
+    cycle_step_label,
+    load_job_health,
+    save_job_health,
+)
 from d_brain.services.session import SessionStore
 from d_brain.services.telegram_markup import (
+    TELEGRAM_TEXT_LIMIT,
+    markdown_to_html,
     markdown_to_markdown_v2,
     normalize_markdown_input,
+    truncate_plain_text_for_edit,
 )
+from d_brain.services.vault_lock import vault_write_lock
 
 DashboardScreen = Literal[
     "home",
@@ -41,7 +60,15 @@ DashboardScreen = Literal[
     "queue_item",
     "brief_type",
     "weekly",
+    "jobhealth",
+    "summaries",
+    "processing",
+    "more",
+    "help",
+    "do_input",
+    "brief_input",
 ]
+logger = logging.getLogger(__name__)
 CAPTURE_TYPES: tuple[str, ...] = ("voice", "text", "photo", "document", "forward")
 TYPE_META: tuple[tuple[str, str, str], ...] = (
     ("voice", "🎤", "Голосовые"),
@@ -115,7 +142,7 @@ def build_help_text() -> str:
         "/help — эта справка\n"
         "/stats — статистика по записям\n"
         "/files — файловый браузер vault\n"
-        "/process — быстрый preview без записи\n"
+        "/process — показать разбор без сохранения\n"
         "/process_full — полный цикл с записью\n"
         "\n"
         "_/start теперь только показывает справку, "
@@ -126,7 +153,6 @@ def build_help_text() -> str:
 def build_home_text(vault_path: Path | str, user_id: int) -> str:
     """Build the dashboard home summary."""
     stats = _collect_usage_stats(vault_path, user_id)
-    today = date.today().isoformat()
 
     if stats["today_total"] == 0:
         today_line = "Сегодня записей пока нет."
@@ -141,11 +167,9 @@ def build_home_text(vault_path: Path | str, user_id: int) -> str:
 
     return (
         "**d-brain**\n\n"
-        f"**Дата:** {today}\n"
-        f"{today_line}\n"
-        f"**За 7 дней:** {stats['week_total']}\n\n"
-        "Выбери действие ниже.\n"
-        "_/help — команды и правила использования._"
+        "Сохраняй мысли голосом или текстом — просто отправь сообщение.\n\n"
+        f"{today_line}\n\n"
+        "Выбери, что сделать."
     )
 
 
@@ -176,27 +200,85 @@ def build_home_keyboard() -> InlineKeyboardMarkup:
     """Build the main inline dashboard keyboard."""
     return _keyboard(
         [
-            [
-                ("📊 Статистика", "menu:stats"),
-                ("📁 Файлы", "menu:files"),
-            ],
-            [
-                ("🔎 Превью", "menu:process"),
-                ("⚙️ Обработать", "menu:processfull"),
-            ],
-            [
-                ("✨ Запрос", "menu:do"),
-                ("❌ Закрыть меню", "menu:close"),
-            ],
-            [
-                ("📰 Дайджест", "menu:digest"),
-                ("🗂 Очередь", "menu:queue"),
-            ],
-            [
-                ("📝 Бриф", "menu:brief"),
-                ("📅 Сводка недели", "menu:weekly"),
-            ],
+            [("✨ Задать вопрос или поручение", "menu:do")],
+            [("📋 Сводки", "menu:summaries"), ("🗂 Требуют решения", "menu:queue")],
+            [("📁 Мои файлы", "menu:files"), ("⚙️ Разобрать записи", "menu:processing")],
+            [("⋯ Ещё", "menu:more")],
+            [("Закрыть меню", "menu:close")],
         ]
+    )
+
+
+def navigation_row(back: str = "menu:home") -> list[tuple[str, str]]:
+    rows = [("Назад", back)]
+    if back != "menu:home":
+        rows.append(("Главное меню", "menu:home"))
+    rows.append(("Закрыть", "menu:close"))
+    return rows
+
+
+async def render_input(
+    bot: Bot, *, chat_id: int, message_id: int, text: str,
+    screen: Literal["do_input", "brief_input"], back: str = "menu:home",
+) -> None:
+    session = get_dashboard_session(chat_id)
+    session.current_screen = screen
+    await render_dashboard(
+        bot, chat_id=chat_id, session=session, text=text,
+        keyboard=_keyboard([navigation_row(back)]), preferred_message_id=message_id,
+    )
+
+
+def build_section_keyboard(section: DashboardScreen) -> InlineKeyboardMarkup:
+    rows = {
+        "summaries": [
+            [("📰 Сводка дня", "menu:digest")],
+            [("📅 Обзор недели", "menu:weekly")],
+            [("📝 Собрать справку", "menu:brief")],
+        ],
+        "processing": [
+            [("🔎 Показать разбор", "menu:process")],
+            [("⚙️ Обработать и сохранить", "menu:processfull")],
+        ],
+        "more": [
+            [("📊 Статистика", "menu:stats")],
+            [("🗺 Карта знаний · HTML", "menu:vaultmap")],
+            [("⚙️ Автообработка", "menu:jobhealth")],
+            [("❓ Справка", "menu:help")],
+        ],
+        "help": [],
+    }[section]
+    back = "menu:more" if section == "help" else "menu:home"
+    return _keyboard([*rows, navigation_row(back)])
+
+
+async def render_section(
+    bot: Bot, *, chat_id: int, section: DashboardScreen,
+    preferred_message_id: int | None = None,
+) -> None:
+    text = {
+        "summaries": (
+            "**Сводки**\n\nПосмотри итоги дня или недели, "
+            "либо собери справку по решению, теме или проекту."
+        ),
+        "processing": (
+            "**Разобрать записи**\n\n"
+            "**Показать разбор** — без сохранения изменений.\n"
+            "**Обработать и сохранить** — полный разбор "
+            "с созданием задач и обновлением заметок."
+        ),
+        "more": (
+            "**Ещё**\n\nСтатистика записей, "
+            "карта знаний, отключённые шаги автообработки и справка."
+        ),
+        "help": build_help_text(),
+    }[section]
+    session = get_dashboard_session(chat_id)
+    session.current_screen = section
+    await render_dashboard(
+        bot, chat_id=chat_id, session=session, text=text,
+        keyboard=build_section_keyboard(section),
+        preferred_message_id=preferred_message_id,
     )
 
 
@@ -205,9 +287,76 @@ def build_stats_keyboard() -> InlineKeyboardMarkup:
     return _keyboard(
         [
             [("🔄 Обновить", "menu:stats")],
-            [("🏠 Домой", "menu:home")],
+            navigation_row("menu:more"),
         ]
     )
+
+
+def _disabled_job_steps(vault_path: Path | str) -> dict[str, dict[str, Any]]:
+    """Steps the scheduled cycle has self-disabled (see processor.py)."""
+    health = load_job_health(Path(vault_path))
+    return {
+        name: entry
+        for name, entry in health.items()
+        if isinstance(entry, dict) and entry.get("disabled")
+    }
+
+
+def build_disabled_steps_text(vault_path: Path | str) -> str:
+    """Build the screen listing scheduled-cycle steps that self-disabled."""
+    disabled = _disabled_job_steps(vault_path)
+    if not disabled:
+        return (
+            "**Отключённые шаги**\n\n"
+            "Сейчас все шаги ночного цикла работают без сбоев."
+        )
+
+    lines = [
+        "**Отключённые шаги**",
+        "",
+        f"Шаг отключается сам после {JOB_HEALTH_DISABLE_THRESHOLD} сбоев подряд "
+        "и пропускается, пока его не включат снова.",
+    ]
+    for name, entry in sorted(disabled.items()):
+        lines.append("")
+        lines.append(f"⛔ **{cycle_step_label(name)}**")
+        error = str(entry.get("last_error") or "").strip()
+        if error:
+            lines.append(f"`{error}`")
+    return "\n".join(lines)
+
+
+def build_disabled_steps_keyboard(vault_path: Path | str) -> InlineKeyboardMarkup:
+    """Build the disabled-steps screen keyboard: one re-enable button per step."""
+    disabled_names = sorted(_disabled_job_steps(vault_path))
+    rows: list[list[tuple[str, str]]] = [
+        [(f"▶️ Включить снова: {name}", f"menu:jobhealthenable:{name}")]
+        for name in disabled_names
+    ]
+    rows.append([("🔄 Обновить", "menu:jobhealth")])
+    rows.append(navigation_row("menu:more"))
+    return _keyboard(rows)
+
+
+def reenable_job_step(vault_path: Path | str, step_name: str) -> bool:
+    """Reset one disabled step's failure streak; return True if it was disabled."""
+    vault_path = Path(vault_path)
+    # vault_write_lock (an exclusive file lock under vault/.locks/) covers the
+    # whole read-modify-write sequence so this can't interleave with the
+    # nightly cycle's own read-modify-write of the same job-health.json (see
+    # processor.py's _record_job_step_health).
+    with vault_write_lock(vault_path):
+        health = load_job_health(vault_path)
+        entry = health.get(step_name)
+        if not isinstance(entry, dict) or not entry.get("disabled"):
+            return False
+        health[step_name] = {
+            **entry,
+            "disabled": False,
+            "consecutive_failures": 0,
+        }
+        save_job_health(vault_path, health)
+    return True
 
 
 def build_file_roots_text(roots: list[BrowserRoot]) -> str:
@@ -232,7 +381,7 @@ def build_file_roots_keyboard(roots: list[BrowserRoot]) -> InlineKeyboardMarkup:
         [(root.label, f"menu:filesroot:{root.id}")]
         for root in roots
     ]
-    rows.append([("🏠 Домой", "menu:home")])
+    rows.append(navigation_row())
     return _keyboard(rows)
 
 
@@ -277,9 +426,6 @@ def build_file_directory_keyboard(
 ) -> InlineKeyboardMarkup:
     """Build the paginated directory keyboard."""
     rows: list[list[tuple[str, str]]] = []
-    if current_dir:
-        rows.append([("⬆️ Вверх", "menu:filesup")])
-
     for index, entry in enumerate(page_entries):
         prefix = "📁" if entry.is_directory else "📄"
         rows.append(
@@ -297,19 +443,16 @@ def build_file_directory_keyboard(
         end = start + len(page_entries) - 1
         pagination_row: list[tuple[str, str]] = []
         if page > 0:
-            pagination_row.append(("⬅️", f"menu:filespage:{page - 1}"))
+            pagination_row.append(("Предыдущие", f"menu:filespage:{page - 1}"))
         pagination_row.append((f"{start}-{end}/{total_entries}", "menu:noop"))
         if page + 1 < total_pages:
-            pagination_row.append(("➡️", f"menu:filespage:{page + 1}"))
+            pagination_row.append(("Следующие", f"menu:filespage:{page + 1}"))
         rows.append(pagination_row)
 
     rows.extend(
         [
             [("🔄 Обновить", "menu:filesrefresh")],
-            [
-                ("🗂 Разделы", "menu:filesroots"),
-                ("🏠 Домой", "menu:home"),
-            ],
+            navigation_row("menu:filesup" if current_dir else "menu:filesroots"),
         ]
     )
     return _keyboard(rows)
@@ -323,7 +466,7 @@ def build_queue_text(
     total_items: int,
 ) -> str:
     """Build one page of the decisions queue list (задача L, ТЗ 7.2)."""
-    lines = ["**Очередь решений**", ""]
+    lines = ["**Требуют решения**", ""]
     if total_items == 0:
         lines.append("Очередь пуста — открытых пунктов нет.")
         return "\n".join(lines)
@@ -367,10 +510,10 @@ def build_queue_keyboard(
         end = start + len(items) - 1
         pagination_row: list[tuple[str, str]] = []
         if page > 0:
-            pagination_row.append(("⬅️", f"menu:queuepage:{page - 1}"))
+            pagination_row.append(("Предыдущие", f"menu:queuepage:{page - 1}"))
         pagination_row.append((f"{start}-{end}/{total_items}", "menu:noop"))
         if page + 1 < total_pages:
-            pagination_row.append(("➡️", f"menu:queuepage:{page + 1}"))
+            pagination_row.append(("Следующие", f"menu:queuepage:{page + 1}"))
         rows.append(pagination_row)
 
     # "Обновить" redraws the page the owner is on, so it reuses the
@@ -378,7 +521,8 @@ def build_queue_keyboard(
     # points* (home, weekly review) use -- that one always opens at page 0,
     # which silently threw an owner working through page 3 back to the top
     # (code review).
-    rows.append([("🔄 Обновить", f"menu:queuepage:{page}"), ("🏠 Домой", "menu:home")])
+    rows.append([("🔄 Обновить", f"menu:queuepage:{page}")])
+    rows.append(navigation_row())
     return _keyboard(rows)
 
 
@@ -422,17 +566,15 @@ def build_queue_item_keyboard(
     ]
     # Back to the page this item was opened from, not to page 0 -- same
     # reason as the "Обновить" button above.
-    rows.append(
-        [("⬅️ К очереди", f"menu:queuepage:{page}"), ("🏠 Домой", "menu:home")]
-    )
+    rows.append(navigation_row(f"menu:queuepage:{page}"))
     return _keyboard(rows)
 
 
 def build_brief_type_text() -> str:
     """Build the brief type-picker screen text (задача L, ТЗ 7.6)."""
     return (
-        "**Собрать бриф**\n\n"
-        "Выбери тип брифа, затем отправь текстом запрос "
+        "**Собрать справку**\n\n"
+        "Выбери тип справки, затем отправь текстом запрос "
         "(название решения, темы или проекта)."
     )
 
@@ -443,8 +585,25 @@ def build_brief_type_keyboard() -> InlineKeyboardMarkup:
         [(_BRIEF_TYPE_BUTTON_LABELS[brief_type], f"menu:brieftype:{brief_type}")]
         for brief_type in BRIEF_TYPES
     ]
-    rows.append([("🏠 Домой", "menu:home")])
+    rows.append(navigation_row("menu:summaries"))
     return _keyboard(rows)
+
+
+_SCREEN_TRUNCATION_SUFFIX = "\n\n… (показаны первые строки, экран обрезан)"
+
+
+def build_rich_menu(text: str, keyboard: InlineKeyboardMarkup) -> InputRichMessage:
+    body = markdown_to_html(normalize_markdown_input(text)).replace("\n", "<br>")
+    content = f"<p>{body}</p>"
+    for row in keyboard.inline_keyboard:
+        buttons = "".join(
+            '<tg-button type="callback_data" '
+            f'data="{escape(button.callback_data or "", quote=True)}" style="link">'
+            f"{escape(button.text)}</tg-button>"
+            for button in row
+        )
+        content += f"<tg-button-row>{buttons}</tg-button-row>"
+    return InputRichMessage(html=content, skip_entity_detection=True)
 
 
 async def render_dashboard(
@@ -464,6 +623,60 @@ async def render_dashboard(
         payload_text = f"ℹ️ _{notice}_\n\n{text}"
     payload_markdown = normalize_markdown_input(payload_text)
     payload_message = markdown_to_markdown_v2(payload_markdown)
+    if len(payload_message) > TELEGRAM_TEXT_LIMIT:
+        # A screen this long (e.g. a weekly review with 40+ changes) blows
+        # past Telegram's message limit. Left alone, the edit below fails
+        # and the ``send_text`` fallback ships an HTML document with no
+        # keyboard -- ``session.dashboard_message_id`` then points at that
+        # document forever, and every later edit on this screen fails too.
+        # MarkdownV2 escaping grows the text (every '.', '-', '(' becomes
+        # two characters), so trimming the raw text to the limit once is
+        # not enough: shrink the raw budget by the observed overshoot until
+        # the escaped payload fits.
+        source_text = payload_text
+        raw_budget = TELEGRAM_TEXT_LIMIT
+        for _ in range(8):
+            overshoot = len(payload_message)
+            raw_budget = max(1, raw_budget * TELEGRAM_TEXT_LIMIT // overshoot)
+            if raw_budget <= len(_SCREEN_TRUNCATION_SUFFIX) + 200:
+                # Nothing readable would survive; leave the oversized text
+                # to the document fallback below instead of a bare suffix.
+                break
+            payload_text = truncate_plain_text_for_edit(
+                source_text,
+                max_length=raw_budget,
+                suffix=_SCREEN_TRUNCATION_SUFFIX,
+            )
+            payload_markdown = normalize_markdown_input(payload_text)
+            payload_message = markdown_to_markdown_v2(payload_markdown)
+            if len(payload_message) <= TELEGRAM_TEXT_LIMIT:
+                break
+
+    rich_message = build_rich_menu(payload_text, keyboard)
+    try:
+        if target_message_id:
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id, message_id=target_message_id,
+                    rich_message=rich_message, reply_markup=None, parse_mode=None,
+                )
+                session.dashboard_message_id = target_message_id
+                return
+            except TelegramBadRequest as error:
+                description = str(error).lower()
+                if "message is not modified" in description:
+                    session.dashboard_message_id = target_message_id
+                    return
+                if not any(reason in description for reason in (
+                    "message to edit not found", "message can't be edited",
+                    "message cannot be edited",
+                )):
+                    raise
+        sent = await bot.send_rich_message(chat_id=chat_id, rich_message=rich_message)
+        session.dashboard_message_id = sent.message_id
+        return
+    except TelegramBadRequest:
+        logger.warning("Rich menu rejected, using ordinary menu", exc_info=True)
 
     if target_message_id:
         try:
@@ -536,6 +749,28 @@ async def render_stats(
     )
 
 
+async def render_disabled_steps(
+    bot: Bot,
+    *,
+    chat_id: int,
+    vault_path: Path | str,
+    preferred_message_id: int | None = None,
+    notice: str | None = None,
+) -> None:
+    """Render the self-disabled scheduled-cycle steps screen."""
+    session = get_dashboard_session(chat_id)
+    session.current_screen = "jobhealth"
+    await render_dashboard(
+        bot,
+        chat_id=chat_id,
+        session=session,
+        text=build_disabled_steps_text(vault_path),
+        keyboard=build_disabled_steps_keyboard(vault_path),
+        preferred_message_id=preferred_message_id,
+        notice=notice,
+    )
+
+
 async def render_file_roots(
     bot: Bot,
     *,
@@ -577,7 +812,8 @@ async def render_file_directory(
 ) -> None:
     """Render one directory inside the file browser."""
     browser = FileBrowserService(vault_path)
-    root, normalized_dir, entries = browser.list_entries(
+    root, normalized_dir, entries = await asyncio.to_thread(
+        browser.list_entries,
         root_id=root_id,
         current_dir=current_dir,
     )
@@ -632,7 +868,7 @@ async def render_queue(
     a response applied to one item is reflected the moment the list is
     reopened, with no separate cache to invalidate.
     """
-    all_items = list_queue_items(Path(vault_path))
+    all_items = await asyncio.to_thread(list_queue_items, Path(vault_path))
     total_items = len(all_items)
     total_pages = max(1, (total_items + QUEUE_PAGE_SIZE - 1) // QUEUE_PAGE_SIZE)
     safe_page = min(max(page, 0), total_pages - 1)
@@ -726,7 +962,7 @@ def build_weekly_review_text(review: WeeklyReview) -> str:
     screen -- no separate pagination here.
     """
     lines = [
-        "**Сводка недели**",
+        "**Обзор недели**",
         "",
         f"**Период:** {review.start.isoformat()} — {review.end.isoformat()}",
         "",
@@ -780,8 +1016,9 @@ def build_weekly_review_keyboard(review: WeeklyReview) -> InlineKeyboardMarkup:
         rows.append(
             [("✅ Подтвердить просмотр", f"menu:weeklyreview:{fingerprint}")]
         )
-    rows.append([("🗂 Очередь целиком", "menu:queue")])
-    rows.append([("🔄 Обновить", "menu:weekly"), ("🏠 Домой", "menu:home")])
+    rows.append([("🗂 Требуют решения", "menu:queue")])
+    rows.append([("🔄 Обновить", "menu:weekly")])
+    rows.append(navigation_row("menu:summaries"))
     return _keyboard(rows)
 
 
@@ -796,7 +1033,9 @@ async def render_weekly_review(
     """Render the "Сводка недели" screen (задача N, missed acceptance
     criterion). Collected fresh from ``collect_weekly_review`` on every
     render, same convention as ``render_queue``."""
-    review = collect_weekly_review(Path(vault_path), date.today())
+    review = await asyncio.to_thread(
+        collect_weekly_review, Path(vault_path), date.today()
+    )
 
     session = get_dashboard_session(chat_id)
     session.current_screen = "weekly"

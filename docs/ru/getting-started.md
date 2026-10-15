@@ -7,13 +7,14 @@ vault не попали в публичный репозиторий с кодо
 
 ## Требования
 
-- Linux и Python 3.12 или новее;
+- Linux или macOS (см. [развёртывание на macOS](macos.md)) и Python 3.12 или
+  новее;
 - `uv` и `jq`;
 - токен Telegram-бота от BotFather;
 - API-ключ Deepgram для распознавания голосовых сообщений;
-- один поддерживаемый AI CLI: Claude Code, Codex CLI, Qwen Code, Gemini CLI
-  или Kimi Code;
-- непривилегированная учётная запись Linux.
+- один поддерживаемый AI CLI: Claude Code, Codex CLI, Qwen Code, Gemini CLI,
+  Kimi Code, Grok CLI или opencode;
+- непривилегированная учётная запись.
 
 Для дополнительных интеграций могут потребоваться другие программы и ключи.
 Подробнее — в разделе [Интеграции](integrations.md).

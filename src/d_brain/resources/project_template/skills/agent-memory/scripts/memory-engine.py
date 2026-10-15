@@ -22,6 +22,12 @@ Options:
   --dry-run               Preview changes without writing
   --verbose               Show per-file details
 
+Access-based strength:
+  Each `touch` increments the note's frontmatter `access_count` field
+  (missing/0 → 1, then +1 per touch). `decay` reads that count and slows
+  the forgetting curve for it: effective_days = days / (1 + ln(access_count))
+  once access_count >= 1, so a frequently touched note decays slower.
+
 Config (.memory-config.json):
 {
   "tiers": {
@@ -388,18 +394,44 @@ def get_best_date(fields: dict, filepath: Path, use_git: bool = True) -> date:
 # ─── core logic ─────────────────────────────────────────────────
 
 
-def calc_relevance(days: int, rate: float, floor: float) -> float:
-    """Floor-adjusted exponential forgetting curve."""
-    return round(floor + (1.0 - floor) * math.exp(-rate * days), 2)
+def _decay_strength(access_count: int) -> float:
+    """Access-based memory strength: repeated touches slow the forgetting curve."""
+    if access_count >= 1:
+        return 1 + math.log(access_count)
+    return 1.0
 
 
-def calc_tier(days: int, tiers: dict, current_tier: str = "") -> str:
-    """Assign tier based on days since last access."""
+def _as_access_count(value: object) -> int:
+    """Coerce a frontmatter ``access_count`` value to a non-negative int."""
+    try:
+        count = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+    return max(0, count)
+
+
+def calc_relevance(
+    days: int, rate: float, floor: float, access_count: int = 0
+) -> float:
+    """Floor-adjusted exponential forgetting curve.
+
+    ``access_count`` slows decay via a strength factor of
+    ``1 + ln(access_count)`` once a note has been touched at least once.
+    """
+    effective_days = days / _decay_strength(access_count)
+    return round(floor + (1.0 - floor) * math.exp(-rate * effective_days), 2)
+
+
+def calc_tier(
+    days: int, tiers: dict, current_tier: str = "", access_count: int = 0
+) -> str:
+    """Assign tier based on (access-strength-adjusted) days since last access."""
     if current_tier == "core":
         return "core"  # never auto-demote core
+    effective_days = days / _decay_strength(access_count)
     sorted_tiers = sorted(tiers.items(), key=lambda x: x[1])
     for tier_name, threshold in sorted_tiers:
-        if days <= threshold:
+        if effective_days <= threshold:
             return tier_name
     return "archive"
 
@@ -473,6 +505,7 @@ def find_cards(target_dir: Path, config: dict) -> list[Path]:
         if c.exists()
         and not c.is_symlink()
         and c.relative_to(target_dir).parts[:1] != ("skills",)
+        and not any(part.startswith(".") for part in c.relative_to(target_dir).parts)
         and not should_skip(c, config["skip_patterns"])
     ]
 
@@ -651,12 +684,13 @@ def cmd_decay(
 
         ref_date = get_best_date(fields, card, config["use_git_dates"])
         days = max(0, (TODAY - ref_date).days)
+        access_count = _as_access_count(fields.get("access_count"))
 
         old_tier = fields.get("tier", "")
         new_relevance = calc_relevance(
-            days, config["decay_rate"], config["relevance_floor"]
+            days, config["decay_rate"], config["relevance_floor"], access_count
         )
-        new_tier = calc_tier(days, config["tiers"], old_tier)
+        new_tier = calc_tier(days, config["tiers"], old_tier, access_count)
 
         updates: dict[str, object] = {
             "relevance": new_relevance,
@@ -674,7 +708,7 @@ def cmd_decay(
 
         results.append(
             {
-                "path": str(card.relative_to(target_dir)),
+                "path": str(card.relative_to(vault_root)),
                 "days": days,
                 "relevance": new_relevance,
                 "tier": new_tier,
@@ -686,7 +720,7 @@ def cmd_decay(
             print(
                 "  "
                 f"{'[dry] ' if dry_run else ''}"
-                f"{card.relative_to(target_dir)}: "
+                f"{card.relative_to(vault_root)}: "
                 f"{old_tier or '?'}→{new_tier} r={new_relevance}"
             )
 
@@ -726,12 +760,14 @@ def cmd_decay(
             print(f"    concurrent conflicts skipped: {conflicts}")
 
 
-def cmd_touch(filepath: str, config: dict):
+def cmd_touch(filepath: str, config: dict, dry_run: bool = False):
     """Promote a file one tier up (graduated recall).
 
     archive → cold → warm → active → active (refresh)
     Each touch promotes one level, not straight to top.
     Natural spaced repetition: multiple reads = stronger memory.
+    Each touch also increments frontmatter `access_count` (missing/0 → 1);
+    `decay` uses that count to slow later forgetting.
     """
     target_file = filepath.split("::", 1)[0]
     p = Path(target_file)
@@ -752,17 +788,26 @@ def cmd_touch(filepath: str, config: dict):
             print(f"  error: {filepath} not found")
             sys.exit(1)
         fields, body, had_yaml = parse_frontmatter(content)
+        access_count = _as_access_count(fields.get("access_count")) + 1
 
         if fields.get("tier") == "core":
-            updates = {"last_accessed": TODAY.isoformat(), "relevance": 1.0}
-            _write_frontmatter_updates(
-                vault_root,
-                p,
-                updates,
-                manifest=manifest,
-                lock=lock,
+            updates = {
+                "last_accessed": TODAY.isoformat(),
+                "relevance": 1.0,
+                "access_count": access_count,
+            }
+            if not dry_run:
+                _write_frontmatter_updates(
+                    vault_root,
+                    p,
+                    updates,
+                    manifest=manifest,
+                    lock=lock,
+                )
+            print(
+                f"  {'[dry] ' if dry_run else ''}"
+                f"touched: {filepath} → core (refreshed)"
             )
-            print(f"  touched: {filepath} → core (refreshed)")
             return
 
         tiers_cfg = config["tiers"]
@@ -804,26 +849,29 @@ def cmd_touch(filepath: str, config: dict):
             "last_accessed": new_date.isoformat(),
             "relevance": new_relevance,
             "tier": new_tier,
+            "access_count": access_count,
         }
-        _write_frontmatter_updates(
-            vault_root,
-            p,
-            updates,
-            manifest=manifest,
-            lock=lock,
-        )
-        if "daily" in p.parts:
-            from d_brain.services.memory_entries import DailyEntryMemoryStore
-
-            rel_path = p.resolve().relative_to(vault_root).as_posix()
-            changed = DailyEntryMemoryStore(vault_root).touch_daily_file(
-                rel_path,
-                today=TODAY,
+        changed = 0
+        if not dry_run:
+            _write_frontmatter_updates(
+                vault_root,
+                p,
+                updates,
+                manifest=manifest,
+                lock=lock,
             )
-        else:
-            changed = 0
+            if "daily" in p.parts:
+                from d_brain.services.memory_entries import DailyEntryMemoryStore
+
+                rel_path = p.resolve().relative_to(vault_root).as_posix()
+                changed = DailyEntryMemoryStore(vault_root).touch_daily_file(
+                    rel_path,
+                    today=TODAY,
+                )
     print(
-        f"  touched: {filepath} → {current_tier}→{new_tier}, relevance={new_relevance}"
+        "  "
+        f"{'[dry] ' if dry_run else ''}"
+        f"touched: {filepath} → {current_tier}→{new_tier}, relevance={new_relevance}"
     )
     if changed:
         print(f"  touched daily entries: {changed}")
@@ -1151,8 +1199,9 @@ def main():
         if not target:
             print("  error: touch requires a file path")
             sys.exit(1)
-        config = load_config(Path(target).parent, config_path)
-        cmd_touch(target, config)
+        touch_vault_root = _vault_root_for_path(Path(target))
+        config = load_config(touch_vault_root, config_path)
+        cmd_touch(target, config, dry_run)
         return
 
     if cmd == "creative":

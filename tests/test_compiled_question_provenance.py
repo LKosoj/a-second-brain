@@ -19,6 +19,31 @@ from d_brain.services.processor import CliProcessor
 DAY = "2026-08-05"
 
 
+def test_stale_source_provenance_uses_only_supplied_snapshot(tmp_path):
+    candidate = CompiledBriefingCandidate(
+        rel_path="compiled/projects/example.md",
+        title="Example",
+        domain="projects",
+        slug="example",
+        description="Example",
+        relevance=0.8,
+        tier="active",
+        freshness_state="stale",
+        confidence="high",
+        text="---\nsources_trust: own\n---\n# Example\n",
+    )
+    result = build_question_provenance(
+        tmp_path,
+        "Example",
+        candidates=[candidate],
+        source_paths=["daily/2026-10-08.md", "daily/2026-10-08.md", "../README.md"],
+    )
+    assert result.block.count("[[daily/2026-10-08.md]]") == 1
+    assert "`../README.md`" in result.block
+    assert "[[../README.md]]" not in result.block
+    assert result.touched_paths == ("compiled/projects/example.md",)
+
+
 def _page_text(
     *,
     domain: str,

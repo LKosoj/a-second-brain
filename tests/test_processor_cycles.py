@@ -82,6 +82,16 @@ def test_periodic_summary_uses_derived_profile(tmp_path: Path) -> None:
     assert "tier: active" in content
 
 
+def test_weekly_summary_description_is_localized(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    summary_path = CliProcessor(
+        vault_path, content_language="ru"
+    )._save_weekly_summary("# Неделя\n", date(2026, 4, 3))
+
+    content = summary_path.read_text(encoding="utf-8")
+    assert "description: Недельный дайджест за 2026-W14" in content
+
+
 def test_generate_weekly_prompt_reads_core_context_and_forbids_goal_rewrites(
     tmp_path: Path,
 ) -> None:
@@ -114,6 +124,9 @@ def test_generate_weekly_prompt_reads_core_context_and_forbids_goal_rewrites(
     assert "goals/1-yearly.md" in prompt
     assert ".session/handoff.md" in prompt
     assert "find-tasks-by-date" in prompt
+    assert '"overdueOption": "overdue-only"' in prompt
+    assert "Process goals are already included; do not add them again." in prompt
+    assert '"overdueOption": "exclude-overdue"' in prompt
     assert "Do not rewrite goal files automatically." in prompt
     assert "Return ONLY markdown, not HTML." in prompt
     assert "Start with one short markdown heading for the digest." in prompt
@@ -168,6 +181,9 @@ def test_generate_weekly_prompt_is_localized_for_russian(
     prompt = captured["prompt"]
     assert "ПРАВИЛА НЕДЕЛЬНОГО РАЗБОРА:" in prompt
     assert "ПРАВИЛА РАБОТЫ С TODOIST:" in prompt
+    assert '"overdueOption": "overdue-only"' in prompt
+    assert "не прибавляй их отдельно" in prompt
+    assert '"overdueOption": "exclude-overdue"' in prompt
     assert "ПОРЯДОК РАБОТЫ:" in prompt
     assert "WEEKLY REVIEW RULES" not in prompt
 
@@ -275,6 +291,10 @@ def test_rollover_weekly_goals_updates_russian_template(tmp_path: Path) -> None:
             "## Неделя в целом\n\n"
             "**Неделя:** 29 из 53\n\n"
             "---\n\n"
+            "## План по дням\n\n"
+            "### Пятница\n\n"
+            "- [ ] Подвести статус W29: что подтверждено.\n\n"
+            "---\n\n"
             "## Итоги недели\n\n"
             "### Фокус следующей недели\n\n"
             "> Новый фокус следующей недели.\n\n"
@@ -303,6 +323,7 @@ def test_rollover_weekly_goals_updates_russian_template(tmp_path: Path) -> None:
     assert "> Новый фокус следующей недели." in content
     assert "> Старый фокус недели." not in content
     assert "**Неделя:** 30 из 53" in content
+    assert "- [ ] Подвести статус W30: что подтверждено." in content
     assert "- Предыдущая неделя: 2026-W29" in content
     assert "*Неделя началась: 2026-07-20*" in content
 
@@ -1073,6 +1094,7 @@ def test_audit_cycle_result_deduplicates_recent_followup_tasks(
                 "severity": "high",
                 "evidence": "Carry forward says 1 while report says no signals.",
                 "action": "Починить weekly system reflection logging",
+                "due": "2026-04-06",
                 "project_hint": "Inbox",
             }
         ],
@@ -1084,6 +1106,7 @@ def test_audit_cycle_result_deduplicates_recent_followup_tasks(
         source_context: str = "",
     ) -> list[dict[str, str]]:
         del source_context
+        assert not tasks or tasks[0]["due_hint"] == "2026-04-06"
         created_batches.append([task["content"] for task in tasks])
         return [{"id": "1", "content": task["content"]} for task in tasks]
 
@@ -1107,6 +1130,40 @@ def test_audit_cycle_result_deduplicates_recent_followup_tasks(
     assert second["task_candidates"] == []
     assert second["tasks_created"] == []
     assert created_batches == [["Починить weekly system reflection logging"], []]
+
+
+def test_audit_cycle_result_does_not_create_task_without_confirmed_due(
+    tmp_path: Path,
+) -> None:
+    processor = CliProcessor(tmp_path / "vault", todoist_api_key="todoist-token")
+    created_batches: list[list[dict[str, Any]]] = []
+    processor._run_json_phase = lambda prompt, phase_name: {  # type: ignore[method-assign]
+        "summary": "Found one problem",
+        "issues": [
+            {
+                "title": "Digest needs verification",
+                "severity": "high",
+                "evidence": "The digest result is incomplete.",
+                "action": "Проверить следующий недельный дайджест",
+                "due": None,
+                "project_hint": "Inbox",
+            }
+        ],
+    }
+    processor._create_todoist_tasks = (  # type: ignore[method-assign]
+        lambda tasks, **kwargs: created_batches.append(tasks) or []
+    )
+
+    result = processor.audit_cycle_result(
+        cycle_name="weekly_digest",
+        day=date(2026, 4, 5),
+        result={"report": "ok"},
+    )
+
+    assert result["issues"]
+    assert result["task_candidates"] == []
+    assert result["tasks_created"] == []
+    assert created_batches == [[]]
 
 
 def test_clear_session_phase_artifacts_removes_stale_audit_raw_outputs(
@@ -1253,10 +1310,13 @@ def test_run_scheduled_cycle_triggers_due_periodic_reviews_and_audits(
         "maintenance.compiled-nightly",
         "maintenance.vault-health",
         "maintenance.compiled-fact-check",
+        "maintenance.compiled-wiki-care",
         "maintenance.compiled-digest",
     ]
     # daily 2 + weekly/monthly/yearly 1 each + digest 1; the same digest write
     # that used to fail with "vault Markdown parent does not exist" now lands.
+    # wiki-care runs for real against an empty vault here (nothing due),
+    # contributing 0.
     assert result["processed_entries"] == 6
     assert result["audit_task_candidates"] == [
         "todo:weekly_digest",
@@ -1265,6 +1325,7 @@ def test_run_scheduled_cycle_triggers_due_periodic_reviews_and_audits(
         "todo:maintenance.compiled-nightly",
         "todo:maintenance.vault-health",
         "todo:maintenance.compiled-fact-check",
+        "todo:maintenance.compiled-wiki-care",
         "todo:maintenance.compiled-digest",
     ]
     assert "📊 **Daily**" in result["report"]
@@ -1553,11 +1614,13 @@ def test_run_scheduled_cycle_runs_compiled_nightly_maintenance(
         "maintenance.compiled-nightly",
         "maintenance.vault-health",
         "maintenance.compiled-fact-check",
+        "maintenance.compiled-wiki-care",
         "maintenance.compiled-digest",
     ]
     assert "## 🧩 Compiled Maintenance" in result["report"]
     assert "## 🩺 Vault Health" in result["report"]
-    # daily 1 + compiled-nightly 1 + vault-health 0 + fact-check 0 + digest 1.
+    # daily 1 + compiled-nightly 1 + vault-health 0 + fact-check 0
+    # + wiki-care 0 (real run against an empty vault) + digest 1.
     # This asserted 2 while the digest was contributing 0 with the error "vault
     # Markdown parent does not exist" -- the vault writer needed
     # CAP_DAC_READ_SEARCH, so the digest never got to write anything. The
@@ -1606,6 +1669,7 @@ def test_run_scheduled_cycle_survives_one_maintenance_workflow_raising(
         "maintenance.compiled-nightly",
         "maintenance.vault-health",
         "maintenance.compiled-fact-check",
+        "maintenance.compiled-wiki-care",
         "maintenance.compiled-digest",
     ]
     results_by_name = {
@@ -1613,6 +1677,7 @@ def test_run_scheduled_cycle_survives_one_maintenance_workflow_raising(
     }
     assert results_by_name["maintenance.vault-health"]["error"] == "boom"
     assert "error" not in results_by_name["maintenance.compiled-fact-check"]
+    assert "error" not in results_by_name["maintenance.compiled-wiki-care"]
     assert "error" not in results_by_name["maintenance.compiled-digest"]
     # Surviving the crash is only half of it (code review): the combined
     # report is what actually reaches the owner at 21:00, and a workflow
@@ -1650,6 +1715,7 @@ def test_run_scheduled_cycle_uses_control_plane_labels_for_maintenance(
         "Поддержка compiled-слоя",
         "Здоровье vault",
         "Проверка фактов compiled",
+        "Уход за вики",
         "Дайджест обогащения compiled",
     ]
 
@@ -1962,10 +2028,8 @@ def test_run_compiled_digest_cycle_writes_and_sends_on_changed_day(
     tmp_path: Path, monkeypatch
 ) -> None:
     """On a day with a real compiled-page change, the cycle writes the
-    digest file (path surfaced via ``summary_path`` for the existing
-    periodic-cycle line renderer) and also sends the digest text directly
-    over Telegram, as a separate message from the combined scheduled
-    report -- see this method's docstring for why that's deliberate.
+    digest file, returns the text in ``report``, and also sends that text
+    directly over Telegram.
     ``write_validated_vault_markdown`` is monkeypatched because the real one
     cannot run in this sandbox (see ``test_compiled_enrich_report.py``'s
     module docstring for the confirmed environment limitation)."""
@@ -1989,6 +2053,7 @@ def test_run_compiled_digest_cycle_writes_and_sends_on_changed_day(
 
     assert result["processed_entries"] == 1
     assert result["searchable_write"] is True
+    assert result["report"] == send_calls[0]
     assert result["summary_path"] == f"summaries/compile/{today.isoformat()}.md"
     assert write_calls == [
         vault_path / "summaries" / "compile" / f"{today.isoformat()}.md"
@@ -2182,3 +2247,62 @@ def test_run_vault_health_cycle_reports_daily_structure_issues_in_russian(
     assert result["malformed_daily_count"] == 1
     assert "## 🩺 Здоровье vault" in result["report"]
     assert "- Нарушения структуры daily: 1" in result["report"]
+
+
+def test_compiled_wiki_care_cycle_reports_changes_as_vault_links(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = CliProcessor(tmp_path / "vault")
+    monkeypatch.setattr(
+        "d_brain.services.processor.run_weekly_wiki_care",
+        lambda *args, **kwargs: {
+            "status": "ok",
+            "links_added": 2,
+            "pages_created": 1,
+            "questions_answered": 0,
+            "articles_imported": 1,
+            "changed_paths": ["compiled/topics/aurora.md"],
+            "errors": [],
+        },
+    )
+
+    result = processor._run_compiled_wiki_care_cycle()
+
+    assert "Связей добавлено: 2" in result["report"]
+    assert "- [[compiled/topics/aurora]]" in result["report"]
+    assert result["processed_entries"] == 4
+
+
+@pytest.mark.parametrize("status", ["skipped-interval", "no-work"])
+def test_compiled_wiki_care_cycle_quiet_run_has_empty_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+) -> None:
+    processor = CliProcessor(tmp_path / "vault")
+    monkeypatch.setattr(
+        "d_brain.services.processor.run_weekly_wiki_care",
+        lambda *args, **kwargs: {"status": status, "errors": []},
+    )
+
+    result = processor._run_compiled_wiki_care_cycle()
+
+    assert result["report"] == ""
+    assert result["processed_entries"] == 0
+
+
+def test_compiled_wiki_care_cycle_survives_an_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = CliProcessor(tmp_path / "vault")
+
+    def _boom(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("wiki care exploded")
+
+    monkeypatch.setattr("d_brain.services.processor.run_weekly_wiki_care", _boom)
+
+    result = processor._run_compiled_wiki_care_cycle()
+
+    assert result == {"error": "wiki care exploded", "processed_entries": 0}

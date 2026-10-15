@@ -187,6 +187,33 @@ def test_graph_analyzer_probes_dotted_repo_file_names_by_appending_md(
     assert stats["ignored_link_reasons"] == {"repo-file": 1}
 
 
+def test_graph_analyzer_excludes_daily_and_imports_from_card_health(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    (vault_path / "daily").mkdir(parents=True)
+    (vault_path / "imports" / "plaud" / "notes").mkdir(parents=True)
+    (vault_path / "thoughts").mkdir(parents=True)
+
+    (vault_path / "daily" / "2026-09-19.md").write_text(
+        "# 2026-09-19\n", encoding="utf-8"
+    )
+    (vault_path / "imports" / "plaud" / "notes" / "meeting.md").write_text(
+        "# Meeting\n", encoding="utf-8"
+    )
+    (vault_path / "thoughts" / "durable.md").write_text(
+        "---\ndescription: Durable card\n---\n\n# Durable\n", encoding="utf-8"
+    )
+
+    stats = _load_graph_analyzer().analyze_vault(vault_path)
+
+    assert "daily/2026-09-19" not in stats["orphans"]
+    assert "imports/plaud/notes/meeting" in stats["orphans"]
+    assert stats["description_count"] == 1
+    assert stats["description_candidate_count"] == 1
+    assert stats["description_ratio"] == 1.0
+
+
 def test_graph_artifact_writer_requires_manifest_before_creating_artifacts(
     tmp_path: Path,
 ) -> None:
@@ -314,7 +341,10 @@ def test_graph_link_builder_never_writes_inside_the_human_zone(tmp_path: Path) -
     builder = _load_graph_link_builder()
     page = _compiled_page_with_human_related(tmp_path)
 
-    assert builder.apply_link(page, "topics/quantum-widgets", dry_run=False) is True
+    assert (
+        builder.apply_link(page.parent, page, "topics/quantum-widgets", dry_run=False)
+        is True
+    )
 
     content = page.read_text(encoding="utf-8")
     start = content.index("<!-- human:start -->")
@@ -342,7 +372,10 @@ def test_graph_link_builder_keeps_human_zone_bytes_including_line_endings(
     )
     page.write_bytes(b"# Aurora\n\n## Owner Notes\n" + zone + b"\n")
 
-    assert builder.apply_link(page, "topics/quantum-widgets", dry_run=False) is True
+    assert (
+        builder.apply_link(page.parent, page, "topics/quantum-widgets", dry_run=False)
+        is True
+    )
 
     after = page.read_bytes()
     assert zone in after
@@ -368,7 +401,10 @@ def test_graph_link_builder_skips_a_note_that_is_not_valid_utf8(
     original = b"# Aurora\n\nOwner note: \xff\xfe\n"
     page.write_bytes(original)
 
-    assert builder.apply_link(page, "topics/quantum-widgets", dry_run=False) is False
+    assert (
+        builder.apply_link(page.parent, page, "topics/quantum-widgets", dry_run=False)
+        is False
+    )
 
     assert page.read_bytes() == original
     assert "[SKIP]" in capsys.readouterr().out
@@ -388,7 +424,10 @@ def test_graph_link_builder_leaves_ambiguous_human_zone_untouched(
     )
     page.write_text(original, encoding="utf-8")
 
-    assert builder.apply_link(page, "topics/quantum-widgets", dry_run=False) is False
+    assert (
+        builder.apply_link(page.parent, page, "topics/quantum-widgets", dry_run=False)
+        is False
+    )
     assert page.read_text(encoding="utf-8") == original
 
 
@@ -409,7 +448,10 @@ def test_graph_link_builder_leaves_unpaired_marker_human_zone_untouched(
     )
     page.write_text(original, encoding="utf-8")
 
-    assert builder.apply_link(page, "topics/quantum-widgets", dry_run=False) is False
+    assert (
+        builder.apply_link(page.parent, page, "topics/quantum-widgets", dry_run=False)
+        is False
+    )
     assert page.read_text(encoding="utf-8") == original
 
 

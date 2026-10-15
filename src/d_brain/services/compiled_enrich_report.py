@@ -1,41 +1,7 @@
-"""Owner-facing daily digest for the compiled enrichment layer (ТЗ 7.1).
+"""Daily digest of memory updates and new questions for the owner.
 
-``build_daily_digest`` is a pure function: it never calls a model and never
-writes to the vault. It only reads pages already written under ``compiled/``
-(via ``CompiledBriefingService``) and, optionally, the owner's decisions
-queue. Callers (the CLI, the bot's "Дайджест" button, and the
-``maintenance.compiled-digest`` nightly-maintenance hook -- see
-``processor.py``'s ``_run_compiled_digest_cycle``) are responsible for
-persisting the returned Markdown to ``summaries/compile/YYYY-MM-DD.md`` and
-for delivering it to Telegram.
-
-Block order follows ТЗ 7.1 exactly: "Требует решения" (needs a decision)
-first, "Что изменилось" (what changed) second, "Стоит посмотреть" (worth a
-look) third. An empty block is omitted entirely -- no empty heading is
-rendered, matching the ТЗ's explicit rule for the third block; the same
-rule is applied uniformly to all three blocks here to keep the digest short
-and to avoid one-off placeholder lines the ТЗ never asks for.
-
-``.session/decisions-queue.json`` contract
--------------------------------------------
-This module does not own that file -- the enrichment pipeline
-(``compiled_briefings.py``) does, and it does not exist yet. Until it does,
-this is the minimal shape this module reads, as required by the task:
-
-    [
-      {
-        "kind": "conflict" | "duplicate-candidate" | "blocked-action"
-                | "drift" | "verify-rejected" | ...,  # free-form label
-        "page": "compiled/<domain>/<slug>.md",         # vault-relative path
-        "summary": "one-line description of the decision needed",
-        "since": "YYYY-MM-DD"                          # when it was queued
-      },
-      ...
-    ]
-
-A missing file, a file that is not valid JSON, or a payload that is not a
-list of such objects is treated as an empty queue -- never as an error (ТЗ
-"Отсутствие или порча файла — это пустой список, а не ошибка").
+Reads compiled pages and the decisions queue without model calls or writes.
+Technical processing details remain in their journals and the queue.
 """
 
 from __future__ import annotations
@@ -45,7 +11,7 @@ import json
 import logging
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -60,7 +26,6 @@ from d_brain.services.compiled_briefings import (
 from d_brain.services.decisions_queue import (
     CONFLICT_POINTER_KINDS,
     DECISIONS_QUEUE_RELATIVE_PATH,
-    QUEUE_CAP,
     QueueItem,
     list_queue_items,
 )
@@ -71,6 +36,10 @@ logger = logging.getLogger(__name__)
 STALE_REVISIT_DAYS = 90
 # ТЗ 7.1: "Стоит посмотреть. Одна-две давно не открывавшиеся страницы".
 MAX_REVISIT_PAGES = 2
+# Keep the Telegram digest scannable while preserving honest totals.
+MAX_DECISIONS_SHOWN = 5
+MAX_CHANGES_SHOWN = 5
+MAX_CHANGE_FACTS_SHOWN = 5
 # ТЗ 6.1 "Уровень памяти управляет бюджетом обогащения" / 6.5 "Повторное
 # всплытие": only these two tiers are eligible to resurface -- "core",
 # "active", and "warm" pages are in active use and are not what the owner
@@ -80,99 +49,7 @@ COLD_REVISIT_TIERS = frozenset({"cold", "archive"})
 
 @dataclass(frozen=True, slots=True)
 class PassStatus:
-    """The outcome of one compiled-enrichment pass, as needed for the digest.
-
-    This is this module's own minimal status contract, not the ТЗ 5.2 step 6
-    pass journal (``.session/compile-enrich.json``) itself -- that journal
-    belongs to the enrichment pipeline (``compiled_briefings.py``'s
-    ``_write_pass_journal``) and is read into a ``PassStatus`` by
-    ``read_pass_status`` below.
-
-    ``status`` is one of "success", "no-work", "unknown", "error" (this
-    codebase's real journal writer spells the first two "ok"/"no-work"; see
-    ``_NON_FAILURE_STATUSES`` in this module). "unknown" is
-    ``read_pass_status``'s own status for a journal that exists but could
-    not be read or parsed -- see that function's docstring. Only "no-work"
-    is ever suppressed (``build_daily_digest``); every other status
-    (including "unknown") always builds. ``error``, when non-empty, is
-    shown as the first "Требует решения" line regardless of ``status``;
-    when a non-"no-work"/non-success status comes with an empty, missing,
-    or non-string ``error``, ``_render_digest`` still shows an honest
-    fallback line instead of silence (ТЗ 7.1: "Сбойный проход, наоборот,
-    всегда порождает сообщение с причиной") -- "unknown" gets its own,
-    distinct line (``_UNKNOWN_STATUS_LINE``) rather than the generic
-    failure one, since it is not evidence the pass itself failed, only
-    that its outcome could not be confirmed.
-
-    ``budget_exhausted`` mirrors the journal's own field (ТЗ 5.5 inv 7:
-    "факт исчерпания бюджета попадает в дайджест"): the technical
-    constraint names ``compiled_briefings.py``'s ``_write_pass_journal``
-    recorded for this pass (e.g. ``"pages-per-pass"``), if any. Never empty
-    strings, never anything but ``str`` -- ``read_pass_status`` already
-    filters those out. A non-empty tuple both adds a line to "Требует
-    решения" (``_render_digest``) and, on its own, keeps the digest from
-    being suppressed as a quiet day (``build_daily_digest``): exhausting a
-    budget is never "nothing happened".
-
-    ``monthly_capped_pages`` and ``deferred_queue_sources`` mirror the two
-    journal fields that make a ``"monthly-enrichments-per-page"`` budget
-    line actionable. The constraint name on its own says only that *some*
-    page ran out of monthly enrichments and that *some* source material is
-    still queued, which is not enough to do anything about: the owner needs
-    the page to open (``monthly_capped_pages``) and the size of what is
-    waiting (``deferred_queue_sources``, the queue events the pass released
-    back to "pending" when a budget ended its drain). Neither field forces a
-    digest on its own -- both only ever appear alongside the
-    ``budget_exhausted`` entry that already does.
-
-    ``queue_evictions`` mirrors the journal's own field (ТЗ 7.2: the owner
-    must learn when the ``QUEUE_CAP``-item decisions-queue cap forced old
-    entries out): how many pre-existing queue entries this pass evicted on
-    overflow, if any. Like ``budget_exhausted``, a nonzero value both adds a
-    line to "Требует решения" (``_render_digest``) and keeps the digest from
-    being suppressed as a quiet day (``build_daily_digest``). The monthly
-    fact-check pass evicts entries too and journals the count separately;
-    ``build_daily_digest`` folds that in via ``_with_fact_check_evictions``,
-    so this field is the digest's single count of "entries lost today",
-    whichever pass caused them.
-
-    ``human_zone_ambiguous_pages`` mirrors the journal's own field: the
-    vault-relative paths of pages ``compiled_briefings.py`` skipped this
-    pass because their <!-- human:start/end --> markers were ambiguous
-    (see that module's ``_record_human_zone_ambiguous``). Unlike a budget
-    limit or a queue overflow, a page in this state stays stuck forever on
-    its own -- a `cold`-tier page never calls the model again by itself, so
-    nothing else will ever prompt a retry -- which is why a non-empty tuple
-    both adds a line to "Требует решения" (``_render_digest``) and keeps the
-    digest from being suppressed as a quiet day (``build_daily_digest``),
-    same as the two fields above.
-
-    ``worker_crash`` does not come from the pass journal at all: it is the
-    message from today's background-queue-worker crash journal, folded in by
-    ``_with_queue_worker_crash``. Same treatment as the fields above -- a
-    line in "Требует решения" and no quiet-day suppression -- and for the
-    same reason as ``human_zone_ambiguous_pages``: a dead drain does not
-    restart itself, so silence would let pages stop being enriched
-    indefinitely.
-
-    ``auto_decisions`` mirrors the journal's ``queue_auto_decisions`` field:
-    how many decisions-queue items this pass answered on the owner's behalf
-    (``compiled_briefings``'s ``_auto_answer_queue_items``). Unlike every
-    field above it, this one is not a problem -- it reports work already
-    finished -- so it goes in "Что изменилось" rather than "Требует
-    решения", and it does not by itself keep a quiet day from being
-    suppressed: a night whose only event was clearing a queue item nobody
-    was waiting on is still a quiet night.
-
-    ``dropped_sources`` holds the vault-relative source paths the refresh
-    queue gave up on entirely (``compiled_briefings``'s
-    ``_record_dropped_queue_source``): the owner wrote something, three
-    compile attempts failed, and the queue entry -- the only trigger that
-    would ever have compiled it -- was deleted. Same treatment and same
-    reason as the two fields above: nothing retries these on its own, so the
-    note stays out of ``compiled/`` until the owner touches the source
-    again.
-    """
+    """Last enrichment pass journal, shared by the CLI and bot callers."""
 
     status: str
     error: str = ""
@@ -190,22 +67,8 @@ class PassStatus:
 # ``compiled_briefings.py``'s ``_write_pass_journal`` after every
 # ``run_nightly_maintenance`` call (G6).
 PASS_JOURNAL_RELATIVE_PATH = Path(".session") / "compile-enrich.json"
-# The monthly fact-check pass (``compiled_fact_check.py``) keeps a journal of
-# its own on purpose -- the file above is overwritten whole by every
-# enrichment pass, so sharing it would erase whichever process ran second.
-# Declared here rather than imported for the same reason the path above is:
-# this module reads both journals, it owns neither.
+# Diagnostic journal paths, also used by the maintenance workflows.
 FACT_CHECK_JOURNAL_RELATIVE_PATH = Path(".session") / "compile-fact-check.json"
-# Written by ``compiled_briefings._write_queue_worker_crash_journal`` when the
-# detached background drain dies unexpectedly. That writer calls the file an
-# "owner-visible trace", but nothing used to read it: the worker runs with
-# stdout/stderr on DEVNULL, so a crashed drain quietly stopped enriching
-# pages and the owner only ever saw pages that were not updating.
-# Written by ``compiled_briefings._record_dropped_queue_source`` when the
-# refresh queue permanently gives up on a source. Unlike the two journals
-# above this one is not keyed by date: it lists sources still missing from
-# ``compiled/``, and the writer removes an entry only once that source
-# finally compiles.
 DROPPED_SOURCES_JOURNAL_RELATIVE_PATH = (
     Path(".session") / "compile-dropped-sources.json"
 )
@@ -236,11 +99,7 @@ def read_pass_status(vault_path: Path) -> PassStatus:
       corruption, a writer bug), and silently reporting it as "success"
       would hide that from the owner. It is reported honestly as
       ``PassStatus(status="unknown")`` instead, with a ``logger.warning``
-      recording the reason for the server-side logs. "unknown" is excluded
-      from ``_NON_FAILURE_STATUSES``, so ``_render_digest`` still shows the
-      owner a line instead of silence, and ``build_daily_digest`` never
-      suppresses the digest for it (suppression only ever checks for the
-      literal "no-work" status).
+      recording the reason for the server-side logs.
     """
     path = Path(vault_path) / PASS_JOURNAL_RELATIVE_PATH
     try:
@@ -344,6 +203,7 @@ class _ChangeItem:
     created_today: bool
     what_added: str
     sources: tuple[str, ...] = ()
+    summary: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,14 +252,29 @@ _FACT_SENTENCE_END = (".", "!", "?", "…", ":")
 
 
 def _join_change_facts(facts: Iterable[str]) -> str:
-    """Join per-source facts into one digest line without doubling punctuation."""
-    joined = ""
+    """Deduplicate, cap, and join facts without doubling punctuation."""
+    unique_facts: list[str] = []
+    seen: set[str] = set()
     for fact in facts:
+        cleaned = re.sub(r"\s+", " ", fact).strip()
+        key = _TRAILING_PUNCT_RE.sub("", cleaned).casefold()
+        if not cleaned or not key or key in seen:
+            continue
+        seen.add(key)
+        unique_facts.append(cleaned)
+
+    shown_facts = unique_facts[:MAX_CHANGE_FACTS_SHOWN]
+    joined = ""
+    for fact in shown_facts:
         if not joined:
             joined = fact
             continue
         separator = " " if joined.endswith(_FACT_SENTENCE_END) else "; "
         joined = f"{joined}{separator}{fact}"
+    hidden_count = len(unique_facts) - len(shown_facts)
+    if hidden_count:
+        separator = " " if joined.endswith(_FACT_SENTENCE_END) else "; "
+        joined = f"{joined}{separator}Ещё пунктов: {hidden_count}."
     return joined
 
 
@@ -445,27 +320,33 @@ def _collect_changes(
             continue
 
         history_rows = CompiledBriefingService._claim_history_rows(candidate.text)
-        superseded_by_source: dict[str, tuple[str, str]] = {}
+        superseded_by_source: dict[str, list[tuple[str, str]]] = {}
         for _, old_source, old_claim, superseded_by in history_rows:
-            superseded_by_source.setdefault(superseded_by, (old_claim, old_source))
+            replaced = (old_claim, old_source)
+            replacements = superseded_by_source.setdefault(superseded_by, [])
+            if replaced not in replacements:
+                replacements.append(replaced)
 
         fields = _page_fields(candidate.text)
         created = _parse_date_field(fields.get("created"))
 
         what_parts: list[str] = []
-        for _, source, what in window_rows:
+        for _, _source, what in window_rows:
             what = what.strip()
             if not what:
                 continue
-            replaced = superseded_by_source.get(source)
-            if replaced is not None:
-                old_claim, old_source = replaced
-                what_parts.append(
-                    f"{what} (замена: было «{old_claim}» из [[{old_source}]])"
-                )
-            else:
-                what_parts.append(what)
+            what_parts.append(what)
         what_added = _join_change_facts(dict.fromkeys(what_parts))
+
+        window_sources = tuple(dict.fromkeys(source for _, source, _ in window_rows))
+        replacement_parts = [
+            f"«{old_claim}» из [[{old_source}]]"
+            for source in window_sources
+            for old_claim, old_source in superseded_by_source.get(source, [])
+        ]
+        if replacement_parts:
+            replacement_note = "Замена: было " + "; ".join(replacement_parts) + "."
+            what_added = f"{what_added} {replacement_note}".strip()
 
         sources = tuple(
             dict.fromkeys(
@@ -480,6 +361,9 @@ def _collect_changes(
                 created_today=(created is not None and start <= created <= end),
                 what_added=what_added or "(без описания)",
                 sources=sources,
+                summary=re.sub(r"\s+", " ", what_parts[0]).strip()
+                if what_parts
+                else "",
             )
         )
     return changes
@@ -638,63 +522,15 @@ def _collect_revisit(
         eligible.append(candidate)
 
     eligible.sort(key=lambda candidate: _revisit_sort_key(day, candidate.rel_path))
-    return [
-        (candidate.rel_path, candidate.title) for candidate in eligible[:limit]
-    ]
+    return [(candidate.rel_path, candidate.title) for candidate in eligible[:limit]]
 
 
 def _render_change_line(item: _ChangeItem) -> str:
-    label = "новая страница" if item.created_today else "обогащена"
-    source_text = (
-        ", ".join(f"[[{source}]]" for source in item.sources) if item.sources else "—"
-    )
-    return (
-        f"- [[{item.rel_path}|{item.title}]] ({label}, {item.domain}) "
-        f"— {item.what_added} · источник: {source_text}"
-    )
+    summary = item.summary or item.what_added
+    if len(summary) > 240:
+        summary = summary[:237].rsplit(" ", 1)[0] + "…"
+    return f"- [[{item.rel_path}|{item.title}]] — {summary}"
 
-
-# Statuses that must NOT get a "failure" line below even when ``error`` is
-# empty -- "no-work" is the ТЗ's one legitimate quiet-day status, and
-# "success"/"ok" are this codebase's two spellings of a normal, non-failing
-# pass (``read_pass_status``'s own tolerant-fallback default for a *missing*
-# journal uses "success"; ``compiled_briefings.py``'s
-# ``run_nightly_maintenance`` writes the literal "ok"). "unknown" --
-# ``read_pass_status``'s status for a journal that *exists* but could not be
-# read or understood -- is deliberately excluded too, but it does not fall
-# through to ``_FAILURE_FALLBACK_LINE`` below: it gets its own
-# ``_UNKNOWN_STATUS_LINE`` instead, since a journal we could not read is not
-# evidence the pass itself failed. Any other status -- most commonly
-# "failed", or an unexpected value a future writer might produce -- still
-# gets ``_FAILURE_FALLBACK_LINE``.
-_NON_FAILURE_STATUSES = frozenset({"no-work", "success", "ok"})
-
-# ТЗ 7.1: "Сбойный проход, наоборот, всегда порождает сообщение с причиной"
-# -- shown when the status is a genuine failure (not "unknown", see above)
-# but the journal's ``error`` field came back empty, missing, or not a
-# string (``read_pass_status`` already tolerates all three when reading the
-# journal).
-_FAILURE_FALLBACK_LINE = "Проход завершился с ошибкой, подробности недоступны"
-
-# Shown instead of ``_FAILURE_FALLBACK_LINE`` when ``read_pass_status``
-# could not read or understand the pass journal at all (``status ==
-# "unknown"``): honest about what happened (we could not check the last
-# pass) without claiming the pass itself failed and without inventing a
-# reason it did not report.
-_UNKNOWN_STATUS_LINE = (
-    "Не удалось прочитать состояние прошлого прохода обогащения "
-    "— статус неизвестен"
-)
-
-# Repeat-noise mitigation (owner acceptance, задача N): a decision item
-# (queued or an open page conflict alike) that first appeared before today
-# is not restated in full every single day -- it is folded into one summary
-# line so a month-old conflict does not bloat the digest, while still never
-# going silent (see ``build_daily_digest``'s docstring).
-_CARRYOVER_SUMMARY_TEMPLATE = (
-    "- Ещё {count} пункт(ов) очереди решений без изменений сегодня "
-    "— см. «Очередь» в меню."
-)
 
 # The one ``budget_exhausted`` name whose owner-facing line is built by a
 # function rather than read from the table below: it is the only budget tied
@@ -723,9 +559,6 @@ _BUDGET_EXHAUSTED_LABELS: dict[str, str] = {
     ),
 }
 
-# Same cap, and the same reason, as ``_MAX_HUMAN_ZONE_PAGES_SHOWN`` below:
-# the path is the actionable part of this line, but one bad month must not
-# let the budget line crowd out the rest of the digest.
 _MAX_MONTHLY_CAPPED_PAGES_SHOWN = 5
 
 
@@ -795,269 +628,27 @@ def describe_budget_exhausted(
     return described
 
 
-# Owner-visibility gap fix: unlike a queue overflow, there is no "Очередь"
-# screen listing pages skipped for ambiguous <!-- human:start/end -->
-# markers, so the path itself -- not just a count -- is the useful part of
-# this line (ТЗ: the owner is the only one who can fix the marker, and
-# needs to know which page to open). Capped so one badly behaved page does
-# not turn this into the whole digest; the rest are still counted, just not
-# named individually.
-_MAX_HUMAN_ZONE_PAGES_SHOWN = 5
-# Same cap, same reason, for sources the refresh queue gave up on: a backend
-# outage can drop a whole batch at once, and naming every one of them would
-# bury the rest of the digest.
-_MAX_DROPPED_SOURCES_SHOWN = 5
-# A crash journal with no usable message still means the drain died -- report
-# it rather than dropping the line for want of a reason.
-_WORKER_CRASH_NO_REASON = "причина не записана"
-
-
-def _describe_human_zone_ambiguous_pages(pages: tuple[str, ...]) -> str:
-    """One "Требует решения" line listing pages skipped this pass because
-    their human-owned zone markers could not be told apart (see
-    ``compiled_briefings.py``'s ``_record_human_zone_ambiguous``).
-    """
-    shown = pages[:_MAX_HUMAN_ZONE_PAGES_SHOWN]
-    page_list = ", ".join(f"[[{page}]]" for page in shown)
-    remaining = len(pages) - len(shown)
-    if remaining > 0:
-        page_list += f" и ещё {remaining}"
-    return (
-        f"- На {len(pages)} страниц(ах) повреждены метки личной заметки "
-        "владельца («<!-- human:start -->» / «<!-- human:end -->» — "
-        "должна остаться ровно одна такая пара, начало раньше конца) — "
-        "пока метки не поправлены вручную, страница не обновляется и не "
-        f"сжимается: {page_list}."
-    )
-
-
-def _describe_dropped_sources(sources: tuple[str, ...]) -> str:
-    """One "Требует решения" line naming sources the refresh queue gave up
-    on (see ``compiled_briefings.py``'s ``_record_dropped_queue_source``).
-
-    Named, not just counted, for the same reason as the human-zone line
-    above: only the owner can act, and the action is to reopen and re-save
-    that specific note so it is queued again. Capped the same way so a bad
-    day for the model backend cannot turn this into the whole digest.
-    """
-    shown = sources[:_MAX_DROPPED_SOURCES_SHOWN]
-    source_list = ", ".join(f"[[{source}]]" for source in shown)
-    remaining = len(sources) - len(shown)
-    if remaining > 0:
-        source_list += f" и ещё {remaining}"
-    return (
-        f"- Не удалось собрать страницы по {len(sources)} источник(ам) — "
-        "попытки исчерпаны, сами они больше не повторятся; открой и сохрани "
-        f"заново, чтобы поставить в очередь: {source_list}."
-    )
-
-
 def _render_digest(
     day: date,
-    pass_status: PassStatus,
     decisions: list[_DecisionItem],
     changes: list[_ChangeItem],
-    revisit: list[tuple[str, str]],
 ) -> str:
-    lines = [f"**Дайджест обогащения — {day.isoformat()}**"]
-
-    decision_lines: list[str] = []
-    error_text = str(pass_status.error or "").strip()
-    if error_text:
-        decision_lines.append(f"- Проход завершился с ошибкой: {error_text}")
-    elif pass_status.status == "unknown":
-        decision_lines.append(f"- {_UNKNOWN_STATUS_LINE}")
-    elif pass_status.status not in _NON_FAILURE_STATUSES:
-        decision_lines.append(f"- {_FAILURE_FALLBACK_LINE}")
-    decision_lines.extend(
-        f"- Бюджет прохода исчерпан: {description}."
-        for description in describe_budget_exhausted(
-            pass_status.budget_exhausted,
-            monthly_capped_pages=pass_status.monthly_capped_pages,
+    lines = [f"**Обновления памяти — {day.isoformat()}**"]
+    if changes:
+        lines += ["", *map(_render_change_line, changes[:MAX_CHANGES_SHOWN])]
+        lines += ["", f"Обновлено карточек: {len(changes)} (включая разбор архива)."]
+    if decisions:
+        lines += ["", "**Требует вашего ответа**"]
+        lines.extend(
+            f"- [[{item.page}]] — {item.summary}"
+            for item in decisions[:MAX_DECISIONS_SHOWN]
         )
-    )
-    if pass_status.deferred_queue_sources > 0:
-        decision_lines.append(
-            "- Из-за исчерпанного бюджета в очереди осталось источников: "
-            f"{pass_status.deferred_queue_sources} — они вернулись в очередь "
-            "и будут обработаны следующим проходом."
-        )
-    if pass_status.queue_evictions > 0:
-        decision_lines.append(
-            "- Очередь решений переполнена: "
-            f"{pass_status.queue_evictions} старых пункт(ов) вытеснено новыми "
-            f"— лимит очереди {QUEUE_CAP} пунктов, проверьте «Очередь» в меню."
-        )
-    if pass_status.human_zone_ambiguous_pages:
-        decision_lines.append(
-            _describe_human_zone_ambiguous_pages(
-                pass_status.human_zone_ambiguous_pages
+        if len(decisions) > MAX_DECISIONS_SHOWN:
+            lines.append(
+                f"- Ещё вопросов: {len(decisions) - MAX_DECISIONS_SHOWN} "
+                "— см. «Очередь»."
             )
-        )
-    if pass_status.worker_crash:
-        decision_lines.append(
-            "- Фоновая обработка очереди страниц аварийно остановилась: "
-            f"{pass_status.worker_crash} — до перезапуска новые записи "
-            "не попадают в собранные страницы."
-        )
-    if pass_status.dropped_sources:
-        decision_lines.append(
-            _describe_dropped_sources(pass_status.dropped_sources)
-        )
-
-    today_str = day.isoformat()
-    today_decisions = [item for item in decisions if item.since == today_str]
-    carryover_decisions = [item for item in decisions if item.since != today_str]
-    decision_lines.extend(
-        f"- [[{item.page}]] — {item.summary}" for item in today_decisions
-    )
-    if carryover_decisions:
-        decision_lines.append(
-            _CARRYOVER_SUMMARY_TEMPLATE.format(count=len(carryover_decisions))
-        )
-    if decision_lines:
-        lines += ["", "**Требует решения**", *decision_lines]
-
-    change_lines = [_render_change_line(item) for item in changes]
-    if pass_status.auto_decisions > 0:
-        change_lines.append(
-            f"- Очередь решений: {pass_status.auto_decisions} пункт(ов) "
-            "разобрано автоматически — решения записаны в журнал ответов."
-        )
-    if change_lines:
-        lines += ["", "**Что изменилось**", *change_lines]
-
-    if revisit:
-        revisit_lines = [f"- [[{rel_path}|{title}]]" for rel_path, title in revisit]
-        lines += ["", "**Стоит посмотреть**", *revisit_lines]
-
-    if len(lines) == 1:
-        lines += ["", "Изменений и открытых вопросов нет."]
-
     return "\n".join(lines)
-
-
-def _with_fact_check_evictions(
-    pass_status: PassStatus, vault_path: Path, day: date
-) -> PassStatus:
-    """Fold the monthly fact-check pass's own queue evictions into
-    ``pass_status`` when that pass ran on ``day``.
-
-    ТЗ 7.2 requires the owner to learn when the queue cap forced old entries
-    out, whoever caused it. ``compiled_fact_check.py`` can cause it -- it
-    appends a ``fact-check-rejected`` entry per failed page -- but it runs
-    with no active ``CompileEnrichPass``, so it records the count in its own
-    journal (``FACT_CHECK_JOURNAL_RELATIVE_PATH``) instead. Nothing read that
-    journal, so those evictions never reached a digest at all.
-
-    Only counted when the journal's ``date`` is ``day``: this is a *daily*
-    digest, and that journal is monthly and is not rewritten in between, so
-    folding it in unconditionally would repeat the same eviction line every
-    day until the next fact-check run.
-
-    Fail-safe like ``_read_decisions_queue``: a missing, unreadable, or
-    malformed journal contributes nothing rather than raising -- the digest
-    must still be delivered.
-    """
-    path = Path(vault_path) / FACT_CHECK_JOURNAL_RELATIVE_PATH
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return pass_status
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        logger.warning("Fact-check journal %s could not be read", path)
-        return pass_status
-    if not isinstance(payload, dict) or payload.get("date") != day.isoformat():
-        return pass_status
-    evictions = payload.get("queue_evictions")
-    if not isinstance(evictions, int) or isinstance(evictions, bool) or evictions <= 0:
-        return pass_status
-    return replace(
-        pass_status, queue_evictions=pass_status.queue_evictions + evictions
-    )
-
-
-def _with_dropped_sources(pass_status: PassStatus, vault_path: Path) -> PassStatus:
-    """Fold the refresh queue's give-up journal into ``pass_status``.
-
-    ``compiled_briefings._record_dropped_queue_source`` writes it when the
-    queue deletes the last trigger that would have compiled a source the
-    owner wrote. Nothing read it: the drain that produces almost all of
-    these runs detached with stdout/stderr on DEVNULL, so its returned
-    ``errors`` list went nowhere and the note just never appeared in
-    ``compiled/``.
-
-    No ``day`` filter, unlike the two journals above: this file lists what
-    is *still* missing rather than what happened on some date, and the
-    writer clears an entry itself once that source finally compiles. A
-    source dropped last Tuesday and still uncompiled today is still a thing
-    the owner has to act on.
-
-    Fail-safe like its siblings: a missing, unreadable, or malformed
-    journal contributes nothing rather than raising.
-    """
-    path = Path(vault_path) / DROPPED_SOURCES_JOURNAL_RELATIVE_PATH
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return pass_status
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        logger.warning("Dropped-sources journal %s could not be read", path)
-        return pass_status
-    if not isinstance(payload, dict):
-        return pass_status
-    entries = payload.get("sources")
-    if not isinstance(entries, list):
-        return pass_status
-    dropped: list[str] = []
-    for item in entries:
-        if not isinstance(item, dict):
-            continue
-        source_path = str(item.get("source_path") or "").strip()
-        if source_path and source_path not in dropped:
-            dropped.append(source_path)
-    if not dropped:
-        return pass_status
-    return replace(pass_status, dropped_sources=tuple(dropped))
-
-
-def _with_queue_worker_crash(
-    pass_status: PassStatus, vault_path: Path, day: date
-) -> PassStatus:
-    """Fold today's background-queue-worker crash into ``pass_status``.
-
-    ``compiled_briefings._write_queue_worker_crash_journal`` records why the
-    detached drain died and calls that record owner-visible, but no reader
-    existed: the worker is spawned with stdout/stderr on DEVNULL, so its
-    death was invisible everywhere except that file. Meanwhile the drain is
-    what enriches pages *during the day* -- with it dead, edits simply stop
-    being picked up, which looks identical to "nothing happened today".
-
-    Only today's crash counts, for the same reason as the fact-check
-    journal above: the file is overwritten per crash, not per day, so an
-    unconditional read would repeat the same line every day forever.
-
-    Fail-safe like its sibling: a missing, unreadable, or malformed journal
-    contributes nothing rather than raising.
-    """
-    path = Path(vault_path) / QUEUE_WORKER_CRASH_JOURNAL_RELATIVE_PATH
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return pass_status
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        logger.warning("Queue worker crash journal %s could not be read", path)
-        return pass_status
-    if not isinstance(payload, dict):
-        return pass_status
-    crashed_at = str(payload.get("crashed_at") or "")
-    if not crashed_at.startswith(day.isoformat()):
-        return pass_status
-    error = payload.get("error")
-    message = ""
-    if isinstance(error, dict):
-        message = " ".join(str(error.get("message") or "").split())
-    return replace(pass_status, worker_crash=message or _WORKER_CRASH_NO_REASON)
 
 
 def build_daily_digest(
@@ -1066,107 +657,24 @@ def build_daily_digest(
     *,
     pass_status: PassStatus,
 ) -> str | None:
-    """Build the ТЗ 7.1 owner digest for one day, or ``None`` if it should
-    not be sent at all.
+    """Return updates and today's identity questions, or None on a quiet day.
 
-    Pure and read-only: reads ``compiled/**`` pages already written to disk
-    (via ``CompiledBriefingService``) plus the optional decisions queue, and
-    renders Markdown. Calls no model, writes nothing.
-
-    Suppression (ТЗ 7.1, corrected per owner acceptance): only when the pass
-    took no work (``pass_status.status == "no-work"``), it reported no
-    error, AND the *merged* decisions list is empty -- JSON-backed queue
-    entries (``.session/decisions-queue.json``) plus every open conflict
-    read live off each page's own "Open Conflicts" table. "Очередь решений"
-    has always had exactly two item kinds (``conflict`` is one of them, see
-    ``decisions_queue.py``'s module docstring), so an open conflict is part
-    of the queue for this purpose -- it forces a digest just like a
-    JSON-backed item, however old it is; the pass having taken no work does
-    not make an unresolved conflict disappear.
-
-    (Earlier code here suppressed the digest whenever only the JSON file was
-    empty, ignoring page conflicts entirely, and defended that as
-    intentional. That read "очередь решений пуста" too narrowly. See
-    ``test_open_conflicts_force_digest_even_on_a_no_work_day``, which
-    replaces the old test that asserted the opposite.)
-
-    Repeat noise from a long-lived item is bounded a different way, not by
-    suppression: ``_render_digest`` shows a decision item in full only when
-    it first appeared today (``since == day``); every older item is folded
-    into one summary line with a count and a pointer to the "Очередь"
-    screen, so a month-old conflict is never fully restated every single
-    day, but it is also never silently dropped.
-
-    An error always forces a digest, with the reason as the first "Требует
-    решения" line -- and a failure status with no usable reason (empty,
-    missing, or non-string ``error``) still gets an honest fallback line
-    there instead of reading like a quiet day (see
-    ``_NON_FAILURE_STATUSES``/``_render_digest``).
-
-    A non-empty ``pass_status.budget_exhausted`` also forces a digest, for
-    the same reason as an error: ТЗ 5.5 inv 7 explicitly forbids treating
-    budget exhaustion as a quiet night ("молчаливое усечение запрещено") --
-    even a "no-work"-status, error-free, decision-free pass must still be
-    reported if a budget was hit, with one "Требует решения" line per
-    exhausted budget (``describe_budget_exhausted``).
-
-    A nonzero ``pass_status.queue_evictions`` forces a digest the same way:
-    the 30-item decisions-queue cap having forced old entries out is itself
-    a fact the owner must learn (ТЗ 7.2), not something a quiet-day
-    suppression should hide.
-
-    A non-empty ``pass_status.human_zone_ambiguous_pages`` forces a digest
-    the same way, and for a stronger reason than the two above: a page
-    stuck on an ambiguous marker does not resolve itself next pass the way
-    an exhausted budget or an evicted queue item eventually does -- only
-    the owner opening that exact page can fix it, so staying silent about
-    it on a "no-work" day would leave it stuck indefinitely.
-
-    A crashed background queue worker forces a digest for the same reason,
-    and is the only one of these signals that comes from a journal the
-    enrichment pass never writes -- see ``_with_queue_worker_crash``.
-
-    A non-empty ``changes`` list forces a digest too (code review). The
-    status describes the *nightly pass*, while ``_collect_changes`` reads
-    the pages' own sources tables -- and pages are also enriched during the
-    day, off the pass, by the background queue drain
-    (``CompiledBriefingService.refresh_after_write``). For an owner whose
-    drain keeps up, the night's pass then finds an empty queue and honestly
-    reports "no-work" while the day's real page changes sit on disk, so
-    suppressing on the status alone hid exactly the digest's block 2 ("что
-    изменилось", ТЗ 7.1). ``revisit`` needs no clause of its own: it is
-    derived from ``changes`` (``_collect_revisit`` matches candidates
-    against the changed pages' domains and title tokens), so it is
-    necessarily empty whenever ``changes`` is.
+    Pass status does not trigger delivery: processing details stay in journals.
+    The full decisions queue and weekly review retain their existing content.
     """
-    pass_status = _with_fact_check_evictions(pass_status, Path(vault_path), day)
-    pass_status = _with_queue_worker_crash(pass_status, Path(vault_path), day)
-    pass_status = _with_dropped_sources(pass_status, Path(vault_path))
-
     service = CompiledBriefingService(Path(vault_path))
-    candidates = service._iter_candidates()
-
-    changes = _collect_changes(candidates, day, day)
-    conflicts = _collect_conflicts(candidates)
-    queued = _read_decisions_queue(Path(vault_path))
-    decisions = _merge_decisions(conflicts, queued)
-    revisit = _collect_revisit(candidates, changes, day)
-
-    is_quiet_day = (
-        pass_status.status == "no-work"
-        and not pass_status.error.strip()
-        and not changes
-        and not decisions
-        and not pass_status.budget_exhausted
-        and not pass_status.queue_evictions
-        and not pass_status.human_zone_ambiguous_pages
-        and not pass_status.worker_crash
-        and not pass_status.dropped_sources
+    changes = _collect_changes(service._iter_candidates(), day, day)
+    decisions = _merge_decisions(
+        [],
+        [
+            item
+            for item in _read_decisions_queue(Path(vault_path))
+            if item.kind == "entity-identity" and item.since == day.isoformat()
+        ],
     )
-    if is_quiet_day:
+    if not changes and not decisions:
         return None
-
-    return _render_digest(day, pass_status, decisions, changes, revisit)
+    return _render_digest(day, decisions, changes)
 
 
 def render_digest_note(day: date, digest_markdown: str) -> bytes:

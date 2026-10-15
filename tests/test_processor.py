@@ -1,6 +1,7 @@
 import fcntl
 import inspect
 import json
+import os
 import subprocess
 import threading
 from datetime import date
@@ -31,6 +32,110 @@ from d_brain.services.processor import (
     CliProcessor,
 )
 from d_brain.services.vault_lock import vault_write_lock
+
+
+def test_todoist_failure_is_saved_and_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    processor = CliProcessor(vault_path, todoist_api_key="token")
+    processor._project_catalog.get_catalog = lambda **kwargs: {  # type: ignore[method-assign]
+        "available": False,
+        "catalog": None,
+        "errors": [],
+    }
+    processor._project_router.route_task = lambda *args, **kwargs: {}  # type: ignore[method-assign]
+    calls = {"count": 0}
+
+    def fake_run(*args, **kwargs):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        if calls["count"] <= 3:
+            return subprocess.CompletedProcess(args[0], 1, "", "timeout")
+        return subprocess.CompletedProcess(
+            args[0], 0, '{"tasks": [{"id": "42", "content": "Позвонить"}]}', ""
+        )
+
+    monkeypatch.setattr("d_brain.services.processor.subprocess.run", fake_run)
+    monkeypatch.setattr("d_brain.services.processor.time.sleep", lambda _: None)
+
+    assert processor._create_todoist_tasks([{"content": "Позвонить"}]) == []
+    assert processor._load_pending_todoist_tasks() == [{"content": "Позвонить"}]
+
+    assert processor._retry_pending_todoist_tasks() == [
+        {"id": "42", "content": "Позвонить"}
+    ]
+    assert processor._load_pending_todoist_tasks() == []
+
+
+def test_reconcile_capture_saves_missing_todoist_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = CliProcessor(tmp_path / "vault", todoist_api_key="token")
+    pending: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        processor,
+        "_create_todoist_tasks",
+        lambda tasks, **kwargs: pending.extend(tasks) or [],
+    )
+    execute_data: dict[str, object] = {"tasks_created": []}
+
+    processor._reconcile_capture_todoist_tasks(
+        {
+            "entries": [
+                {
+                    "classification": "task",
+                    "task_content": "Позвонить",
+                    "task_priority": 2,
+                    "task_due": "tomorrow",
+                }
+            ]
+        },
+        execute_data,
+    )
+
+    assert pending == [
+        {"content": "Позвонить", "priority": 2, "due_hint": "tomorrow"}
+    ]
+    assert execute_data["tasks_pending"] == pending
+
+
+def test_execute_counts_reviewed_separately_from_processed_when_task_is_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = CliProcessor(tmp_path / "vault")
+    written: dict[str, object] = {}
+    capture_data = {
+        "entries": [
+            {"classification": "task"},
+            {"classification": "project"},
+            {"classification": "skip"},
+        ]
+    }
+    monkeypatch.setattr(processor, "_build_execute_prompt", lambda day: "execute")
+    monkeypatch.setattr(
+        processor,
+        "_run_json_phase",
+        lambda *args, **kwargs: {"tasks_created": [], "thoughts_saved": []},
+    )
+    monkeypatch.setattr(
+        processor,
+        "_write_session_json",
+        lambda name, payload: written.update({name: payload}),
+    )
+    monkeypatch.setattr(
+        processor,
+        "_reconcile_capture_todoist_tasks",
+        lambda capture, execute: execute.update(
+            {"tasks_pending": [{"content": "Позвонить"}]}
+        ),
+    )
+    monkeypatch.setattr(processor, "_normalize_saved_thoughts", lambda *a, **k: None)
+
+    result = processor._daily_workflow._execute(date(2026, 4, 4), capture_data)
+
+    assert result["entry_counts"] == {"reviewed": 3, "processed": 1}
+    assert written["execute.json"] == result
 
 
 def test_process_daily_facade_signature_and_timeout_mapping(tmp_path: Path) -> None:
@@ -104,6 +209,10 @@ def test_do_processor_uses_vault_scoped_runner(tmp_path: Path) -> None:
     assert processor._cli_extra_env()["MCP_CONFIG_PATH"] == str(
         tmp_path / "mcp-config.json"
     )
+    assert processor._cli_extra_env()["VAULT_PATH"] == str(vault_path.resolve())
+    assert processor._cli_extra_env()["PATH"].split(os.pathsep)[0] == str(
+        tmp_path / ".venv" / "bin"
+    )
 
 
 def test_processor_cli_extra_env_forwards_model_gateway_settings(
@@ -174,10 +283,37 @@ def test_process_prompts_include_content_language_rule(tmp_path: Path) -> None:
     assert "in English" in capture_prompt
     assert "in English" in reflect_prompt
     assert ".session/memory-audit.md" in reflect_prompt
+    assert "read memory configuration from .memory-config.json" in reflect_prompt
+    assert "not vault/.memory-config.json" in reflect_prompt
     assert "Default to NO edit when unsure" in reflect_prompt
     assert "keep it in `daily` or `.session/handoff.md` instead" in reflect_prompt
     assert "Keep exactly one instance of each heading" in reflect_prompt
     assert "Keep at most 10 observation bullets in handoff" in reflect_prompt
+
+
+def test_capture_and_execute_prompts_keep_task_creation_and_due_dates_deterministic(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _setup_daily_processing_vault(vault_path, day)
+    phases_path = vault_path.parent / "skills/dbrain-processor/phases"
+    for phase_name in ("capture", "execute"):
+        source = SKILLS_TEMPLATE_ROOT / f"dbrain-processor/phases/{phase_name}.md"
+        (phases_path / f"{phase_name}.md").write_text(
+            source.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+    processor = CliProcessor(vault_path)
+
+    capture_prompt = processor._build_capture_prompt(day)
+    execute_prompt = processor._build_execute_prompt(day)
+
+    assert "set `task_due` only when the source explicitly gives" in capture_prompt
+    assert "otherwise use `null`" in capture_prompt
+    assert "Do not call `todoist add-tasks` for captured entries" in execute_prompt
+    assert "Do not create Todoist tasks for entries from capture.json" in execute_prompt
+    assert "uses only explicit task_due values" in execute_prompt
 
 
 def test_vault_retrieval_skill_is_injected_only_into_vault_write_and_answer_prompts(
@@ -319,6 +455,29 @@ def test_execute_prompt_injects_vault_retrieval_skill(
     assert captured["prompt"].index("=== AUTO ARCHIVE RECALL ===") < captured[
         "prompt"
     ].index("USER REQUEST:")
+
+
+def test_execute_prompt_instructs_matplotlib_chart_for_numbers_over_time(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _setup_daily_processing_vault(vault_path, day)
+    processor = CliProcessor(vault_path)
+    captured: dict[str, str] = {}
+    processor._run_assistant_prompt = (  # type: ignore[method-assign]
+        lambda prompt: captured.setdefault("prompt", prompt) and "готово"
+    )
+
+    processor.execute_prompt("Сравни расходы за последние месяцы")
+
+    prompt = captured["prompt"]
+    assert "matplotlib.use(\"Agg\")" in prompt
+    assert "attachments/charts/" in prompt
+    assert "DejaVu Sans" in prompt
+    assert "into the report" in prompt
+    assert "Skip the chart for qualitative comparisons" in prompt
+    assert "Never invent values or scores" in prompt
 
 
 def test_run_json_phase_retries_with_stricter_contract_and_persists_raw_output(
@@ -1007,6 +1166,27 @@ def test_question_prompt_reads_core_business_and_projects_context(
     assert "Источники:" in prompt
 
 
+def test_question_prompt_instructs_matplotlib_chart_for_numbers_over_time(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _setup_daily_processing_vault(vault_path, day)
+    processor = CliProcessor(vault_path)
+
+    prompt = processor._build_question_answer_prompt(
+        "Какие приоритеты на эту неделю?",
+        user_id=0,
+    )
+
+    assert "matplotlib.use(\"Agg\")" in prompt
+    assert "attachments/charts/" in prompt
+    assert "DejaVu Sans" in prompt
+    assert "into the answer" in prompt
+    assert "Skip the chart for qualitative comparisons" in prompt
+    assert "Never invent values or scores" in prompt
+
+
 def test_telegram_output_rules_use_adaptive_answer_depth() -> None:
     rules = CliProcessor._telegram_markdown_output_rules(
         opening_line="Start with the answer.",
@@ -1038,7 +1218,8 @@ def test_question_prompt_requires_source_footer_for_fact_and_history_routes(
 
     assert "SOURCE FOOTER POLICY: REQUIRED" in fact_prompt
     assert "SOURCE FOOTER POLICY: REQUIRED" in history_prompt
-    assert "2-5 фактически использованных vault-relative" in fact_prompt
+    assert "2-5 фактически использованных источников" in fact_prompt
+    assert "telegram:<chat>:<message>" in fact_prompt
     assert "не выдумывай ссылку" in fact_prompt
 
 
@@ -1336,7 +1517,9 @@ def test_process_daily_scheduled_persists_phase_files_and_runs_maintenance(
         encoding="utf-8"
     )
     assert "<!-- d-brain:reflect:start -->" in daily_content
-    assert "**Tasks created:** 1" in daily_content
+    assert "**Создано задач:** 1" in daily_content
+    assert "**Сохранено мыслей:** 0" in daily_content
+    assert "**Обновлено CRM:** 0" in daily_content
     assert maintenance == {
         "creative": True,
         "health": True,
@@ -1479,7 +1662,7 @@ def test_reflect_daily_block_keeps_a_zero_priority_visible(
         },
     )
 
-    assert "priority: 0" in captured["block"]
+    assert "приоритет: 0" in captured["block"]
 
 
 def test_reflect_daily_block_repeat_does_not_duplicate_heading(
@@ -1509,7 +1692,7 @@ def test_reflect_daily_block_repeat_does_not_duplicate_heading(
     assert len(reflect_headings) == 1
     assert content.count("<!-- d-brain:reflect:start -->") == 1
     assert content.count("<!-- d-brain:reflect:end -->") == 1
-    assert content.count("d-brain processing") == 1
+    assert content.count("Обработка d-brain") == 1
 
 
 def test_process_daily_scheduled_preserves_side_effect_order(tmp_path: Path) -> None:
@@ -1568,6 +1751,9 @@ def test_process_daily_scheduled_preserves_side_effect_order(tmp_path: Path) -> 
     processor._write_session_json = (  # type: ignore[method-assign]
         lambda file_name, payload: events.append(f"write:{file_name}")
     )
+    processor._reconcile_capture_todoist_tasks = (  # type: ignore[method-assign]
+        lambda capture_data, execute_data: events.append("reconcile-todoist")
+    )
     processor._normalize_saved_thoughts = (  # type: ignore[method-assign]
         lambda execute_data, day: events.append("normalize-thoughts")
     )
@@ -1601,6 +1787,8 @@ def test_process_daily_scheduled_preserves_side_effect_order(tmp_path: Path) -> 
         "count",
         "write:capture.json",
         "execute:retry=False:raw=True",
+        "reconcile-todoist",
+        "count",
         "write:execute.json",
         "normalize-thoughts",
         "memory-decay",
@@ -1886,6 +2074,50 @@ def test_answer_question_uses_creative_recall_and_touches_core_memory(
         "business/_index.md",
         "projects/_index.md",
     )
+
+
+def test_answer_question_returns_generated_attachment_paths(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _setup_daily_processing_vault(vault_path, day)
+    processor = CliProcessor(vault_path)
+    processor._capture_creative_recall = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    processor._touch_memory_paths = lambda *paths: None  # type: ignore[method-assign]
+
+    def fake_run(_prompt: str) -> str:
+        artifact = vault_path / "attachments" / "migration-plan.xml"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text("<Project />", encoding="utf-8")
+        return "Файл создан."
+
+    processor._run_assistant_prompt = fake_run  # type: ignore[method-assign]
+
+    result = processor.answer_question("Создай проект в MS Project", user_id=42)
+
+    assert result["artifact_paths"] == [
+        str((vault_path / "attachments" / "migration-plan.xml").resolve())
+    ]
+
+
+def test_answer_question_returns_existing_attachment_named_in_answer(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _setup_daily_processing_vault(vault_path, day)
+    artifact = vault_path / "attachments" / "migration-plan.xml"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("<Project />", encoding="utf-8")
+    processor = CliProcessor(vault_path)
+    processor._capture_creative_recall = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    processor._touch_memory_paths = lambda *paths: None  # type: ignore[method-assign]
+    processor._run_assistant_prompt = (  # type: ignore[method-assign]
+        lambda _prompt: "Отправляю `attachments/migration-plan.xml`."
+    )
+
+    result = processor.answer_question("Пришли этот файл", user_id=42)
+
+    assert result["artifact_paths"] == [str(artifact.resolve())]
 
 
 def test_answer_question_does_not_depend_on_uv_for_memory_steps(
@@ -2601,3 +2833,105 @@ def test_normalize_owner_report_markdown_supports_english_output(
     assert "Here is the final digest" not in markdown_body
     assert "- **One**" in markdown_body
     assert "- *Two*" in markdown_body
+
+
+class _FakeNightlyCompiledService:
+    """Stand-in for ``CompiledBriefingService`` in
+    ``_run_compiled_nightly_maintenance`` tests (T4): only
+    ``run_nightly_maintenance`` is exercised by that method, so this avoids
+    building a real vault/queue just to check the new "Импорты"/"Imports"
+    summary line."""
+
+    def __init__(self, result: dict) -> None:
+        self._result = result
+
+    def run_nightly_maintenance(self) -> dict:
+        return dict(self._result)
+
+
+def _base_nightly_result(**overrides: object) -> dict:
+    result: dict = {
+        "queued_drained": 0,
+        "consolidations": [],
+        "archived": [],
+        "lint_issues": [],
+        "freshness_issues": [],
+        "queue_busy": False,
+        "queue_errors": [],
+        "imports_used": 0,
+        "imports_nothing": 0,
+        "imports_failed": 0,
+        "import_sweep": {},
+    }
+    result.update(overrides)
+    return result
+
+
+def test_run_compiled_nightly_maintenance_adds_imports_line_ru(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = CliProcessor(tmp_path / "vault")
+    fake_result = _base_nightly_result(
+        imports_used=2, imports_nothing=1, imports_failed=0
+    )
+    monkeypatch.setattr(
+        "d_brain.services.processor.CompiledBriefingService",
+        lambda *args, **kwargs: _FakeNightlyCompiledService(fake_result),  # noqa: ARG005
+    )
+
+    result = processor._run_compiled_nightly_maintenance()
+
+    assert "- Импорты: обработано 2, пусто 1, ошибок 0" in result["report"]
+
+
+def test_run_compiled_nightly_maintenance_adds_imports_line_en(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = CliProcessor(tmp_path / "vault", content_language="en")
+    fake_result = _base_nightly_result(
+        imports_used=0, imports_nothing=0, imports_failed=1
+    )
+    monkeypatch.setattr(
+        "d_brain.services.processor.CompiledBriefingService",
+        lambda *args, **kwargs: _FakeNightlyCompiledService(fake_result),  # noqa: ARG005
+    )
+
+    result = processor._run_compiled_nightly_maintenance()
+
+    assert "- Imports: processed 0, empty 0, errors 1" in result["report"]
+
+
+def test_run_compiled_nightly_maintenance_omits_imports_line_when_all_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = CliProcessor(tmp_path / "vault")
+    fake_result = _base_nightly_result()
+    monkeypatch.setattr(
+        "d_brain.services.processor.CompiledBriefingService",
+        lambda *args, **kwargs: _FakeNightlyCompiledService(fake_result),  # noqa: ARG005
+    )
+
+    result = processor._run_compiled_nightly_maintenance()
+
+    assert "Импорты" not in result["report"]
+    assert "Imports" not in result["report"]
+
+
+def test_run_compiled_nightly_maintenance_adds_imports_line_for_sweep_only_activity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sweep can post/mark import notes on a night the queue drain
+    itself touches none (T4) -- the summary line must still show up, gated
+    on ``import_sweep``'s own counters, not only the drain-derived ones."""
+    processor = CliProcessor(tmp_path / "vault")
+    fake_result = _base_nightly_result(
+        import_sweep={"marked_used": 0, "requeued": 3, "skipped": 5}
+    )
+    monkeypatch.setattr(
+        "d_brain.services.processor.CompiledBriefingService",
+        lambda *args, **kwargs: _FakeNightlyCompiledService(fake_result),  # noqa: ARG005
+    )
+
+    result = processor._run_compiled_nightly_maintenance()
+
+    assert "- Импорты: обработано 0, пусто 0, ошибок 0" in result["report"]

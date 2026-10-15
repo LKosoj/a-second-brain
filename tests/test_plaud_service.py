@@ -314,6 +314,57 @@ def test_plaud_sync_imports_recordings_and_creates_daily_stub(
     assert signal.entries == 1
 
 
+def test_plaud_sync_logs_ingest_ops_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault_path = tmp_path / "vault"
+    (vault_path.parent / "skills/dbrain-processor/references").mkdir(parents=True)
+    (vault_path.parent / "skills/dbrain-processor/references/plaud.md").write_text(
+        "owner={OWNER_FULL_NAME}",
+        encoding="utf-8",
+    )
+    _reject_direct_markdown_write(monkeypatch)
+    items = [{"file_id": "file-1"}]
+    details = {
+        "file-1": {
+            "file_id": "file-1",
+            "title": "Weekly sync",
+            "record_time": 1712217600000,
+            "trans_result": "Я отправлю follow-up завтра.",
+            "ai_content": {"summary": "Иван должен отправить follow-up."},
+        }
+    }
+    service = PlaudSyncService(
+        vault_path,
+        bearer_token="token",
+        owner_full_name="Иванов Иван",
+        client=_FakePlaudClient(items, details),  # type: ignore[arg-type]
+    )
+    service._run_prompt = lambda prompt: json.dumps(  # type: ignore[method-assign]
+        {
+            "context_type": "personal_memo",
+            "archive": True,
+            "todoist_create": False,
+            "owner_confidence": "medium",
+            "reason": "archive only",
+            "tasks": [],
+            "search_value": {
+                "topics": ["sync"],
+                "entities": [],
+                "meeting_prep_value": False,
+            },
+        },
+        ensure_ascii=False,
+    )
+
+    service.sync(backfill=True, refresh_qmd=False)
+
+    note_files = list((vault_path / "imports" / "plaud" / "notes").rglob("*.md"))
+    note_rel_path = note_files[0].relative_to(vault_path).as_posix()
+    log_line = (vault_path / ".session" / "log.md").read_text(encoding="utf-8").strip()
+    assert log_line.endswith(f"[ingest] Weekly sync → {note_rel_path}")
+
+
 def test_plaud_daily_stub_repeat_does_not_duplicate_heading(tmp_path: Path) -> None:
     vault_path = tmp_path / "vault"
     service = PlaudSyncService(
@@ -551,7 +602,9 @@ def test_plaud_migrate_note_path_drift_updates_note_state_and_daily(
 
     recorded_utc = datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC)
     recorded_local = recorded_utc.astimezone(timezone(timedelta(hours=3)))
-    monkeypatch.setattr(service, "_recorded_at", lambda payload: recorded_local)
+    monkeypatch.setattr(
+        service, "_recorded_at", lambda payload, **kwargs: recorded_local
+    )
     legacy_note_path, _ = service._file_paths("file-legacy", recorded_utc)
     canonical_note_path, _ = service._file_paths("file-legacy", recorded_local)
     legacy_note_rel = legacy_note_path.relative_to(vault_path).as_posix()

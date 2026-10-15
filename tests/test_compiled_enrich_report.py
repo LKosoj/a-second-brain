@@ -21,10 +21,15 @@ from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from d_brain import run_compiled_digest
 from d_brain.manifest import load_manifest_for_vault
 from d_brain.services.compiled_briefings import CompiledBriefingCandidate
 from d_brain.services.compiled_enrich_report import (
+    MAX_CHANGE_FACTS_SHOWN,
+    MAX_CHANGES_SHOWN,
+    MAX_DECISIONS_SHOWN,
     STALE_REVISIT_DAYS,
     PassStatus,
     _ChangeItem,
@@ -37,12 +42,51 @@ from d_brain.services.compiled_enrich_report import (
 )
 from d_brain.services.decisions_queue import (
     CONFLICT_KIND,
-    QUEUE_CAP,
     list_queue_items,
 )
 from d_brain.services.frontmatter import parse_frontmatter_bytes, validate_document
 
 DAY = date(2026, 8, 5)
+
+
+def test_daily_digest_limits_decisions_and_changes(
+    tmp_path, write_vault_manifest
+) -> None:
+    vault = tmp_path / "vault"
+    write_vault_manifest(vault)
+    decisions = []
+    for index in range(MAX_DECISIONS_SHOWN + 2):
+        decisions.append(
+            {
+                "kind": "entity-identity",
+                "page": f"compiled/topics/decision-{index}.md",
+                "summary": f"решение {index}",
+                "since": DAY.isoformat(),
+            }
+        )
+    _write_queue(vault, decisions)
+    for index in range(MAX_CHANGES_SHOWN + 2):
+        _write_page(
+            vault,
+            f"compiled/topics/change-{index}.md",
+            domain="topics",
+            title=f"Изменение {index}",
+            created=DAY.isoformat(),
+            last_accessed=DAY.isoformat(),
+            sources_rows=[
+                (DAY.isoformat(), f"daily/source-{index}.md", f"факт {index}")
+            ],
+        )
+
+    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="success"))
+
+    assert digest is not None
+    assert "Ещё вопросов: 2" in digest
+    assert "Обновлено карточек: 7" in digest
+    assert "решение 4" in digest
+    assert "решение 5" not in digest
+    assert "Изменение 4" in digest
+    assert "Изменение 5" not in digest
 
 
 def _compiled_page_text(
@@ -193,11 +237,6 @@ def test_missing_compiled_directory_returns_none_for_no_work(
 
 
 def test_no_work_with_pages_changed_today_still_builds(tmp_path, write_vault_manifest):
-    """Code review: pages are also enriched off the nightly pass, by the
-    background queue drain (``refresh_after_write``). For an owner whose
-    drain keeps up, the night's pass then honestly reports "no-work" while
-    the day's real page changes sit on disk -- suppressing on the status
-    alone hid exactly the digest's block 2 ("что изменилось", ТЗ 7.1)."""
     vault = tmp_path / "vault"
     (vault / "compiled").mkdir(parents=True)
     write_vault_manifest(vault)
@@ -220,18 +259,12 @@ def test_no_work_with_pages_changed_today_still_builds(tmp_path, write_vault_man
     digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="no-work"))
 
     assert digest is not None
-    assert "**Что изменилось**" in digest
+    assert "**Обновления памяти" in digest
     assert "[[compiled/projects/demo-project.md|Demo Project]]" in digest
     assert "Новый дедлайн — 15 сентября." in digest
 
 
 def test_no_work_with_queued_decision_still_builds(tmp_path, write_vault_manifest):
-    """ТЗ 7.1: "Если проход завершился со статусом «нет работы» и очередь
-    решений пуста, дайджест не отправляется" -- a non-empty queue must
-    override the no-work suppression. ``since`` is today's date so this item
-    lands in the "today" bucket and stays shown in full -- the carryover
-    folding behavior (задача N) is covered separately, this test is only
-    about the no-work override."""
     vault = tmp_path / "vault"
     (vault / "compiled").mkdir(parents=True)
     write_vault_manifest(vault)
@@ -239,9 +272,9 @@ def test_no_work_with_queued_decision_still_builds(tmp_path, write_vault_manifes
         vault,
         [
             {
-                "kind": "duplicate-candidate",
+                "kind": "entity-identity",
                 "page": "compiled/topics/aurora.md",
-                "summary": "похоже на дубликат существующей страницы",
+                "summary": "Какой проект Аврора имеется в виду?",
                 "since": DAY.isoformat(),
             }
         ],
@@ -250,149 +283,15 @@ def test_no_work_with_queued_decision_still_builds(tmp_path, write_vault_manifes
     digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="no-work"))
 
     assert digest is not None
-    assert "**Требует решения**" in digest
+    assert "**Требует вашего ответа**" in digest
     assert "[[compiled/topics/aurora.md]]" in digest
-    assert "похоже на дубликат существующей страницы" in digest
-
-
-def test_no_work_with_fact_check_decision_still_builds(tmp_path, write_vault_manifest):
-    """ТЗ 6.6: the monthly fact-check appends its own ``kind=
-    "fact-check-rejected"`` entries to this SAME decisions queue -- proving
-    no digest code change is needed for that new workflow to surface here.
-    ``since`` is today's date so this item stays in the "today" (full-text)
-    bucket -- see задача N's carryover-folding tests for the other case.
-    """
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-    _write_queue(
-        vault,
-        [
-            {
-                "kind": "fact-check-rejected",
-                "page": "compiled/topics/aurora.md",
-                "summary": (
-                    "проверка фактов: 2/3 проверяемых утверждений не "
-                    "подтвердились — решить, актуальна ли страница"
-                ),
-                "since": DAY.isoformat(),
-            }
-        ],
-    )
-
-    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="no-work"))
-
-    assert digest is not None
-    assert "**Требует решения**" in digest
-    assert "[[compiled/topics/aurora.md]]" in digest
-    assert "проверка фактов" in digest
-
-
-def test_error_forces_build_with_reason_first(tmp_path, write_vault_manifest):
-    """ТЗ 7.1: "Сбойный проход, наоборот, всегда порождает сообщение с
-    причиной" -- even under a "no-work" status, a non-empty error must
-    force a digest and must be the first "Требует решения" line. ``since``
-    is today's date so the queued item stays in the full-text bucket and
-    this test's ordering assertion is unaffected by carryover folding
-    (задача N)."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-    _write_queue(
-        vault,
-        [
-            {
-                "kind": "drift",
-                "page": "compiled/topics/aurora.md",
-                "summary": "превышен месячный лимит обогащений",
-                "since": DAY.isoformat(),
-            }
-        ],
-    )
-
-    digest = build_daily_digest(
-        vault,
-        DAY,
-        pass_status=PassStatus(
-            status="no-work", error="Compile: модель вернула невалидный JSON"
-        ),
-    )
-
-    assert digest is not None
-    decisions_section = digest.split("**Требует решения**", 1)[1]
-    error_line_index = decisions_section.index(
-        "Compile: модель вернула невалидный JSON"
-    )
-    queue_line_index = decisions_section.index("превышен месячный лимит")
-    assert error_line_index < queue_line_index
-
-
-def test_failure_status_with_empty_error_still_shows_honest_fallback_line(
-    tmp_path, write_vault_manifest
-):
-    """Задача N дефект 2: a failure status ("failed") with an empty
-    ``error`` field must not render like a quiet day -- ``_render_digest``
-    must fall back to an honest "reason unavailable" line instead of
-    silently omitting the "Требует решения" block entirely."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-
-    digest = build_daily_digest(
-        vault, DAY, pass_status=PassStatus(status="failed", error="")
-    )
-
-    assert digest is not None
-    assert "**Требует решения**" in digest
-    assert "Проход завершился с ошибкой, подробности недоступны" in digest
-    assert "Изменений и открытых вопросов нет." not in digest
-
-
-def test_failure_status_with_non_string_error_object_does_not_crash(
-    tmp_path, write_vault_manifest
-):
-    """Same fallback, forced via a directly constructed ``PassStatus`` whose
-    ``error`` is not a string at all (bypassing ``read_pass_status``'s own
-    coercion) -- ``_render_digest`` must not crash calling ``.strip()`` on
-    it and must still show the honest fallback line."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-
-    digest = build_daily_digest(
-        vault,
-        DAY,
-        pass_status=PassStatus(status="failed", error=None),  # type: ignore[arg-type]
-    )
-
-    assert digest is not None
-    assert "Проход завершился с ошибкой, подробности недоступны" in digest
-
-
-def test_success_status_with_empty_error_does_not_get_failure_fallback(
-    tmp_path, write_vault_manifest
-):
-    """The non-regression half of the same fix: a normal successful pass
-    ("success"/"ok") with an empty ``error`` and nothing else to report must
-    keep showing the quiet-day fallback line, not the new failure one --
-    only "no-work" is suppressed outright, but a real success must not be
-    mistaken for a failure either."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-
-    for status in ("success", "ok"):
-        digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status=status))
-
-        assert digest is not None
-        assert "Изменений и открытых вопросов нет." in digest
-        assert "Проход завершился с ошибкой" not in digest
+    assert "Какой проект Аврора имеется в виду?" in digest
 
 
 # --- build_daily_digest: "Что изменилось" -------------------------------
 
 
-def test_changed_block_distinguishes_created_vs_enriched(
+def test_changed_block_shows_current_details_without_labels(
     tmp_path, write_vault_manifest
 ):
     vault = tmp_path / "vault"
@@ -431,23 +330,16 @@ def test_changed_block_distinguishes_created_vs_enriched(
     digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="success"))
 
     assert digest is not None
-    assert "**Что изменилось**" in digest
+    assert "**Обновления памяти" in digest
     assert "compiled/topics/aurora.md" in digest
-    assert "новая страница" in digest
+    assert "новая страница" not in digest
     assert "compiled/people/sokolova.md" in digest
-    assert "обогащена" in digest
+    assert "обогащена" not in digest
     assert "новая деталь о встрече" in digest
     assert "compiled/topics/legacy.md" not in digest
 
 
-def test_enriched_change_shows_replacement_not_plain_addition(
-    tmp_path, write_vault_manifest
-):
-    """ТЗ 7.1: for an enriched page, show a short diff, not a restatement --
-    when today's row is the winning side of a temporal supersession (a
-    "Claim History" row whose "Superseded By" source is today's source),
-    the digest must say it replaces the prior claim and name it, not print
-    the new claim as a plain addition (uses ``_claim_history_rows``)."""
+def test_enriched_change_shows_one_fact_without_history(tmp_path, write_vault_manifest):
     vault = tmp_path / "vault"
     write_vault_manifest(vault)
     _write_page(
@@ -459,7 +351,10 @@ def test_enriched_change_shows_replacement_not_plain_addition(
         last_accessed=DAY.isoformat(),
         # The superseded row was already moved out of the sources table by
         # the compile pass -- only the new (winning) claim remains here.
-        sources_rows=[(DAY.isoformat(), "daily/2026-08-05.md", "бюджет 150k")],
+        sources_rows=[
+            (DAY.isoformat(), "daily/2026-08-05.md", "бюджет 150k"),
+            (DAY.isoformat(), "daily/2026-08-05.md", "срок согласования — пятница"),
+        ],
         claim_history_rows=[
             (
                 "2026-07-01",
@@ -474,17 +369,14 @@ def test_enriched_change_shows_replacement_not_plain_addition(
 
     assert digest is not None
     assert "бюджет 150k" in digest
-    assert "бюджет 100k" in digest
-    assert "замена" in digest
+    assert "срок согласования — пятница" not in digest
+    assert "бюджет 100k" not in digest
+    assert "Замена: было" not in digest
 
 
-def test_created_field_parsed_as_date_not_raw_string(tmp_path, write_vault_manifest):
-    """ТЗ: ``created`` must be parsed as a date, not compared as a raw
-    string. A same-day page whose ``created`` frontmatter uses an alternate
-    valid ISO date form (basic "YYYYMMDD", no dashes) is still today's page
-    -- naive string equality against ``day.isoformat()`` would wrongly call
-    it "enriched" instead of "new". A page with an unparsable ``created``
-    value must not crash and must be treated as enriched, not new."""
+def test_created_date_formats_do_not_affect_short_digest(
+    tmp_path, write_vault_manifest
+):
     vault = tmp_path / "vault"
     write_vault_manifest(vault)
     _write_page(
@@ -512,292 +404,14 @@ def test_created_field_parsed_as_date_not_raw_string(tmp_path, write_vault_manif
     lines = digest.splitlines()
     aurora_line = next(line for line in lines if "compiled/topics/aurora.md" in line)
     garbled_line = next(line for line in lines if "compiled/topics/garbled.md" in line)
-    assert "новая страница" in aurora_line
-    assert "обогащена" in garbled_line
+    assert "первая версия" in aurora_line
+    assert "обновление" in garbled_line
 
 
 # --- build_daily_digest: "Требует решения" / conflicts + queue ---------
 
 
-def test_open_conflicts_include_both_sides(tmp_path, write_vault_manifest):
-    """Uses ``status="success"`` (not "no-work") deliberately: the digest
-    must always show both sides of an open conflict when it *is* built --
-    the "no-work" + empty-queue combination is a suppression case covered
-    separately below (see ``test_quiet_day_suppressed_despite_open_page_conflict``)
-    and must not be entangled with this content assertion."""
-    vault = tmp_path / "vault"
-    write_vault_manifest(vault)
-    _write_page(
-        vault,
-        "compiled/decisions/budget.md",
-        domain="decisions",
-        title="Бюджет проекта Аврора",
-        created="2026-07-01",
-        last_accessed="2026-07-01",
-        sources_rows=[("2026-07-01", "daily/2026-07-01.md", "первичный бюджет")],
-        conflicts_rows=[
-            (
-                DAY.isoformat(),
-                "Бюджет 100k",
-                "daily/2026-07-01.md",
-                "Бюджет 150k",
-                "daily/2026-08-05.md",
-            )
-        ],
-    )
-
-    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="success"))
-
-    assert digest is not None
-    assert "compiled/decisions/budget.md" in digest
-    assert "Бюджет 100k" in digest
-    assert "daily/2026-07-01.md" in digest
-    assert "Бюджет 150k" in digest
-    assert "daily/2026-08-05.md" in digest
-
-
-def test_open_conflicts_force_digest_even_on_a_no_work_day(
-    tmp_path, write_vault_manifest
-):
-    """Owner acceptance correction (inverts the old
-    ``test_quiet_day_suppressed_despite_open_page_conflict``, which asserted
-    the opposite and was defended as intentional in this module's old
-    docstrings): an open page conflict is one of the decisions queue's two
-    item kinds, so it is part of the *merged* decisions list the "тишина"
-    condition checks -- it must force a digest even when the pass took no
-    work and reported no error, however old the conflict is.
-
-    Its claim text is not restated in full here, though: with ``since`` a
-    month before ``DAY``, it lands in the carryover bucket and is folded
-    into one summary line instead (see the carryover-folding test below) --
-    proving the digest is not suppressed without re-asserting the exact
-    rendering of an already-old item."""
-    vault = tmp_path / "vault"
-    write_vault_manifest(vault)
-    _write_page(
-        vault,
-        "compiled/decisions/budget.md",
-        domain="decisions",
-        title="Бюджет проекта Аврора",
-        created="2026-07-01",
-        last_accessed="2026-07-01",
-        sources_rows=[("2026-07-01", "daily/2026-07-01.md", "первичный бюджет")],
-        conflicts_rows=[
-            (
-                "2026-07-29",
-                "Бюджет 100k",
-                "daily/2026-07-01.md",
-                "Бюджет 150k",
-                "daily/2026-07-29.md",
-            )
-        ],
-    )
-
-    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="no-work"))
-
-    assert digest is not None
-    assert "**Требует решения**" in digest
-    assert "Ещё 1" in digest  # folded carryover summary, not full claim text
-
-
-def test_decision_items_split_today_full_text_vs_carryover_summary(
-    tmp_path, write_vault_manifest
-):
-    """ТЗ acceptance (задача N): a decision item that first appeared today
-    (``since == day``) is still shown in full, exactly as before; a decision
-    item that appeared on an earlier day is folded into one summary line
-    with a count instead of being fully restated -- so a long-standing
-    conflict or queued item does not bloat the digest every single day, but
-    is also never silently dropped."""
-    vault = tmp_path / "vault"
-    write_vault_manifest(vault)
-    _write_page(
-        vault,
-        "compiled/decisions/budget.md",
-        domain="decisions",
-        title="Бюджет проекта Аврора",
-        created="2026-07-01",
-        last_accessed="2026-07-01",
-        sources_rows=[("2026-07-01", "daily/2026-07-01.md", "первичный бюджет")],
-        conflicts_rows=[
-            (
-                "2026-07-01",
-                "Бюджет 100k",
-                "daily/2026-07-01.md",
-                "Бюджет 150k",
-                "daily/2026-07-29.md",
-            )
-        ],
-    )
-    _write_queue(
-        vault,
-        [
-            {
-                "kind": "duplicate-candidate",
-                "page": "compiled/topics/aurora.md",
-                "summary": "похожа на существующую страницу",
-                "since": DAY.isoformat(),
-            }
-        ],
-    )
-
-    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="success"))
-
-    assert digest is not None
-    assert "похожа на существующую страницу" in digest  # today: full text
-    assert "Бюджет 100k" not in digest  # carried over: folded away
-    assert "Ещё 1" in digest
-
-
-def test_decisions_queue_deduplicated_against_page_conflicts(
-    tmp_path, write_vault_manifest
-):
-    """ТЗ: queue items must be merged in, "дедуплицируя по паре «страница +
-    суть»" -- a queue entry describing the same page conflict must not
-    double up, but a distinct queue item for that page must still show."""
-    vault = tmp_path / "vault"
-    write_vault_manifest(vault)
-    _write_page(
-        vault,
-        "compiled/decisions/budget.md",
-        domain="decisions",
-        title="Бюджет проекта Аврора",
-        created="2026-07-01",
-        last_accessed="2026-07-01",
-        sources_rows=[("2026-07-01", "daily/2026-07-01.md", "первичный бюджет")],
-        conflicts_rows=[
-            (
-                DAY.isoformat(),
-                "Бюджет 100k",
-                "daily/2026-07-01.md",
-                "Бюджет 150k",
-                "daily/2026-08-05.md",
-            )
-        ],
-    )
-    duplicate_summary = (
-        "«Бюджет 100k» (daily/2026-07-01.md) vs «Бюджет 150k» (daily/2026-08-05.md)"
-    )
-    _write_queue(
-        vault,
-        [
-            {
-                "kind": "conflict",
-                "page": "compiled/decisions/budget.md",
-                "summary": duplicate_summary,
-                "since": DAY.isoformat(),
-            },
-            {
-                "kind": "duplicate-candidate",
-                "page": "compiled/decisions/budget.md",
-                "summary": "похоже на дубль страницы про бюджет",
-                "since": DAY.isoformat(),
-            },
-        ],
-    )
-
-    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="no-work"))
-
-    assert digest is not None
-    assert digest.count(duplicate_summary) == 1
-    assert "похоже на дубль страницы про бюджет" in digest
-
-
-def test_decisions_queue_dedup_ignores_case_spacing_and_a_trailing_period(
-    tmp_path, write_vault_manifest
-):
-    """The queue is written by the model, so a duplicate of a page conflict
-    commonly differs from it only by case, an extra space, or a trailing
-    period (``_normalize_decision_summary``). An exact string match would let
-    both through and the owner would answer the same conflict twice."""
-    vault = tmp_path / "vault"
-    write_vault_manifest(vault)
-    _write_page(
-        vault,
-        "compiled/decisions/budget.md",
-        domain="decisions",
-        title="Бюджет проекта Аврора",
-        created="2026-07-01",
-        last_accessed="2026-07-01",
-        sources_rows=[("2026-07-01", "daily/2026-07-01.md", "первичный бюджет")],
-        conflicts_rows=[
-            (
-                DAY.isoformat(),
-                "Бюджет 100k",
-                "daily/2026-07-01.md",
-                "Бюджет 150k",
-                "daily/2026-08-05.md",
-            )
-        ],
-    )
-    conflict_summary = (
-        "«Бюджет 100k» (daily/2026-07-01.md) vs «Бюджет 150k» (daily/2026-08-05.md)"
-    )
-    sloppy_duplicate = conflict_summary.upper().replace(" vs ", "  VS  ") + " ."
-    _write_queue(
-        vault,
-        [
-            {
-                "kind": "conflict",
-                "page": "compiled/decisions/budget.md",
-                "summary": sloppy_duplicate,
-                "since": DAY.isoformat(),
-            }
-        ],
-    )
-
-    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="no-work"))
-
-    assert digest is not None
-    assert conflict_summary in digest  # the page conflict itself still shows
-    assert sloppy_duplicate not in digest
-
-
-def test_decisions_queue_dedup_keeps_the_same_summary_on_another_page(
-    tmp_path, write_vault_manifest
-):
-    """The de-dup key is the pair «страница + суть» (ТЗ), not the summary
-    alone: two pages can legitimately raise word-for-word the same question,
-    and folding them together would silently drop one page's decision."""
-    vault = tmp_path / "vault"
-    write_vault_manifest(vault)
-    _write_page(
-        vault,
-        "compiled/decisions/budget.md",
-        domain="decisions",
-        title="Бюджет проекта Аврора",
-        created="2026-07-01",
-        last_accessed="2026-07-01",
-        sources_rows=[("2026-07-01", "daily/2026-07-01.md", "первичный бюджет")],
-    )
-    shared_summary = "источник не найден в vault"
-    _write_queue(
-        vault,
-        [
-            {
-                "kind": "duplicate-candidate",
-                "page": "compiled/decisions/budget.md",
-                "summary": shared_summary,
-                "since": DAY.isoformat(),
-            },
-            {
-                "kind": "duplicate-candidate",
-                "page": "compiled/decisions/hiring.md",
-                "summary": shared_summary,
-                "since": DAY.isoformat(),
-            },
-        ],
-    )
-
-    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="no-work"))
-
-    assert digest is not None
-    assert digest.count(shared_summary) == 2
-
-
-def test_digest_counts_only_what_the_queue_screen_shows(
-    tmp_path, write_vault_manifest
-):
+def test_digest_counts_only_what_the_queue_screen_shows(tmp_path, write_vault_manifest):
     """The digest's decision count and the "Очередь" screen must agree.
 
     Both conflict-pointer kinds are hidden by ``list_queue_items`` (the
@@ -831,25 +445,6 @@ def test_digest_counts_only_what_the_queue_screen_shows(
     # Nothing else happened, so with both entries hidden this is a quiet day.
     digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="no-work"))
     assert digest is None
-
-
-def test_digest_reports_queue_items_the_pass_decided_itself(
-    tmp_path, write_vault_manifest
-):
-    """A decision taken for the owner has to be visible to the owner: it
-    lands in "Что изменилось" (the work is done), not in "Требует решения"
-    (nothing is being asked)."""
-    vault = tmp_path / "vault"
-    write_vault_manifest(vault)
-
-    digest = build_daily_digest(
-        vault, DAY, pass_status=PassStatus(status="ok", auto_decisions=3)
-    )
-
-    assert digest is not None
-    assert "**Что изменилось**" in digest
-    assert "3 пункт(ов) разобрано автоматически" in digest
-    assert "**Требует решения**" not in digest
 
 
 def test_decisions_queue_missing_file_is_empty_not_error(
@@ -898,7 +493,9 @@ def test_decisions_queue_non_list_payload_is_empty_not_error(
 # --- build_daily_digest: "Стоит посмотреть" -----------------------------
 
 
-def test_worth_a_look_picks_related_stale_page_only(tmp_path, write_vault_manifest):
+def test_daily_digest_omits_revisit_even_with_related_stale_pages(
+    tmp_path, write_vault_manifest
+):
     vault = tmp_path / "vault"
     write_vault_manifest(vault)
     _write_page(
@@ -947,8 +544,8 @@ def test_worth_a_look_picks_related_stale_page_only(tmp_path, write_vault_manife
     digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="success"))
 
     assert digest is not None
-    assert "**Стоит посмотреть**" in digest
-    assert "compiled/topics/aurora-strategy.md" in digest
+    assert "**Стоит посмотреть**" not in digest
+    assert "compiled/topics/aurora-strategy.md" not in digest
     assert "compiled/people/unrelated.md" not in digest
     assert "compiled/topics/aurora-recent.md" not in digest
 
@@ -1006,11 +603,17 @@ def test_collect_revisit_ignores_non_cold_tier(tmp_path):
         )
     ]
     warm = _revisit_candidate(
-        "compiled/topics/warm.md", "Стратегия Аврора Warm", "topics", "warm",
+        "compiled/topics/warm.md",
+        "Стратегия Аврора Warm",
+        "topics",
+        "warm",
         "2026-01-01",
     )
     cold = _revisit_candidate(
-        "compiled/topics/cold.md", "Стратегия Аврора Cold", "topics", "cold",
+        "compiled/topics/cold.md",
+        "Стратегия Аврора Cold",
+        "topics",
+        "cold",
         "2026-01-01",
     )
 
@@ -1092,47 +695,6 @@ def test_collect_revisit_deterministic_per_day_but_varies_across_days():
         key=lambda p: hashlib.sha256(f"{DAY.isoformat()}|{p}".encode()).hexdigest(),
     )[:2]
     assert [rel_path for rel_path, _ in first] == expected_first
-
-
-def test_block_order_matches_tz_7_1(tmp_path, write_vault_manifest):
-    vault = tmp_path / "vault"
-    write_vault_manifest(vault)
-    _write_page(
-        vault,
-        "compiled/topics/aurora.md",
-        domain="topics",
-        title="Проект Аврора",
-        created=DAY.isoformat(),
-        last_accessed=DAY.isoformat(),
-        sources_rows=[(DAY.isoformat(), "daily/2026-08-05.md", "обновление")],
-        conflicts_rows=[
-            (
-                DAY.isoformat(),
-                "старое утверждение",
-                "daily/2026-07-01.md",
-                "новое утверждение",
-                "daily/2026-08-05.md",
-            )
-        ],
-    )
-    _write_page(
-        vault,
-        "compiled/topics/aurora-strategy.md",
-        domain="topics",
-        title="Стратегия Аврора 2025",
-        created="2025-01-01",
-        last_accessed="2026-01-01",
-        sources_rows=[("2025-01-01", "daily/2025-01-01.md", "план")],
-        tier="cold",
-    )
-
-    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="success"))
-
-    assert digest is not None
-    decisions_index = digest.index("**Требует решения**")
-    changes_index = digest.index("**Что изменилось**")
-    revisit_index = digest.index("**Стоит посмотреть**")
-    assert decisions_index < changes_index < revisit_index
 
 
 # --- read_pass_status: journal reading (задача N) ------------------------
@@ -1258,70 +820,6 @@ def test_read_pass_status_object_without_status_field_is_unknown_and_logs_warnin
     assert any("compile-enrich.json" in record.message for record in caplog.records)
 
 
-def test_corrupt_journal_forces_honest_digest_not_a_quiet_day(
-    tmp_path, write_vault_manifest
-):
-    """End-to-end (corrupted journal on disk -> ``read_pass_status`` ->
-    ``build_daily_digest``): on an otherwise quiet vault, a state file that
-    exists but cannot be parsed must not silently produce the same digest
-    as a genuinely quiet day -- the owner must see an honest line saying
-    the last pass's state could not be read, not "Изменений и открытых
-    вопросов нет.", and the digest must not be suppressed."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-    journal = vault / ".session" / "compile-enrich.json"
-    journal.parent.mkdir(parents=True, exist_ok=True)
-    journal.write_text("{not valid json", encoding="utf-8")
-
-    digest = build_daily_digest(vault, DAY, pass_status=read_pass_status(vault))
-
-    assert digest is not None
-    assert (
-        "Не удалось прочитать состояние прошлого прохода обогащения "
-        "— статус неизвестен" in digest
-    )
-    assert "Изменений и открытых вопросов нет." not in digest
-
-
-def test_failed_journal_with_missing_error_field_still_shows_fallback_line(
-    tmp_path, write_vault_manifest
-):
-    """End-to-end (journal -> ``read_pass_status`` -> ``build_daily_digest``)
-    version of the direct-``PassStatus`` fallback-line test above: a real
-    ``"failed"`` journal with no ``error`` key must still surface the
-    honest fallback line, not render like a quiet day."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-    _write_journal(vault, {"status": "failed"})
-
-    digest = build_daily_digest(vault, DAY, pass_status=read_pass_status(vault))
-
-    assert digest is not None
-    assert "Проход завершился с ошибкой, подробности недоступны" in digest
-
-
-def test_read_pass_status_ok_and_failed_do_not_suppress_digest(
-    tmp_path, write_vault_manifest
-):
-    """Verifies (by running, not by reasoning) that real journal statuses
-    other than "no-work" ("ok", "failed") reach ``build_daily_digest`` and
-    do not trip its ``status == "no-work"`` suppression check -- unlike
-    ``test_read_pass_status_reads_real_no_work_journal`` above, which stops
-    at the ``PassStatus`` returned by ``read_pass_status``, this drives the
-    real value all the way into ``build_daily_digest``."""
-    for journal_status, error in (("ok", ""), ("failed", "qmd unavailable")):
-        vault = tmp_path / f"vault-{journal_status}"
-        (vault / "compiled").mkdir(parents=True)
-        write_vault_manifest(vault)
-        _write_journal(vault, {"status": journal_status, "error": error})
-
-        digest = build_daily_digest(vault, DAY, pass_status=read_pass_status(vault))
-
-        assert digest is not None
-
-
 def test_read_pass_status_no_work_suppresses_quiet_digest(
     tmp_path, write_vault_manifest
 ):
@@ -1388,83 +886,6 @@ def test_read_pass_status_filters_non_string_and_blank_budget_entries(tmp_path):
     assert status.budget_exhausted == ("pages-per-pass",)
 
 
-def test_budget_exhausted_forces_digest_on_otherwise_quiet_no_work_day(
-    tmp_path, write_vault_manifest
-):
-    """ТЗ 5.5 инв 7: "При исчерпании бюджета проход завершается штатно,
-    остаток остаётся в очереди, факт исчерпания попадает в дайджест.
-    Молчаливое усечение запрещено." -- a "no-work" pass with no error and
-    no decisions queued must still produce a digest when a budget was
-    exhausted, instead of collapsing to the ``None`` a quiet day returns."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-
-    digest = build_daily_digest(
-        vault,
-        DAY,
-        pass_status=PassStatus(status="no-work", budget_exhausted=("pages-per-pass",)),
-    )
-
-    assert digest is not None
-    assert "**Требует решения**" in digest
-    assert "Бюджет прохода исчерпан" in digest
-
-
-def test_budget_exhausted_line_translates_technical_name_not_shown_raw(
-    tmp_path, write_vault_manifest
-):
-    """ТЗ: journal names like "pages-per-pass" are technical -- the owner
-    must see a human sentence, not the code identifier verbatim."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-
-    digest = build_daily_digest(
-        vault,
-        DAY,
-        pass_status=PassStatus(status="success", budget_exhausted=("pages-per-pass",)),
-    )
-
-    assert digest is not None
-    assert "pages-per-pass" not in digest
-    assert "лимит страниц" in digest
-
-
-def test_no_budget_exhausted_adds_no_line(tmp_path, write_vault_manifest):
-    """Non-regression: an ordinary pass with nothing exhausted must not gain
-    a spurious "Бюджет" line."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-
-    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="success"))
-
-    assert digest is not None
-    assert "Бюджет" not in digest
-
-
-def test_read_pass_status_no_work_with_budget_exhausted_does_not_suppress(
-    tmp_path, write_vault_manifest
-):
-    """End-to-end (journal -> ``read_pass_status`` -> ``build_daily_digest``)
-    version of ``test_budget_exhausted_forces_digest_on_otherwise_quiet_no_work_day``
-    above, driven through the real journal reader instead of a hand-built
-    ``PassStatus``."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-    _write_journal(
-        vault,
-        {"status": "no-work", "budget_exhausted": ["monthly-enrichments-per-page"]},
-    )
-
-    digest = build_daily_digest(vault, DAY, pass_status=read_pass_status(vault))
-
-    assert digest is not None
-    assert "Бюджет прохода исчерпан" in digest
-
-
 def test_read_pass_status_reads_monthly_capped_pages_and_deferred_sources(tmp_path):
     """The two fields that make a monthly-cap budget line actionable: which
     page ran out of enrichments, and how much source material the pass left
@@ -1502,127 +923,6 @@ def test_read_pass_status_tolerates_bad_monthly_cap_fields(tmp_path):
 
     assert status.monthly_capped_pages == ()
     assert status.deferred_queue_sources == 0
-
-
-def test_budget_line_names_the_page_that_hit_the_monthly_cap(
-    tmp_path, write_vault_manifest
-):
-    """The only action this budget offers the owner is "open that page and
-    decide whether it is still one page", so the line has to say which page
-    -- "какая-то страница" named nothing to open."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-
-    digest = build_daily_digest(
-        vault,
-        DAY,
-        pass_status=PassStatus(
-            status="success",
-            budget_exhausted=("monthly-enrichments-per-page",),
-            monthly_capped_pages=("compiled/projects/demo.md",),
-        ),
-    )
-
-    assert digest is not None
-    assert "[[compiled/projects/demo.md]]" in digest
-    assert "какая-то страница" not in digest
-
-
-def test_budget_line_without_recorded_pages_keeps_the_page_less_wording(
-    tmp_path, write_vault_manifest
-):
-    """A journal from before ``monthly_capped_pages`` existed has no path to
-    name -- the line must fall back to the old wording, not invent one."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-
-    digest = build_daily_digest(
-        vault,
-        DAY,
-        pass_status=PassStatus(
-            status="success",
-            budget_exhausted=("monthly-enrichments-per-page",),
-        ),
-    )
-
-    assert digest is not None
-    assert "какая-то страница" in digest
-
-
-def test_budget_line_names_several_capped_pages_and_caps_the_list(
-    tmp_path, write_vault_manifest
-):
-    """More capped pages than the line will name: every one is counted, the
-    first few are named, and the rest are summarized -- one bad month must
-    not turn this line into the whole digest."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-    pages = tuple(f"compiled/projects/demo-{index}.md" for index in range(7))
-
-    digest = build_daily_digest(
-        vault,
-        DAY,
-        pass_status=PassStatus(
-            status="success",
-            budget_exhausted=("monthly-enrichments-per-page",),
-            monthly_capped_pages=pages,
-        ),
-    )
-
-    assert digest is not None
-    assert "[[compiled/projects/demo-0.md]]" in digest
-    assert "[[compiled/projects/demo-4.md]]" in digest
-    assert "[[compiled/projects/demo-5.md]]" not in digest
-    assert "и ещё 2" in digest
-
-
-def test_digest_reports_how_many_sources_the_budget_left_in_the_queue(
-    tmp_path, write_vault_manifest
-):
-    """ТЗ 5.5 инв 7 says the remainder stays in the queue; the owner also
-    needs to know how big that remainder is, otherwise "остаток остался в
-    очереди" reads the same for one deferred source and for fifty."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-
-    digest = build_daily_digest(
-        vault,
-        DAY,
-        pass_status=PassStatus(
-            status="no-work",
-            budget_exhausted=("monthly-enrichments-per-page",),
-            monthly_capped_pages=("compiled/projects/demo.md",),
-            deferred_queue_sources=6,
-        ),
-    )
-
-    assert digest is not None
-    assert "в очереди осталось источников: 6" in digest
-
-
-def test_digest_without_deferred_sources_adds_no_remainder_line(
-    tmp_path, write_vault_manifest
-):
-    """Non-regression: a budget that ended a pass with nothing left claimed
-    must not gain a "0 источников" line."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-
-    digest = build_daily_digest(
-        vault,
-        DAY,
-        pass_status=PassStatus(
-            status="success", budget_exhausted=("pages-per-pass",)
-        ),
-    )
-
-    assert digest is not None
-    assert "осталось источников" not in digest
 
 
 def test_budget_exhausted_labels_cover_every_name_the_core_can_write():
@@ -1701,59 +1001,6 @@ def test_read_pass_status_non_positive_or_non_int_queue_evictions_is_zero(tmp_pa
         assert status.queue_evictions == 0, bad_value
 
 
-def test_queue_evictions_forces_digest_on_otherwise_quiet_no_work_day(
-    tmp_path, write_vault_manifest
-):
-    """Mirrors ``test_budget_exhausted_forces_digest_on_otherwise_quiet_no_work_day``:
-    a "no-work" pass with no error and no decisions queued must still
-    produce a digest when the queue cap forced old entries out, instead of
-    collapsing to the ``None`` a quiet day returns."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-
-    digest = build_daily_digest(
-        vault,
-        DAY,
-        pass_status=PassStatus(status="no-work", queue_evictions=2),
-    )
-
-    assert digest is not None
-    assert "**Требует решения**" in digest
-    assert "2" in digest
-    assert "Очередь решений переполнена" in digest
-
-
-def test_no_queue_evictions_adds_no_line(tmp_path, write_vault_manifest):
-    """Non-regression: an ordinary pass with nothing evicted must not gain a
-    spurious eviction line."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-
-    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="success"))
-
-    assert digest is not None
-    assert "переполнена" not in digest
-
-
-def test_read_pass_status_no_work_with_queue_evictions_does_not_suppress(
-    tmp_path, write_vault_manifest
-):
-    """End-to-end (journal -> ``read_pass_status`` -> ``build_daily_digest``),
-    driven through the real journal reader instead of a hand-built
-    ``PassStatus``."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-    _write_journal(vault, {"status": "no-work", "queue_evictions": 1})
-
-    digest = build_daily_digest(vault, DAY, pass_status=read_pass_status(vault))
-
-    assert digest is not None
-    assert "Очередь решений переполнена" in digest
-
-
 # --- human_zone_ambiguous_pages: owner-visibility gap fix (code review) --
 # Pages ``compiled_briefings.py`` skips because their <!-- human:start/end
 # --> markers are ambiguous used to only reach the server logs -- the owner
@@ -1819,123 +1066,6 @@ def test_read_pass_status_filters_non_string_and_blank_human_zone_entries(tmp_pa
     status = read_pass_status(tmp_path)
 
     assert status.human_zone_ambiguous_pages == ("compiled/projects/a.md",)
-
-
-def test_human_zone_ambiguous_pages_forces_digest_on_otherwise_quiet_no_work_day(
-    tmp_path, write_vault_manifest
-):
-    """Same rationale as ``budget_exhausted``/``queue_evictions``: unlike
-    those two, a page stuck on a broken marker does not even resolve itself
-    next pass, so a "no-work" pass with no error and no decisions queued
-    must still produce a digest instead of collapsing to ``None``."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-
-    digest = build_daily_digest(
-        vault,
-        DAY,
-        pass_status=PassStatus(
-            status="no-work",
-            human_zone_ambiguous_pages=("compiled/projects/broken.md",),
-        ),
-    )
-
-    assert digest is not None
-    assert "**Требует решения**" in digest
-    assert "[[compiled/projects/broken.md]]" in digest
-
-
-def test_human_zone_ambiguous_pages_line_is_plain_and_names_the_page(
-    tmp_path, write_vault_manifest
-):
-    """ТЗ: the owner is not a programmer, so the line must not read as a
-    raw technical term -- and (unlike a budget name) the page path itself
-    is the useful part, not just a count, since there is no "Очередь"
-    screen listing these pages."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-
-    digest = build_daily_digest(
-        vault,
-        DAY,
-        pass_status=PassStatus(
-            status="success",
-            human_zone_ambiguous_pages=("compiled/projects/broken.md",),
-        ),
-    )
-
-    assert digest is not None
-    assert "ambiguous" not in digest.lower()
-    assert "[[compiled/projects/broken.md]]" in digest
-    assert "human:start" in digest  # findable in the actual file
-    assert "human:end" in digest
-
-
-def test_human_zone_ambiguous_pages_line_caps_shown_pages_with_and_more_suffix(
-    tmp_path, write_vault_manifest
-):
-    """Requirement: showing every single path forever would let one bad
-    night dominate the whole digest -- past the cap, the rest are folded
-    into an honest "и ещё N" instead of being shown or silently dropped."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-    pages = tuple(f"compiled/projects/p{i}.md" for i in range(8))
-
-    digest = build_daily_digest(
-        vault,
-        DAY,
-        pass_status=PassStatus(status="success", human_zone_ambiguous_pages=pages),
-    )
-
-    assert digest is not None
-    for page in pages[:5]:
-        assert f"[[{page}]]" in digest
-    for page in pages[5:]:
-        assert f"[[{page}]]" not in digest
-    assert "и ещё 3" in digest
-    assert "8" in digest
-
-
-def test_no_human_zone_ambiguous_pages_adds_no_line(tmp_path, write_vault_manifest):
-    """Non-regression: with nothing broken, this line must not appear every
-    day -- it would just become noise the owner learns to ignore."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-
-    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="success"))
-
-    assert digest is not None
-    assert "human:start" not in digest
-    assert "human-zone" not in digest.lower()
-
-
-def test_read_pass_status_no_work_with_human_zone_ambiguous_pages_does_not_suppress(
-    tmp_path, write_vault_manifest
-):
-    """End-to-end (journal -> ``read_pass_status`` -> ``build_daily_digest``):
-    a page with a broken marker, otherwise nothing else happening that day,
-    still reaches the owner with an actionable line instead of "Изменений и
-    открытых вопросов нет"."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-    _write_journal(
-        vault,
-        {
-            "status": "no-work",
-            "human_zone_ambiguous_pages": ["compiled/projects/broken.md"],
-        },
-    )
-
-    digest = build_daily_digest(vault, DAY, pass_status=read_pass_status(vault))
-
-    assert digest is not None
-    assert "[[compiled/projects/broken.md]]" in digest
-    assert "Изменений и открытых вопросов нет" not in digest
 
 
 # --- _collect_changes: date-range generalization (задача N) --------------
@@ -2035,6 +1165,42 @@ def test_collect_changes_does_not_glue_a_separator_onto_a_finished_sentence():
     )
 
 
+def test_collect_changes_deduplicates_and_limits_facts():
+    rows = [
+        f"| {DAY.isoformat()} | [[daily/{index}.md]] | Факт {index}. |"
+        for index in range(MAX_CHANGE_FACTS_SHOWN + 2)
+    ]
+    rows.insert(
+        1,
+        f"| {DAY.isoformat()} | [[daily/duplicate.md]] |  факт 0  |",
+    )
+    candidate = CompiledBriefingCandidate(
+        rel_path="compiled/topics/aurora.md",
+        domain="topics",
+        slug="aurora",
+        title="Проект Аврора",
+        description="",
+        freshness_state="",
+        confidence="",
+        relevance=0.0,
+        tier="active",
+        text=(
+            "---\ncreated: 2026-08-01\n---\n\n# Проект Аврора\n\n"
+            "## Sources That Shaped This Page\n\n"
+            "| Date | Source | What Added |\n| --- | --- | --- |\n"
+            + "\n".join(rows)
+            + "\n"
+        ),
+    )
+
+    changes = _collect_changes([candidate], DAY, DAY)
+
+    assert changes[0].what_added.count("Факт 0") == 1
+    assert f"Факт {MAX_CHANGE_FACTS_SHOWN - 1}." in changes[0].what_added
+    assert f"Факт {MAX_CHANGE_FACTS_SHOWN}." not in changes[0].what_added
+    assert "Ещё пунктов: 2." in changes[0].what_added
+
+
 # --- _collect_revisit: limit parameter (задача N) -------------------------
 
 
@@ -2132,9 +1298,7 @@ def test_collect_weekly_review_queue_matches_list_queue_items(
     assert review.queue_items[0].kind == CONFLICT_KIND
 
 
-def test_collect_weekly_review_window_and_review_pick(
-    tmp_path, write_vault_manifest
-):
+def test_collect_weekly_review_window_and_review_pick(tmp_path, write_vault_manifest):
     vault = tmp_path / "vault"
     write_vault_manifest(vault)
     _write_page(
@@ -2251,9 +1415,7 @@ def test_dry_run_prints_digest_without_writing_or_sending(
         run_compiled_digest, "write_validated_vault_markdown", _fail_write
     )
     monkeypatch.setattr(run_compiled_digest, "send_telegram_text_sync", _fail_send)
-    monkeypatch.setattr(
-        "sys.argv", ["prog", "--date", DAY.isoformat(), "--dry-run"]
-    )
+    monkeypatch.setattr("sys.argv", ["prog", "--date", DAY.isoformat(), "--dry-run"])
 
     exit_code = run_compiled_digest.main()
 
@@ -2263,28 +1425,20 @@ def test_dry_run_prints_digest_without_writing_or_sending(
     assert not (vault / "summaries").exists()
 
 
-def test_dry_run_quiet_day_prints_fallback_line(
+def test_dry_run_quiet_day_prints_no_work(
     tmp_path, write_vault_manifest, monkeypatch, capsys
 ):
-    """``read_pass_status`` falls back to ``PassStatus(status="success")``
-    when no pass journal exists (as in this fresh temp vault), so an empty
-    vault renders the digest's own "nothing happened" fallback line rather
-    than hitting ``build_daily_digest``'s "no-work" suppression -- that
-    suppression only fires for a real journal whose status is literally
-    "no-work"."""
     vault = tmp_path / "vault"
     (vault / "compiled").mkdir(parents=True)
     write_vault_manifest(vault)
     _patch_settings(monkeypatch, vault)
-    monkeypatch.setattr(
-        "sys.argv", ["prog", "--date", DAY.isoformat(), "--dry-run"]
-    )
+    monkeypatch.setattr("sys.argv", ["prog", "--date", DAY.isoformat(), "--dry-run"])
 
     exit_code = run_compiled_digest.main()
 
     assert exit_code == 0
     out = capsys.readouterr().out
-    assert "Изменений и открытых вопросов нет." in out
+    assert "no-work: nothing to report" in out
 
 
 def test_dry_run_none_digest_prints_no_work_placeholder(
@@ -2299,9 +1453,7 @@ def test_dry_run_none_digest_prints_no_work_placeholder(
     write_vault_manifest(vault)
     _patch_settings(monkeypatch, vault)
     monkeypatch.setattr(run_compiled_digest, "build_daily_digest", lambda *a, **k: None)
-    monkeypatch.setattr(
-        "sys.argv", ["prog", "--date", DAY.isoformat(), "--dry-run"]
-    )
+    monkeypatch.setattr("sys.argv", ["prog", "--date", DAY.isoformat(), "--dry-run"])
 
     exit_code = run_compiled_digest.main()
 
@@ -2451,43 +1603,7 @@ def _write_fact_check_journal(vault: Path, *, day: str, evictions: int) -> None:
     )
 
 
-def test_fact_check_queue_evictions_reach_the_digest(tmp_path, write_vault_manifest):
-    """Code review: the monthly fact-check pass runs with no active
-    ``CompileEnrichPass``, so it journals its evictions separately -- and
-    nothing read that journal, so ТЗ 7.2's "факт вытеснения попадает в
-    дайджест" silently did not hold for the pass that most often causes it."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-    _write_fact_check_journal(vault, day=DAY.isoformat(), evictions=7)
-
-    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="no-work"))
-
-    assert digest is not None
-    assert "Очередь решений переполнена: 7 старых пункт(ов)" in digest
-
-
-def test_fact_check_queue_evictions_add_to_the_pass_own_count(
-    tmp_path, write_vault_manifest
-):
-    """Both passes can evict on the same day; the digest shows one honest
-    total, not whichever number it happened to read first."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-    _write_fact_check_journal(vault, day=DAY.isoformat(), evictions=2)
-
-    digest = build_daily_digest(
-        vault, DAY, pass_status=PassStatus(status="ok", queue_evictions=3)
-    )
-
-    assert digest is not None
-    assert "Очередь решений переполнена: 5 старых пункт(ов)" in digest
-
-
-def test_fact_check_journal_from_another_day_is_ignored(
-    tmp_path, write_vault_manifest
-):
+def test_fact_check_journal_from_another_day_is_ignored(tmp_path, write_vault_manifest):
     """That journal is monthly and is not rewritten in between, so counting
     it unconditionally would repeat the same eviction line every single day
     until the next fact-check run."""
@@ -2501,41 +1617,6 @@ def test_fact_check_journal_from_another_day_is_ignored(
     digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="no-work"))
 
     assert digest is None
-
-
-def test_broken_fact_check_journal_never_breaks_the_digest(
-    tmp_path, write_vault_manifest
-):
-    """Fail-safe like ``_read_decisions_queue``: a corrupt journal must cost
-    the owner the eviction line, not the whole digest."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-    session = vault / ".session"
-    session.mkdir(parents=True, exist_ok=True)
-    (session / "compile-fact-check.json").write_text("{not json", encoding="utf-8")
-
-    digest = build_daily_digest(
-        vault, DAY, pass_status=PassStatus(status="ok", queue_evictions=1)
-    )
-
-    assert digest is not None
-    assert "Очередь решений переполнена: 1 старых пункт(ов)" in digest
-
-
-def test_eviction_line_quotes_the_real_queue_cap(tmp_path, write_vault_manifest):
-    """The cap belongs to ``decisions_queue.QUEUE_CAP``; the digest used to
-    spell it out as a literal, which goes stale the moment the cap moves."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-
-    digest = build_daily_digest(
-        vault, DAY, pass_status=PassStatus(status="ok", queue_evictions=1)
-    )
-
-    assert digest is not None
-    assert f"лимит очереди {QUEUE_CAP} пунктов" in digest
 
 
 def _write_queue_worker_crash_journal(
@@ -2559,43 +1640,6 @@ def _write_queue_worker_crash_journal(
     )
 
 
-def test_a_crashed_background_drain_reaches_the_owner(tmp_path, write_vault_manifest):
-    """The drain is spawned detached with stdout/stderr on DEVNULL, so its
-    crash journal was the only record it had died -- and nothing read that
-    journal. A dead drain stops enriching pages during the day while looking
-    exactly like a quiet day."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-    _write_queue_worker_crash_journal(
-        vault, crashed_at=f"{DAY.isoformat()}T14:05:11+03:00"
-    )
-
-    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="no-work"))
-
-    assert digest is not None
-    assert "Фоновая обработка очереди страниц аварийно остановилась" in digest
-    assert "qmd index is locked" in digest
-
-
-def test_a_crash_journal_without_a_reason_is_still_reported(
-    tmp_path, write_vault_manifest
-):
-    """A crash journal that lost its ``error`` block still proves the drain
-    died -- report it rather than dropping the line for want of a reason."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-    _write_queue_worker_crash_journal(
-        vault, crashed_at=f"{DAY.isoformat()}T14:05:11+03:00", message=None
-    )
-
-    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="no-work"))
-
-    assert digest is not None
-    assert "причина не записана" in digest
-
-
 def test_a_crash_from_another_day_is_not_repeated_forever(
     tmp_path, write_vault_manifest
 ):
@@ -2611,25 +1655,6 @@ def test_a_crash_from_another_day_is_not_repeated_forever(
     digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="no-work"))
 
     assert digest is None
-
-
-def test_a_broken_crash_journal_never_breaks_the_digest(
-    tmp_path, write_vault_manifest
-):
-    """Fail-safe like every other journal this module folds in."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-    session = vault / ".session"
-    session.mkdir(parents=True, exist_ok=True)
-    (session / "compile-queue-worker.json").write_text("{not json", encoding="utf-8")
-
-    digest = build_daily_digest(
-        vault, DAY, pass_status=PassStatus(status="ok", queue_evictions=1)
-    )
-
-    assert digest is not None
-    assert "Очередь решений переполнена: 1 старых пункт(ов)" in digest
 
 
 def _write_dropped_sources_journal(vault: Path, *sources: str) -> None:
@@ -2657,83 +1682,6 @@ def _write_dropped_sources_journal(vault: Path, *sources: str) -> None:
     )
 
 
-def test_a_source_the_queue_gave_up_on_reaches_the_owner(
-    tmp_path, write_vault_manifest
-):
-    """The owner wrote a note, three compile attempts failed, and the queue
-    entry -- the only trigger that would ever compile it -- was deleted. The
-    drain that produces almost all of these runs detached with stdout/stderr
-    on DEVNULL, so its returned ``errors`` list went nowhere: the note simply
-    never appeared in ``compiled/`` and nothing said why."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-    _write_dropped_sources_journal(vault, "daily/2026-08-05.md")
-
-    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="no-work"))
-
-    assert digest is not None
-    assert "Не удалось собрать страницы по 1 источник(ам)" in digest
-    assert "[[daily/2026-08-05.md]]" in digest
-
-
-def test_dropped_sources_are_not_expired_by_the_calendar(
-    tmp_path, write_vault_manifest
-):
-    """Unlike the crash and fact-check journals, this one lists what is
-    *still* missing rather than what happened on a date -- the writer clears
-    an entry itself once that source finally compiles. A source dropped last
-    week and still uncompiled is still the owner's to act on."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-    session = vault / ".session"
-    session.mkdir(parents=True, exist_ok=True)
-    (session / "compile-dropped-sources.json").write_text(
-        json.dumps(
-            {
-                "sources": [
-                    {
-                        "source_path": "daily/2026-07-20.md",
-                        "dropped_at": f"{(DAY - timedelta(days=16)).isoformat()}"
-                        "T14:05:11+03:00",
-                        "attempts": 3,
-                        "errors": ["backend-refused"],
-                    }
-                ]
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-
-    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="no-work"))
-
-    assert digest is not None
-    assert "[[daily/2026-07-20.md]]" in digest
-
-
-def test_a_backend_outage_dropping_many_sources_does_not_bury_the_digest(
-    tmp_path, write_vault_manifest
-):
-    """One bad night for the model backend can drop a whole batch at once;
-    the line names a capped sample and counts the rest, same as the
-    human-zone line."""
-    vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
-    write_vault_manifest(vault)
-    _write_dropped_sources_journal(
-        vault, *(f"daily/2026-07-{day:02d}.md" for day in range(1, 9))
-    )
-
-    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="no-work"))
-
-    assert digest is not None
-    assert "Не удалось собрать страницы по 8 источник(ам)" in digest
-    assert "и ещё 3" in digest
-    assert "[[daily/2026-07-06.md]]" not in digest
-
-
 def test_an_empty_dropped_sources_journal_stays_a_quiet_day(
     tmp_path, write_vault_manifest
 ):
@@ -2750,22 +1698,126 @@ def test_an_empty_dropped_sources_journal_stays_a_quiet_day(
     assert digest is None
 
 
-def test_a_broken_dropped_sources_journal_never_breaks_the_digest(
-    tmp_path, write_vault_manifest
+@pytest.mark.parametrize("status", ["success", "ok", "no-work", "failed", "unknown"])
+def test_processing_details_alone_do_not_trigger_digest(
+    tmp_path, write_vault_manifest, status
 ):
-    """Fail-safe like every other journal this module folds in."""
     vault = tmp_path / "vault"
-    (vault / "compiled").mkdir(parents=True)
     write_vault_manifest(vault)
-    session = vault / ".session"
-    session.mkdir(parents=True, exist_ok=True)
-    (session / "compile-dropped-sources.json").write_text(
-        "{not json", encoding="utf-8"
+    pass_status = PassStatus(
+        status=status,
+        error="backend unavailable",
+        budget_exhausted=("pages-per-pass", "monthly-enrichments-per-page"),
+        deferred_queue_sources=2,
+        queue_evictions=3,
+        human_zone_ambiguous_pages=("compiled/topics/demo.md",),
+        worker_crash="worker stopped",
+        dropped_sources=("daily/2026-08-05.md",),
+        auto_decisions=4,
     )
 
-    digest = build_daily_digest(
-        vault, DAY, pass_status=PassStatus(status="ok", queue_evictions=1)
+    assert build_daily_digest(vault, DAY, pass_status=pass_status) is None
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "conflict",
+        "undecided-conflict",
+        "duplicate-candidate",
+        "drift",
+        "verify-rejected",
+        "fact-check-rejected",
+        "human-zone-ambiguous",
+        "page-encoding-broken",
+        "entity-identity",
+    ],
+)
+@pytest.mark.parametrize("since", [DAY.isoformat(), "2026-08-04"])
+def test_only_new_identity_questions_are_shown(
+    tmp_path, write_vault_manifest, kind, since
+):
+    vault = tmp_path / "vault"
+    write_vault_manifest(vault)
+    _write_queue(
+        vault,
+        [
+            {
+                "kind": kind,
+                "page": "compiled/people/fictional-person.md",
+                "summary": "Какой Иван имеется в виду?",
+                "since": since,
+            }
+        ],
     )
+    queue_before = (vault / ".session/decisions-queue.json").read_bytes()
+
+    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="ok"))
+
+    if kind == "entity-identity" and since == DAY.isoformat():
+        assert digest is not None
+        assert "**Требует вашего ответа**" in digest
+        assert "Какой Иван имеется в виду?" in digest
+    else:
+        assert digest is None
+    assert (vault / ".session/decisions-queue.json").read_bytes() == queue_before
+
+
+def test_open_page_conflicts_stay_out_of_digest(tmp_path, write_vault_manifest):
+    vault = tmp_path / "vault"
+    write_vault_manifest(vault)
+    _write_page(
+        vault,
+        "compiled/topics/demo.md",
+        domain="topics",
+        title="Аврора",
+        created="2026-08-01",
+        last_accessed=DAY.isoformat(),
+        sources_rows=[("2026-08-01", "daily/2026-08-01.md", "старый факт")],
+        conflicts_rows=[
+            (
+                DAY.isoformat(),
+                "первая версия",
+                "daily/2026-08-01.md",
+                "вторая версия",
+                "daily/2026-08-05.md",
+            )
+        ],
+    )
+    path = vault / "compiled/topics/demo.md"
+    page_before = path.read_bytes()
+
+    assert build_daily_digest(vault, DAY, pass_status=PassStatus(status="ok")) is None
+    assert path.read_bytes() == page_before
+
+
+def test_new_questions_follow_changes(tmp_path, write_vault_manifest):
+    vault = tmp_path / "vault"
+    write_vault_manifest(vault)
+    _write_page(
+        vault,
+        "compiled/topics/demo.md",
+        domain="topics",
+        title="Аврора",
+        created=DAY.isoformat(),
+        last_accessed=DAY.isoformat(),
+        sources_rows=[(DAY.isoformat(), "daily/2026-08-05.md", "срок — сентябрь")],
+    )
+    _write_queue(
+        vault,
+        [
+            {
+                "kind": "entity-identity",
+                "page": "compiled/people/ivan.md",
+                "summary": "Какой Иван имеется в виду?",
+                "since": DAY.isoformat(),
+            }
+        ],
+    )
+
+    digest = build_daily_digest(vault, DAY, pass_status=PassStatus(status="ok"))
 
     assert digest is not None
-    assert "Очередь решений переполнена: 1 старых пункт(ов)" in digest
+    assert digest.index("срок — сентябрь") < digest.index("Требует вашего ответа")
+    assert "Обновлено карточек: 1" in digest
+    assert "Стоит посмотреть" not in digest

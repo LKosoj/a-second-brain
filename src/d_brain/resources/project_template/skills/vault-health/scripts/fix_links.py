@@ -99,8 +99,13 @@ def build_stem_index() -> dict[str, list[str]]:
     for md_file in md_files:
         rel = str(md_file.relative_to(VAULT_PATH))
         stem = md_file.stem
-        index[stem].append(rel)
-        index[rel.removesuffix(".md")].append(rel)
+        # A root-level note's stem equals its suffix-stripped relative path
+        # (e.g. "MEMORY"), so index both keys through a set to avoid listing
+        # the same file twice under one key -- a duplicate makes a genuinely
+        # unique stem look ambiguous and turns a safe replace into a remove.
+        for key in {stem, rel.removesuffix(".md")}:
+            if rel not in index[key]:
+                index[key].append(rel)
     return index
 
 

@@ -6,7 +6,8 @@ tier: archive
 ---
 # Phase 2: EXECUTE
 
-Read capture.json from Phase 1. Create Todoist tasks, save thoughts, update business/project context, and report the exact changes.
+Read capture.json from Phase 1. Leave captured Todoist tasks to the Python
+runtime; save thoughts, update business/project context, and report exact changes.
 
 ## Input
 - `.session/capture.json` — output from Phase 1
@@ -16,7 +17,7 @@ Read capture.json from Phase 1. Create Todoist tasks, save thoughts, update busi
 - `hobbies/<slug>.md` — personal hobbies and interests
 - `finances/<slug>.md` — personal finances, investments, budget
 
-The business, projects, family, hobbies and finances indexes are already in the injected core context.
+The directions-to-storage table in `directions.md` and the business, projects, family, hobbies, finances, health and home indexes are in the injected core context.
 
 ## Task
 
@@ -25,20 +26,16 @@ Before writing anything:
 - prefer updating an existing durable note over creating a near-duplicate;
 - if uncertainty stays high, keep it in `observations` instead of forcing a task/note/CRM write.
 
-### 1. Create Todoist tasks
+### 1. Leave captured Todoist tasks to the runtime
 
 For each entry with `classification: "task"`:
-- Choose `projectId` from the provided live Todoist project catalog when the fit is clear.
-- Inbox is fallback only.
-- Personal tasks may still belong to named personal projects.
-- Create the owner's controllable next step, not a vague outcome statement.
-- If the note implies a reusable cadence, prefer a process-goal style recurring task.
-
-```bash
-mcp-cli call todoist add-tasks '{"tasks": [{"content": "...", "dueString": "...", "priority": "p2"}]}'
-```
-
-Record created task IDs.
+- Do not call `todoist add-tasks` for captured entries.
+- Do not rephrase or create these tasks yourself. The Python runtime creates
+  each one once from `task_content` after this phase.
+- The runtime passes a deadline only when capture returned a non-empty
+  `task_due`; never invent or infer another deadline.
+- Leave capture-created items out of `tasks_created`; the runtime adds the
+  exact created IDs there after this phase.
 
 ### 2. Check process goals
 
@@ -50,8 +47,21 @@ If missing or stale, create or refresh them from the current weekly/monthly goal
 
 ### 3. Save thoughts
 
+`compiled/projects/` and `compiled/people/` contain the primary entity cards.
+Read the matching card before saving an update about an existing entity.
+`project` here is the type of a captured thought, not permission to create
+another primary project card. Link the thought to the existing primary project.
+Compiled processing independently updates people and projects from source notes,
+including PLAUD, even when the same source also produces a decision or a task.
+
+Read the editable `directions` list in `directions.md`. Add zero or more
+exact names from that list to the thought's `directions` frontmatter and its
+`thoughts_saved` result. Directions describe areas of activity, independently
+of `idea`, `learning`, `reflection`, or `project`. Do not invent names or force
+personal learning or blog work into the work direction.
+
 For each entry with classification `idea`, `reflection`, `learning`, or `project`:
-- Create a file in `thoughts/{category}/YYYY-MM-DD-slug.md`
+- First choose its primary storage using the table in `directions.md` and the personal-life rules below. Save it once. Use `thoughts/{category}/YYYY-MM-DD-slug.md` when no more specific storage applies.
 - Use the agent-memory card contract:
   - `description` must read like a retrieval snippet
   - keep tags sparse and meaningful
@@ -66,6 +76,11 @@ For each entry with classification `idea`, `reflection`, `learning`, or `project
 
 ### 4. Update CRM
 
+The `Основные карточки` sections in `business/network.md` and
+`projects/projects.md` are maintained by Python from primary compiled cards.
+Do not edit their `d-brain:entities:start/end` blocks. Preserve owner-written
+context outside those blocks; do not copy the full primary card into an index.
+
 For entries with `classification: "crm_update"`:
 - Update the most relevant existing business/project file:
   - `business/crm.md`
@@ -79,12 +94,24 @@ For entries with `classification: "crm_update"`:
 
 ### 4a. Update personal-life domains
 
-For entries whose content is about a personal-life area:
-- `family_event`, `family_observation` → `family/events.md`, `family/plans.md`, or `family/notes.md`
-- `hobby`, `interest`, `personal_project_observation` → create or update `hobbies/<slug>.md`
-- `financial_observation`, `investment_observation`, `budget_observation` → create or update `finances/<slug>.md`
-- Prefer updating an existing file. Use the domain's `_index.md` as the linking hub.
-- Do not auto-route to `private/` — `private/` is owner-managed (Obsidian or explicit `/do`), no automatic EXECUTE write path.
+For every captured entry, use its content and the storage table in `directions.md`.
+Do not expect separate classes such as `family_event` or `financial_observation`:
+CAPTURE emits the seven general classes. Meaning and direction select storage,
+independently of class. Personal events, observations and durable plans can be
+saved even when the entry also contains a task; leave Todoist creation to Python.
+For `skip_reason: entry_status:already_processed`, check only whether supported
+personal-life facts are missing from the selected domain. That marker prevents
+repeating tasks and generic processing; it does not prove the personal note
+was saved. Do not repeat a fact already stored with the same source.
+
+- Read the selected domain's `_index.md` and matching notes before writing.
+- Prefer an existing note; otherwise create a descriptively named note under
+  that domain. Save the fact once, with source wikilinks and directions.
+- Update the domain index with a justified link to each saved note.
+- Include these writes in `thoughts_saved` using their actual paths and directions.
+- Articles by other authors are learning, not facts about the owner's life.
+  Corporate budgets are work, not the owner's finances.
+- Do not automatically write to `private/`; explicit owner requests govern it.
 
 ### 5. Build links
 
@@ -115,13 +142,16 @@ If it still fails after the third attempt, keep the exact error text in `observa
 
 ## Output Format
 
+`tasks_created` contains only tasks actually created by this phase, such as
+explicit process goals, with their exact returned `id` and `content`. Exclude
+capture tasks: Python adds them later. Do not report planned or failed actions
+as completed.
+
 Print ONLY valid JSON:
 
 ```json
 {
-  "tasks_created": [
-    {"id": "8501234567", "content": "Follow-up Acme Corp", "priority": 2, "due": "tomorrow"}
-  ],
+  "tasks_created": [],
   "thoughts_saved": [
     {"path": "thoughts/ideas/2026-02-19-layered-memory.md", "title": "AI agents need layered memory", "category": "ideas"}
   ],

@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import os
 import shutil
+import sys
 from collections.abc import Sequence
 from importlib.resources import as_file, files
 from pathlib import Path
@@ -139,6 +140,50 @@ def _qmd_command(args: argparse.Namespace) -> int:
     return run_qmd(args.qmd_args)
 
 
+def _recover_command(args: argparse.Namespace) -> int:
+    from d_brain.services.frontmatter import UnsafeVaultPathError, recover_ops_journal
+    from d_brain.services.vault_lock import VaultLockError
+
+    try:
+        result = recover_ops_journal(args.vault, args.run_id)
+    except (UnsafeVaultPathError, VaultLockError, FileNotFoundError) as exc:
+        print(f"a-second-brain recover: {exc}", file=sys.stderr)
+        return 2
+    for relative_path in result["restored"]:
+        print(f"restored: {relative_path}")
+    for relative_path in result["removed"]:
+        print(f"removed (created by run): {relative_path}")
+    for relative_path in result["skipped"]:
+        print(f"skipped (changed since run): {relative_path}")
+    print(
+        f"recover {args.run_id}: "
+        f"{len(result['restored'])} restored, {len(result['removed'])} removed, "
+        f"{len(result['skipped'])} skipped"
+    )
+    return 0
+
+
+def _ops_prune_command(args: argparse.Namespace) -> int:
+    from d_brain.services.frontmatter import UnsafeVaultPathError, prune_ops_journal
+    from d_brain.services.vault_lock import VaultLockError
+
+    if args.days < 0:
+        print(f"ops-prune: --days must be >= 0, got {args.days}", file=sys.stderr)
+        return 1
+
+    try:
+        result = prune_ops_journal(args.vault, max_age_days=args.days)
+    except (UnsafeVaultPathError, VaultLockError, FileNotFoundError) as exc:
+        print(f"a-second-brain ops-prune: {exc}", file=sys.stderr)
+        return 2
+    print(
+        f"ops-prune: {result['dropped_entries']} journal entries, "
+        f"{result['dropped_snapshots']} snapshots removed "
+        f"(older than {args.days} days)"
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="a-second-brain")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -184,6 +229,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="arguments passed to QMD",
     )
     qmd_parser.set_defaults(handler=_qmd_command)
+
+    recover_parser = subparsers.add_parser(
+        "recover",
+        help=(
+            "undo every rewrite/frontmatter patch recorded for one run_id in "
+            ".session/ops.jsonl (file moves are not journaled and cannot be "
+            "undone) -- do not run alongside the bot or the nightly process"
+        ),
+    )
+    recover_parser.add_argument("run_id", help="run_id to roll back")
+    recover_parser.add_argument(
+        "--vault",
+        type=Path,
+        default=Path("vault"),
+        help="vault directory (default: vault)",
+    )
+    recover_parser.set_defaults(handler=_recover_command)
+
+    ops_prune_parser = subparsers.add_parser(
+        "ops-prune",
+        help=(
+            "drop ops-journal entries and snapshot backups older than N days "
+            "-- do not run alongside the bot or the nightly process"
+        ),
+    )
+    ops_prune_parser.add_argument(
+        "--vault",
+        type=Path,
+        default=Path("vault"),
+        help="vault directory (default: vault)",
+    )
+    ops_prune_parser.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        help="max age in days to keep (default: 30)",
+    )
+    ops_prune_parser.set_defaults(handler=_ops_prune_command)
 
     run_parser = subparsers.add_parser("run", help="start the Telegram bot")
     run_parser.set_defaults(handler=lambda _args: _run_bot())

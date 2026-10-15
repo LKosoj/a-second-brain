@@ -43,6 +43,7 @@ deal_deadline: 2026-03-15     # (optional) Deal close date
 last_accessed: 2026-02-25     # (auto) When card was last read/touched
 relevance: 0.85               # (auto) 0.0-1.0, decays over time
 tier: active                  # (auto) core | active | warm | cold | archive
+access_count: 3               # (auto) touches so far; slows decay as 1 + ln(n)
 ---
 ```
 

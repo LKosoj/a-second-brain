@@ -153,6 +153,8 @@ python3 ~/.hermes/skills/ms-project/scripts/mpp_write.py plan.json \
 ### Python пакеты
 ```bash
 uv pip install jpype1
+# или, из корня репозитория a-second-brain:
+uv sync --extra ms-project
 ```
 
 ### Java библиотеки (авто-загрузка)

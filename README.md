@@ -151,15 +151,34 @@ and which paths are runtime infrastructure.
 See the [CLI reference](docs/en/cli.md) for installation and maintenance
 commands and the bot help screen for the complete Telegram command list.
 
+### Continuing a discussion
+
+To continue a discussion, use Telegram's Reply action on the relevant bot
+message and send text or a voice message. This also works for files sent
+alongside the answer: the bot receives the original question, the complete
+answer, and the preceding messages in the selected chain.
+
+History persists across days and bot restarts. Replying to an earlier message
+continues the chain up to that message, without later answers or other
+discussions. Messages without Reply keep their existing behavior; the bot
+does not select a discussion automatically.
+
+When no saved history exists, the bot uses the selected message's text or
+downloads its attached file and reads the contents, including an HTML report
+without a caption. The extracted text is saved for subsequent replies.
+This allows continuing an older answer, but does not recover conversation
+that is absent from the file itself.
+
 ## Requirements
 
-- a dedicated unprivileged Linux account with Python 3.12 or newer
+- a dedicated unprivileged Linux account with Python 3.12 or newer (macOS is
+  also supported via launchd, see [macOS deployment](docs/en/macos.md))
 - [uv](https://docs.astral.sh/uv/)
 - `jq`
 - a Telegram bot token from BotFather
 - a Deepgram API key for voice transcription
 - one installed and authenticated AI CLI: Claude Code, Codex CLI, Qwen Code,
-  Gemini CLI, or Kimi Code
+  Gemini CLI, Kimi Code, Grok CLI, or opencode
 
 Todoist, web extraction, PLAUD, QMD, and encrypted backups are optional and
 have additional requirements. See [Integrations](docs/en/integrations.md) and

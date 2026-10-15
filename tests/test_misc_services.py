@@ -221,6 +221,31 @@ last_accessed: 2026-03-11
     assert store._config["decay_rate"] == 0.05
 
 
+def test_daily_entry_memory_store_creates_group_accessible_state(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    store = DailyEntryMemoryStore(vault_path)
+
+    store._write({"version": 1, "entries": {}})
+
+    assert (vault_path / ".memory-entries.json").stat().st_mode & 0o777 == 0o660
+
+
+def test_daily_entry_memory_store_preserves_existing_mode(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    state_path = vault_path / ".memory-entries.json"
+    state_path.write_text("{}\n", encoding="utf-8")
+    state_path.chmod(0o640)
+    store = DailyEntryMemoryStore(vault_path)
+
+    store._write({"version": 1, "entries": {}})
+
+    assert state_path.stat().st_mode & 0o777 == 0o640
+
+
 def test_scheduled_digest_uses_daily_processed_entries() -> None:
     digest = run_daily_process._build_scheduled_digest(
         date(2026, 4, 4),
@@ -861,6 +886,7 @@ def test_run_daily_process_sends_scheduled_digest_with_changes(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     sent: list[tuple[str, str | None, bool]] = []
+    monkeypatch.setenv("D_BRAIN_RUN_ID", "daily-process-test")
 
     class FakeProcessor:
         def process_daily(self, day: date, *, mode: str):  # noqa: ANN202
@@ -948,7 +974,9 @@ def test_run_daily_process_sends_scheduled_digest_with_changes(
                 "- День сместился в qmd ranking tuning и recall contract.\n"
                 "- MEMORY.md очищен до durable operating context.\n\n"
                 "**Новые задачи**\n"
-                "- Проверить ranking qmd"
+                "- Проверить ranking qmd\n\n"
+                "run_id: daily-process-test (откат: a-second-brain recover "
+                f"daily-process-test --vault {tmp_path})"
             ),
             None,
             True,

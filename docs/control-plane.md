@@ -61,6 +61,7 @@ Typical examples:
 - `maintenance.compiled-nightly`
 - `maintenance.vault-health`
 - `maintenance.compiled-fact-check`
+- `maintenance.compiled-wiki-care`
 - `maintenance.compiled-digest`
 - `integration.documents.archive`
 - `integration.web.archive`
@@ -168,7 +169,7 @@ Every risky integration must define:
 The control plane registry is the canonical source of truth for all workflow definitions. It drives:
 - question routing (5 route strategies: planning, relationship, status-history, fact-lookup, general)
 - capture workflow metadata (`capture.daily-entry`)
-- scheduled maintenance orchestration (`maintenance.scheduled-cycle`, `maintenance.compiled-nightly`, `maintenance.vault-health`, `maintenance.compiled-fact-check`, `maintenance.compiled-digest`)
+- scheduled maintenance orchestration (`maintenance.scheduled-cycle`, `maintenance.compiled-nightly`, `maintenance.vault-health`, `maintenance.compiled-fact-check`, `maintenance.compiled-wiki-care`, `maintenance.compiled-digest`)
 - integration workflow contracts (`integration.documents.archive`, `integration.web.archive`, `integration.youtube.archive`, `integration.plaud.sync`)
 - top-level text workflow resolution via `router.resolve_text_workflow()`
 

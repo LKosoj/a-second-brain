@@ -2,15 +2,18 @@
 
 import asyncio
 import logging
+from typing import cast
 
-from aiogram import Bot, Router
+from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
-from d_brain.bot.formatters import format_process_report
+from d_brain.bot.conversations import reply_context, save_answer
+from d_brain.bot.dashboard import render_home, render_input
+from d_brain.bot.formatters import format_process_report, inline_artifact_image_paths
 from d_brain.bot.progress import wait_for_task_with_progress
-from d_brain.bot.replies import answer_rich_text, answer_text, edit_text
+from d_brain.bot.replies import answer_files, answer_rich_text, answer_text, edit_text
 from d_brain.bot.states import DoCommandState
 from d_brain.config import get_settings
 from d_brain.services.processor import CliProcessor
@@ -19,10 +22,50 @@ from d_brain.services.transcription import DeepgramTranscriber
 router = Router(name="do")
 logger = logging.getLogger(__name__)
 
+# Commands actually registered via Command(...) across bot/handlers/*.py
+# (code review): matching any "/word" shape also caught things like
+# "/brief" and "/cancel", which are not real commands, so they were dropped
+# here with nowhere else to go -- the user was left stuck in /do. Only the
+# commands listed here should fall through to their own router instead of
+# being treated as a /do prompt.
+_KNOWN_COMMANDS = (
+    "start",
+    "help",
+    "stats",
+    "status",
+    "do",
+    "menu",
+    "files",
+    "process",
+    "process_full",
+    "why",
+    "reminders",
+)
+# "/" + one of the known commands, optionally "@botname", then end-of-text
+# or whitespace -- e.g. "/why", "/why@bot", "/why foo" all match. A prompt
+# that merely starts with "/" without being one of these, e.g. "/etc/hosts"
+# or "/brief", does not match and still reaches handle_do_input below (no
+# other router claims it either).
+_BOT_COMMAND_RE = rf"^/(?:{'|'.join(_KNOWN_COMMANDS)})(@[A-Za-z0-9_]+)?(\s|$)"
 
-async def start_do_flow(message: Message, state: FSMContext) -> None:
+
+async def start_do_flow(
+    message: Message, state: FSMContext, *, menu_message_id: int | None = None
+) -> None:
     """Prompt the user for the next /do input."""
     await state.set_state(DoCommandState.waiting_for_input)
+    if menu_message_id is not None:
+        await state.update_data(menu_message_id=menu_message_id)
+        await render_input(
+            cast(Bot, message.bot), chat_id=message.chat.id, message_id=menu_message_id,
+            screen="do_input",
+            text=(
+                "**Что сделать?**\n\n"
+                "Отправь вопрос или поручение голосом или текстом.\n"
+                "Для отмены нажми «Назад» или отправь `-`."
+            ),
+        )
+        return
     await answer_text(
         message,
         "🎯 **Что сделать?**\n\n"
@@ -55,10 +98,31 @@ async def cmd_do(message: Message, command: CommandObject, state: FSMContext) ->
     await start_do_flow(message, state)
 
 
-@router.message(DoCommandState.waiting_for_input)
+@router.message(DoCommandState.waiting_for_input, ~F.text.regexp(_BOT_COMMAND_RE))
 async def handle_do_input(message: Message, bot: Bot, state: FSMContext) -> None:
-    """Handle voice/text input after /do command."""
+    """Handle voice/text input after /do command.
+
+    Excludes text shaped like one of the actually registered commands
+    (_BOT_COMMAND_RE / _KNOWN_COMMANDS) so a command typed while waiting for
+    /do input -- e.g. ``/why``, ``/why@bot``, ``/why foo`` -- is not
+    swallowed as a literal AI prompt and instead falls through to its own
+    router (why.py is registered after do.py in bot/main.py). A prompt that
+    is not one of those commands, even if it starts with "/", e.g.
+    ``/etc/hosts`` or ``/brief`` (not a registered command), does not match
+    and still reaches this handler -- no other router would claim it either,
+    so matching on command *shape* alone (any "/word") silently dropped it
+    instead. Voice messages have ``text is None``, which the magic filter
+    resolves to ``False`` here, so they still reach this handler unaffected.
+    """
+    data = await state.get_data()
     await state.clear()  # Clear state immediately
+    menu_message_id = data.get("menu_message_id")
+    if isinstance(menu_message_id, int):
+        await render_home(
+            bot, chat_id=message.chat.id, vault_path=get_settings().vault_path,
+            user_id=message.from_user.id if message.from_user else message.chat.id,
+            preferred_message_id=menu_message_id,
+        )
 
     prompt = None
 
@@ -137,11 +201,14 @@ async def process_request(message: Message, prompt: str, user_id: int = 0) -> No
         getattr(settings, "openai_api_key", ""),
         getattr(settings, "openai_base_url", ""),
         getattr(settings, "openai_model", ""),
+        getattr(settings, "tavily_api_key", ""),
     )
 
     async def run_with_progress() -> dict[str, object]:
+        context = await reply_context(message, settings.vault_path, user_id)
+        kwargs = {} if context is None else {"conversation_context": context}
         task = asyncio.create_task(
-            asyncio.to_thread(processor.execute_prompt, prompt, user_id)
+            asyncio.to_thread(processor.execute_prompt, prompt, user_id, **kwargs)
         )
 
         async def update_progress(elapsed_seconds: float) -> None:
@@ -162,6 +229,8 @@ async def process_request(message: Message, prompt: str, user_id: int = 0) -> No
 
     try:
         report = await run_with_progress()
+    except ValueError as exc:
+        report = {"error": str(exc)}
     except Exception:
         logger.exception("Execute prompt task failed")
         report = {"error": "Execution task crashed unexpectedly"}
@@ -174,6 +243,28 @@ async def process_request(message: Message, prompt: str, user_id: int = 0) -> No
 
     final_sender = answer_text if "error" in report else answer_rich_text
     try:
-        await final_sender(message, formatted)
+        sent = await final_sender(message, formatted)
+        if "error" not in report:
+            save_answer(message, sent, settings.vault_path, user_id, prompt, formatted)
     except Exception:
         logger.exception("Failed to send /do final reply")
+    artifact_paths = report.get("artifact_paths")
+    if isinstance(artifact_paths, list):
+        paths = [str(path) for path in artifact_paths]
+        inline_paths = inline_artifact_image_paths(formatted, paths)
+        try:
+            files = await answer_files(
+                message, [path for path in paths if path not in inline_paths]
+            )
+            if "error" not in report:
+                for sent_file in files:
+                    save_answer(
+                        message,
+                        sent_file,
+                        settings.vault_path,
+                        user_id,
+                        prompt,
+                        formatted,
+                    )
+        except Exception:
+            logger.exception("Failed to send /do artifacts")

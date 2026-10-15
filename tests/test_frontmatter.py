@@ -1056,6 +1056,7 @@ def test_validated_write_creates_new_markdown_without_following_symlink(
     write_validated_vault_markdown(vault, note, content)
 
     assert note.read_bytes() == content
+    assert stat.S_IMODE(note.stat().st_mode) == 0o660
 
     swapped = vault / "swapped.md"
     original_rename = frontmatter_module._rename_noreplace

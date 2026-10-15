@@ -9,6 +9,7 @@ instead of the pane keeps the result free of ANSI escapes and TUI chrome.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import subprocess
 import time
@@ -17,6 +18,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 _SESSION_NAME = "dbrain"
 _BUFFER_NAME = "dbrain-prompt"
@@ -30,6 +33,17 @@ _TRUST_DIALOG_MARKER = "trust this folder"
 # claude records the submitted prompt within a second; the rest is slack.
 _PROMPT_ACCEPT_TIMEOUT = 30.0
 _PASTE_SETTLE = 1.0
+# The caller's overall `timeout` can be set generously for a legitimate long
+# turn, so it alone does not catch a session that stopped making any progress
+# well before that ceiling. This idle bound does, and is configurable because
+# "no progress" can mean different things for different workloads. The
+# transcript is only appended to once the assistant's block finishes, so the
+# default here must exceed the longest turn that is expected to run with no
+# tool call in between -- e.g. plaud's own call timeout
+# (PLAUD_TASK_TIMEOUT = 1200s in services/plaud.py) -- or a legitimate long,
+# silent turn would be killed before that deadline even fires.
+_STALL_SECONDS_ENV = "CLAUDE_TMUX_STALL_SECONDS"
+_DEFAULT_STALL_SECONDS = 1500.0
 
 
 class ClaudeTmuxError(RuntimeError):
@@ -241,6 +255,32 @@ def _send_prompt(
     raise ClaudeTmuxError("claude did not accept the prompt in the tmux session")
 
 
+def _stall_seconds(env: Mapping[str, str]) -> float:
+    """Idle threshold before a silently stuck turn is treated as failed."""
+
+    raw = str(env.get(_STALL_SECONDS_ENV) or "").strip()
+    if not raw:
+        return _DEFAULT_STALL_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_STALL_SECONDS
+    return value if value > 0 else _DEFAULT_STALL_SECONDS
+
+
+def _transcript_fingerprint(root: Path, session_id: str) -> tuple[int, float] | None:
+    """Cheap (size, mtime) marker used to detect a turn making no progress."""
+
+    path = _find_transcript(root, session_id)
+    if path is None:
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_size, stat.st_mtime)
+
+
 def _wait_for_answer(
     socket: str,
     root: Path,
@@ -248,6 +288,9 @@ def _wait_for_answer(
     env: Mapping[str, str],
     deadline: float,
 ) -> str:
+    stall_seconds = _stall_seconds(env)
+    fingerprint = _transcript_fingerprint(root, session_id)
+    last_progress = time.monotonic()
     while True:
         state = _read_state(root, session_id)
         if state.turn_finished:
@@ -255,9 +298,36 @@ def _wait_for_answer(
                 raise ClaudeTmuxError("claude finished the turn without any text")
             return state.assistant_text
         _fail_if_pane_died(socket, env)
-        if time.monotonic() >= deadline:
+        current = _transcript_fingerprint(root, session_id)
+        now = time.monotonic()
+        if current != fingerprint:
+            fingerprint = current
+            last_progress = now
+        elif now - last_progress >= stall_seconds:
+            raise TimeoutError(
+                f"claude tmux session made no progress for {stall_seconds:.0f}s"
+            )
+        if now >= deadline:
             raise TimeoutError("claude tmux session timed out while answering")
         time.sleep(_POLL_INTERVAL)
+
+
+def _cleanup_transcript(root: Path, session_id: str) -> None:
+    """Remove the session transcript after a successful run.
+
+    Transcripts hold the full prompt (MEMORY, daily notes, business/CRM
+    context...) and claude never rotates them itself, so keeping them around
+    after a successful turn is unnecessary retention of private vault
+    content. A failed turn keeps its transcript so it stays inspectable.
+    """
+
+    path = _find_transcript(root, session_id)
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except OSError as exc:
+        logger.warning("Failed to remove claude tmux transcript %s: %s", path, exc)
 
 
 def run_claude_tmux(
@@ -312,9 +382,11 @@ def run_claude_tmux(
             check=False,
         )
         _send_prompt(socket, prompt, root, session_id, tmux_env, deadline)
-        return _wait_for_answer(socket, root, session_id, tmux_env, deadline)
+        answer = _wait_for_answer(socket, root, session_id, tmux_env, deadline)
     finally:
         _tmux(socket, "kill-server", env=tmux_env, check=False)
+    _cleanup_transcript(root, session_id)
+    return answer
 
 
 __all__ = ["ClaudeTmuxError", "run_claude_tmux"]

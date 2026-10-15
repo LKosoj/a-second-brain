@@ -155,12 +155,18 @@ class DailyEntryMemoryStore:
 
     def _write(self, payload: dict[str, Any]) -> None:
         self._store_path.parent.mkdir(parents=True, exist_ok=True)
+        mode = (
+            self._store_path.stat().st_mode & 0o777
+            if self._store_path.exists()
+            else 0o660
+        )
         with tempfile.NamedTemporaryFile(
             "w",
             encoding="utf-8",
             dir=self._store_path.parent,
             delete=False,
         ) as temp_file:
+            os.fchmod(temp_file.fileno(), mode)
             temp_file.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
             temp_path = Path(temp_file.name)
         os.replace(temp_path, self._store_path)

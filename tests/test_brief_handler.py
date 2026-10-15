@@ -183,7 +183,7 @@ async def test_process_brief_request_answers_even_when_the_build_blows_up(
 
     # MarkdownV2-escaped on the way out, like every other reply this handler
     # sends through ``answer_text``.
-    assert message.answers[0][0] == "❌ Не удалось собрать бриф\\."
+    assert message.answers[0][0] == "❌ Не удалось собрать справку\\."
 
 
 def _sample_brief_result() -> BriefResult:
@@ -276,7 +276,7 @@ async def test_process_brief_request_write_failure_reports_error(monkeypatch) ->
     await brief_handler.process_brief_request(message, "decision", "закупка сервера")
 
     assert delivered == []
-    assert "не удалось сохранить бриф" in message.answers[0][0].lower()
+    assert "не удалось сохранить справку" in message.answers[0][0].lower()
 
 
 async def test_process_brief_request_delivery_failure_still_names_the_saved_file(
@@ -337,6 +337,6 @@ async def test_process_brief_request_delivery_failure_still_names_the_saved_file
 
     assert written == [Path("/tmp/vault/summaries/briefs/b.md")]
     assert fallback == [
-        "❌ Бриф сохранён в `summaries/briefs/b.md`, "
+        "❌ Справка сохранена в `summaries/briefs/b.md`, "
         "но отправить его в чат не удалось."
     ]

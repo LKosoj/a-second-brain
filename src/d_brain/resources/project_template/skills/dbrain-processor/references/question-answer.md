@@ -24,8 +24,11 @@ Answer the user's question now instead of capturing it as a note.
 - if uncertainty remains, state it briefly
 - if a needed source is missing, say so instead of guessing
 - do not narrate the retrieval process unless it changes the answer
-- for fact, status, and history answers, finish with `Источники:` and 2-5
-  vault-relative `[[wikilinks]]` to files actually read
+- for fact, status, and history answers, finish with `Источники:` and 2-5 real
+  sources: vault Markdown notes as `[[wikilinks]]`, provided original
+  conversation references as `telegram:<chat>:<message>`, and other provided
+  source paths in inline code. Never invent a Markdown note for an archive
+  message or follow a repository path outside the allowed vault scope.
 - cite source notes, not search-result snippets; never invent a citation
 - when fewer than two confirming sources exist, list only the real source(s),
   state the evidence gap briefly, and mark unsupported conclusions as inference

@@ -7,6 +7,7 @@ When the target is ambiguous, the owner is asked to pick -- one button per
 candidate -- rather than have the bot guess (ТЗ 7.3 "не гадай, спроси").
 """
 
+import asyncio
 import hashlib
 import logging
 from pathlib import Path
@@ -144,7 +145,7 @@ async def process_why_request(message: Message, query: str, state: FSMContext) -
     settings = get_settings()
     vault_path = Path(settings.vault_path)
     try:
-        outcome = build_why(vault_path, query)
+        outcome = await asyncio.to_thread(build_why, vault_path, query)
     except Exception:
         # ``build_why`` re-reads every ``compiled/**`` page, which the
         # nightly pass can be rewriting or archiving underneath it. Letting
@@ -185,11 +186,15 @@ async def deliver_why_result(
 ) -> None:
     """Send the /why answer and touch the resolved page -- the same
     best-effort ``QmdService.touch_notes`` promotion ``run_compiled_brief.py``
-    already applies to a brief's source page (задача L)."""
+    already applies to a brief's source page (задача L).
+    """
     try:
-        QmdService(vault_path).touch_notes([result.rel_path])
+        await asyncio.to_thread(
+            QmdService(vault_path).touch_notes, [result.rel_path]
+        )
     except Exception as exc:  # pragma: no cover - best-effort touch
         logger.warning("Failed to touch /why source %s: %s", result.rel_path, exc)
+
     try:
         await answer_rich_text(message, result.markdown)
     except Exception:
@@ -252,7 +257,7 @@ async def handle_why_choice(query: CallbackQuery, state: FSMContext) -> None:
     # itself is a separate message, so nothing is lost by conceding it early.
     await query.answer()
     try:
-        result = build_why_for_path(vault_path, rel_path)
+        result = await asyncio.to_thread(build_why_for_path, vault_path, rel_path)
     except Exception:
         # Same guard, for the same reason, as ``process_why_request``'s
         # around ``build_why``: both re-read ``compiled/**`` pages the

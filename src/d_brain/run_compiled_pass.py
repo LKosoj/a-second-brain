@@ -49,6 +49,7 @@ from d_brain.services.compiled_briefings import (
     CompiledSourceStateError,
 )
 from d_brain.services.compiled_enrich_report import PASS_JOURNAL_RELATIVE_PATH
+from d_brain.services.frontmatter import ensure_run_identity
 
 
 def _resolve_sources(dates: list[str], sources: list[str]) -> list[str]:
@@ -124,6 +125,14 @@ def _run_dry_run(
 
 def _run_rollback(service: CompiledBriefingService, pass_id: str) -> dict[str, Any]:
     result = service.rollback_compile_enrich_pass(pass_id)
+    if result.get("restored"):
+        # A CLI-triggered rollback has no later "pass" step to refresh the
+        # qmd search index for it (unlike run_nightly_maintenance, which
+        # refreshes it once from its own writes and again here if a gate
+        # reverts them) -- without this, restored pages stay searchable
+        # under whatever the rollback put back while the index still
+        # reflects the rolled-back content.
+        service._refresh_qmd_index()  # noqa: SLF001
     # ``manifest_found`` tells apart "nothing to roll back because this
     # pass_id has no snapshot at all" (made-up id, typo, already cleaned up
     # by retention) from "nothing to roll back because this pass genuinely
@@ -163,7 +172,9 @@ def _run_pass(
     return result
 
 
+
 def main() -> int:
+    ensure_run_identity("compiled-pass", "compiled-pass")
     parser = argparse.ArgumentParser(
         description="Run, preview, or roll back one manual compile-enrich pass"
     )

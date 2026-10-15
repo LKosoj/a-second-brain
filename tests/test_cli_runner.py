@@ -69,6 +69,7 @@ def _process_alive(pid: int) -> bool:
         "claude",
         "claude-tmux",
         "codex",
+        "codex-tmux",
         "qwen",
         "gemini",
         "kimi",
@@ -84,6 +85,7 @@ def test_normalize_ai_cli_accepts_supported_values(value: str) -> None:
         "claude",
         "claude-tmux",
         "codex",
+        "codex-tmux",
         "qwen",
         "gemini",
         "kimi",
@@ -199,6 +201,27 @@ def test_claude_tmux_delegates_to_the_tmux_runner(
         "claude",
         "--dangerously-skip-permissions",
     ]
+
+
+def test_codex_tmux_delegates_to_the_tmux_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, Path, int]] = []
+
+    def _fake_runner(prompt, workdir, env, timeout):  # type: ignore[no-untyped-def]
+        del env
+        calls.append((prompt, workdir, timeout))
+        return "tmux answer"
+
+    monkeypatch.setitem(cli_runner._EXTERNAL_RUNNERS, "codex-tmux", _fake_runner)
+    runner = CliRunner(tmp_path, "codex-tmux")
+
+    output = runner.run("secret prompt", timeout=42)
+
+    assert output == "tmux answer"
+    assert calls == [("secret prompt", tmp_path, 42)]
+    assert "secret prompt" not in runner.build_command("secret prompt")
 
 
 def test_kimi_uses_acp_stdio_without_prompt_in_argv(tmp_path: Path) -> None:

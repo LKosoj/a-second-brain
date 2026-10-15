@@ -1,5 +1,6 @@
 """Inline dashboard and file browser handlers."""
 
+import asyncio
 import logging
 from contextlib import suppress
 from datetime import date
@@ -10,19 +11,23 @@ from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, FSInputFile, Message
 
 from d_brain.bot.dashboard import (
+    DashboardScreen,
     close_dashboard,
     file_browser_parent_dir,
     get_dashboard_session,
     page_fingerprint,
+    reenable_job_step,
     render_brief_type,
+    render_disabled_steps,
     render_file_directory,
     render_file_roots,
     render_home,
     render_queue,
     render_queue_item,
+    render_section,
     render_stats,
     render_weekly_review,
     send_browser_file,
@@ -48,6 +53,7 @@ from d_brain.services.decisions_queue import (
 from d_brain.services.file_browser import FileBrowserError
 from d_brain.services.frontmatter import write_validated_vault_markdown
 from d_brain.services.vault_lock import vault_write_lock
+from d_brain.services.vault_map import export_vault_map
 
 router = Router(name="menu")
 logger = logging.getLogger(__name__)
@@ -105,7 +111,8 @@ async def _deliver_daily_digest(message: Message, *, vault_path: str | Path) -> 
     today = date.today()
 
     try:
-        digest = build_daily_digest(
+        digest = await asyncio.to_thread(
+            build_daily_digest,
             resolved_vault_path,
             today,
             pass_status=_read_enrich_pass_status(resolved_vault_path),
@@ -203,9 +210,10 @@ async def _render_file_directory_or_roots(
 
 
 @router.message(Command("menu"))
-async def cmd_menu(message: Message, bot: Bot) -> None:
+async def cmd_menu(message: Message, bot: Bot, state: FSMContext) -> None:
     """Open or recreate the inline dashboard."""
     settings = get_settings()
+    await state.clear()
     await render_home(
         bot,
         chat_id=message.chat.id,
@@ -215,9 +223,10 @@ async def cmd_menu(message: Message, bot: Bot) -> None:
 
 
 @router.message(Command("files"))
-async def cmd_files(message: Message, bot: Bot) -> None:
+async def cmd_files(message: Message, bot: Bot, state: FSMContext) -> None:
     """Open the file browser root picker."""
     settings = get_settings()
+    await state.clear()
     await render_file_roots(
         bot,
         chat_id=message.chat.id,
@@ -247,7 +256,19 @@ async def handle_menu_callback(
         await query.answer()
         return
 
+    await state.clear()
+
+    if data in {"menu:summaries", "menu:processing", "menu:more", "menu:help"}:
+        await query.answer()
+        await render_section(
+            bot, chat_id=chat_id,
+            section=cast(DashboardScreen, data.removeprefix("menu:")),
+            preferred_message_id=message_id,
+        )
+        return
+
     if data == "menu:home":
+        await query.answer()
         await render_home(
             bot,
             chat_id=chat_id,
@@ -255,10 +276,10 @@ async def handle_menu_callback(
             user_id=query.from_user.id,
             preferred_message_id=message_id,
         )
-        await query.answer()
         return
 
     if data == "menu:stats":
+        await query.answer()
         await render_stats(
             bot,
             chat_id=chat_id,
@@ -266,20 +287,70 @@ async def handle_menu_callback(
             user_id=query.from_user.id,
             preferred_message_id=message_id,
         )
+        return
+
+    if data == "menu:jobhealth":
+        await query.answer()
+        await render_disabled_steps(
+            bot,
+            chat_id=chat_id,
+            vault_path=settings.vault_path,
+            preferred_message_id=message_id,
+        )
+        return
+
+    if data.startswith("menu:jobhealthenable:"):
+        step_name = data.removeprefix("menu:jobhealthenable:")
+        was_disabled = await asyncio.to_thread(
+            reenable_job_step, settings.vault_path, step_name
+        )
+        notice = (
+            "Шаг снова включён."
+            if was_disabled
+            else "Шаг уже был включён или не найден."
+        )
+        await render_disabled_steps(
+            bot,
+            chat_id=chat_id,
+            vault_path=settings.vault_path,
+            preferred_message_id=message_id,
+            notice=notice,
+        )
         await query.answer()
         return
 
     if data == "menu:files":
+        await query.answer()
         await render_file_roots(
             bot,
             chat_id=chat_id,
             vault_path=settings.vault_path,
             preferred_message_id=message_id,
         )
-        await query.answer()
+        return
+
+    if data == "menu:vaultmap":
+        await query.answer("Собираю карту знаний…")
+        try:
+            path = await asyncio.to_thread(export_vault_map, settings.vault_path)
+            await bot.send_document(
+                chat_id=chat_id,
+                document=FSInputFile(path),
+                parse_mode=None,
+                caption=(
+                    "Карта знаний: названия, описания и связи. "
+                    "Скачайте HTML и откройте в браузере без интернета."
+                ),
+            )
+        except Exception:
+            logger.exception("Failed to build or send vault map")
+            await answer_text(
+                message, "Не удалось отправить карту знаний. Попробуйте ещё раз."
+            )
         return
 
     if data.startswith("menu:filesroot:"):
+        await query.answer()
         root_id = data.removeprefix("menu:filesroot:")
         try:
             await render_file_directory(
@@ -297,20 +368,20 @@ async def handle_menu_callback(
                 preferred_message_id=message_id,
                 notice="Не удалось открыть выбранный раздел.",
             )
-        await query.answer()
         return
 
     if data == "menu:filesroots":
+        await query.answer()
         await render_file_roots(
             bot,
             chat_id=chat_id,
             vault_path=settings.vault_path,
             preferred_message_id=message_id,
         )
-        await query.answer()
         return
 
     if data == "menu:filesrefresh":
+        await query.answer()
         if session.file_root_id is None:
             await render_file_roots(
                 bot,
@@ -329,10 +400,10 @@ async def handle_menu_callback(
                 page=session.file_page,
                 preferred_message_id=message_id,
             )
-        await query.answer()
         return
 
     if data == "menu:filesup":
+        await query.answer()
         if session.file_root_id is None:
             await render_file_roots(
                 bot,
@@ -351,10 +422,10 @@ async def handle_menu_callback(
                 page=0,
                 preferred_message_id=message_id,
             )
-        await query.answer()
         return
 
     if data.startswith("menu:filespage:"):
+        await query.answer()
         if session.file_root_id is None:
             await render_file_roots(
                 bot,
@@ -377,7 +448,6 @@ async def handle_menu_callback(
                 page=page,
                 preferred_message_id=message_id,
             )
-        await query.answer()
         return
 
     if data.startswith("menu:filesentry:"):
@@ -403,6 +473,7 @@ async def handle_menu_callback(
 
         entry = session.file_entries[entry_index]
         if entry.is_directory:
+            await query.answer()
             await _render_file_directory_or_roots(
                 bot,
                 chat_id=chat_id,
@@ -412,9 +483,9 @@ async def handle_menu_callback(
                 page=0,
                 preferred_message_id=message_id,
             )
-            await query.answer()
             return
 
+        await query.answer("Отправляю файл…")
         try:
             file_name = await send_browser_file(
                 bot,
@@ -471,7 +542,7 @@ async def handle_menu_callback(
         return
 
     if data == "menu:process":
-        await query.answer("Запускаю preview...")
+        await query.answer("Показываю разбор без сохранения…")
         await run_interactive_process(message, actor_id=query.from_user.id)
         return
 
@@ -482,25 +553,26 @@ async def handle_menu_callback(
 
     if data == "menu:do":
         await query.answer()
-        await start_do_flow(message, state)
+        await start_do_flow(message, state, menu_message_id=message_id)
         return
 
     if data == "menu:digest":
-        await query.answer("Строю дайджест...")
+        await query.answer("Готовлю сводку дня…")
         await _deliver_daily_digest(message, vault_path=settings.vault_path)
         return
 
     if data == "menu:queue":
+        await query.answer()
         await render_queue(
             bot,
             chat_id=chat_id,
             vault_path=settings.vault_path,
             preferred_message_id=message_id,
         )
-        await query.answer()
         return
 
     if data.startswith("menu:queuepage:"):
+        await query.answer()
         try:
             page = int(data.removeprefix("menu:queuepage:"))
         except ValueError:
@@ -512,7 +584,6 @@ async def handle_menu_callback(
             page=page,
             preferred_message_id=message_id,
         )
-        await query.answer()
         return
 
     if data.startswith("menu:queueitem:"):
@@ -580,7 +651,9 @@ async def handle_menu_callback(
             return
 
         try:
-            outcome = apply_response(Path(settings.vault_path), item, action_id)
+            outcome = await asyncio.to_thread(
+                apply_response, Path(settings.vault_path), item, action_id
+            )
         except ValueError:
             await query.answer("Действие недоступно для этого пункта.", show_alert=True)
             return
@@ -622,13 +695,13 @@ async def handle_menu_callback(
         return
 
     if data == "menu:weekly":
+        await query.answer()
         await render_weekly_review(
             bot,
             chat_id=chat_id,
             vault_path=settings.vault_path,
             preferred_message_id=message_id,
         )
-        await query.answer()
         return
 
     if data.startswith("menu:weeklyreview:"):
@@ -654,7 +727,9 @@ async def handle_menu_callback(
             return
 
         try:
-            outcome = mark_page_human_reviewed(Path(settings.vault_path), rel_path)
+            outcome = await asyncio.to_thread(
+                mark_page_human_reviewed, Path(settings.vault_path), rel_path
+            )
         except Exception:
             logger.exception("Weekly review mark failed for %s", rel_path)
             await query.answer(_QUEUE_ACTION_FAILED_MESSAGE, show_alert=True)
@@ -675,26 +750,26 @@ async def handle_menu_callback(
         return
 
     if data == "menu:brief":
+        await query.answer()
         await render_brief_type(
             bot,
             chat_id=chat_id,
             preferred_message_id=message_id,
         )
-        await query.answer()
         return
 
     if data.startswith("menu:brieftype:"):
         brief_type = data.removeprefix("menu:brieftype:")
         if brief_type not in BRIEF_TYPES:
-            await query.answer("Неизвестный тип брифа.", show_alert=True)
+            await query.answer("Неизвестный тип справки.", show_alert=True)
             return
         await query.answer()
-        await start_brief_flow(message, state, brief_type)
+        await start_brief_flow(message, state, brief_type, menu_message_id=message_id)
         return
 
     if data == "menu:close":
-        await close_dashboard(bot, chat_id=chat_id, preferred_message_id=message_id)
         await query.answer("Меню закрыто. Открыть снова: /menu")
+        await close_dashboard(bot, chat_id=chat_id, preferred_message_id=message_id)
         return
 
     await query.answer("Неизвестное действие.", show_alert=False)

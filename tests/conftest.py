@@ -37,6 +37,20 @@ def _block_real_telegram_delivery(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _isolate_run_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep ``ensure_run_identity`` from leaking its run id across tests.
+
+    ``run_daily_process.main``/``run_compiled_pass.main`` seed
+    ``D_BRAIN_RUN_ID``/``D_BRAIN_WORKFLOW`` with ``os.environ.setdefault``;
+    registering both keys with ``monkeypatch`` first makes that write part of
+    the per-test undo, so the first test to call ``main()`` cannot pin a run
+    id for the rest of the session.
+    """
+    monkeypatch.delenv("D_BRAIN_RUN_ID", raising=False)
+    monkeypatch.delenv("D_BRAIN_WORKFLOW", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _block_real_ai_cli(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep the suite from spending real model quota on installed CLIs.
 

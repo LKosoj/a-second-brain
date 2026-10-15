@@ -61,6 +61,9 @@ class FakeService:
         self.calls.append(("rollback_compile_enrich_pass", {"pass_id": pass_id}))
         return dict(self.rollback_result)
 
+    def _refresh_qmd_index(self) -> None:
+        self.calls.append(("_refresh_qmd_index", {}))
+
 
 @pytest.fixture(autouse=True)
 def _reset_fake_service():
@@ -202,7 +205,10 @@ def test_rollback_calls_service_directly_and_reports_pass_id(
 
     assert exit_code == 0
     service = FakeService.created[0]
-    assert service.calls == [("rollback_compile_enrich_pass", {"pass_id": "pass-xyz"})]
+    assert service.calls == [
+        ("rollback_compile_enrich_pass", {"pass_id": "pass-xyz"}),
+        ("_refresh_qmd_index", {}),
+    ]
     out = json.loads(capsys.readouterr().out)
     assert out == {
         "pass_id": "pass-xyz",

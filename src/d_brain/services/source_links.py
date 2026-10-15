@@ -101,6 +101,18 @@ _UNSAFE_FORWARD_NAME_RE = re.compile(r"[\[\]|#\n\r]")
 # runner and the rest of the compile-enrich pipeline.
 _DAILY_ENTRY_HEADER_LOOKALIKE_RE = re.compile(r"^##\s+\d{1,2}:\d{2}\s+\[")
 
+# Same shape, but with re.MULTILINE so "^" and the readers' own "\s+" can
+# both cross a line break: DAILY_ENTRY_SPLIT_RE and DAILY_ENTRY_RE match
+# "\s+" without re.DOTALL, and plain "\s" already spans newlines with or
+# without that flag, so "## 12:00\n[text]" or "##\n12:00 [text]" reads back
+# as a real entry header on disk even though neither physical line alone
+# looks like one. _DAILY_ENTRY_HEADER_LOOKALIKE_RE above cannot see that:
+# it runs against one already-split physical line at a time (see
+# _defuse_matching_lines), so it only ever catches the single-line case.
+_DAILY_ENTRY_HEADER_LOOKALIKE_MULTILINE_RE = re.compile(
+    r"^##\s+\d{1,2}:\d{2}\s+\[", re.MULTILINE
+)
+
 # Only "\r" and "\r\n" are treated as line boundaries here, not the wider
 # set str.splitlines() recognizes ("\v", "\f", and Unicode line/paragraph
 # separators): storage.py's _render_with_newline folds a bare "\r"/"\r\n"
@@ -141,6 +153,41 @@ def _defuse_matching_lines(
         pieces.append(
             part if index == spared or not pattern.match(part) else f" {part}"
         )
+        if index < len(boundaries):
+            pieces.append(boundaries[index])
+    return "".join(pieces)
+
+
+def _escape_daily_header_lookalikes(text: str, spared: int) -> str:
+    """Indent the physical line where a header look-alike's "##" sits.
+
+    ``_DAILY_ENTRY_HEADER_LOOKALIKE_MULTILINE_RE`` may match across more
+    than one physical line, but breaking every reader's "^##"-anchored
+    match only requires indenting the line the "##" itself starts --
+    lines after it, if any, are returned untouched, same as the plain
+    single-line case.
+
+    Matching runs against ``parts`` re-joined with plain "\\n", not the
+    original ``text``: Python's own MULTILINE "^" only treats "\\n" as a
+    line separator, but a bare "\\r" is a boundary here too (storage.py's
+    ``_render_with_newline`` folds it into a real "\\n" once written), and
+    ``_LINE_BOUNDARY_RE`` already knows to split on it.
+    """
+    parts = _LINE_BOUNDARY_RE.split(text)
+    boundaries = _LINE_BOUNDARY_RE.findall(text)
+    joined = "\n".join(parts)
+    starts = {
+        match.start()
+        for match in _DAILY_ENTRY_HEADER_LOOKALIKE_MULTILINE_RE.finditer(joined)
+    }
+    if not starts:
+        return text
+    pieces: list[str] = []
+    offset = 0
+    for index, part in enumerate(parts):
+        defuse = index != spared and offset in starts
+        pieces.append(f" {part}" if defuse else part)
+        offset += len(part) + 1
         if index < len(boundaries):
             pieces.append(boundaries[index])
     return "".join(pieces)
@@ -250,7 +297,7 @@ def escape_embedded_daily_headers(
         if keep_leading_header
         else -1
     )
-    return _defuse_matching_lines(text, _DAILY_ENTRY_HEADER_LOOKALIKE_RE, spared)
+    return _escape_daily_header_lookalikes(text, spared)
 
 
 def forward_source_name(message: Any) -> str:

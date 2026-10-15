@@ -39,6 +39,10 @@ def _create_vault(
         "daily/2026-07-28.md": "Вчера.\n",
         ".session/handoff.md": "Передача.\n",
     }
+    files["directions.md"] = "Направления и места хранения.\n"
+    for domain in ("family", "hobbies", "finances", "health", "home"):
+        (vault / domain).mkdir()
+        files[f"{domain}/_index.md"] = f"{domain} index.\n"
     for relative, content in files.items():
         (vault / relative).write_text(content, encoding="utf-8")
     write_vault_manifest(
@@ -111,6 +115,12 @@ def test_context_pack_uses_the_full_declared_collapse_order(
         "git_summary",
         "hygiene",
         "projects_index",
+        "family_index",
+        "hobbies_index",
+        "finances_index",
+        "health_index",
+        "home_index",
+        "directions",
         "business_index",
         "yesterday_daily",
         "monthly_goals",
@@ -314,3 +324,13 @@ def test_session_start_hook_uses_vault_cwd_and_runtime_mode_has_no_output(
         "=== INJECTED CORE CONTEXT ===\n"
     )
     assert _snapshot_tree(tmp_path) == before
+
+
+def test_personal_storage_and_directions_are_injected(tmp_path, write_vault_manifest):
+    vault = _create_vault(tmp_path, write_vault_manifest)
+    pack = ContextPackBuilder(vault).build(date(2026, 7, 29))
+    for domain in ("family", "hobbies", "finances", "health", "home"):
+        assert f"{domain}/_index.md" in pack.loaded_paths
+        assert f"{domain} index." in pack.text
+    assert "directions.md" in pack.loaded_paths
+    assert "Направления и места хранения." in pack.text

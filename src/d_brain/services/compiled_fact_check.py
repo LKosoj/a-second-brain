@@ -72,6 +72,7 @@ from d_brain.services.compiled_briefings import (
 )
 from d_brain.services.decisions_queue import append_decision_queue_entries
 from d_brain.services.frontmatter import patch_validated_vault_frontmatter
+from d_brain.services.ops_log import append_ops_log
 from d_brain.services.vault_lock import vault_write_lock
 
 logger = logging.getLogger(__name__)
@@ -364,15 +365,9 @@ def _write_fact_check_journal(
     purpose: that file is overwritten whole by every enrichment pass, so
     sharing it would erase whichever process ran second.
 
-    ``queue_evictions`` mirrors the field ``compiled_briefings.py``'s own
-    pass journal carries (ТЗ 7.2: "факт вытеснения попадает в дайджест") --
-    this run cannot fold into that pass's ``queue_evictions`` counter (there
-    is no active ``CompileEnrichPass`` here, see ``run_monthly_fact_check``),
-    so it gets its own record here instead, in this run's own journal.
-    ``compiled_enrich_report._with_fact_check_evictions`` reads it back and
-    adds it to the digest's count for the same ``date``, which is what
-    actually closes ТЗ 7.2 for this pass; writing it here without that
-    reader made the whole field an owner-invisible no-op.
+    ``queue_evictions`` is recorded separately because this run has no
+    active ``CompileEnrichPass``. The daily digest omits processing details;
+    the counter remains available in this diagnostic journal.
     """
     payload = {
         "date": today.isoformat(),
@@ -426,6 +421,10 @@ def run_monthly_fact_check(
     flagged_pages: list[str] = []
     errors: list[str] = []
     queue_evictions = 0
+    # Set only in the ``except`` below (code review): empty means the try
+    # body ran to completion, which is exactly when ``patched_pages``/
+    # ``flagged_pages``/``errors`` above hold this run's real counts.
+    fact_check_exc_type = ""
 
     try:
         if plans:
@@ -477,6 +476,9 @@ def run_monthly_fact_check(
                     queue_evictions = append_decision_queue_entries(
                         resolved_vault_path, queue_entries, existing_lock=lock
                     )
+    except Exception as exc:
+        fact_check_exc_type = type(exc).__name__
+        raise
     finally:
         # In ``finally`` for the same reason ``compiled_briefings.py``'s
         # ``run_nightly_maintenance`` journals its pass there (code review):
@@ -505,6 +507,20 @@ def run_monthly_fact_check(
             )
         except Exception as exc:  # noqa: BLE001 - must not mask the real cause
             logger.warning("Failed to write monthly fact-check journal: %s", exc)
+        # Moved into ``finally`` (code review): this call used to sit right
+        # after the try/finally above, so a run that raised out of the try
+        # body never made it into the ops log at all. Placed next to the
+        # unconditional journal write above rather than wrapped in its own
+        # try/except: ``append_ops_log`` is already best-effort and does not
+        # raise on its own account.
+        if fact_check_exc_type:
+            fact_check_summary = f"ошибка: {fact_check_exc_type}"
+        else:
+            fact_check_summary = (
+                f"страниц {len(plans)}, исправлено {len(patched_pages)}, "
+                f"помечено {len(flagged_pages)}, ошибок {len(errors)}"
+            )
+        append_ops_log(resolved_vault_path, "fact-check", fact_check_summary)
 
     return {
         "status": "no-work" if not plans else "ok",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -20,10 +21,72 @@ from d_brain.manifest import ManifestValidationError, VaultManifest, load_manife
 
 CheckLevel = Literal["OK", "INFO", "WARN", "ERR"]
 SUPPORTED_AI_CLIS = frozenset(
-    {"claude", "claude-tmux", "codex", "qwen", "gemini", "kimi", "grok", "opencode"}
+    {
+        "claude",
+        "claude-tmux",
+        "codex",
+        "codex-tmux",
+        "qwen",
+        "gemini",
+        "kimi",
+        "grok",
+        "opencode",
+    }
 )
 # Backends whose executable name differs from the AI_CLI value.
-AI_CLI_BINARIES = {"claude-tmux": "claude"}
+AI_CLI_BINARIES = {"claude-tmux": "claude", "codex-tmux": "codex"}
+# Setting names doctor looks up. pydantic-settings reads .env keys
+# case-insensitively; a lowercase variant of one of these still works at
+# runtime, but is worth flagging since not every consumer of .env
+# (shell scripts, systemd's EnvironmentFile) is as forgiving.
+KNOWN_ENV_KEYS = frozenset(
+    {
+        "TELEGRAM_BOT_TOKEN",
+        "DEEPGRAM_API_KEY",
+        "OWNER_TELEGRAM_ID",
+        "AI_CLI",
+        "OWNER_FULL_NAME",
+        "TODOIST_API_KEY",
+        "PLAUD_BEARER_TOKEN",
+        "PLAUD_REGION",
+        "VAULT_BACKUP_GPG_RECIPIENT",
+        "VAULT_BACKUP_DIR",
+        "VAULT_PATH",
+    }
+)
+SUPPORTED_PLAUD_REGIONS = frozenset({"api", "api-euc1"})
+_ENV_ASSIGNMENT_RE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+
+
+def _first_symlink_component(path: Path) -> Path | None:
+    """Return the first symlinked path component of an absolute path, if any.
+
+    ``vault_lock.open_vault_root_nofollow`` opens every directory component
+    with ``O_NOFOLLOW`` and refuses to proceed past a symlink, so a symlink
+    anywhere in the vault path breaks vault writes at runtime.
+    """
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        if current.is_symlink():
+            return current
+    return None
+
+
+def _has_unquoted_risky_value(raw_value: str) -> bool:
+    """Whether a raw (unparsed) .env value has an unquoted space or ``$``.
+
+    python-dotenv parses these values without complaint, but a value like
+    this breaks naive shell-based consumers of the same file.
+    """
+    value = raw_value.strip()
+    if value[:1] in ("\"", "'"):
+        closing = value.find(value[0], 1)
+        # A quoted value may be followed only by an inline comment.
+        if closing != -1 and value[closing + 1 :].lstrip()[:1] in ("", "#"):
+            return False
+    value = value.split(" #", 1)[0].rstrip()
+    return " " in value or "$" in value
 
 
 @dataclass(frozen=True)
@@ -108,6 +171,14 @@ class ProjectDoctor:
             except (OSError, ValueError):
                 self.report.add("ERR", ".env could not be parsed")
                 file_values = {}
+            for key in file_values:
+                if key != key.upper() and key.upper() in KNOWN_ENV_KEYS:
+                    self.report.add(
+                        "WARN",
+                        f".env key '{key}' should be uppercase "
+                        f"'{key.upper()}'; pydantic-settings reads env keys "
+                        "case-insensitively but not every tool does",
+                    )
             self.values.update(
                 {
                     str(key): str(value)
@@ -115,6 +186,7 @@ class ProjectDoctor:
                     if value is not None
                 }
             )
+            self._check_raw_env_lines(env_path)
             mode = stat.S_IMODE(env_path.stat().st_mode)
             if mode & 0o077:
                 self.report.add(
@@ -127,6 +199,30 @@ class ProjectDoctor:
             self.report.add("ERR", f".env is missing at {env_path}")
 
         self.values.update(self.process_environ)
+
+    def _check_raw_env_lines(self, env_path: Path) -> None:
+        try:
+            text = env_path.read_text(encoding="utf-8")
+        except OSError:
+            return
+        flagged: list[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            match = _ENV_ASSIGNMENT_RE.match(stripped)
+            if match is None:
+                continue
+            key, raw_value = match.group(1), match.group(2)
+            if _has_unquoted_risky_value(raw_value) and key not in flagged:
+                flagged.append(key)
+        for key in flagged:
+            self.report.add(
+                "WARN",
+                f"{key} in .env has an unquoted space or '$'; quote the "
+                "value so shell-based tools (a manual `source .env`, "
+                "ad-hoc scripts) parse it correctly",
+            )
 
     def _check_environment(self) -> None:
         for name in ("TELEGRAM_BOT_TOKEN", "DEEPGRAM_API_KEY"):
@@ -171,6 +267,17 @@ class ProjectDoctor:
             self.report.add("OK", f"Private vault exists at {self.vault_path}")
         else:
             self.report.add("ERR", f"Private vault is missing at {self.vault_path}")
+
+        raw_absolute = (
+            candidate if candidate.is_absolute() else (self.project_dir / candidate)
+        )
+        symlinked = _first_symlink_component(raw_absolute)
+        if symlinked is not None:
+            self.report.add(
+                "WARN",
+                f"vault path contains a symlink at {symlinked}; vault_lock "
+                "refuses symlinked path components and will error at runtime",
+            )
 
         try:
             self.manifest = load_manifest(self.project_dir)
@@ -232,10 +339,10 @@ class ProjectDoctor:
             self.report.add("ERR", f"AI CLI '{self.ai_cli}' is missing")
             return
         self.report.add("OK", f"AI CLI '{self.ai_cli}' is installed")
-        if self.ai_cli == "claude-tmux" and not shutil.which("tmux"):
+        if self.ai_cli in {"claude-tmux", "codex-tmux"} and not shutil.which("tmux"):
             self.ai_cli_installed = False
             self.report.add(
-                "ERR", "AI CLI 'claude-tmux' requires tmux, which is missing"
+                "ERR", f"AI CLI '{self.ai_cli}' requires tmux, which is missing"
             )
             return
         if self._auth_ready():
@@ -272,6 +379,14 @@ class ProjectDoctor:
             self.report.add("OK", "PLAUD integration is configured")
         else:
             self.report.add("INFO", "PLAUD integration is not configured")
+
+        plaud_region = self._value("PLAUD_REGION")
+        if plaud_region and plaud_region not in SUPPORTED_PLAUD_REGIONS:
+            supported = ", ".join(sorted(SUPPORTED_PLAUD_REGIONS))
+            self.report.add(
+                "WARN",
+                f"PLAUD_REGION '{plaud_region}' is not one of: {supported}",
+            )
 
     def _check_backup(self) -> None:
         recipient = self._value("VAULT_BACKUP_GPG_RECIPIENT")
@@ -321,6 +436,7 @@ class ProjectDoctor:
             "claude": (["claude", "auth", "status"], '"loggedIn": true'),
             "claude-tmux": (["claude", "auth", "status"], '"loggedIn": true'),
             "codex": (["codex", "login", "status"], "Logged in"),
+            "codex-tmux": (["codex", "login", "status"], "Logged in"),
             "qwen": (["qwen", "auth", "status"], "Authentication Method"),
         }
         command, marker = commands[self.ai_cli]
@@ -342,6 +458,7 @@ class ProjectDoctor:
             "claude": "claude auth login",
             "claude-tmux": "claude auth login",
             "codex": "codex login",
+            "codex-tmux": "codex login",
             "qwen": "qwen auth qwen-oauth",
             "gemini": "configure GOOGLE_API_KEY or GEMINI_API_KEY",
             "kimi": "kimi login",
@@ -358,7 +475,7 @@ class ProjectDoctor:
             return
 
         # The TUI backend spends its first seconds booting claude's interface.
-        timeout = 60 if self.ai_cli == "claude-tmux" else 20
+        timeout = 60 if self.ai_cli in {"claude-tmux", "codex-tmux"} else 20
         command = [
             sys.executable,
             "-m",
@@ -394,7 +511,16 @@ class ProjectDoctor:
             )
 
     def _value(self, name: str) -> str:
-        return self.values.get(name, "").strip()
+        if name in self.values:
+            return self.values[name].strip()
+        # pydantic-settings reads .env keys case-insensitively; fall back to
+        # a case-insensitive lookup so a lowercase key is not misreported as
+        # missing (see the .env key-casing WARN in _load_environment).
+        upper = name.upper()
+        for key, value in self.values.items():
+            if key.upper() == upper:
+                return value.strip()
+        return ""
 
 
 def run_doctor(

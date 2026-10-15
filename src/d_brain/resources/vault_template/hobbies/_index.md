@@ -7,6 +7,4 @@ tier: active
 ---
 # Hobbies
 
-- [[photography]]
-- [[running]]
-- [[reading]]
+Здесь перечисляются ссылки на сохранённые заметки этого раздела.

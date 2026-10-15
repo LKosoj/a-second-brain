@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,6 +20,7 @@ from d_brain.services.link_summary import (
     format_link_summary_message,
 )
 from d_brain.services.localization import translate
+from d_brain.services.secrets import scrub_secrets
 from d_brain.services.session import SessionStore
 from d_brain.services.source_links import (
     SourceInfo,
@@ -31,9 +33,18 @@ from d_brain.services.storage import VaultStorage
 router = Router(name="photo")
 logger = logging.getLogger(__name__)
 ALBUM_SETTLE_SECONDS = 1.0
+# Upper bound on how long _flush_album waits for a media group's still-saving
+# photos (code review): the AI analysis step in _save_photo has no timeout of
+# its own, so a hung analysis call previously left _album_pending above zero
+# forever, and the already-saved sibling photos in the same album were never
+# flushed. Past this many seconds, flush whatever is already collected.
+ALBUM_MAX_WAIT_SECONDS = 120.0
 _album_lock = asyncio.Lock()
 _album_items: dict[str, list["PhotoEntry"]] = {}
 _album_tasks: dict[str, asyncio.Task[None]] = {}
+# Photos still being downloaded/analyzed for a media group, keyed by
+# media_group_id -- see _flush_album for why this exists.
+_album_pending: dict[str, int] = {}
 
 
 @dataclass(slots=True)
@@ -123,7 +134,21 @@ async def _analyze_photo(
         settings.ai_cli,
         settings.content_language,
     )
-    return await asyncio.to_thread(analyzer.analyze, relative_path)
+    analysis = await asyncio.to_thread(analyzer.analyze, relative_path)
+    if not analysis:
+        return analysis
+    # OCR text is whatever was visible on the picture -- a screenshot with a
+    # token in it would otherwise land in daily/ and .session/ verbatim.
+    for key in ("description", "ocr_text"):
+        scrubbed, scrub_count = scrub_secrets(analysis.get(key) or "")
+        if scrub_count:
+            analysis[key] = scrubbed
+            logger.info(
+                "scrub_secrets: %d replacement(s) in %s",
+                scrub_count,
+                f"photo-analysis:{relative_path}:{key}",
+            )
+    return analysis
 
 
 async def _save_photo(
@@ -135,11 +160,14 @@ async def _save_photo(
     storage = VaultStorage(settings.vault_path, settings.content_language)
 
     photo = cast(list[PhotoSize], message.photo)[-1]
-    file = await bot.get_file(photo.file_id)
+    # Timeouts mirror do.py's voice download (code review): without them, a
+    # hung Telegram API call left this photo's _album_pending slot open
+    # forever, so _flush_album never saw the group settle.
+    file = await asyncio.wait_for(bot.get_file(photo.file_id), timeout=60)
     if not file.file_path:
         raise ValueError("Не удалось скачать фото.")
 
-    file_bytes = await bot.download_file(file.file_path)
+    file_bytes = await asyncio.wait_for(bot.download_file(file.file_path), timeout=120)
     if not file_bytes:
         raise ValueError("Не удалось скачать фото.")
 
@@ -186,7 +214,13 @@ async def _save_photo(
             source=source,
             refresh_qmd=False,
         )
-        caption = result.content
+        caption, scrub_count = scrub_secrets(result.content)
+        if scrub_count:
+            logger.info(
+                "scrub_secrets: %d replacement(s) in %s",
+                scrub_count,
+                f"photo:{message.message_id}",
+            )
         youtube_urls = tuple(item.url for item in result.transcripts)
         link_summaries = tuple(result.summaries)
 
@@ -243,21 +277,50 @@ async def _flush_album(
     reply_message: Message,
     storage: VaultStorage,
 ) -> None:
-    """Flush one collected album into daily as a grouped entry."""
+    """Flush one collected album into daily as a grouped entry.
+
+    A new photo registers itself in ``_album_pending`` on arrival, before its
+    slow AI analysis runs (see handle_photo) -- membership in the album no
+    longer waits on that analysis. This settle wait is therefore restarted
+    only by a genuinely new arrival (handle_photo cancels and recreates this
+    task each time). If it wakes up and a sibling photo from the same group
+    is still being analyzed, that is not a new arrival, so it keeps waiting
+    for _album_pending to drain instead of flushing a partial album -- but
+    only up to ALBUM_MAX_WAIT_SECONDS (code review): the AI analysis step has
+    no timeout of its own, so a hung analysis must not block the
+    already-saved photos in this group from ever being flushed.
+    """
+    deadline = time.monotonic() + ALBUM_MAX_WAIT_SECONDS
     try:
-        await asyncio.sleep(ALBUM_SETTLE_SECONDS)
+        while True:
+            await asyncio.sleep(ALBUM_SETTLE_SECONDS)
+            async with _album_lock:
+                pending = _album_pending.get(media_group_id, 0)
+                if pending > 0 and time.monotonic() < deadline:
+                    continue
+                if pending > 0:
+                    logger.warning(
+                        "Album %s: %d photo(s) still saving after %.0fs, "
+                        "flushing the %d already-saved photo(s) without them",
+                        media_group_id,
+                        pending,
+                        ALBUM_MAX_WAIT_SECONDS,
+                        len(_album_items.get(media_group_id, [])),
+                    )
+                items = sorted(
+                    _album_items.pop(media_group_id, []),
+                    key=lambda item: item.message_id,
+                )
+                _album_pending.pop(media_group_id, None)
+                _album_tasks.pop(media_group_id, None)
+                break
     except asyncio.CancelledError:
         return
 
-    async with _album_lock:
-        items = sorted(
-            _album_items.pop(media_group_id, []),
-            key=lambda item: item.message_id,
-        )
-        if not items:
-            _album_tasks.pop(media_group_id, None)
-            return
+    if not items:
+        return
 
+    async with _album_lock:
         try:
             content = _build_album_daily_content(items)
             # Fail closed: if any photo in the album was forwarded, mark
@@ -331,24 +394,53 @@ async def handle_photo(message: Message, bot: Bot) -> None:
 
     settings = get_settings()
     storage = VaultStorage(settings.vault_path, settings.content_language)
+    media_group_id = message.media_group_id
+
+    if media_group_id:
+        # Register this photo's arrival -- and (re)start the settle timer --
+        # before the slow _save_photo() analysis runs below, not after. AI
+        # analysis alone can take anywhere from 0.05s to 30s per photo, so
+        # gating album membership on when it *finishes* let photos in the
+        # same media_group_id miss each other's settle window and each get
+        # flushed as their own single-photo entry. _album_pending tracks
+        # photos that have arrived but not yet finished saving; _flush_album
+        # waits for it to drain before writing the grouped entry.
+        async with _album_lock:
+            _album_pending[media_group_id] = _album_pending.get(media_group_id, 0) + 1
+            existing_task = _album_tasks.get(media_group_id)
+            if existing_task is not None:
+                existing_task.cancel()
+            _album_tasks[media_group_id] = asyncio.create_task(
+                _flush_album(media_group_id, message, storage)
+            )
 
     try:
         entry = await _save_photo(message, bot)
         _log_photo_session(message, entry)
 
-        if message.media_group_id:
+        if media_group_id:
             async with _album_lock:
-                album_items = _album_items.setdefault(message.media_group_id, [])
-                album_items.append(entry)
-                existing_task = _album_tasks.get(message.media_group_id)
-                if existing_task is not None:
-                    existing_task.cancel()
-                _album_tasks[message.media_group_id] = asyncio.create_task(
-                    _flush_album(message.media_group_id, message, storage)
-                )
+                _album_items.setdefault(media_group_id, []).append(entry)
+                if media_group_id not in _album_tasks:
+                    # The group's flush task already fired and cleared
+                    # _album_items/_album_pending/_album_tasks for it before
+                    # this photo's _save_photo finished (code review): past
+                    # ALBUM_MAX_WAIT_SECONDS, _flush_album flushes and forgets
+                    # the group entirely, so a late arrival landing after that
+                    # had no task left to ever drain it. Start a fresh one so
+                    # this photo still reaches daily, as its own belated entry.
+                    logger.warning(
+                        "Photo %s arrived in album %s after it was already "
+                        "flushed; flushing it separately",
+                        entry.relative_path,
+                        media_group_id,
+                    )
+                    _album_tasks[media_group_id] = asyncio.create_task(
+                        _flush_album(media_group_id, message, storage)
+                    )
             logger.info(
                 "Photo queued in album %s: %s",
-                message.media_group_id,
+                media_group_id,
                 entry.relative_path,
             )
             return
@@ -394,3 +486,16 @@ async def handle_photo(message: Message, bot: Bot) -> None:
             f"Ошибка: {e}",
             parse_mode=None,
         )
+    finally:
+        # Release this photo's slot in _album_pending exactly once, whether
+        # the save succeeded or failed (code review): decrementing in both
+        # the success branch above and the except branch double-counted it
+        # whenever something after the success decrement still raised (e.g.
+        # the logger.info call below it), under-flushing _album_pending and
+        # risking a premature flush of a still-incomplete album. A failed
+        # save must still release its slot -- otherwise the sibling photos
+        # that did save wait for it forever and the album is never flushed.
+        if media_group_id:
+            async with _album_lock:
+                if media_group_id in _album_pending:
+                    _album_pending[media_group_id] -= 1

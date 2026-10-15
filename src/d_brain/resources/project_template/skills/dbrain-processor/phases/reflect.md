@@ -36,6 +36,9 @@ Build one concise Telegram markdown report. Include:
 
 - ONE Big Thing (from capture.json)
 - Thoughts saved (from execute.json)
+- Directions present in saved thoughts, using their exact `directions` values;
+  distinguish learning, blog and business activity from the work direction.
+  Do not report an entity-card update unless the result proves it was written.
 - Tasks created (with IDs)
 - Process goals status
 - Workload by day
@@ -73,9 +76,12 @@ Rules:
 - Prefer the smallest edit that restores one clean canonical statement
 - If an item is mainly useful for the current session, today only, or the next handoff, keep it in `daily` or `.session/handoff.md` instead
 - Do NOT write step-by-step implementation progress, one-off smoke tests, file inventories, temporary migration status, or short-lived next actions into `MEMORY.md`
-- When a durable fact is corrected, create a successor note with valid namespaced
+- Updating one curated MEMORY bullet is a surgical summary edit, not
+  supersession of the entire MEMORY.md note.
+- When a durable fact in an individual epistemic card is corrected, create a successor note with valid namespaced
   epistemic metadata and run
-  `uv run skills/agent-memory/scripts/memory-engine.py supersede OLD NEW --vault vault`.
+  `uv run ../skills/agent-memory/scripts/memory-engine.py supersede OLD NEW --vault .`
+  from the runtime vault working directory; OLD and NEW are vault-relative paths.
   Do not silently overwrite or delete the older fact; keep its body unchanged.
   Run it only while non-cooperative vault editors are quiesced: the shared
   vault-write lock coordinates services, but cannot provide absolute CAS
@@ -94,6 +100,8 @@ If problems occurred during processing, append to `.session/handoff.md` under `#
 
 Update session context:
 - Last Session: what was processed
+- In Last Session, keep two explicit counts from `execute.json.entry_counts`:
+  entries reviewed and entries processed. Do not call reviewed entries processed.
 - Key Decisions: if any
 - In Progress: incomplete items
 - Next Steps: what to do next

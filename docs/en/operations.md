@@ -43,6 +43,7 @@ The enable step runs `doctor` first.
 |---|---|
 | `a-second-brain.service` | Telegram bot |
 | `a-second-brain-process.timer` | Daily processing at 21:00 |
+| `a-second-brain-morning-brief.timer` | Morning brief at 08:00 |
 | `a-second-brain-plaud-sync.timer` | Hourly PLAUD sync when configured |
 | `a-second-brain-qmd-maintenance.timer` | Weekly QMD cleanup when `qmd` exists |
 
@@ -87,10 +88,12 @@ Stop write-heavy work before a significant update:
 ```bash
 for unit in \
   a-second-brain-process.timer \
+  a-second-brain-morning-brief.timer \
   a-second-brain-plaud-sync.timer \
   a-second-brain-qmd-maintenance.timer \
   a-second-brain.service \
   a-second-brain-process.service \
+  a-second-brain-morning-brief.service \
   a-second-brain-plaud-sync.service \
   a-second-brain-qmd-maintenance.service
 do
@@ -116,6 +119,10 @@ uv run --frozen --no-dev python -m d_brain.run_vault_backup
 
 Manual commands use the same `.env` and project working directory as the
 services.
+
+To undo one run's vault writes, use `a-second-brain recover <run_id>`; to trim
+the ops journal by hand, `a-second-brain ops-prune` (see `docs/en/cli.md`).
+Stop the bot and make sure no nightly process is running before either.
 
 ## Run after logout
 

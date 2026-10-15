@@ -4,20 +4,23 @@
 <dict>
     <key>Label</key>
     <string>com.second-brain.process</string>
+    <!-- launchd runs one program per plist, unlike systemd's
+         ExecStartPre + ExecStart. Mirror the systemd process unit (backup,
+         then the daily process) by handing the wrapper a shell command that
+         runs both, in order, via the same @UV_BIN@ invocation. -->
     <key>ProgramArguments</key>
     <array>
         <string>@WRAPPER@</string>
         <string>@PROJECT_DIR@</string>
-        <string>@UV_BIN@</string>
-        <string>run</string>
-        <string>--frozen</string>
-        <string>--no-dev</string>
-        <string>python</string>
-        <string>-m</string>
-        <string>d_brain.run_daily_process</string>
-        <string>--mode</string>
-        <string>scheduled</string>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>"@UV_BIN@" run --frozen --no-dev python -m d_brain.run_vault_backup &amp;&amp; "@UV_BIN@" run --frozen --no-dev python -m d_brain.run_daily_process --mode scheduled</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>UV_BIN</key>
+        <string>@UV_BIN@</string>
+    </dict>
     <key>WorkingDirectory</key>
     <string>@PROJECT_DIR@</string>
     <key>StartCalendarInterval</key>

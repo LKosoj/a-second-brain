@@ -2,23 +2,30 @@
 
 from __future__ import annotations
 
+import base64
 import html
 import logging
+import mimetypes
 import re
+from pathlib import Path
 from typing import Any, cast
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import BufferedInputFile, InputRichMessage, Message
+from aiogram.types import BufferedInputFile, FSInputFile, InputRichMessage, Message
 
 from d_brain.bot.formatters import (
     TELEGRAM_TEXT_LIMIT,
     markdown_to_plain_text,
     normalize_markdown_input,
 )
+from d_brain.config import get_settings
+from d_brain.services.file_browser import FileBrowserError, FileBrowserService
 from d_brain.services.telegram_markup import (
+    extract_attachment_image_refs,
     markdown_to_document_html,
     markdown_to_markdown_v2,
+    replace_markdown_image_links,
 )
 
 logger = logging.getLogger(__name__)
@@ -27,6 +34,41 @@ RICH_MEDIA_MARKUP_RE = re.compile(
     r"!\[[^\]]*\]\(|<(?:audio|img|tg-collage|tg-map|tg-slideshow|video)\b",
     re.IGNORECASE,
 )
+MAX_INLINE_IMAGE_BYTES = 10 * 1024 * 1024
+
+
+def _resolve_attachment_image_data_uri(href: str) -> str | None:
+    """Resolve one `attachments/...` markdown href to an inline data URI."""
+    relative_path = href.split("/", 1)[1] if "/" in href else ""
+    if not relative_path:
+        return None
+    browser = FileBrowserService(get_settings().vault_path)
+    try:
+        _root, resolved_path = browser.resolve_file(
+            root_id="attachments",
+            relative_path=relative_path,
+        )
+        if resolved_path.stat().st_size > MAX_INLINE_IMAGE_BYTES:
+            return None
+        data = resolved_path.read_bytes()
+    except (FileBrowserError, OSError):
+        return None
+    mime_type = (
+        mimetypes.guess_type(resolved_path.name)[0] or "application/octet-stream"
+    )
+    return f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def _embed_attachment_images(markdown: str) -> str:
+    """Inline attachment-image markdown links as base64 data URIs.
+
+    Returns the markdown unchanged (without calling ``get_settings()``) when
+    there is nothing to embed, so callers without a configured environment
+    (e.g. tests) are unaffected.
+    """
+    if not extract_attachment_image_refs(markdown):
+        return markdown
+    return replace_markdown_image_links(markdown, _resolve_attachment_image_data_uri)
 
 
 def text_reply_kwargs(**kwargs: Any) -> dict[str, Any]:
@@ -52,6 +94,7 @@ def _telegram_message_payload(
 def _render_html_document(text: str, *, parse_mode: str | None) -> bytes:
     """Render one long markdown payload into a standalone HTML document."""
     markdown = normalize_markdown_input(text, parse_mode=parse_mode)
+    markdown = _embed_attachment_images(markdown)
     body = markdown_to_document_html(markdown)
     if not body:
         body = f"<pre>{html.escape(markdown_to_plain_text(markdown))}</pre>"
@@ -212,13 +255,23 @@ async def _send_rich_one(
 
 
 async def answer_text(message: Message, text: str, **kwargs: Any) -> Message:
-    """Send one logical answer; long payloads become one HTML document."""
+    """Send one logical answer; long payloads become one HTML document.
+
+    A payload with attachment-image links always becomes an HTML document
+    (bypassing the length threshold): those images are only ever delivered
+    inlined inside that document, never as separate files.
+    """
     parse_mode = kwargs.get("parse_mode")
+    has_inline_images = bool(
+        extract_attachment_image_refs(
+            normalize_markdown_input(text, parse_mode=parse_mode)
+        )
+    )
     payload_text, payload_parse_mode = _telegram_message_payload(
         text,
         parse_mode=parse_mode,
     )
-    if len(payload_text) <= TELEGRAM_TEXT_LIMIT:
+    if not has_inline_images and len(payload_text) <= TELEGRAM_TEXT_LIMIT:
         payload_kwargs = dict(kwargs)
         payload_kwargs["parse_mode"] = payload_parse_mode
         return await _answer_one(message, payload_text, **payload_kwargs)
@@ -226,7 +279,20 @@ async def answer_text(message: Message, text: str, **kwargs: Any) -> Message:
         _render_html_document(text, parse_mode=parse_mode),
         filename="d-brain-message.html",
     )
-    return await _answer_document(message, document, caption=None)
+    return await _answer_document(
+        message, document, caption=None, reply_markup=kwargs.get("reply_markup")
+    )
+
+
+async def answer_files(message: Message, paths: list[str]) -> list[Message]:
+    """Send user-facing files produced by an assistant request."""
+    sent: list[Message] = []
+    for raw_path in paths:
+        path = Path(raw_path)
+        sent.append(
+            await message.answer_document(FSInputFile(path, filename=path.name))
+        )
+    return sent
 
 
 async def answer_rich_text(message: Message, text: str, **kwargs: Any) -> Message:
@@ -256,13 +322,23 @@ async def answer_rich_text(message: Message, text: str, **kwargs: Any) -> Messag
 
 
 async def send_text(bot: Bot, *, chat_id: int, text: str, **kwargs: Any) -> Message:
-    """Send one logical text message; long payloads become one HTML document."""
+    """Send one logical text message; long payloads become one HTML document.
+
+    A payload with attachment-image links always becomes an HTML document
+    (bypassing the length threshold): those images are only ever delivered
+    inlined inside that document, never as separate files.
+    """
     parse_mode = kwargs.get("parse_mode")
+    has_inline_images = bool(
+        extract_attachment_image_refs(
+            normalize_markdown_input(text, parse_mode=parse_mode)
+        )
+    )
     payload_text, payload_parse_mode = _telegram_message_payload(
         text,
         parse_mode=parse_mode,
     )
-    if len(payload_text) <= TELEGRAM_TEXT_LIMIT:
+    if not has_inline_images and len(payload_text) <= TELEGRAM_TEXT_LIMIT:
         payload_kwargs = dict(kwargs)
         payload_kwargs["parse_mode"] = payload_parse_mode
         return await _send_one(
@@ -280,6 +356,7 @@ async def send_text(bot: Bot, *, chat_id: int, text: str, **kwargs: Any) -> Mess
         chat_id=chat_id,
         document=document,
         caption=None,
+        reply_markup=kwargs.get("reply_markup"),
     )
 
 

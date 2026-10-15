@@ -1,0 +1,12 @@
+[Unit]
+Description=A Second Brain morning brief
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@PROJECT_DIR@
+EnvironmentFile=@PROJECT_DIR@/.env
+Environment=UV_BIN=@UV_BIN@
+ExecStart=@UV_BIN@ run --frozen --no-dev python -m d_brain.run_morning_brief
+NoNewPrivileges=true

@@ -83,6 +83,7 @@ def _prepare_project(project_dir: Path) -> None:
     for name in (
         "com.second-brain.bot.plist.in",
         "com.second-brain.process.plist.in",
+        "com.second-brain.morning-brief.plist.in",
         "com.second-brain.plaud-sync.plist.in",
         "com.second-brain.qmd-maintenance.plist.in",
     ):

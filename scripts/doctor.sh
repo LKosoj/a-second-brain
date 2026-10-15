@@ -2,4 +2,4 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-exec uv run --frozen --no-dev a-second-brain doctor "$PROJECT_DIR" "$@"
+exec uv run --directory "$PROJECT_DIR" --frozen --no-dev a-second-brain doctor "$PROJECT_DIR" "$@"

@@ -6,6 +6,8 @@ import logging
 from aiogram import Bot, Router
 from aiogram.types import Message
 
+from d_brain.bot.conversations import is_reply_to_bot, save_answer
+from d_brain.bot.handlers.do import process_request
 from d_brain.bot.replies import answer_text
 from d_brain.config import get_settings
 from d_brain.services.qmd import QmdService
@@ -71,6 +73,10 @@ async def handle_voice(message: Message, bot: Bot) -> None:
             await answer_text(message, "Не удалось распознать аудио.")
             return
 
+        if is_reply_to_bot(message):
+            await process_request(message, transcript, message.from_user.id)
+            return
+
         timestamp = message.date.astimezone()
         source = build_telegram_source_info(message, language=settings.content_language)
         # A forwarded voice message is someone else's recording, not the
@@ -115,10 +121,18 @@ async def handle_voice(message: Message, bot: Bot) -> None:
         # note was lost when it was not, which is the one wrong answer here
         # that invites re-recording over an entry that already exists.
         try:
-            await answer_text(
+            sent = await answer_text(
                 message,
                 f"🎤 {transcript}\n\n✓ Сохранено",
                 parse_mode=None,
+            )
+            save_answer(
+                message,
+                sent,
+                settings.vault_path,
+                message.from_user.id,
+                transcript,
+                f"🎤 {transcript}\n\n✓ Сохранено",
             )
         except Exception:
             logger.exception("Failed to deliver voice transcript confirmation")

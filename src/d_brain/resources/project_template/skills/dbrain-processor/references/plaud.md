@@ -51,7 +51,7 @@ Return only JSON:
   "tasks": [
     {
       "content": "task title",
-      "due_hint": "optional natural language date",
+      "due_hint": "2026-04-05",
       "priority": 1,
       "evidence": "supporting fragment"
     }
@@ -67,4 +67,7 @@ Return only JSON:
 Critical constraints:
 - If `owner_confidence` is not `high`, then `todoist_create=false` and `tasks=[]`.
 - Do not invent assignees, dates, or obligations.
+- `due_hint` is an absolute `YYYY-MM-DD` date for an explicit deadline, resolved
+  from the recording's local `recorded_at` date, or an empty string when absent
+  or unclear. Do not shift relative deadlines to the import date.
 - If there is any ambiguity, prefer archive-only behavior.

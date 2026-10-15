@@ -11,7 +11,9 @@ from aiogram.types import (
 
 from d_brain.bot.replies import (
     RICH_TEXT_LIMIT,
+    answer_files,
     answer_rich_text,
+    answer_text,
     edit_rich_text,
     edit_text,
     send_rich_text,
@@ -118,6 +120,22 @@ async def test_send_text_sends_long_plain_message_as_html_file() -> None:
     assert _chat_id == 42
     assert document.filename == "d-brain-message.html"
     assert text in document.data.decode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_answer_files_sends_each_generated_artifact(tmp_path) -> None:
+    first = tmp_path / "plan.xml"
+    second = tmp_path / "diagram.png"
+    first.write_text("<Project />", encoding="utf-8")
+    second.write_bytes(b"png")
+    message = _FakeMessage()
+
+    await answer_files(message, [str(first), str(second)])
+
+    assert [document.filename for document in message.documents] == [
+        "plan.xml",
+        "diagram.png",
+    ]
 
 
 @pytest.mark.asyncio
@@ -324,3 +342,131 @@ async def test_send_text_escapes_raw_html_in_html_file() -> None:
     document = bot.documents[0][1].data.decode("utf-8")
     assert "<script>alert(1)</script>" not in document
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in document
+
+
+def _patch_vault_path(monkeypatch: pytest.MonkeyPatch, vault_path) -> None:
+    monkeypatch.setattr(
+        "d_brain.bot.replies.get_settings",
+        lambda: SimpleNamespace(vault_path=vault_path),
+    )
+
+
+@pytest.mark.asyncio
+async def test_answer_text_embeds_attachment_image_as_html_document(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault_path = tmp_path / "vault"
+    (vault_path / "attachments").mkdir(parents=True)
+    (vault_path / "attachments" / "chart.png").write_bytes(b"\x89PNG\r\n fake-bytes")
+    _patch_vault_path(monkeypatch, vault_path)
+    message = _FakeMessage()
+
+    await answer_text(message, "Итог: ![chart](attachments/chart.png)")
+
+    assert message.answers == []
+    assert len(message.documents) == 1
+    document = message.documents[0].data.decode("utf-8")
+    assert "data:image/png;base64," in document
+
+
+@pytest.mark.asyncio
+async def test_answer_text_embeds_attachment_image_with_title_and_angle_brackets(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault_path = tmp_path / "vault"
+    (vault_path / "attachments").mkdir(parents=True)
+    (vault_path / "attachments" / "chart.png").write_bytes(b"\x89PNG\r\n fake-bytes")
+    _patch_vault_path(monkeypatch, vault_path)
+    message = _FakeMessage()
+
+    await answer_text(
+        message,
+        'Итог: ![chart](attachments/chart.png "Chart title") '
+        "![chart2](<attachments/chart.png>)",
+    )
+
+    assert message.answers == []
+    assert len(message.documents) == 1
+    document = message.documents[0].data.decode("utf-8")
+    assert document.count("data:image/png;base64,") == 2
+
+
+@pytest.mark.asyncio
+async def test_answer_text_falls_back_to_alt_text_for_missing_file(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault_path = tmp_path / "vault"
+    (vault_path / "attachments").mkdir(parents=True)
+    _patch_vault_path(monkeypatch, vault_path)
+    message = _FakeMessage()
+
+    await answer_text(message, "Итог: ![chart](attachments/missing.png)")
+
+    assert len(message.documents) == 1
+    document = message.documents[0].data.decode("utf-8")
+    assert "data:image" not in document
+    assert "chart" in document
+
+
+@pytest.mark.asyncio
+async def test_answer_text_falls_back_to_alt_text_for_symlink_escape(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault_path = tmp_path / "vault"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.png"
+    secret.write_bytes(b"secret-bytes")
+    (vault_path / "attachments").mkdir(parents=True)
+    (vault_path / "attachments" / "evil.png").symlink_to(secret)
+    _patch_vault_path(monkeypatch, vault_path)
+    message = _FakeMessage()
+
+    await answer_text(message, "Итог: ![chart](attachments/evil.png)")
+
+    document = message.documents[0].data.decode("utf-8")
+    assert "data:image" not in document
+    assert "secret-bytes" not in document
+    assert "chart" in document
+
+
+@pytest.mark.asyncio
+async def test_answer_text_falls_back_to_alt_text_for_oversized_file(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault_path = tmp_path / "vault"
+    (vault_path / "attachments").mkdir(parents=True)
+    (vault_path / "attachments" / "chart.png").write_bytes(b"0123456789")
+    _patch_vault_path(monkeypatch, vault_path)
+    monkeypatch.setattr("d_brain.bot.replies.MAX_INLINE_IMAGE_BYTES", 5)
+    message = _FakeMessage()
+
+    await answer_text(message, "Итог: ![chart](attachments/chart.png)")
+
+    document = message.documents[0].data.decode("utf-8")
+    assert "data:image" not in document
+    assert "chart" in document
+
+
+@pytest.mark.asyncio
+async def test_answer_text_ignores_traversal_and_absolute_image_paths() -> None:
+    # No settings monkeypatch: proves get_settings()/file access is never
+    # attempted for hrefs that do not look like a plain attachments/ path.
+    message = _FakeMessage()
+
+    await answer_text(
+        message, "Итог: ![chart](attachments/../secret.png) done", parse_mode=None
+    )
+
+    assert message.documents == []
+    assert len(message.answers) == 1
+
+
+@pytest.mark.asyncio
+async def test_answer_text_without_images_keeps_previous_short_reply_behavior() -> None:
+    message = _FakeMessage()
+
+    await answer_text(message, "Просто короткий ответ", parse_mode=None)
+
+    assert message.documents == []
+    assert len(message.answers) == 1

@@ -29,9 +29,14 @@ Before classifying, rely on:
 ## Classification Heuristics
 
 ### Choose `task` when
-- the user or another clearly identified owner has to do something,
+- the assistant owner has to do something, including an explicit follow-up or
+  control obligation for delegated work under the ownership reference,
 - there is an explicit or strongly implied next action,
 - or delaying the note creates operational risk.
+
+All task candidates still require the assistant owner's responsibility.
+Another person's obligation alone belongs in an appropriate informational
+class, not in the owner's Todoist tasks.
 
 ### Choose `idea` when
 - the value is in preserving a concept or possibility,
@@ -77,7 +82,19 @@ Infer urgency from:
 
 ## Output Locations
 
-| Category | Destination |
+Classification is the type of action or knowledge, not a life direction.
+Read direction names from `directions.md` rather than keeping a fixed
+list here. A learning, decision, person and project can share one direction.
+A source may update BOTH a person and a project: choosing one primary class
+does not make its other supported entity information irrelevant.
+Primary project/person identities live in `compiled/projects/` and
+`compiled/people/`; saved thoughts link to those cards instead of becoming
+additional project identities.
+
+Use the defaults below only when no more specific storage applies in
+`directions.md`. Choose storage by meaning, not by adding new CAPTURE classes.
+
+| Category | Default destination |
 |----------|-------------|
 | `task` | Todoist |
 | `idea` | `thoughts/ideas/` |

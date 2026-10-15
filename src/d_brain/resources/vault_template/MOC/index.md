@@ -11,3 +11,4 @@ tier: active
 - [[goals/3-weekly]]
 - [[business/_index]]
 - [[projects/_index]]
+- [[MOC/compiled-index]]

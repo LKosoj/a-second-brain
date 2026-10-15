@@ -15,6 +15,11 @@
         <string>a-second-brain</string>
         <string>run</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>UV_BIN</key>
+        <string>@UV_BIN@</string>
+    </dict>
     <key>WorkingDirectory</key>
     <string>@PROJECT_DIR@</string>
     <key>RunAtLoad</key>
