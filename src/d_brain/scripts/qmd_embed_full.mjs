@@ -1,6 +1,17 @@
 #!/usr/bin/env node
 
-import {
+import { existsSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const QMD_NODE_CANDIDATES = [
+  `${process.env.HOME}/.local/lib/node_modules/@tobilu/qmd`,
+  "/usr/local/lib/node_modules/@tobilu/qmd",
+];
+const QMD_NODE_PATH =
+  QMD_NODE_CANDIDATES.find((p) => existsSync(p)) ?? QMD_NODE_CANDIDATES[0];
+const _storeMod = await import(pathToFileURL(`${QMD_NODE_PATH}/dist/store.js`).href);
+const _llmMod = await import(pathToFileURL(`${QMD_NODE_PATH}/dist/llm.js`).href);
+const {
   chunkDocument,
   chunkDocumentByTokens,
   clearAllEmbeddings,
@@ -8,12 +19,12 @@ import {
   extractTitle,
   getEmbeddingFingerprint,
   insertEmbedding,
-} from "/usr/local/lib/node_modules/@tobilu/qmd/dist/store.js";
-import {
+} = _storeMod;
+const {
   disposeDefaultLlamaCpp,
   formatDocForEmbedding,
   getDefaultLlamaCpp,
-} from "/usr/local/lib/node_modules/@tobilu/qmd/dist/llm.js";
+} = _llmMod;
 import {
   embedTextsViaRemote,
   formatRemoteDocument,
