@@ -9,7 +9,7 @@ import os
 import re
 import sqlite3
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
@@ -523,11 +523,33 @@ class QmdService:
             )
 
     def _recall_candidates(
-        self, query: str, limit: int
+        self, query: str, limit: int, *, scope: Sequence[str] = ()
     ) -> tuple[str, list[dict[str, Any]]]:
         """Fetch qmd candidates with semantic query and deterministic fallback."""
         attempts: list[tuple[str, list[str], int]]
-        if self._uses_remote_embeddings():
+        if scope:
+            uris: list[str] = []
+            for value in scope:
+                path = Path(value)
+                if path.is_absolute() or ".." in path.parts or not path.parts:
+                    raise ValueError("search scope must be a vault-relative path")
+                for collection, root in self._collection_roots().items():
+                    if path.is_relative_to(root):
+                        suffix = path.relative_to(root).as_posix()
+                        uris.append(f"qmd://{collection}/{suffix}".removesuffix("/."))
+            if not uris:
+                return "none", []
+            command = [
+                "node",
+                str(self._remote_query_script_path),
+                query,
+                "--limit",
+                str(max(limit * 4, 12)),
+            ]
+            for uri in uris:
+                command.extend(["--scope-uri", uri])
+            attempts = [("query", command, QMD_RECALL_TIMEOUT_SECONDS)]
+        elif self._uses_remote_embeddings():
             attempts = [
                 (
                     "query",
@@ -612,9 +634,19 @@ class QmdService:
                 return backend, payload
         return "none", []
 
-    def query(self, query: str, *, limit: int = DEFAULT_RECALL_LIMIT) -> dict[str, Any]:
+    def query(
+        self,
+        query: str,
+        *,
+        limit: int = DEFAULT_RECALL_LIMIT,
+        scope: Sequence[str] = (),
+    ) -> dict[str, Any]:
         """Run qmd retrieval without applying memory-specific score adjustments."""
-        backend, candidates = self._recall_candidates(query, limit)
+        backend, candidates = (
+            self._recall_candidates(query, limit, scope=scope)
+            if scope
+            else self._recall_candidates(query, limit)
+        )
         return {
             "query": query,
             "backend": backend,
@@ -646,6 +678,7 @@ class QmdService:
         deep: bool = False,
         limit: int = DEFAULT_RECALL_LIMIT,
         raw: bool = False,
+        scope: Sequence[str] = (),
     ) -> dict[str, Any]:
         """Run memory-aware archive recall on top of qmd candidates.
 
@@ -659,7 +692,7 @@ class QmdService:
         supersession_adjustment are reported as 0.0 because nothing was
         added to the score.
 
-        Regardless of ``raw``, this method searches the entire qmd index —
+        Without ``scope``, this method searches the entire qmd index —
         daily, thoughts, imports, goals, business, projects, etc. — not
         only the ``compiled`` collection. Callers that need compiled-only
         results (e.g. matching against existing compiled pages before
@@ -669,7 +702,11 @@ class QmdService:
         for "no matching compiled page exists" and cause a duplicate to be
         created.
         """
-        backend, candidates = self._recall_candidates(query, limit)
+        backend, candidates = (
+            self._recall_candidates(query, limit, scope=scope)
+            if scope
+            else self._recall_candidates(query, limit)
+        )
         ranked: list[dict[str, Any]] = []
         for candidate in candidates:
             uri = str(candidate.get("file", ""))

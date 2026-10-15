@@ -3717,9 +3717,9 @@ or recent vault notes before answering instead of guessing.
     ) -> str:
         """Inject route-aware context blocks before the user question."""
         compiled_block = self._build_compiled_briefings_block(question)
-        recall_block = self._build_auto_recall_block(
-            question,
-            purpose="question_answer",
+        recall_block = (
+            "" if compiled_block.startswith("=== COMPILED CATALOG ===")
+            else self._build_auto_recall_block(question, purpose="question_answer")
         )
         block_by_name = {
             "compiled": compiled_block,
@@ -3791,6 +3791,15 @@ or recent vault notes before answering instead of guessing.
         already run, when a background enrichment job or the model's own
         write could have changed a page's frontmatter underneath it.
         """
+        from d_brain.services.compiled_index import (
+            build_question_catalog,
+            is_overview_question,
+        )
+
+        if is_overview_question(question):
+            self._question_provenance_candidates = ()
+            self._question_provenance_source_paths = ()
+            return build_question_catalog(self.vault_path, question)
         service = CompiledBriefingService(
             self.vault_path,
             content_language=self.content_language,

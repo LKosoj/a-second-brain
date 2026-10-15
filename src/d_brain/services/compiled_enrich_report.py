@@ -526,9 +526,7 @@ def _collect_revisit(
 
 
 def _render_change_line(item: _ChangeItem) -> str:
-    summary = item.summary or item.what_added
-    if len(summary) > 240:
-        summary = summary[:237].rsplit(" ", 1)[0] + "…"
+    summary = item.what_added or item.summary
     return f"- [[{item.rel_path}|{item.title}]] — {summary}"
 
 

@@ -36,6 +36,10 @@ they are relevant to the user's request and allowed by the runtime scope.
   projects), read `MOC/compiled-index.md` first — it is the catalog of every
   `compiled/` page grouped by domain.
 - For a semantic question, run `a-second-brain qmd recall "<query>"`.
+- When the relevant project or source directory is known, restrict retrieval
+  before ranking: `a-second-brain qmd recall "<query>" --scope <vault-relative-path>`.
+  Repeat `--scope` to include its source files. Expand to the archive if this
+  scope supplies insufficient evidence; a scoped miss is not proof of absence.
 - For long-running, old, or exhaustive history, run
   `a-second-brain qmd deep-recall "<query>"`.
 - Before relying on a selected result, read the source with
@@ -69,6 +73,10 @@ they are relevant to the user's request and allowed by the runtime scope.
   a workflow's path/write limits to track access.
 
 ## Runtime recall blocks
+
+`COMPILED CATALOG` contains descriptions only. Open the selected pages with
+`a-second-brain qmd get` before answering factual questions; cite the pages
+actually read, rather than treating a catalog entry as evidence.
 
 If the prompt contains `AUTO ARCHIVE RECALL` with `FULLTEXT FOLLOW-UP`, read
 every listed source file in full. This runtime evidence instruction takes

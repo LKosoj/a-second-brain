@@ -893,12 +893,20 @@ def build_qmd_recall_block(
         return ""
 
     qmd = QmdService(vault_path)
+    from d_brain.services.compiled_index import project_scope_paths
+
+    scope = project_scope_paths(vault_path, task)
+
+    def recall_query(query: str, *, deep: bool) -> dict[str, Any]:
+        if scope:
+            return qmd.recall(query, deep=deep, limit=_RECALL_FETCH_LIMIT, scope=scope)
+        return qmd.recall(query, deep=deep, limit=_RECALL_FETCH_LIMIT)
+
     queries = _plan_queries(plan)
     payloads = [
-        qmd.recall(
+        recall_query(
             query,
             deep=plan.deep,
-            limit=_RECALL_FETCH_LIMIT,
         )
         for query in queries
     ]
@@ -917,10 +925,9 @@ def build_qmd_recall_block(
                 history_query,
             )
             payloads.append(
-                qmd.recall(
+                recall_query(
                     history_query,
                     deep=True,
-                    limit=_RECALL_FETCH_LIMIT,
                 )
             )
     elif _needs_history_backfill(
@@ -943,12 +950,27 @@ def build_qmd_recall_block(
                 history_query,
             )
             payloads.append(
-                qmd.recall(
+                recall_query(
                     history_query,
                     deep=True,
-                    limit=_RECALL_FETCH_LIMIT,
                 )
             )
+    scoped_paths = {
+        item.get("rel_path") or item.get("file")
+        for payload in payloads for item in payload.get("results", [])
+        if float(item.get("confidence", 0)) >= RECALL_CONFIDENCE_THRESHOLD
+    }
+    incomplete_history = bool(scope) and _needs_history_backfill(
+        payloads, purpose=purpose, deep=False,
+        history_scope=plan.history_scope, history_start=history_start,
+    )
+    if scope and (len(scoped_paths) < DEFAULT_RECALL_LIMIT or incomplete_history):
+        payloads.extend(
+            qmd.recall(
+                query, deep=plan.deep or incomplete_history, limit=_RECALL_FETCH_LIMIT
+            )
+            for query in queries
+        )
     merged_payload = _merge_recall_payloads(
         payloads,
         task=task,

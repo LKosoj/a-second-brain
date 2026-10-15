@@ -339,7 +339,9 @@ def test_changed_block_shows_current_details_without_labels(
     assert "compiled/topics/legacy.md" not in digest
 
 
-def test_enriched_change_shows_one_fact_without_history(tmp_path, write_vault_manifest):
+def test_enriched_change_shows_all_facts_and_replacement(
+    tmp_path, write_vault_manifest
+):
     vault = tmp_path / "vault"
     write_vault_manifest(vault)
     _write_page(
@@ -369,9 +371,9 @@ def test_enriched_change_shows_one_fact_without_history(tmp_path, write_vault_ma
 
     assert digest is not None
     assert "бюджет 150k" in digest
-    assert "срок согласования — пятница" not in digest
-    assert "бюджет 100k" not in digest
-    assert "Замена: было" not in digest
+    assert "срок согласования — пятница" in digest
+    assert "бюджет 100k" in digest
+    assert "Замена: было" in digest
 
 
 def test_created_date_formats_do_not_affect_short_digest(

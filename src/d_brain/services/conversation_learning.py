@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import date, datetime
 from pathlib import Path
@@ -13,7 +14,10 @@ from d_brain.services.frontmatter import (
     parse_frontmatter_bytes,
     write_validated_vault_markdown,
 )
+from d_brain.services.qmd import RECALL_CONFIDENCE_THRESHOLD, QmdService
 from d_brain.services.session import SessionStore
+
+logger = logging.getLogger(__name__)
 
 _TOKEN_RE = re.compile(r"[\w-]+", re.UNICODE)
 _IGNORED_TOKENS = frozenset(
@@ -480,11 +484,11 @@ Empty arrays are correct when evidence is absent or a reusable lesson is unsuppo
         }
 
     def relevant_lessons(self, query: str, *, limit: int = 3) -> str:
-        """Return a small deterministic block of lexically related corrections."""
+        """Combine semantic lesson recall with the existing lexical matches."""
         query_tokens = self._tokens(query)
         if not query_tokens or limit <= 0:
             return ""
-        matches: list[tuple[int, str, str, str, str, str, list[str]]] = []
+        matches: list[tuple[float, str, str, str, str, str, list[str]]] = []
         root = self.vault_path / "thoughts/learnings"
         paths = (
             sorted(
@@ -496,6 +500,27 @@ Empty arrays are correct when evidence is absent or a reusable lesson is unsuppo
             if root.exists()
             else []
         )
+        semantic_scores: dict[str, float] = {}
+        if paths:
+            try:
+                qmd = QmdService(self.vault_path)
+                payload = (
+                    qmd.recall(
+                        query,
+                        deep=True,
+                        limit=max(limit * 4, 12),
+                        scope=("thoughts/learnings",),
+                    )
+                    if qmd._db_path.is_file()
+                    else {}
+                )
+                semantic_scores = {
+                    str(item.get("rel_path")): float(item.get("confidence", 0))
+                    for item in payload.get("results", [])
+                    if float(item.get("confidence", 0)) >= RECALL_CONFIDENCE_THRESHOLD
+                }
+            except (OSError, ValueError) as exc:
+                logger.debug("Semantic lesson recall unavailable: %s", exc)
         for path in paths:
             try:
                 fields = parse_frontmatter_bytes(path.read_bytes()).fields
@@ -508,7 +533,11 @@ Empty arrays are correct when evidence is absent or a reusable lesson is unsuppo
             value = lesson or practice
             source = self._nonempty(fields.get("source"))
             exceptions = self._exceptions(fields.get("exceptions")) or []
-            score = len(query_tokens & self._tokens(f"{condition} {value} {outcome}"))
+            overlap = query_tokens & self._tokens(f"{condition} {value} {outcome}")
+            score = max(
+                len(overlap) / len(query_tokens),
+                semantic_scores.get(path.relative_to(self.vault_path).as_posix(), 0),
+            )
             if score:
                 matches.append(
                     (

@@ -164,6 +164,22 @@ note.
 
 ### 3. QMD semantic retrieval
 
+Overview questions receive a short catalog before full compiled pages. The
+assistant opens selected pages before making factual claims; catalog entries
+alone are not evidence. Exact, status, and history questions keep the existing
+briefing path.
+
+Use `a-second-brain qmd recall "delivery date" --scope compiled/projects/aurora.md`
+to restrict retrieval before selecting the best results. Repeat `--scope` to
+include source files or directories. Automatic recall starts with the card and
+sources of an explicitly and unambiguously named project, then expands to the
+archive when fewer than five confident results are available or historical
+coverage is insufficient.
+
+Saved corrections and confirmed practices also use semantic QMD recall scoped
+to `thoughts/learnings/`. Lexical matching remains available without an index.
+Application conditions, exceptions, and evidence references are preserved.
+
 Semantic search means search by meaning rather than only by matching words.
 QMD turns note chunks into embeddings, which are numeric representations used
 to compare meaning. A reranker is a second model that reorders the best

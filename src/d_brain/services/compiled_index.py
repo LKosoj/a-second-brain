@@ -22,6 +22,7 @@ existing file for the same reason -- only a first-ever creation stamps
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -45,6 +46,102 @@ _CATALOG_DESCRIPTION = "Каталог страниц compiled/ по домен�
 _CATALOG_NOTE = "Генерируется автоматически в ночном проходе, не править вручную."
 _DEFAULT_RELEVANCE = 0.9
 _DEFAULT_TIER = "active"
+
+
+def is_overview_question(question: str) -> bool:
+    from d_brain.control_plane.router import classify_question_route
+
+    query = question.casefold()
+    if "истори" in query or "history" in query:
+        return False
+    return classify_question_route(question) == "general" and any(
+        cue in query
+        for cue in (
+            "обзор",
+            "что есть по",
+            "что известно о",
+            "какие проекты",
+            "какие темы",
+            "список проектов",
+            "overview",
+            "what do we know",
+            "list projects",
+            "list topics",
+        )
+    )
+
+
+def build_question_catalog(vault_path: Path, question: str) -> str:
+    """Offer metadata first; the agent opens selected pages using qmd get."""
+    pages = _collect_pages(vault_path)
+    if not pages:
+        return ""
+    tokens = CompiledBriefingService._tokens(question.casefold())
+    scored = [
+        (
+            len(
+                tokens
+                & CompiledBriefingService._tokens(
+                    f"{page.title} {page.description} {page.domain}".casefold()
+                )
+            ),
+            page,
+        )
+        for page in pages
+    ]
+    if any(score for score, _ in scored):
+        scored = [(score, page) for score, page in scored if score]
+    scored.sort(key=lambda item: (-item[0], item[1].title.casefold()))
+    lines = [
+        "=== COMPILED CATALOG ===",
+        "These are descriptions, not source evidence. Choose relevant pages, "
+        "then read them with a-second-brain qmd get <vault-relative-path> "
+        "before making factual claims. Cite the pages you actually read.",
+        "Full catalog: MOC/compiled-index.md. "
+        "Read it if this shortlist is insufficient.",
+    ]
+    lines.extend(_render_page_line(page) for _, page in scored[:30])
+    lines.append("=== END COMPILED CATALOG ===")
+    return "\n".join(lines)
+
+
+def project_scope_paths(vault_path: Path, question: str) -> tuple[str, ...]:
+    """Resolve an explicitly and unambiguously named project and its sources."""
+    matches: list[Path] = []
+    service = CompiledBriefingService(vault_path)
+    for path in sorted((vault_path / "compiled/projects").glob("*.md")):
+        text = service._read_page_text(path)
+        fields = service._frontmatter_fields(text)
+        if fields.get("canonical_path"):
+            continue
+        title = service._title_from_text(text)
+        names = [
+            title,
+            re.sub(r"^(?:проект|project)\s+", "", title, flags=re.I),
+            path.stem.replace("-", " "),
+            *service._normalize_list(fields.get("aliases")),
+        ]
+        if any(
+            len(name) >= 3
+            and re.search(rf"(?<!\w){re.escape(name)}(?!\w)", question, re.IGNORECASE)
+            for name in names
+            if name
+        ):
+            matches.append(path)
+    if len(matches) != 1:
+        return ()
+    path = matches[0]
+    text = service._read_page_text(path)
+    paths = [path.relative_to(vault_path).as_posix()]
+    for source in service._source_links_from_note(text):
+        resolved = service._resolve_lint_source_path(source)
+        if (
+            resolved is not None
+            and resolved.is_file()
+            and resolved.is_relative_to(vault_path)
+        ):
+            paths.append(resolved.relative_to(vault_path).as_posix())
+    return tuple(dict.fromkeys(paths))
 
 
 @dataclass(frozen=True, slots=True)

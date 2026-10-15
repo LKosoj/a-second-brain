@@ -95,6 +95,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     service = QmdService(vault_path)
     qmd_args = args.qmd_args or ["status"]
+    scope: list[str] = []
+    if qmd_args[0] in {"query", "recall", "deep-recall"}:
+        while "--scope" in qmd_args:
+            index = qmd_args.index("--scope")
+            if index + 1 >= len(qmd_args):
+                sys.stderr.write(
+                    "--scope requires a vault-relative file or directory\n"
+                )
+                return 2
+            scope.append(qmd_args[index + 1])
+            del qmd_args[index : index + 2]
 
     try:
         if qmd_args and qmd_args[0] in {"recall", "deep-recall"}:
@@ -102,7 +113,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not query:
                 sys.stderr.write("recall requires a query\n")
                 return 1
-            payload = service.recall(query, deep=deep, limit=limit)
+            payload = (
+                service.recall(query, deep=deep, limit=limit, scope=scope)
+                if scope
+                else service.recall(query, deep=deep, limit=limit)
+            )
             if json_output:
                 sys.stdout.write(
                     json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
@@ -113,7 +128,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if (
             qmd_args
             and qmd_args[0] == "query"
-            and service.uses_remote_embeddings()
+            and (scope or service.uses_remote_embeddings())
         ):
             try:
                 query, limit, output_format = _parse_remote_query_args(qmd_args)
@@ -123,7 +138,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not query:
                 sys.stderr.write("qmd query requires a query\n")
                 return 1
-            payload = service.query(query, limit=limit)
+            payload = (
+                service.query(query, limit=limit, scope=scope)
+                if scope
+                else service.query(query, limit=limit)
+            )
             if output_format == "json":
                 sys.stdout.write(
                     json.dumps(payload["results"], ensure_ascii=False, indent=2) + "\n"
@@ -153,6 +172,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except FileNotFoundError:
         sys.stderr.write("qmd CLI is not installed\n")
         return 1
+    except ValueError as exc:
+        sys.stderr.write(f"qmd: {exc}\n")
+        return 2
 
     if result.stdout:
         sys.stdout.write(result.stdout)

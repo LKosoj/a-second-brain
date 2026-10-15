@@ -29,9 +29,14 @@ const RERANK_SCORE_WEIGHT = 0.35;
 function parseArgs(argv) {
   let limit = 12;
   const queryParts = [];
+  const scope = [];
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
+    if (arg === "--scope-uri" && index + 1 < argv.length) {
+      scope.push(argv[++index]);
+      continue;
+    }
     if ((arg === "-n" || arg === "--limit") && index + 1 < argv.length) {
       const parsed = Number.parseInt(argv[index + 1], 10);
       if (Number.isInteger(parsed) && parsed > 0) {
@@ -45,8 +50,76 @@ function parseArgs(argv) {
 
   return {
     limit,
+    scope,
     query: queryParts.join(" ").trim(),
   };
+}
+
+export function searchScoped(store, query, embedding, scope, limit) {
+  const uri = "('qmd://' || d.collection || '/' || d.path)";
+  const where = `EXISTS (SELECT 1 FROM json_each(?) s
+    WHERE ${uri} = s.value OR instr(${uri}, s.value || '/') = 1)`;
+  const params = [JSON.stringify(scope.map((path) => path.replace(/\/$/, "")))];
+  const documents = store.db.prepare(`
+    SELECT d.id, d.hash, d.title, ${uri} AS filepath, c.doc AS body
+    FROM documents d JOIN content c ON c.hash = d.hash
+    WHERE d.active = 1 AND (${where})
+  `).all(...params);
+  if (!documents.length) return [[], []];
+
+  const byHash = new Map();
+  for (const doc of documents) {
+    const entries = byHash.get(doc.hash) || [];
+    entries.push(doc);
+    byHash.set(doc.hash, entries);
+  }
+  const vecResults = [];
+  const hasVectors = store.db.prepare(
+    "SELECT name FROM sqlite_master WHERE name = 'vectors_vec'",
+  ).get();
+  if (embedding?.length && hasVectors) {
+    const chunks = store.db.prepare(`
+      SELECT DISTINCT cv.hash || '_' || cv.seq AS hash_seq, cv.hash, cv.pos
+      FROM content_vectors cv JOIN documents d ON d.hash = cv.hash
+      WHERE d.active = 1 AND (${where})
+    `).all(...params);
+    if (chunks.length) {
+      const chunksByKey = new Map(chunks.map((chunk) => [chunk.hash_seq, chunk]));
+      const matches = store.db.prepare(`
+        SELECT hash_seq, distance FROM vectors_vec
+        WHERE embedding MATCH ? AND k = ?
+          AND hash_seq IN (SELECT value FROM json_each(?))
+      `).all(
+        new Float32Array(embedding),
+        Math.min(limit * 3, chunks.length),
+        JSON.stringify(chunks.map((chunk) => chunk.hash_seq)),
+      );
+      const seen = new Set();
+      for (const match of matches) {
+        const chunk = chunksByKey.get(match.hash_seq);
+        for (const doc of byHash.get(chunk.hash) || []) {
+          if (seen.has(doc.filepath)) continue;
+          seen.add(doc.filepath);
+          vecResults.push({
+            ...doc, score: 1 - match.distance, source: "vec", chunkPos: chunk.pos,
+          });
+        }
+      }
+    }
+  }
+  const terms = query.match(/[\p{L}\p{N}_-]+/gu) || [];
+  const ftsQuery = terms.map((term) => `"${term}"`).join(" OR ");
+  const ftsResults = ftsQuery ? store.db.prepare(`
+    SELECT d.title, ${uri} AS filepath, c.doc AS body,
+      bm25(documents_fts, 1.5, 4.0, 1.0) AS rank
+    FROM documents_fts JOIN documents d ON d.id = documents_fts.rowid
+    JOIN content c ON c.hash = d.hash
+    WHERE documents_fts MATCH ? AND d.active = 1 AND (${where})
+    ORDER BY rank LIMIT ?
+  `).all(ftsQuery, ...params, limit).map((doc) => ({
+    ...doc, score: Math.abs(doc.rank) / (1 + Math.abs(doc.rank)), source: "fts",
+  })) : [];
+  return [vecResults.slice(0, limit), ftsResults];
 }
 
 function tokenizeQuery(query) {
@@ -257,7 +330,7 @@ async function maybeRerankResults(store, query, results) {
 }
 
 async function main() {
-  const { limit, query } = parseArgs(process.argv.slice(2));
+  const { limit, query, scope } = parseArgs(process.argv.slice(2));
   const dbPath = process.env.QMD_DB_PATH;
   const model = getDesiredEmbedModel();
 
@@ -272,26 +345,36 @@ async function main() {
   }
 
   const store = createStore(dbPath);
+  let localLlm;
   try {
-    const [queryEmbedding] = await embedTextsViaRemote(
-      [formatRemoteQuery(query, model)],
-      { model },
-    );
+    let queryEmbedding;
+    if (process.env.EMB_MODEL?.trim()) {
+      [queryEmbedding] = await embedTextsViaRemote(
+        [formatRemoteQuery(query, model)], { model },
+      );
+    } else {
+      const { getDefaultLlamaCpp } = await import(
+        pathToFileURL(`${QMD_NODE_PATH}/dist/llm.js`).href
+      );
+      localLlm = getDefaultLlamaCpp();
+      queryEmbedding = await localLlm.embed(
+        _storeMod.formatQueryForEmbedding(query, model), { model, isQuery: true },
+      );
+    }
 
     if (!queryEmbedding?.embedding?.length) {
       process.stdout.write("[]\n");
       return;
     }
 
-    const vecResults = await store.searchVec(
-      query,
-      model,
-      limit,
-      undefined,
-      undefined,
-      queryEmbedding.embedding,
-    );
-    const ftsResults = store.searchFTS(query, limit);
+    const [vecResults, ftsResults] = scope.length
+      ? searchScoped(store, query, queryEmbedding.embedding, scope, limit)
+      : [
+        await store.searchVec(
+          query, model, limit, undefined, undefined, queryEmbedding.embedding,
+        ),
+        store.searchFTS(query, limit),
+      ];
     const hybridResults = buildHybridResults(query, vecResults, ftsResults, limit);
     const results = await maybeRerankResults(store, query, hybridResults);
 
@@ -310,11 +393,14 @@ async function main() {
     process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
   } finally {
     store.close();
+    if (localLlm) await localLlm.dispose();
   }
 }
 
-main().catch((error) => {
-  const message = error instanceof Error ? error.stack || error.message : String(error);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => {
+    const message = error instanceof Error ? error.stack || error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    process.exitCode = 1;
+  });
+}
