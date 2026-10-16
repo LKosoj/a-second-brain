@@ -3767,8 +3767,15 @@ or recent vault notes before answering instead of guessing.
         if (
             intent in {TEXT_INTENT_QUESTION, TEXT_INTENT_ACTION}
             and confidence != "high"
+            and not self._classification_model
         ):
             intent = TEXT_INTENT_CAPTURE
+        logger.info(
+            "Text intent resolved: backend=%s intent=%s confidence=%s",
+            self._classification_model or self._openai_model or self.ai_cli,
+            intent,
+            confidence,
+        )
         if intent == TEXT_INTENT_ACTION:
             return {
                 "intent": intent, "confidence": str(confidence), "reason": str(reason)

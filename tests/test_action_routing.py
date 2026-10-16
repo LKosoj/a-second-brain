@@ -128,7 +128,10 @@ async def test_document_caption_action_receives_original_file(
         ("action", 0.95, "action"),
         ("question", 0.9, "question"),
         ("capture", 0.99, "capture"),
-        ("action", 0.7, "capture"),
+        ("action", 0.7, "action"),
+        ("action", 0.76, "action"),
+        ("action", 0.79, "action"),
+        ("question", 0.76, "question"),
     ],
 )
 def test_configured_decision_model_classifies_without_cli(
