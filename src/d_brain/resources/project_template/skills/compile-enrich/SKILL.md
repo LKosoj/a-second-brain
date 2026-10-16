@@ -88,7 +88,7 @@ way around.
   pages -- still fully deterministic, no model calls).
 - `src/d_brain/services/compiled_fact_check.py` -- `run_monthly_fact_check`,
   the only satellite in this list that writes: a bounded monthly re-check
-  that patches just `last_verified`/`confidence` via frontmatter, or queues
+  that patches just `last_source_checked`/`confidence` via frontmatter, or queues
   a `fact-check-rejected` decision instead of silently patching a page that
   fails.
 

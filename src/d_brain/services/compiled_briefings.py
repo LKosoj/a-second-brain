@@ -194,6 +194,7 @@ CORE_FRONTMATTER_FIELDS = frozenset(
         "tier",
         "sources_trust",
         "last_verified",
+        "last_source_checked",
         "enrichment_count",
         "conflicts_open",
         "human_reviewed",
@@ -414,6 +415,7 @@ BATCH_CONSOLIDATION_EXCERPT_CHARS = 1600
 SOURCE_STATE_VERSION = 1
 SOURCE_STATE_IGNORED_FRONTMATTER_FIELDS = {
     "last_accessed",
+    "last_source_checked",
     "relevance",
     "tier",
     # T4: ``_on_source_finished``/``sweep_unmarked_imports`` patch these two
@@ -3424,7 +3426,9 @@ class CompiledBriefingService:
                 and what != NOT_ENRICHMENT_SOURCE_MARKER
             }
         )
-        if monthly_enrichments >= MAX_ENRICHMENTS_PER_PAGE_PER_MONTH:
+        page_tier = self._frontmatter_fields(existing_text).get("tier", "").strip()
+        if (monthly_enrichments >= MAX_ENRICHMENTS_PER_PAGE_PER_MONTH
+                and page_tier not in {"core", "active"}):
             if pass_obj is not None:
                 # Pass-level bookkeeping for the nightly digest; there is no
                 # journal to record into outside a pass.
@@ -5413,6 +5417,10 @@ class CompiledBriefingService:
             f"tier: {tier}",
             f"sources_trust: {sources_trust}",
             f"last_verified: {last_verified}",
+            "last_source_checked: " + self._validated_date_field(
+                existing_meta.get("last_source_checked"),
+                field="last_source_checked", page_path=page_path,
+            ),
             f"enrichment_count: {enrichment_count}",
             f"conflicts_open: {conflicts_open}",
             f"human_reviewed: {human_reviewed}",
@@ -5625,13 +5633,22 @@ class CompiledBriefingService:
         # _record_human_zone_ambiguous) and the page stays readable, instead
         # of being written with a second marker pair that would make every
         # later pass fail on reading it.
-        if self._human_zone_span(rendered) is _AMBIGUOUS_HUMAN_ZONE:
+        human_span = self._human_zone_span(rendered)
+        if human_span is _AMBIGUOUS_HUMAN_ZONE:
             raise HumanZoneMarkerError(
                 "rendered page would carry ambiguous human zone markers: "
                 f"start={rendered.count(HUMAN_ZONE_START)} "
                 f"end={rendered.count(HUMAN_ZONE_END)}"
             )
-        return rendered
+        def canonical_link(match: re.Match[str]) -> str:
+            if (human_span is not None
+                    and human_span[0] <= match.start() < human_span[1]):
+                return match.group(0)
+            return match.group(0).replace(
+                match.group(1), self._canonical_source_reference(match.group(1)), 1
+            )
+
+        return WIKILINK_RE.sub(canonical_link, rendered)
 
     def _apply_partial_sections(
         self,
@@ -6974,7 +6991,7 @@ class CompiledBriefingService:
         return candidates[0] if candidates else None
 
     def _normalize_lint_source(self, source: str) -> str:
-        raw = str(source or "").strip()
+        raw = self._canonical_source_reference(str(source or "").strip())
         raw = raw.split("#", 1)[0].strip()
         raw = self._strip_relative_prefix(raw)
         if raw.startswith("vault/"):
@@ -7561,7 +7578,7 @@ class CompiledBriefingService:
         paths: list[str] = []
         project_root = self.vault_path.parent.resolve()
         for item in value:
-            raw = str(item or "").strip()
+            raw = self._canonical_source_reference(str(item or "").strip())
             if not raw:
                 continue
             if raw.startswith("/"):
@@ -7581,6 +7598,25 @@ class CompiledBriefingService:
             if raw.endswith(".md") or "/" in raw:
                 paths.append(raw)
         return paths
+
+    @staticmethod
+    def _canonical_source_reference(raw: str) -> str:
+        is_qmd = raw.startswith("qmd:/")
+        if is_qmd:
+            raw = re.sub(r"^qmd:/+", "", raw)
+            if raw.startswith("core/"):
+                raw = raw[len("core/"):]
+            for collection, folder in (
+                ("youtube", "imports/youtube/notes"),
+                ("documents", "imports/documents/notes"),
+                ("documents_forwarded", "imports/documents/forwarded"),
+            ):
+                if raw.startswith(f"{collection}/"):
+                    raw = folder + raw[len(collection):]
+                    break
+        if raw.startswith("plaud/"):
+            raw = "imports/plaud/notes/" + raw[len("plaud/"):]
+        return raw
 
     @staticmethod
     def _strip_relative_prefix(raw: str) -> str:

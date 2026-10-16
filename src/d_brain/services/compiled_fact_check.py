@@ -1,8 +1,8 @@
-"""Monthly deterministic fact-check for the compiled layer (ТЗ 6.6).
+"""Deterministic source-integrity check for the compiled layer (ТЗ 6.6).
 
 Independent of, and much narrower than, the compile-enrich pass in
 ``compiled_briefings.py``: it never calls a model, never rewrites a page
-body, and only ever patches two frontmatter fields -- ``last_verified`` and
+body, and only ever patches two frontmatter fields -- ``last_source_checked`` and
 ``confidence`` -- via ``patch_validated_vault_frontmatter``. The existing
 per-claim ``last_verified`` bump inside ``CompiledBriefingService.
 _render_briefing`` (set whenever a brand-new claim is appended during
@@ -36,13 +36,13 @@ currently has zero open conflicts. That page-level (not per-claim) verdict
 for judgment claims, like the deliberately broad Todoist-mention regex
 above, is a known simplification, kept as-is rather than reworked.
 
-A page's ``last_verified`` advances to today only when at most half of its
+A page's ``last_source_checked`` advances to today only when at most half of its
 *checked* claims (environment-dependent + judgment; unverifiable claims are
 never checked, so they are excluded from this ratio) failed -- the same
 "more than half fails" principle ``compiled_briefings._verify_claims_batch``
 uses for enrichment-time Verify rejection (``rejected_count * 2 >
 len(sample)``), mirrored here rather than reused as a call. A page that
-fails this gate keeps its previous ``last_verified`` and is appended to
+fails this gate keeps its previous ``last_source_checked`` and is appended to
 ``.session/decisions-queue.json`` for the owner to decide on archival --
 this module never archives a page itself.
 
@@ -133,16 +133,16 @@ class PageFactCheckPlan:
     failed_count: int
     unverifiable_count: int
     exceeded_half: bool
-    previous_last_verified: str
-    next_last_verified: str
+    previous_last_source_checked: str
+    next_last_source_checked: str
     previous_confidence: str
     next_confidence: str
 
     @property
     def frontmatter_updates(self) -> dict[str, str]:
         updates: dict[str, str] = {}
-        if self.next_last_verified != self.previous_last_verified:
-            updates["last_verified"] = self.next_last_verified
+        if self.next_last_source_checked != self.previous_last_source_checked:
+            updates["last_source_checked"] = self.next_last_source_checked
         if self.next_confidence != self.previous_confidence:
             updates["confidence"] = self.next_confidence
         return updates
@@ -266,17 +266,17 @@ def evaluate_page(
     # same as an empty Verify sample would.
     exceeded_half = len(failed) * 2 > len(checked)
 
-    previous_last_verified = fields.get("last_verified", "").strip()
-    if not DATE_ONLY_RE.match(previous_last_verified):
-        previous_last_verified = ""
+    previous_last_source_checked = fields.get("last_source_checked", "").strip()
+    if not DATE_ONLY_RE.match(previous_last_source_checked):
+        previous_last_source_checked = ""
     # "Nothing was checked" must not look like "everything passed": unlike
     # the enrichment-time Verify pattern this gate borrows from (where an
     # empty sample means a page with no claims yet), an empty ``checked``
     # here means every claim on this page was skipped (e.g. all
     # unverifiable), so there is no basis to call the page freshly
     # verified.
-    next_last_verified = (
-        previous_last_verified
+    next_last_source_checked = (
+        previous_last_source_checked
         if exceeded_half or not checked
         else today.isoformat()
     )
@@ -296,22 +296,22 @@ def evaluate_page(
         failed_count=len(failed),
         unverifiable_count=len(unverifiable),
         exceeded_half=exceeded_half,
-        previous_last_verified=previous_last_verified,
-        next_last_verified=next_last_verified,
+        previous_last_source_checked=previous_last_source_checked,
+        next_last_source_checked=next_last_source_checked,
         previous_confidence=previous_confidence,
         next_confidence=next_confidence,
     )
 
 
 def _page_sort_key(fields: dict[str, str], rel_path: str) -> tuple[int, str, str]:
-    """Empty ``last_verified`` first, then oldest first (ТЗ 6.6). ISO dates
+    """Empty ``last_source_checked`` first, then oldest first (ТЗ 6.6). ISO dates
     sort correctly as plain strings; an invalid value is treated as empty
     (oldest priority) instead of silently sorting as a valid recent date.
     """
-    last_verified = fields.get("last_verified", "").strip()
-    if not DATE_ONLY_RE.match(last_verified):
+    last_source_checked = fields.get("last_source_checked", "").strip()
+    if not DATE_ONLY_RE.match(last_source_checked):
         return (0, "", rel_path)
-    return (1, last_verified, rel_path)
+    return (1, last_source_checked, rel_path)
 
 
 def select_pages_for_fact_check(
@@ -322,7 +322,7 @@ def select_pages_for_fact_check(
     """ТЗ 6.6 page selection: core/active/warm tiers plus not-yet-scored
     (empty tier) pages, any domain (``compiled/archive/`` is already
     excluded by ``_iter_candidates``), ordered empty-then-oldest
-    ``last_verified``, capped at ``limit``.
+    ``last_source_checked``, capped at ``limit``.
     """
     eligible = [
         candidate
@@ -393,11 +393,11 @@ def run_monthly_fact_check(
     """ТЗ 6.6 entry point.
 
     Select a bounded batch of core/active/warm pages ordered by
-    ``last_verified`` staleness, deterministically re-check every live
+    ``last_source_checked`` staleness, deterministically re-check every live
     claim on each (zero model calls), and patch only
-    ``last_verified``/``confidence`` under one shared vault lock. A page
+    ``last_source_checked``/``confidence`` under one shared vault lock. A page
     whose checked claims fail more than half keeps its previous
-    ``last_verified`` and is queued (``.session/decisions-queue.json``) for
+    ``last_source_checked`` and is queued (``.session/decisions-queue.json``) for
     the owner's archival decision instead of being patched -- this
     function never archives a page itself.
 

@@ -1,11 +1,12 @@
 ---
 name: ms-project
-description: "Read, analyze, and write Microsoft Project (.mpp / .xml) files. Full workflow: extract → analyze → edit → regenerate. Uses MPXJ for reading, native Python for writing MSPDI XML."
-type: note
-last_accessed: 2026-05-01
-relevance: 0.34
-tier: archive
+description: >-
+  Read, analyze, edit, and regenerate Microsoft Project files (.mpp and MSPDI .xml) using
+  MPXJ for extraction and Python for XML output. Use when the user needs to inspect
+  schedules, tasks, dependencies, resources, calendars, baselines, or produce an updated
+  project plan.
 ---
+
 
 # Microsoft Project (.mpp) Tools
 
@@ -19,35 +20,44 @@ tier: archive
 - `scripts/mpxj.jar` — MPXJ Java library (v13.10.0)
 - `deps/` — Java-зависимости (POI, JAXB и др.)
 
+Запускай команды из корня проекта, используя Python с установленным `jpype1`. Для исходного репозитория подготовь и активируй окружение:
+
+```bash
+uv sync --extra ms-project
+source .venv/bin/activate
+```
+
+Пути `skills/ms-project/` ведут к публичному скиллу. Если он установлен отдельно, найди скрипты относительно каталога этого `SKILL.md`.
+
 ## Чтение .mpp (mpp_read.py)
 
 ### Базовое использование
 ```bash
-python3 ~/.hermes/skills/ms-project/scripts/mpp_read.py project.mpp
+python3 skills/ms-project/scripts/mpp_read.py project.mpp
 ```
 
 ### Форматы вывода
 ```bash
 # JSON (default) — для обработки и генерации XML
-python3 ~/.hermes/skills/ms-project/scripts/mpp_read.py project.mpp --format json > plan.json
+python3 skills/ms-project/scripts/mpp_read.py project.mpp --format json > plan.json
 
 # Markdown — для просмотра
-python3 ~/.hermes/skills/ms-project/scripts/mpp_read.py project.mpp --format md
+python3 skills/ms-project/scripts/mpp_read.py project.mpp --format md
 
 # CSV — для Excel
-python3 ~/.hermes/skills/ms-project/scripts/mpp_read.py project.mpp --format csv
+python3 skills/ms-project/scripts/mpp_read.py project.mpp --format csv
 ```
 
 ### Опции
 ```bash
 # Только сводка
-python3 ~/.hermes/skills/ms-project/scripts/mpp_read.py project.mpp --summary
+python3 skills/ms-project/scripts/mpp_read.py project.mpp --summary
 
 # Конкретные поля
-python3 ~/.hermes/skills/ms-project/scripts/mpp_read.py project.mpp --fields id,name,start,finish,percent_complete
+python3 skills/ms-project/scripts/mpp_read.py project.mpp --fields id,name,start,finish,percent_complete
 
 # Фильтр по дате
-python3 ~/.hermes/skills/ms-project/scripts/mpp_read.py project.mpp --filter-date 2026-04-01
+python3 skills/ms-project/scripts/mpp_read.py project.mpp --filter-date 2026-04-01
 ```
 
 ### Доступные поля
@@ -57,12 +67,12 @@ python3 ~/.hermes/skills/ms-project/scripts/mpp_read.py project.mpp --filter-dat
 
 ### Базовое использование
 ```bash
-python3 ~/.hermes/skills/ms-project/scripts/mpp_write.py plan.json --output project.xml
+python3 skills/ms-project/scripts/mpp_write.py plan.json --output project.xml
 ```
 
 ### С корректировками
 ```bash
-python3 ~/.hermes/skills/ms-project/scripts/mpp_write.py plan.json \
+python3 skills/ms-project/scripts/mpp_write.py plan.json \
   --output corrected.xml \
   --corrections corrections.json
 ```
@@ -85,7 +95,7 @@ python3 ~/.hermes/skills/ms-project/scripts/mpp_write.py plan.json \
 
 ### Шаг 1: Прочитать .mpp → JSON
 ```bash
-python3 ~/.hermes/skills/ms-project/scripts/mpp_read.py project.mpp --format json > plan.json
+python3 skills/ms-project/scripts/mpp_read.py project.mpp --format json > plan.json
 ```
 
 ### Шаг 2: Создать файл корректировок
@@ -103,7 +113,7 @@ EOF
 
 ### Шаг 3: Сгенерировать XML
 ```bash
-python3 ~/.hermes/skills/ms-project/scripts/mpp_write.py plan.json \
+python3 skills/ms-project/scripts/mpp_write.py plan.json \
   --output project_corrected.xml \
   --corrections corrections.json
 ```
@@ -153,13 +163,15 @@ python3 ~/.hermes/skills/ms-project/scripts/mpp_write.py plan.json \
 ### Python пакеты
 ```bash
 uv pip install jpype1
-# или, из корня репозитория a-second-brain:
+# Или из корня исходного репозитория:
 uv sync --extra ms-project
 ```
 
-### Java библиотеки (авто-загрузка)
+### Java библиотеки (каталог `deps/`)
 - mpxj.jar (в scripts/)
 - POI, JAXB и др. (в deps/)
+- JAXB также требует `istack-commons-runtime-4.1.2.jar` и `txw2-4.0.5.jar`.
+- Для .mpp нужны `rtfparserkit-1.16.0.jar` и `log4j-core-2.23.1.jar`.
 
 ## Ограничения
 
@@ -178,18 +190,20 @@ uv sync --extra ms-project
 ### Ошибка: No module named 'jpype'
 ```bash
 uv pip install jpype1
+# Или из корня исходного репозитория:
+uv sync --extra ms-project
 ```
 
 ### Ошибка: ClassNotFoundException (Java)
 Проверить наличие deps/:
 ```bash
-ls ~/.hermes/skills/ms-project/deps/
+ls skills/ms-project/deps/
 ```
 
 ### Пересоздать deps при необходимости
-Скрипт сам скачает зависимости при первом запуске, или вручную:
+Скрипт не скачивает зависимости. Восстанови отсутствующие JAR-файлы в `deps/` из Maven Central с указанными выше версиями:
 ```bash
-cd ~/.hermes/skills/ms-project/deps/
+cd skills/ms-project/deps/
 # Скачать POI, JAXB jars (см. scripts/mpp_read.py)
 ```
 

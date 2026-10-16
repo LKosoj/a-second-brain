@@ -2074,6 +2074,12 @@ def test_handle_document_acks_and_processes_in_background(
     assert len(scheduled) == 1
     assert order[:2] == ["stage", "answer"]
 
+    monkeypatch.setattr(
+        document_handler.CliProcessor,
+        "classify_text_intent",
+        lambda self, text: {"intent": "capture"},
+    )
+
     asyncio.run(scheduled[0])
 
     assert edits == ["✅ Документ сохранён."]

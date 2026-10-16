@@ -2,7 +2,7 @@
 
 Runs ``compiled_fact_check.run_monthly_fact_check`` against the configured
 vault: a bounded, deterministic (zero model calls) re-check of the oldest
-core/active/warm compiled pages, patching only ``last_verified``/
+core/active/warm compiled pages, patching only ``last_source_checked``/
 ``confidence`` and queuing pages that fail the check for the owner instead
 of archiving them automatically.
 """

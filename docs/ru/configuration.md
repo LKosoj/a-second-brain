@@ -69,7 +69,8 @@ units.
 |---|---|
 | `OPENAI_API_KEY` | API-ключ совместимого gateway |
 | `BASE_URL` | Базовый URL OpenAI-совместимого API |
-| `MODEL` | Модель планировщика recall |
+| `CLASSIFICATION_MODEL` | Модель Decisions API для обработки сообщений и решения о поиске в памяти; имеет приоритет над `MODEL` |
+| `MODEL` | Модель чат-API для тех же решений, если `CLASSIFICATION_MODEL` пуста; если обе пусты — CLI |
 | `EMB_MODEL` | Удалённая модель эмбеддингов QMD; если пусто — локальная `Qwen3-Embedding-0.6B` |
 | `RERANK_MODEL` | Модель reranking для QMD; если пусто — локальная `Qwen3-Reranker-0.6B` |
 

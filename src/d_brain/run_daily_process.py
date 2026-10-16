@@ -241,6 +241,10 @@ def _build_scheduled_digest(
                 status = f"- {label}: `{str(cycle_result['summary_path'])}`"
             elif cycle_result.get("note_path"):
                 status = f"- {label}: `{str(cycle_result['note_path'])}`"
+            elif cycle_result.get("status") == "skipped-interval":
+                status = (
+                    f"- {label}: пропущен — срок следующего прохода ещё не наступил"
+                )
             elif cycle_result.get("skipped"):
                 status = f"- {label}: без новых сигналов"
             elif cycle_result.get("carry_forward_observations"):

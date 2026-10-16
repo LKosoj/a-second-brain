@@ -58,7 +58,8 @@ Do not describe old nested business/project trees as if they were current truth.
 
 ## Compiled Layer Frontmatter
 
-Five `compiled/` frontmatter fields -- `sources_trust`, `last_verified`,
+Six `compiled/` frontmatter fields -- `sources_trust`, `last_verified`,
+`last_source_checked`,
 `enrichment_count`, `conflicts_open`, `human_reviewed` -- are set only by
 code inside `CompiledBriefingService`, never by heuristics. `add_descriptions.py`
 and any similar description-generation tooling must never guess at or

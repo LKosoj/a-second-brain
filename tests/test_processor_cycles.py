@@ -1708,7 +1708,7 @@ def test_run_scheduled_cycle_uses_control_plane_labels_for_maintenance(
     assert [cycle["label"] for cycle in result["periodic_cycles"]] == [
         "Поддержка compiled-слоя",
         "Здоровье vault",
-        "Проверка фактов compiled",
+        "Проверка источников compiled",
         "Уход за вики",
         "Дайджест обогащения compiled",
     ]
@@ -1855,13 +1855,15 @@ def test_run_compiled_fact_check_cycle_reports_in_russian_by_default(
 
     result = processor._run_compiled_fact_check_cycle()
 
-    assert "## 🔎 Проверка фактов compiled" in result["report"]
+    assert "## 🔎 Проверка источников compiled" in result["report"]
     assert "- Страниц проверено: 3" in result["report"]
-    assert "- Дата подтверждена: 2" in result["report"]
+    assert "- Метки обновлены: 2" in result["report"]
     assert "- Отправлено на решение владельца: 1" in result["report"]
-    assert "- Утверждений проверено: 5, не подтвердилось: 1, непроверяемых: 0" in (
-        result["report"]
+    expected = (
+        "- Записей проверено технически: 5, "
+        "проблем с источниками или конфликтами: 1, непроверяемых: 0"
     )
+    assert expected in result["report"]
 
 
 def test_run_compiled_fact_check_cycle_reports_in_english_for_english_setting(
@@ -1889,11 +1891,12 @@ def test_run_compiled_fact_check_cycle_reports_in_english_for_english_setting(
 
     result = processor._run_compiled_fact_check_cycle()
 
-    assert "## 🔎 Compiled Fact-Check" in result["report"]
+    assert "## 🔎 Compiled Source Check" in result["report"]
     assert "- Pages checked: 3" in result["report"]
-    assert "- Date confirmed: 2" in result["report"]
+    assert "- Metadata updated: 2" in result["report"]
     assert "- Sent to owner for a decision: 1" in result["report"]
-    assert "- Claims checked: 5, failed: 1, unverifiable: 0" in result["report"]
+    assert ("- Records checked technically: 5, "
+            "source or conflict issues: 1, unverifiable: 0") in result["report"]
     assert "- Write errors: 1" in result["report"]
     assert "Проверка фактов" not in result["report"]
 

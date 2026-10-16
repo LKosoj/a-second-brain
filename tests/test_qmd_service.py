@@ -118,7 +118,7 @@ def test_services_use_absolute_mcp_config_path(tmp_path: Path) -> None:
     assert plaud._cli_extra_env()["MCP_CONFIG_PATH"] == expected
 
 
-def test_qmd_touch_uses_configured_absolute_uv_path(
+def test_qmd_touch_uses_current_python_without_uv_cache(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -138,7 +138,37 @@ def test_qmd_touch_uses_configured_absolute_uv_path(
 
     service.touch_notes(["daily/example.md"])
 
-    assert calls[0][:2] == ["/opt/uv/bin/uv", "run"]
+    assert calls[0][0] == sys.executable
+    assert "run" not in calls[0]
+
+
+def test_qmd_touch_updates_memory_without_a_writable_uv_cache(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    vault = project / "vault"
+    service = _qmd_service(vault)
+    note = vault / "thoughts/example.md"
+    note.parent.mkdir(parents=True)
+    note.write_text(
+        '---\ntype: note\ndescription: "Example"\n'
+        'tags: [example, test]\nstatus: active\n'
+        'created: 2026-01-01\nupdated: 2026-01-01\n'
+        'last_accessed: 2026-01-01\nrelevance: 0.5\ntier: warm\n'
+        'access_count: 0\n---\n# Example\n'
+    )
+    script = project / "skills/agent-memory/scripts/memory-engine.py"
+    script.parent.mkdir(parents=True)
+    real_script = (
+        Path(__file__).parents[1] / "skills/agent-memory/scripts/memory-engine.py"
+    )
+    script.symlink_to(real_script)
+    monkeypatch.setenv("UV_BIN", "/does-not-exist/uv")
+    monkeypatch.setenv("UV_CACHE_DIR", "/proc/not-writable")
+    service.touch_notes(["thoughts/example.md"])
+    fields = QmdService._read_frontmatter_signal(note)
+    assert fields is not None
+    assert "access_count: 1" in note.read_text()
+    assert "# Example" in note.read_text()
 
 
 def test_run_qmd_get_touches_opened_notes(monkeypatch, tmp_path: Path) -> None:

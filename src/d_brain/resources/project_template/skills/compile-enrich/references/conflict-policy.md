@@ -142,11 +142,12 @@ below.
 - `MAX_MODEL_CALLS_PER_PASS` = 200 -- every impact/compile/verify/JSON-repair
   call shares this one budget.
 - `MAX_ENRICHMENTS_PER_PAGE_PER_MONTH` = 60 -- beyond this, further source
-  material for that page waits until the month rolls over, and a `drift`
+  material for non-`core`/`active` pages waits until the month rolls over, and a `drift`
   entry is queued for judgement. Counted as distinct (date, source) pairs in
   "Sources That Shaped This Page", not as rows: one enrichment appends one
   row per claim, so counting rows charged a single pass several times over
-  and froze pages enriched two or three times.
+  and froze pages enriched two or three times. `core` and `active` pages
+  remain eligible; per-pass page and model-call budgets still apply.
 - `MAX_CLAIMS_PER_PASS` = 20 -- claims accepted from one model response.
 - `MAX_CONFLICT_RETRIES_PER_PASS` = 20 -- still-open conflicts one pass
   re-adjudicates (one model call each).
@@ -161,7 +162,9 @@ treated as a failure.
 
 A separate, narrower, fully deterministic pass (**zero model calls**) from
 the nightly compile-enrich pass above. It only ever patches two frontmatter
-fields, `last_verified` and `confidence`. A page that fails its check is
+fields, `last_source_checked` and `confidence`. This checks source-link
+integrity and conflict markers, not claim content. `last_verified` is unchanged.
+A page that fails its check is
 left unadvanced and queued as a `fact-check-rejected` decision rather than
 being silently patched or archived.
 

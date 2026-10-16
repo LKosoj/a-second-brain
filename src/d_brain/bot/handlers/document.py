@@ -10,6 +10,7 @@ from aiogram import Bot, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message
 
+from d_brain.bot.handlers.do import process_request
 from d_brain.bot.replies import (
     answer_rich_text,
     answer_text,
@@ -18,11 +19,13 @@ from d_brain.bot.replies import (
 )
 from d_brain.config import get_settings
 from d_brain.services.documents import (
+    DocumentArchiveResult,
     DocumentArchiveService,
     DocumentTooLargeError,
     StagedDocumentUpload,
     UnsupportedDocumentError,
 )
+from d_brain.services.processor import TEXT_INTENT_ACTION, CliProcessor
 from d_brain.services.session import SessionStore
 from d_brain.services.source_links import (
     SourceInfo,
@@ -245,3 +248,32 @@ async def _process_document_upload(
                 await answer_text(message, error_text, parse_mode=None)
         except Exception:
             logger.exception("Failed to deliver document failure report")
+        return
+
+    await _execute_document_caption(message, result)
+
+
+async def _execute_document_caption(
+    message: Message, result: DocumentArchiveResult
+) -> None:
+    """Run an owner's explicit caption request with the archived file paths."""
+    if not message.caption or not message.from_user or message.forward_origin:
+        return
+    settings = get_settings()
+    processor = CliProcessor(
+        settings.vault_path,
+        ai_cli=settings.ai_cli,
+        content_language=settings.content_language,
+        openai_api_key=getattr(settings, "openai_api_key", ""),
+        openai_base_url=getattr(settings, "openai_base_url", ""),
+        openai_model=getattr(settings, "openai_model", ""),
+        classification_model=getattr(settings, "classification_model", ""),
+    )
+    intent = await asyncio.to_thread(processor.classify_text_intent, message.caption)
+    if intent["intent"] == TEXT_INTENT_ACTION:
+        prompt = (
+            f"{message.caption}\n\n"
+            f"Original document: {settings.vault_path / result.original_path}\n"
+            f"Extracted text: {settings.vault_path / result.text_path}\n"
+        )
+        await process_request(message, prompt, message.from_user.id)

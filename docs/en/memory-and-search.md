@@ -115,7 +115,8 @@ Beyond the frontmatter fields other notes use, a compiled page also carries
 fields that only code writes, never the model: `sources_trust`,
 `last_verified`, `enrichment_count`, `conflicts_open`, and `human_reviewed`.
 `last_verified` records when the page's claims were last confirmed — by a
-fresh claim landing, or by the fact-check pass described below. That is a
+fresh claim landing during enrichment. Source-link checks have their own
+`last_source_checked` date and do not confirm claim content. That is a
 different signal from the ordinary `last_accessed` field, which only tracks
 when the page was last opened: a frequently opened page is not automatically
 a frequently checked one.
@@ -376,14 +377,15 @@ A page that has stayed at the `archive` tier long enough, with no incoming
 links, is moved into `compiled/archive/<domain>/` instead of being deleted.
 Nothing under `compiled/` is ever deleted by this pipeline.
 
-Fact-checking itself runs every night, not on a monthly schedule — but each
+Source-integrity checking runs every night, not on a monthly schedule — but each
 run only processes a small, bounded batch of the stalest `core`/`active`/
 `warm` pages, so with a normal vault size any single page is actually
 rechecked roughly once a month. It calls no model: it re-derives each
 claim's category from its recorded source and re-checks the wikilinks it
-references. A page whose checked claims mostly still hold has its
-`last_verified` date moved to today. A page that fails instead keeps its
-previous `last_verified` date, has its `confidence` stepped down one level,
+references; it does not compare claim content with the source text.
+A page whose records mostly pass these technical checks has its
+`last_source_checked` date moved to today. A page that fails instead keeps its
+previous `last_source_checked` date, has its `confidence` stepped down one level,
 and is queued for the owner as a `fact-check-rejected` decision instead of
 being silently patched or archived on its own; a page with even one
 unverifiable claim also has its `confidence` capped at `medium` either way.

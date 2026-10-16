@@ -69,7 +69,8 @@ installation.
 |---|---|
 | `OPENAI_API_KEY` | API key for the compatible gateway |
 | `BASE_URL` | OpenAI-compatible API base URL |
-| `MODEL` | Recall-planner model |
+| `CLASSIFICATION_MODEL` | Decisions API model for message routing and memory-search decisions; takes priority over `MODEL` |
+| `MODEL` | Chat API model for the same decisions when `CLASSIFICATION_MODEL` is empty; both empty uses CLI |
 | `EMB_MODEL` | Remote QMD embedding model; empty uses local `Qwen3-Embedding-0.6B` |
 | `RERANK_MODEL` | QMD reranking model; empty uses local `Qwen3-Reranker-0.6B` |
 

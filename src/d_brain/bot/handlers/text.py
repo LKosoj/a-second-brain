@@ -17,7 +17,11 @@ from d_brain.services.link_summary import (
     LinkSummaryService,
     format_link_summary_message,
 )
-from d_brain.services.processor import TEXT_INTENT_QUESTION, CliProcessor
+from d_brain.services.processor import (
+    TEXT_INTENT_ACTION,
+    TEXT_INTENT_QUESTION,
+    CliProcessor,
+)
 from d_brain.services.secrets import scrub_secrets
 from d_brain.services.session import SessionStore
 from d_brain.services.source_links import build_telegram_source_info
@@ -151,6 +155,7 @@ async def handle_text(message: Message) -> None:
         getattr(settings, "tavily_api_key", ""),
         0,
         getattr(settings, "recall_planner_disable_thinking", False),
+        getattr(settings, "classification_model", ""),
     )
     status_message = await _upsert_status_message(
         message,
@@ -182,6 +187,10 @@ async def handle_text(message: Message) -> None:
             step="анализирую сообщение",
             args=(message.text,),
         )
+        if intent["intent"] == TEXT_INTENT_ACTION:
+            await _safe_delete_status(status_message)
+            await process_request(message, message.text, message.from_user.id)
+            return
         branch = _text_branch_label(
             intent["intent"],
             str(intent.get("workflow") or ""),

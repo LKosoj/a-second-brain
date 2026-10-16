@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import date
@@ -1073,12 +1074,10 @@ class QmdService:
             memory_engine = (
                 self.vault_path.parent / "skills/agent-memory/scripts/memory-engine.py"
             )
-            uv_bin = os.environ.get("UV_BIN", "uv").strip() or "uv"
             try:
                 result = subprocess.run(
                     [
-                        uv_bin,
-                        "run",
+                        sys.executable,
                         str(memory_engine),
                         "touch",
                         str(relative),
@@ -1091,14 +1090,14 @@ class QmdService:
                 )
             except FileNotFoundError:
                 logger.warning(
-                    "Failed to touch memory note %s: uv executable not found: %s",
+                    "Failed to touch memory note %s: Python executable not found: %s",
                     relative,
-                    uv_bin,
+                    sys.executable,
                 )
                 continue
             except subprocess.TimeoutExpired:
                 logger.warning(
-                    "Failed to touch memory note %s: uv run timed out after 60s",
+                    "Failed to touch memory note %s: Python timed out after 60s",
                     relative,
                 )
                 continue

@@ -224,6 +224,45 @@ def test_connect_orphans_rejects_symlink_swap_without_external_write(
     assert external_path.read_text(encoding="utf-8") == external_content
 
 
+def test_fix_links_matches_graph_target_in_original_uri(tmp_path, monkeypatch):
+    module = _load_vault_health_script("fix_links")
+    manual = "[[qmd://daily/source.md#heading|Manual]]"
+    text = (
+        "[[qmd://daily/source.md#heading|Source]]\n"
+        f"{module.HUMAN_ZONE_START}\n{manual}\n{module.HUMAN_ZONE_END}\n"
+    )
+    changed = []
+
+    def write(vault_path, file_path, transform, **kwargs):
+        changed.append(module._protect_human_zone(text, transform))
+        return True
+
+    monkeypatch.setattr(module, "_write_repair", write)
+    module.apply_replace(
+        tmp_path, tmp_path / "note.md", "qmd:/daily/source", "daily/source",
+        manifest=None,
+    )
+    assert "[[daily/source#heading|Source]]" in changed[0]
+    assert manual in changed[0]
+
+
+def test_fix_links_resolves_qmd_and_plaud_only_when_target_exists(tmp_path):
+    module = _load_vault_health_script("fix_links")
+    module.VAULT_PATH = tmp_path
+    target = tmp_path / "imports/plaud/notes/2026/source.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("# Source")
+    for raw in (
+        "qmd:/plaud/2026/source", "qmd://plaud/2026/source", "plaud/2026/source"
+    ):
+        assert module.suggest_fix("compiled/topics/test", raw, {}) == (
+            "imports/plaud/notes/2026/source", "replace"
+        )
+    assert module.suggest_fix("compiled/topics/test", "qmd:/daily/missing", {}) == (
+        None, "none"
+    )
+
+
 def test_fix_links_collapses_legacy_paths_and_removes_repo_links(
     tmp_path: Path,
 ) -> None:

@@ -26,8 +26,13 @@ MPP_READER_TIMEOUT_SECONDS = max(10, DOCUMENT_EXTRACTION_TIMEOUT_SECONDS - 5)
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _MPP_READER_SCRIPT_CANDIDATES = (
     _REPO_ROOT
-    / "vault"
-    / ".claude"
+    / "skills"
+    / "ms-project"
+    / "scripts"
+    / "mpp_read.py",
+    Path(__file__).resolve().parents[1]
+    / "resources"
+    / "project_template"
     / "skills"
     / "ms-project"
     / "scripts"

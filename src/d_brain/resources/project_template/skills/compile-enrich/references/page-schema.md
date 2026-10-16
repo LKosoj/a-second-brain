@@ -59,7 +59,9 @@ sub-fields (`decision_status`, `decision_owner`, `decision_date`, `severity`, ..
 - `sources_trust` -- `own | forwarded | integration | inferred`; the minimum
   trust level among the page's sources so far.
 - `last_verified` -- `YYYY-MM-DD` or empty; when the page's claims were last
-  confirmed (by a fresh claim landing, or by the monthly fact-check).
+  confirmed by a fresh claim landing during enrichment.
+- `last_source_checked` -- `YYYY-MM-DD` or empty; when source links and
+  conflict markers were technically checked, without verifying claim content.
 - `enrichment_count` -- how many times this page has been enriched.
 - `conflicts_open` -- number of unresolved factual conflicts.
 - `human_reviewed` -- `YYYY-MM-DD` or empty; when the owner last confirmed

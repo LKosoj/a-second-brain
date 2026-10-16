@@ -32,7 +32,17 @@ class Settings(BaseSettings):
     openai_model: str = Field(
         default="",
         validation_alias="MODEL",
-        description="Model name used by the recall planner helper",
+        description=(
+            "Chat model for classification and recall "
+            "when CLASSIFICATION_MODEL is empty"
+        ),
+    )
+    classification_model: str = Field(
+        default="",
+        description=(
+            "Decisions API model for classification and recall; "
+            "empty uses MODEL or CLI"
+        ),
     )
     recall_planner_disable_thinking: bool = Field(
         default=False,

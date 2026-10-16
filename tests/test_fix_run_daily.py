@@ -25,6 +25,20 @@ from d_brain import run_daily_process
 from d_brain.services.processor import INTERACTIVE_MODE, SCHEDULED_MODE, CliProcessor
 
 
+def test_scheduled_digest_distinguishes_interval_skip_from_execution():
+    text = run_daily_process._build_scheduled_digest(
+        date(2026, 10, 15),
+        {"periodic_cycles": [
+            {"label": "Уход за вики", "result": {"status": "skipped-interval"}},
+            {"label": "Здоровье", "result": {"status": "ok"}},
+        ]},
+        {},
+    )
+    assert "Уход за вики: пропущен" in text
+    assert "Уход за вики: выполнен" not in text
+    assert "Здоровье: выполнен" in text
+
+
 def _fake_settings(vault_path: Path) -> SimpleNamespace:
     return SimpleNamespace(
         vault_path=vault_path,

@@ -10483,6 +10483,24 @@ def test_compiled_briefings_archive_tier_write_counts_toward_touched_pages(
     assert rel_path in service._active_pass.touched_pages
 
 
+def test_render_normalizes_source_links_and_preserves_human_zone(tmp_path):
+    service = _compiled_service(tmp_path / "vault")
+    manual = "Keep [[qmd:/daily/original#heading|my label]] exactly."
+    payload = _minimal_compile_payload()
+    payload["current_state"] = "Read [[qmd:/daily/new#heading|new label]]."
+    payload["source_links"] = ["qmd://plaud/2026/10/source.md"]
+    rendered = service._render_briefing(
+        target=_demo_target(), payload=payload,
+        source_rel_path="daily/source.md",
+        existing_text=_full_compiled_page_text(human_note=manual),
+        existing_meta={"last_source_checked": "2026-10-14"}, signal=None,
+    )
+    assert "[[daily/new#heading|new label]]" in rendered
+    assert "[[imports/plaud/notes/2026/10/source.md]]" in rendered
+    assert manual in rendered
+    assert "last_source_checked: 2026-10-14" in rendered
+
+
 def test_compiled_briefings_monthly_enrichment_budget_blocks_page(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -10580,9 +10598,12 @@ def test_compiled_briefings_monthly_budget_counts_enrichments_not_claims(
     assert "monthly-enrichments-per-page" not in service._active_pass.budget_exhausted
 
 
+@pytest.mark.parametrize("tier, offset", [("active", -1), ("active", 0), ("core", 1)])
 def test_compiled_briefings_monthly_enrichment_budget_allows_the_last_slot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    tier: str,
+    offset: int,
 ) -> None:
     """One enrichment below the monthly cap must still go through. The other
     budget tests all fill the month to exactly the cap, so an off-by-one
@@ -10597,13 +10618,14 @@ def test_compiled_briefings_monthly_enrichment_budget_allows_the_last_slot(
     page_path.parent.mkdir(parents=True, exist_ok=True)
     page_path.write_text(
         _full_compiled_page_text(
+            tier=tier,
             shaped_rows=[
                 (f"{month_prefix}-01", f"daily/day{i}.md", f"change {i}")
-                for i in range(MAX_ENRICHMENTS_PER_PAGE_PER_MONTH - 1)
+                for i in range(MAX_ENRICHMENTS_PER_PAGE_PER_MONTH + offset)
             ],
             sources=[
                 f"daily/day{i}.md"
-                for i in range(MAX_ENRICHMENTS_PER_PAGE_PER_MONTH - 1)
+                for i in range(MAX_ENRICHMENTS_PER_PAGE_PER_MONTH + offset)
             ],
         ),
         encoding="utf-8",

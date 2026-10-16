@@ -35,10 +35,31 @@ from d_brain.services.decisions_queue import QUEUE_CAP
 DAY = date(2026, 8, 5)
 
 
+def test_source_check_does_not_refresh_content_verification(
+    tmp_path, write_vault_manifest
+):
+    write_vault_manifest(tmp_path)
+    source = tmp_path / "daily/source.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("# Source\nThe date has not been agreed.\n")
+    _write_page(
+        tmp_path, "compiled/topics/aurora.md",
+        sources_rows=[("2026-08-01", "daily/source.md", "The date is agreed.")],
+    )
+    path = tmp_path / "compiled/topics/aurora.md"
+    path.write_text(path.read_text().replace(
+        "confidence: high", "last_verified: 2026-06-01\nconfidence: high"
+    ))
+    candidate = _candidate_for(tmp_path, path.relative_to(tmp_path).as_posix())
+    plan = evaluate_page(tmp_path, candidate, today=DAY)
+    assert plan.frontmatter_updates == {"last_source_checked": DAY.isoformat()}
+    assert "last_verified: 2026-06-01" in path.read_text()
+
+
 def _page_text(
     *,
     tier: str = "active",
-    last_verified: str = "",
+    last_source_checked: str = "",
     confidence: str = "high",
     conflicts_open: int = 0,
     sources_rows: list[tuple[str, str, str]],
@@ -64,7 +85,7 @@ def _page_text(
         "updated: 2026-07-01\n"
         "freshness_state: fresh\n"
         f"confidence: {confidence}\n"
-        f"last_verified: {last_verified}\n"
+        f"last_source_checked: {last_source_checked}\n"
         f"conflicts_open: {conflicts_open}\n"
         "last_accessed: 2026-07-01\n"
         "relevance: 0.80\n"
@@ -386,7 +407,7 @@ def test_judgment_claim_fails_when_open_conflicts_rows_present_despite_zero_coun
 # --- half-threshold gate ---------------------------------------------------
 
 
-def test_page_advances_last_verified_when_exactly_half_claims_fail(
+def test_page_advances_last_source_checked_when_exactly_half_claims_fail(
     tmp_path, write_vault_manifest
 ):
     vault = tmp_path / "vault"
@@ -396,7 +417,7 @@ def test_page_advances_last_verified_when_exactly_half_claims_fail(
     _write_page(
         vault,
         "compiled/topics/aurora.md",
-        last_verified="2026-06-01",
+        last_source_checked="2026-06-01",
         sources_rows=[
             ("2026-07-01", "daily/2026-07-01.md", "Клиент подтвердил A"),
             ("2026-07-02", "daily/2099-01-01.md", "Клиент подтвердил B"),
@@ -410,7 +431,7 @@ def test_page_advances_last_verified_when_exactly_half_claims_fail(
     assert plan.checked_count == 2
     assert plan.failed_count == 1
     assert plan.exceeded_half is False
-    assert plan.next_last_verified == DAY.isoformat()
+    assert plan.next_last_source_checked == DAY.isoformat()
 
 
 def test_page_does_not_advance_when_more_than_half_claims_fail(
@@ -423,7 +444,7 @@ def test_page_does_not_advance_when_more_than_half_claims_fail(
     _write_page(
         vault,
         "compiled/topics/aurora.md",
-        last_verified="2026-06-01",
+        last_source_checked="2026-06-01",
         sources_rows=[
             ("2026-07-01", "daily/2026-07-01.md", "Клиент подтвердил A"),
             ("2026-07-02", "daily/2099-01-01.md", "Клиент подтвердил B"),
@@ -438,11 +459,11 @@ def test_page_does_not_advance_when_more_than_half_claims_fail(
     assert plan.checked_count == 3
     assert plan.failed_count == 2
     assert plan.exceeded_half is True
-    assert plan.next_last_verified == "2026-06-01"
-    assert "last_verified" not in plan.frontmatter_updates
+    assert plan.next_last_source_checked == "2026-06-01"
+    assert "last_source_checked" not in plan.frontmatter_updates
 
 
-def test_page_with_no_checked_claims_does_not_advance_last_verified(
+def test_page_with_no_checked_claims_does_not_advance_last_source_checked(
     tmp_path, write_vault_manifest
 ):
     """"Nothing was checked" must not look like "everything passed"
@@ -453,7 +474,7 @@ def test_page_with_no_checked_claims_does_not_advance_last_verified(
     _write_page(
         vault,
         "compiled/topics/aurora.md",
-        last_verified="2026-06-01",
+        last_source_checked="2026-06-01",
         sources_rows=[
             ("2026-07-01", "daily/2026-07-01.md", "Задача в Todoist закрыта"),
         ],
@@ -464,8 +485,8 @@ def test_page_with_no_checked_claims_does_not_advance_last_verified(
     )
 
     assert plan.checked_count == 0
-    assert plan.next_last_verified == "2026-06-01"
-    assert "last_verified" not in plan.frontmatter_updates
+    assert plan.next_last_source_checked == "2026-06-01"
+    assert "last_source_checked" not in plan.frontmatter_updates
 
 
 # --- confidence cap / step-down --------------------------------------------
@@ -592,7 +613,7 @@ def test_selection_includes_pages_with_empty_tier(tmp_path, write_vault_manifest
     }
 
 
-def test_selection_orders_empty_last_verified_first_then_oldest(
+def test_selection_orders_empty_last_source_checked_first_then_oldest(
     tmp_path, write_vault_manifest
 ):
     vault = tmp_path / "vault"
@@ -600,19 +621,19 @@ def test_selection_orders_empty_last_verified_first_then_oldest(
     _write_page(
         vault,
         "compiled/topics/newer.md",
-        last_verified="2026-07-20",
+        last_source_checked="2026-07-20",
         sources_rows=[("2026-07-01", "daily/2026-07-01.md", "заметка")],
     )
     _write_page(
         vault,
         "compiled/topics/older.md",
-        last_verified="2026-06-01",
+        last_source_checked="2026-06-01",
         sources_rows=[("2026-07-01", "daily/2026-07-01.md", "заметка")],
     )
     _write_page(
         vault,
         "compiled/topics/never.md",
-        last_verified="",
+        last_source_checked="",
         sources_rows=[("2026-07-01", "daily/2026-07-01.md", "заметка")],
     )
 
@@ -666,7 +687,7 @@ def test_selection_excludes_archive_domain_even_with_eligible_tier(
 # --- run_monthly_fact_check orchestration -----------------------------------
 
 
-def test_run_monthly_fact_check_advances_and_patches_only_last_verified(
+def test_run_monthly_fact_check_advances_and_patches_only_last_source_checked(
     tmp_path, write_vault_manifest, monkeypatch
 ):
     vault = tmp_path / "vault"
@@ -676,7 +697,7 @@ def test_run_monthly_fact_check_advances_and_patches_only_last_verified(
     _write_page(
         vault,
         "compiled/topics/aurora.md",
-        last_verified="2026-06-01",
+        last_source_checked="2026-06-01",
         confidence="high",
         sources_rows=[
             ("2026-07-01", "daily/2026-07-01.md", "Клиент подтвердил статус"),
@@ -700,7 +721,7 @@ def test_run_monthly_fact_check_advances_and_patches_only_last_verified(
     assert len(calls) == 1
     patched_path, updates = calls[0]
     assert patched_path == vault / "compiled/topics/aurora.md"
-    assert updates == {"last_verified": DAY.isoformat()}
+    assert updates == {"last_source_checked": DAY.isoformat()}
 
 
 def test_run_monthly_fact_check_logs_fact_check_ops_entry(
@@ -713,7 +734,7 @@ def test_run_monthly_fact_check_logs_fact_check_ops_entry(
     _write_page(
         vault,
         "compiled/topics/aurora.md",
-        last_verified="2026-06-01",
+        last_source_checked="2026-06-01",
         confidence="high",
         sources_rows=[
             ("2026-07-01", "daily/2026-07-01.md", "Клиент подтвердил статус"),
@@ -750,7 +771,7 @@ def test_run_monthly_fact_check_logs_ops_entry_on_failure(
     _write_page(
         vault,
         "compiled/topics/aurora.md",
-        last_verified="2026-06-01",
+        last_source_checked="2026-06-01",
         confidence="high",
         sources_rows=[
             ("2026-07-01", "daily/2026-07-01.md", "Клиент подтвердил статус"),
@@ -777,7 +798,7 @@ def test_run_monthly_fact_check_queues_and_holds_when_gate_fails(
     _write_page(
         vault,
         "compiled/topics/aurora.md",
-        last_verified="2026-06-01",
+        last_source_checked="2026-06-01",
         confidence="high",
         sources_rows=[
             ("2026-07-01", "daily/2099-01-01.md", "Клиент подтвердил A"),
@@ -797,7 +818,7 @@ def test_run_monthly_fact_check_queues_and_holds_when_gate_fails(
 
     assert result["pages_patched"] == 1
     assert result["pages_flagged"] == 1
-    # last_verified is untouched (gate failed): only confidence stepped down.
+    # last_source_checked is untouched (gate failed): only confidence stepped down.
     assert calls == [{"confidence": "medium"}]
 
     queue_path = vault / ".session" / "decisions-queue.json"
@@ -820,7 +841,7 @@ def test_run_monthly_fact_check_still_queues_page_when_frontmatter_patch_fails(
     _write_page(
         vault,
         "compiled/topics/aurora.md",
-        last_verified="2026-06-01",
+        last_source_checked="2026-06-01",
         confidence="high",
         sources_rows=[
             ("2026-07-01", "daily/2099-01-01.md", "Клиент подтвердил A"),
@@ -855,7 +876,7 @@ def test_run_monthly_fact_check_does_not_grow_queue_for_repeatedly_failing_page(
     _write_page(
         vault,
         "compiled/topics/aurora.md",
-        last_verified="2026-06-01",
+        last_source_checked="2026-06-01",
         confidence="high",
         sources_rows=[
             ("2026-07-01", "daily/2099-01-01.md", "Клиент подтвердил A"),
@@ -882,7 +903,7 @@ def test_run_monthly_fact_check_writes_own_journal_separate_from_compile_enrich(
     _write_page(
         vault,
         "compiled/topics/aurora.md",
-        last_verified="2026-06-01",
+        last_source_checked="2026-06-01",
         sources_rows=[("2026-07-01", "daily/2026-07-01.md", "Клиент подтвердил A")],
     )
     monkeypatch.setattr(
@@ -912,7 +933,7 @@ def test_run_monthly_fact_check_journals_even_when_the_queue_write_blows_up(
     _write_page(
         vault,
         "compiled/topics/aurora.md",
-        last_verified="2026-06-01",
+        last_source_checked="2026-06-01",
         confidence="high",
         sources_rows=[
             ("2026-07-01", "daily/2099-01-01.md", "Клиент подтвердил A"),
@@ -950,7 +971,7 @@ def test_a_failing_journal_write_does_not_replace_the_real_cause(
     _write_page(
         vault,
         "compiled/topics/aurora.md",
-        last_verified="2026-06-01",
+        last_source_checked="2026-06-01",
         confidence="high",
         sources_rows=[("2026-07-01", "daily/2099-01-01.md", "Клиент подтвердил A")],
     )
@@ -989,7 +1010,7 @@ def test_run_monthly_fact_check_reports_queue_evictions_when_batch_exceeds_cap(
         _write_page(
             vault,
             f"compiled/topics/aurora-{i:02d}.md",
-            last_verified="2026-06-01",
+            last_source_checked="2026-06-01",
             confidence="high",
             sources_rows=[
                 ("2026-07-01", "daily/2099-01-01.md", "Клиент подтвердил A"),
@@ -1024,7 +1045,7 @@ def test_run_monthly_fact_check_reports_zero_queue_evictions_for_small_batch(
     _write_page(
         vault,
         "compiled/topics/aurora.md",
-        last_verified="2026-06-01",
+        last_source_checked="2026-06-01",
         confidence="high",
         sources_rows=[
             ("2026-07-01", "daily/2099-01-01.md", "Клиент подтвердил A"),
