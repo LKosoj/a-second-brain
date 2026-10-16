@@ -2069,7 +2069,7 @@ def test_handle_document_acks_and_processes_in_background(
     asyncio.run(document_handler.handle_document(FakeMessage(), FakeBot()))
 
     assert answers == [
-        "📄 Файл сохранён: report.pdf. Извлечение текста запущено в фоне."
+        "📄 Файл получен: report.pdf. Проверяю подпись и подготавливаю файл."
     ]
     assert len(scheduled) == 1
     assert order[:2] == ["stage", "answer"]

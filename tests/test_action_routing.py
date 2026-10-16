@@ -255,3 +255,52 @@ def test_processor_passes_decision_model_and_cli_to_recall(tmp_path, monkeypatch
     assert calls[0]["config"].classification_model == "decision-model"
     assert calls[0]["config"].model == "chat-model"
     assert calls[0]["run_prompt"] == processor._run_vault_prompt
+
+
+async def test_document_classifies_caption_before_preparing_file(monkeypatch):
+    order = []
+    edits = []
+
+    async def classify(message):
+        order.append("classify")
+        return "action"
+
+    def archive(**kwargs):
+        order.append("archive")
+        raise ValueError("test extraction failure")
+
+    async def edit(message, content, **kwargs):
+        edits.append(content)
+
+    monkeypatch.setattr(document, "_classify_document_caption", classify)
+    monkeypatch.setattr(document, "edit_text", edit)
+    await document._process_document_upload(
+        SimpleNamespace(message_id=123, caption="Сделай отчёт"),
+        SimpleNamespace(),
+        SimpleNamespace(archive_staged_document=archive),
+        staged=SimpleNamespace(original_path="deck.pptx", file_format="pptx"),
+        file_name="deck.pptx",
+        timestamp=None,
+        source=None,
+    )
+    assert order == ["classify", "archive"]
+    assert "Поручение принято" in edits[0]
+
+
+async def test_document_execution_keeps_previously_chosen_route(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        document,
+        "_classify_document_caption",
+        AsyncMock(side_effect=AssertionError("Must not classify a second time")),
+    )
+    monkeypatch.setattr(
+        document, "get_settings", lambda: SimpleNamespace(vault_path=tmp_path)
+    )
+    execute = AsyncMock()
+    monkeypatch.setattr(document, "process_request", execute)
+    await document._execute_document_caption(
+        SimpleNamespace(caption="Сделай отчёт", from_user=SimpleNamespace(id=42)),
+        SimpleNamespace(original_path="deck.pptx", text_path="deck.txt"),
+        intent="action",
+    )
+    execute.assert_awaited_once()

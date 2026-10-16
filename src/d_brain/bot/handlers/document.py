@@ -25,7 +25,11 @@ from d_brain.services.documents import (
     StagedDocumentUpload,
     UnsupportedDocumentError,
 )
-from d_brain.services.processor import TEXT_INTENT_ACTION, CliProcessor
+from d_brain.services.processor import (
+    TEXT_INTENT_ACTION,
+    TEXT_INTENT_CAPTURE,
+    CliProcessor,
+)
 from d_brain.services.session import SessionStore
 from d_brain.services.source_links import (
     SourceInfo,
@@ -128,7 +132,7 @@ async def handle_document(message: Message, bot: Bot) -> None:
         entry_type = f"[forward from: {source_name}]"
     else:
         status_text = (
-            f"📄 Файл сохранён: {file_name}. Извлечение текста запущено в фоне."
+            f"📄 Файл получен: {file_name}. Проверяю подпись и подготавливаю файл."
         )
         entry_type = "[document]"
 
@@ -172,6 +176,16 @@ async def _process_document_upload(
     """
 
     try:
+        caption_intent = await _classify_document_caption(message)
+        if caption_intent == TEXT_INTENT_ACTION:
+            try:
+                await edit_text(
+                    status_msg,
+                    f"⏳ Поручение принято. Подготавливаю файл: {file_name}.",
+                    parse_mode=None,
+                )
+            except Exception:
+                logger.exception("Failed to deliver document action status")
         result = await asyncio.to_thread(
             service.archive_staged_document,
             original_path=staged.original_path,
@@ -213,7 +227,11 @@ async def _process_document_upload(
             source_url=source.url,
         )
 
-        final_text = service.build_result_message(result, file_name=file_name)
+        final_text = (
+            "⏳ Файл подготовлен. Перехожу к выполнению поручения."
+            if caption_intent == TEXT_INTENT_ACTION
+            else service.build_result_message(result, file_name=file_name)
+        )
         # Nested so the fallback send is covered too (code review): the
         # archive, the daily entry and the session record above have all
         # committed by now, so no failure of the *delivery* may reach the
@@ -250,15 +268,13 @@ async def _process_document_upload(
             logger.exception("Failed to deliver document failure report")
         return
 
-    await _execute_document_caption(message, result)
+    await _execute_document_caption(message, result, intent=caption_intent)
 
 
-async def _execute_document_caption(
-    message: Message, result: DocumentArchiveResult
-) -> None:
-    """Run an owner's explicit caption request with the archived file paths."""
+async def _classify_document_caption(message: Message) -> str:
+    """Choose the caption route before document extraction and indexing."""
     if not message.caption or not message.from_user or message.forward_origin:
-        return
+        return TEXT_INTENT_CAPTURE
     settings = get_settings()
     processor = CliProcessor(
         settings.vault_path,
@@ -270,7 +286,17 @@ async def _execute_document_caption(
         classification_model=getattr(settings, "classification_model", ""),
     )
     intent = await asyncio.to_thread(processor.classify_text_intent, message.caption)
-    if intent["intent"] == TEXT_INTENT_ACTION:
+    return intent["intent"]
+
+
+async def _execute_document_caption(
+    message: Message, result: DocumentArchiveResult, *, intent: str | None = None
+) -> None:
+    """Run the caption request using the route chosen before preparation."""
+    if intent is None:
+        intent = await _classify_document_caption(message)
+    if intent == TEXT_INTENT_ACTION and message.from_user:
+        settings = get_settings()
         prompt = (
             f"{message.caption}\n\n"
             f"Original document: {settings.vault_path / result.original_path}\n"
