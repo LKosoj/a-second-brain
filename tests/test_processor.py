@@ -2088,7 +2088,7 @@ def test_answer_question_returns_generated_attachment_paths(tmp_path: Path) -> N
         artifact = vault_path / "attachments" / "migration-plan.xml"
         artifact.parent.mkdir(parents=True)
         artifact.write_text("<Project />", encoding="utf-8")
-        return "Файл создан."
+        return "Файл создан: [План](attachments/migration-plan.xml)."
 
     processor._run_assistant_prompt = fake_run  # type: ignore[method-assign]
 

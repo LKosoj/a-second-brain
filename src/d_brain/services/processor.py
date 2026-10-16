@@ -465,17 +465,20 @@ class CliProcessor:
         self,
         prompt: str,
     ) -> tuple[str, list[str]]:
-        """Return attachments created, changed, or named in the answer."""
-        before = self._attachment_snapshot()
+        """Return only attachments explicitly linked or listed in the final answer."""
         output = self._run_assistant_prompt(prompt)
-        after = self._attachment_snapshot()
-        artifact_paths = sorted(
+        artifact_paths = sorted({
             str(path.resolve())
-            for path, fingerprint in after.items()
-            if before.get(path) != fingerprint
-            or path.relative_to(self.vault_path).as_posix() in output
-            or str(path.resolve()) in output
-        )
+            for path in self._attachment_snapshot()
+            if any(
+                marker in output
+                for ref in (
+                    path.relative_to(self.vault_path).as_posix(),
+                    str(path.resolve()),
+                )
+                for marker in (f"`{ref}`", f"]({ref})", f"](<{ref}>)")
+            )
+        })
         return output, artifact_paths
 
     @staticmethod
@@ -3059,7 +3062,9 @@ If `.session/question-creative-recall.txt` exists and is useful, read it too.
 
 Save newly created user-facing files under `attachments/`. Locate existing
 files at their actual path inside the vault without moving originals. Include
-the exact vault-relative path in the answer.
+the exact vault-relative path in a Markdown link or inline code in the answer.
+List only final deliverables for the user. Do not list working files, previews,
+logs, source scripts, or validation reports unless the user requested them.
 
 If the answer includes actual numerical data over time or a numerical comparison,
 draw one chart
@@ -4729,7 +4734,9 @@ USER REQUEST:
 
 Save newly created user-facing files under `attachments/`. Locate existing
 files at their actual path inside the vault without moving originals. Include
-the exact vault-relative path in the report.
+the exact vault-relative path in a Markdown link or inline code in the report.
+List only final deliverables for the user. Do not list working files, previews,
+logs, source scripts, or validation reports unless the user requested them.
 
 If the report includes actual numerical data over time or a numerical comparison,
 draw one chart
