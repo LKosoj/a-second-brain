@@ -393,6 +393,42 @@ def test_generate_weekly_system_reflection_skips_without_observations(
     assert result["report"].startswith("🛠 **Системная рефлексия**")
 
 
+def test_weekly_system_reflection_can_check_later_fixes(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    session = vault / ".session"
+    session.mkdir(parents=True)
+    (session / "handoff.md").write_text(
+        "# Handoff\n\n## Observations\n- [friction] QMD touch failed\n",
+        encoding="utf-8",
+    )
+    daily = vault / "daily"
+    daily.mkdir()
+    for day in ("2026-10-11", "2026-10-12", "2026-10-15", "2026-10-19"):
+        (daily / f"{day}.md").write_text(
+            "QMD touch fixed and verified\n", encoding="utf-8"
+        )
+    processor = CliProcessor(vault)
+    prompts: list[str] = []
+
+    def run_phase(prompt: str, *, phase_name: str) -> dict[str, Any]:
+        prompts.append(prompt)
+        return {"create_reflection": False}
+
+    processor._run_json_phase = run_phase  # type: ignore[method-assign]
+    processor.generate_weekly_system_reflection(
+        day=date(2026, 10, 18), refresh_qmd=False
+    )
+
+    prompt = prompts[0]
+    assert "daily/2026-10-12.md" in prompt
+    assert "daily/2026-10-15.md" in prompt
+    assert "daily/2026-10-11.md" not in prompt
+    assert "daily/2026-10-19.md" not in prompt
+    assert "read the listed daily sources for later fixes" in prompt
+    assert "A later verified fix supersedes an earlier failure" in prompt
+    assert "Work only from the supplied observations" not in prompt
+
+
 def test_generate_weekly_system_reflection_writes_note_and_updates_handoff(
     tmp_path: Path,
 ) -> None:
