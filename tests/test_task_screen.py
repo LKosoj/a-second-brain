@@ -177,13 +177,45 @@ async def test_arrow_explains_selected_task_with_owner_identity(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("api_key", ["", "  "])
+async def test_unconfigured_todoist_shows_setup_without_loading(monkeypatch, api_key):
+    monkeypatch.setattr(
+        tasks, "get_settings", lambda: SimpleNamespace(todoist_api_key=api_key)
+    )
+    client = Mock()
+    monkeypatch.setattr(tasks, "TodoistTasks", client)
+    render = AsyncMock()
+    monkeypatch.setattr(tasks, "render_dashboard", render)
+
+    await tasks.show_tasks(None, 1, 42)
+
+    client.assert_not_called()
+    render.assert_awaited_once()
+    view = render.await_args.kwargs
+    assert "Todoist не подключён" in view["text"]
+    assert "TODOIST_API_KEY" in view["text"]
+    assert ".env" in view["text"]
+    assert "перезапустите" in view["text"]
+    assert view["preferred_message_id"] == 42
+    assert [
+        button.callback_data
+        for row in view["keyboard"].inline_keyboard
+        for button in row
+    ] == ["menu:home"]
+    session = dashboard.get_dashboard_session(1)
+    assert session.current_screen == "tasks"
+    assert session.task_items == []
+    assert not session.task_busy
+
+
+@pytest.mark.asyncio
 async def test_loading_error_does_not_look_like_empty_task_list(tmp_path, monkeypatch):
     monkeypatch.setattr(
         tasks,
         "get_settings",
         lambda: SimpleNamespace(
             vault_path=tmp_path,
-            todoist_api_key="",
+            todoist_api_key="example-token",
         ),
     )
     monkeypatch.setattr(
@@ -197,6 +229,11 @@ async def test_loading_error_does_not_look_like_empty_task_list(tmp_path, monkey
     monkeypatch.setattr(tasks, "render_dashboard", render)
     await tasks.show_tasks(None, 1, 42)
     assert "Не удалось загрузить" in render.await_args.kwargs["text"]
+    assert [
+        button.callback_data
+        for row in render.await_args.kwargs["keyboard"].inline_keyboard
+        for button in row
+    ] == ["menu:tasks", "menu:home"]
     assert not dashboard.get_dashboard_session(1).task_busy
 
 
@@ -302,7 +339,7 @@ async def test_show_tasks_groups_today_then_overdue_and_sorts_priorities(
         "get_settings",
         lambda: SimpleNamespace(
             vault_path=tmp_path,
-            todoist_api_key="",
+            todoist_api_key="example-token",
         ),
     )
     monkeypatch.setattr(
@@ -375,7 +412,7 @@ async def test_loading_does_not_reopen_menu_after_user_closes_it(tmp_path, monke
         "get_settings",
         lambda: SimpleNamespace(
             vault_path=tmp_path,
-            todoist_api_key="",
+            todoist_api_key="example-token",
         ),
     )
 

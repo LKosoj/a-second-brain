@@ -171,6 +171,26 @@ async def show_tasks(bot: Bot, chat_id: int, message_id: int) -> None:
         ]
     )
     try:
+        settings = get_settings()
+        if not settings.todoist_api_key.strip():
+            await render_dashboard(
+                bot,
+                chat_id=chat_id,
+                session=session,
+                text=(
+                    "Todoist не подключён. "
+                    "Для списка дел нужно настроить подключение.\n\n"
+                    "Получите API-токен в настройках Todoist и укажите его в "
+                    "TODOIST_API_KEY в файле .env на сервере бота. "
+                    "Для подключения также нужны mcp-cli, npx "
+                    "и mcp-config.json проекта. "
+                    "После настройки перезапустите бота и откройте список снова.\n\n"
+                    "Остальные функции бота доступны без Todoist."
+                ),
+                keyboard=back,
+                preferred_message_id=message_id,
+            )
+            return
         await render_dashboard(
             bot,
             chat_id=chat_id,
@@ -179,7 +199,6 @@ async def show_tasks(bot: Bot, chat_id: int, message_id: int) -> None:
             keyboard=back,
             preferred_message_id=message_id,
         )
-        settings = get_settings()
         client = TodoistTasks(settings.vault_path, settings.todoist_api_key)
         timezone, items = await asyncio.to_thread(client.today)
         if (
