@@ -332,6 +332,7 @@ def test_control_plane_doc_current_status_mentions_live_integration_adoption() -
     assert (
         "integration workflow contracts (`integration.documents.archive`, "
         "`integration.web.archive`, `integration.youtube.archive`, "
+        "`integration.todoist.today`, "
         "`integration.plaud.sync`)"
     ) in control_plane
     assert "integration runtime adoption of registry contracts" not in control_plane
@@ -535,6 +536,7 @@ def test_control_plane_registry_exposes_integration_workflows() -> None:
         "integration.documents.archive",
         "integration.web.archive",
         "integration.youtube.archive",
+        "integration.todoist.today",
         "integration.plaud.sync",
     ]
 

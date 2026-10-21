@@ -144,7 +144,7 @@ and which paths are runtime infrastructure.
 | `/why` | Explain why a compiled page states a claim, with its sources |
 | `/process` | Preview today's classification without write-heavy execution |
 | `/process_full` | Run the full daily cycle now |
-| `/menu` | Open the dashboard: digest, decisions queue, brief builder, weekly summary |
+| `/menu` | Open the dashboard: today's tasks, digest, decisions queue, brief builder, weekly summary |
 | `/stats` | Show capture statistics |
 | `/files` | Browse and download allowed vault files |
 

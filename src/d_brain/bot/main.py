@@ -37,6 +37,7 @@ def create_dispatcher() -> Dispatcher:
         photo,
         process,
         reminders,
+        tasks,
         text,
         voice,
         why,
@@ -48,6 +49,7 @@ def create_dispatcher() -> Dispatcher:
     # Register routers - ORDER MATTERS
     dp.include_router(commands.router)
     dp.include_router(menu.router)
+    dp.include_router(tasks.router)
     dp.include_router(process.router)
     dp.include_router(do.router)  # Before voice/text to catch FSM state
     dp.include_router(why.router)  # Before voice/text to catch FSM state

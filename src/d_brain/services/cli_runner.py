@@ -7,6 +7,7 @@ import os
 import re
 import signal
 import subprocess
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +18,7 @@ from d_brain.services.cli_json_stream import (
     recover_cli_error_from_raw_stream,
     recover_cli_text_from_raw_stream,
 )
+from d_brain.services.cli_models import model_unavailable, resolve_light_model
 from d_brain.services.codex_tmux import run_codex_tmux
 from d_brain.services.kimi_acp import run_kimi_acp
 
@@ -326,9 +328,7 @@ CLI_SPECS: dict[AiCliName, CliSpec] = {
 
 
 # Backends driven by a dedicated Python runner instead of an argv/stdin call.
-_EXTERNAL_RUNNERS: dict[
-    AiCliName, Callable[[str, Path, Mapping[str, str], int], str]
-] = {
+_EXTERNAL_RUNNERS: dict[AiCliName, Callable[..., str]] = {
     "kimi": run_kimi_acp,
     "claude-tmux": run_claude_tmux,
     "codex-tmux": run_codex_tmux,
@@ -484,7 +484,9 @@ class CliRunner:
                 self.ai_cli,
             )
 
-    def build_command(self, prompt: str, *, restricted: bool = False) -> list[str]:
+    def build_command(
+        self, prompt: str, *, restricted: bool = False, model: str | None = None
+    ) -> list[str]:
         """Build argv for backend execution.
 
         ``restricted=True`` is for the unattended scheduled cycle: it swaps
@@ -500,7 +502,10 @@ class CliRunner:
             self._warn_if_restricted_unsupported(
                 restricted, has_restricted_variant=False
             )
-            return list(self.spec.argv_prefix)
+            command = list(self.spec.argv_prefix)
+            if model:
+                command[1:1] = ["--model", model]
+            return command
         prefix = self.spec.argv_prefix
         restricted_prefix = self.spec.restricted_argv_prefix
         if restricted and restricted_prefix is not None:
@@ -508,7 +513,10 @@ class CliRunner:
         self._warn_if_restricted_unsupported(
             restricted, has_restricted_variant=restricted_prefix is not None
         )
-        return [*prefix, prompt]
+        command = [*prefix, prompt]
+        if model:
+            command[1:1] = ["--model", model]
+        return command
 
     def _decode_stdout(self, stdout: str) -> str:
         """Recover final assistant text from machine-readable output when enabled."""
@@ -547,6 +555,59 @@ class CliRunner:
         timeout: int,
         extra_env: Mapping[str, str] | None = None,
         restricted: bool = False,
+        light: bool = False,
+    ) -> str:
+        """Run with the normal model, or try a light model then the default."""
+        if not light:
+            return self._run_once(
+                prompt, timeout=timeout, extra_env=extra_env, restricted=restricted
+            )
+
+        deadline = time.monotonic() + timeout
+        model = resolve_light_model(
+            self.ai_cli,
+            self.workdir,
+            build_subprocess_env(extra_env),
+            timeout=min(10, timeout),
+        )
+        remaining = int(deadline - time.monotonic())
+        if remaining <= 0:
+            raise TimeoutError("CLI timeout exhausted during light-model selection")
+        if model:
+            logger.info("Using light model %s for %s", model, self.ai_cli)
+            try:
+                return self._run_once(
+                    prompt,
+                    timeout=remaining,
+                    extra_env=extra_env,
+                    restricted=restricted,
+                    model=model,
+                )
+            except CliExecutionError as error:
+                if not model_unavailable(f"{error}\n{error.stderr}"):
+                    raise
+                logger.warning(
+                    "Light model %s unavailable for %s; retrying with default",
+                    model,
+                    self.ai_cli,
+                )
+        else:
+            logger.info("No light model found for %s; using default", self.ai_cli)
+        remaining = int(deadline - time.monotonic())
+        if remaining <= 0:
+            raise TimeoutError("CLI timeout exhausted before default-model fallback")
+        return self._run_once(
+            prompt, timeout=remaining, extra_env=extra_env, restricted=restricted
+        )
+
+    def _run_once(
+        self,
+        prompt: str,
+        *,
+        timeout: int,
+        extra_env: Mapping[str, str] | None = None,
+        restricted: bool = False,
+        model: str | None = None,
     ) -> str:
         """Execute prompt and return stdout text.
 
@@ -566,7 +627,12 @@ class CliRunner:
                 restricted, has_restricted_variant=False
             )
             try:
-                output = external_runner(prompt, self.workdir, env, timeout)
+                if model:
+                    output = external_runner(
+                        prompt, self.workdir, env, timeout, model=model
+                    )
+                else:
+                    output = external_runner(prompt, self.workdir, env, timeout)
             except TimeoutError:
                 raise
             except Exception as exc:
@@ -587,8 +653,10 @@ class CliRunner:
                 restricted, has_restricted_variant=restricted_stdin_prefix is not None
             )
             cmd = list(stdin_prefix)
+            if model:
+                cmd[1:1] = ["--model", model]
         else:
-            cmd = self.build_command(prompt, restricted=restricted)
+            cmd = self.build_command(prompt, restricted=restricted, model=model)
 
         try:
             # start_new_session puts the CLI into its own process group so a

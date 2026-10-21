@@ -63,6 +63,146 @@ def _process_alive(pid: int) -> bool:
     return state != "Z"
 
 
+@pytest.mark.parametrize("backend", list(cli_runner.CLI_SPECS))
+def test_light_model_rejection_retries_default_for_every_backend(
+    tmp_path, monkeypatch, backend
+):
+    attempts = []
+    monkeypatch.setattr(cli_runner, "resolve_light_model", lambda *a, **k: "test-mini")
+
+    def run_once(self, prompt, **kwargs):
+        attempts.append((prompt, kwargs))
+        if kwargs.get("model"):
+            raise CliExecutionError("The 'test-mini' model is not supported")
+        return "default answer"
+
+    monkeypatch.setattr(CliRunner, "_run_once", run_once)
+    runner = CliRunner(tmp_path, backend)
+    assert runner.run("question", timeout=30, light=True, restricted=True) == (
+        "default answer"
+    )
+    assert [call[1].get("model") for call in attempts] == ["test-mini", None]
+    assert all(call[0] == "question" for call in attempts)
+    assert all(call[1]["restricted"] for call in attempts)
+    assert all(0 < call[1]["timeout"] <= 30 for call in attempts)
+
+
+@pytest.mark.parametrize("error", ["Unauthorized", "Network error", "quota exceeded"])
+def test_light_model_does_not_retry_unrelated_errors(tmp_path, monkeypatch, error):
+    attempts = []
+    monkeypatch.setattr(cli_runner, "resolve_light_model", lambda *a, **k: "test-mini")
+
+    def run_once(self, prompt, **kwargs):
+        attempts.append(kwargs)
+        raise CliExecutionError(error)
+
+    monkeypatch.setattr(CliRunner, "_run_once", run_once)
+    with pytest.raises(CliExecutionError, match=error):
+        CliRunner(tmp_path, "codex").run("question", timeout=30, light=True)
+    assert len(attempts) == 1
+
+
+def test_light_model_success_needs_one_attempt(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli_runner, "resolve_light_model", lambda *a, **k: "test-mini")
+    calls = []
+    monkeypatch.setattr(
+        cli_runner.subprocess, "Popen",
+        _fake_popen(calls, stdout='{"type":"result","result":"answer"}\n'),
+    )
+    assert (
+        CliRunner(tmp_path, "claude").run("question", timeout=30, light=True)
+        == "answer"
+    )
+    assert calls[0]["args"][0][1:3] == ["--model", "test-mini"]
+    assert calls[0]["input"] == "question"
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("backend", ["kimi", "claude-tmux", "codex-tmux"])
+def test_light_model_is_passed_to_external_runner(tmp_path, monkeypatch, backend):
+    monkeypatch.setattr(cli_runner, "resolve_light_model", lambda *a, **k: "test-mini")
+    calls = []
+
+    def run(prompt, workdir, env, timeout, *, model=None):
+        calls.append(model)
+        if model:
+            raise RuntimeError("unknown model test-mini")
+        return "answer"
+
+    monkeypatch.setitem(cli_runner._EXTERNAL_RUNNERS, backend, run)
+    assert (
+        CliRunner(tmp_path, backend).run("question", timeout=30, light=True)
+        == "answer"
+    )
+    assert calls == ["test-mini", None]
+
+
+def test_absent_light_model_runs_default_without_model_flag(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli_runner, "resolve_light_model", lambda *a, **k: None)
+    calls = []
+    monkeypatch.setattr(
+        cli_runner.subprocess, "Popen",
+        _fake_popen(calls, stdout='{"type":"result","result":"answer"}\n'),
+    )
+    CliRunner(tmp_path, "claude").run("question", timeout=30, light=True)
+    assert "--model" not in calls[0]["args"][0]
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_structured_model_error_retries_without_override(
+    tmp_path, monkeypatch, returncode
+):
+    monkeypatch.setattr(cli_runner, "resolve_light_model", lambda *a, **k: "test-mini")
+    calls = []
+    failed = _fake_popen(
+        calls, returncode=returncode,
+        stdout='{"type":"turn.failed","error":{"message":"model_not_found"}}\n',
+    )
+    succeeded = _fake_popen(
+        calls,
+        stdout='{"type":"item.completed","item":{"type":"agent_message",'
+        '"text":"answer"}}\n',
+    )
+    processes = iter([failed, succeeded])
+    monkeypatch.setattr(
+        cli_runner.subprocess, "Popen", lambda *a, **k: next(processes)(*a, **k)
+    )
+    assert (
+        CliRunner(tmp_path, "codex").run("question", timeout=30, light=True)
+        == "answer"
+    )
+    assert "--model" in calls[0]["args"][0]
+    assert "--model" not in calls[1]["args"][0]
+
+
+def test_default_model_failure_is_returned_without_a_third_attempt(
+    tmp_path, monkeypatch
+):
+    attempts = []
+    monkeypatch.setattr(cli_runner, "resolve_light_model", lambda *a, **k: "test-mini")
+
+    def run_once(self, prompt, **kwargs):
+        attempts.append(kwargs.get("model"))
+        if kwargs.get("model"):
+            raise CliExecutionError("unknown model")
+        raise CliExecutionError("default model unavailable")
+
+    monkeypatch.setattr(CliRunner, "_run_once", run_once)
+    with pytest.raises(CliExecutionError, match="default model unavailable"):
+        CliRunner(tmp_path, "codex").run("question", timeout=30, light=True)
+    assert attempts == ["test-mini", None]
+
+
+@pytest.mark.parametrize(
+    "backend", ["claude", "codex", "qwen", "gemini", "grok", "opencode"]
+)
+def test_explicit_model_precedes_prompt_flags(backend):
+    command = CliRunner(Path("."), backend).build_command("question", model="test-mini")
+    assert command[1:3] == ["--model", "test-mini"]
+    assert command[-1] == "question"
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -224,7 +364,10 @@ def test_codex_tmux_delegates_to_the_tmux_runner(
     assert "secret prompt" not in runner.build_command("secret prompt")
 
 
-def test_kimi_uses_acp_stdio_without_prompt_in_argv(tmp_path: Path) -> None:
+@pytest.mark.parametrize("model", [None, "example-mini"])
+def test_kimi_uses_acp_stdio_without_prompt_in_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, model: str | None
+) -> None:
     executable = tmp_path / "kimi"
     marker = tmp_path / "request.json"
     executable.write_text(
@@ -289,16 +432,19 @@ def test_kimi_uses_acp_stdio_without_prompt_in_argv(tmp_path: Path) -> None:
     env_path = f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}"
     runner = CliRunner(tmp_path, "kimi")
     prompt = "secret prompt that must stay off argv"
+    monkeypatch.setattr(cli_runner, "resolve_light_model", lambda *a, **k: model)
 
     output = runner.run(
         prompt,
         timeout=5,
         extra_env={"PATH": env_path, "KIMI_TEST_MARKER": str(marker)},
+        light=model is not None,
     )
 
     assert output == '{"ok": true}'
     request = json.loads(marker.read_text())
-    assert request == {"argv": ["acp"], "prompt": prompt}
+    argv = ["--model", model, "acp"] if model else ["acp"]
+    assert request == {"argv": argv, "prompt": prompt}
 
 
 @pytest.mark.parametrize(

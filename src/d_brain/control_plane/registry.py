@@ -440,6 +440,21 @@ CONTROL_PLANE_REGISTRY: tuple[WorkflowSpec, ...] = (
         notes="Archive one fetched YouTube transcript into vault notes.",
     ),
     WorkflowSpec(
+        name="integration.todoist.today",
+        kind=WORKFLOW_KIND_INTEGRATION,
+        entrypoint="d_brain.bot.handlers.tasks.handle_task_callback",
+        owner="bot",
+        display_name="Today's Tasks",
+        triggers=("menu:tasks", "tasks:"),
+        required_context=("todoist",),
+        allowed_writes=("todoist", ".session", "answer-artifact"),
+        fallback_behavior=(
+            "Keep task unchecked unless Todoist confirms completion; task questions "
+            "try a light model and fall back to the CLI default if unavailable."
+        ),
+        notes="Today's and overdue tasks; completion and read-only task questions.",
+    ),
+    WorkflowSpec(
         name="integration.plaud.sync",
         kind=WORKFLOW_KIND_INTEGRATION,
         entrypoint="d_brain.services.plaud.PlaudSyncService.sync",

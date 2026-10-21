@@ -98,6 +98,24 @@ Gemini authentication may use `GOOGLE_API_KEY`, `GEMINI_API_KEY`,
 `GOOGLE_APPLICATION_CREDENTIALS`, or `GOOGLE_GENAI_USE_VERTEXAI`. The other AI
 CLIs use their own login commands.
 
+## Light models for individual CLI requests
+
+`CliRunner.run(..., light=True)` tries a light model for a read-only request.
+Claude uses `haiku`, and Gemini uses `flash-lite`. Codex, Grok, Kimi and
+OpenCode use their CLI catalogs; Qwen uses its configured `modelProviders`.
+Known light families are preferred, with newer numeric versions selected
+within a tier. A catalog entry does not guarantee account access.
+
+If the selected model is rejected, the runner retries once without a model
+override, preserving the CLI's configured default. Missing catalogs or no
+matching light model also use the default. Network, authentication, quota
+and timeout failures do not trigger another model. Both attempts share the
+request timeout. Selection and fallback are recorded in the application log.
+The tmux backends support the same selection. Existing callers keep their
+normal model until they explicitly request `light=True`.
+The task list's detail arrow requests light models for both CLI-based retrieval
+planning and the final answer. Other questions and actions keep their normal model.
+
 ## Validation
 
 Run diagnostics after every configuration change:

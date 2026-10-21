@@ -66,7 +66,16 @@ Typical examples:
 - `integration.documents.archive`
 - `integration.web.archive`
 - `integration.youtube.archive`
+- `integration.todoist.today`
 - `integration.plaud.sync`
+
+The Telegram menu's **Дела на сегодня** screen reads today's and overdue
+Todoist tasks, ordered by priority within each group. Embedded checkbox
+buttons complete a task; overdue checkboxes use the danger color. Completion
+is confirmed by Todoist and checks the original due date before advancing a
+recurring task. The adjacent arrow asks the existing read-only question
+workflow for details, using a light CLI model with fallback to the CLI default.
+The list refreshes on opening or with **Обновить**; it has no separate task store.
 
 ## Ownership Model
 
@@ -170,7 +179,7 @@ The control plane registry is the canonical source of truth for all workflow def
 - question routing (5 route strategies: planning, relationship, status-history, fact-lookup, general)
 - capture workflow metadata (`capture.daily-entry`)
 - scheduled maintenance orchestration (`maintenance.scheduled-cycle`, `maintenance.compiled-nightly`, `maintenance.vault-health`, `maintenance.compiled-fact-check`, `maintenance.compiled-wiki-care`, `maintenance.compiled-digest`)
-- integration workflow contracts (`integration.documents.archive`, `integration.web.archive`, `integration.youtube.archive`, `integration.plaud.sync`)
+- integration workflow contracts (`integration.documents.archive`, `integration.web.archive`, `integration.youtube.archive`, `integration.todoist.today`, `integration.plaud.sync`)
 - top-level text workflow resolution via `router.resolve_text_workflow()`
 
 Navigation docs (`CLAUDE.md`, skill docs, this file) reference the registry as their upstream source. They should never redefine workflow behavior independently.

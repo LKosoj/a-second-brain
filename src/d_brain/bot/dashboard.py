@@ -49,9 +49,11 @@ from d_brain.services.telegram_markup import (
     normalize_markdown_input,
     truncate_plain_text_for_edit,
 )
+from d_brain.services.todoist_tasks import TodoistTask
 from d_brain.services.vault_lock import vault_write_lock
 
 DashboardScreen = Literal[
+    "tasks",
     "home",
     "stats",
     "file_roots",
@@ -109,6 +111,10 @@ class DashboardSession:
     queue_page: int = 0
     queue_items: list[QueueItem] = field(default_factory=list)
     weekly_review: WeeklyReview | None = None
+    task_items: list[TodoistTask] = field(default_factory=list)
+    task_timezone: str = "UTC"
+    task_page: int = 0
+    task_busy: bool = False
 
 
 _SESSIONS: dict[int, DashboardSession] = {}
@@ -201,6 +207,7 @@ def build_home_keyboard() -> InlineKeyboardMarkup:
     return _keyboard(
         [
             [("✨ Задать вопрос или поручение", "menu:do")],
+            [("☑ Дела на сегодня", "menu:tasks")],
             [("📋 Сводки", "menu:summaries"), ("🗂 Требуют решения", "menu:queue")],
             [("📁 Мои файлы", "menu:files"), ("⚙️ Разобрать записи", "menu:processing")],
             [("⋯ Ещё", "menu:more")],
@@ -615,6 +622,7 @@ async def render_dashboard(
     keyboard: InlineKeyboardMarkup,
     preferred_message_id: int | None = None,
     notice: str | None = None,
+    rich_message: InputRichMessage | None = None,
 ) -> None:
     """Render one dashboard screen by editing or sending a message."""
     target_message_id = preferred_message_id or session.dashboard_message_id
@@ -652,7 +660,7 @@ async def render_dashboard(
             if len(payload_message) <= TELEGRAM_TEXT_LIMIT:
                 break
 
-    rich_message = build_rich_menu(payload_text, keyboard)
+    rich_message = rich_message or build_rich_menu(payload_text, keyboard)
     try:
         if target_message_id:
             try:

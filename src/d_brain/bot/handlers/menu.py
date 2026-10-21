@@ -35,6 +35,7 @@ from d_brain.bot.dashboard import (
 from d_brain.bot.handlers.brief import start_brief_flow
 from d_brain.bot.handlers.do import start_do_flow
 from d_brain.bot.handlers.process import run_full_process, run_interactive_process
+from d_brain.bot.handlers.tasks import show_tasks
 from d_brain.bot.replies import answer_rich_text, answer_text, edit_rich_text, edit_text
 from d_brain.config import get_settings
 from d_brain.manifest import load_manifest_for_vault
@@ -257,6 +258,14 @@ async def handle_menu_callback(
         return
 
     await state.clear()
+
+    if data == "menu:tasks":
+        if session.task_busy:
+            await query.answer("Подождите, список задач обновляется.")
+            return
+        await query.answer()
+        await show_tasks(bot, chat_id, message_id)
+        return
 
     if data in {"menu:summaries", "menu:processing", "menu:more", "menu:help"}:
         await query.answer()

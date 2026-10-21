@@ -86,8 +86,9 @@ def test_all_previous_actions_are_reachable_and_navigation_is_last():
         "menu:weekly",
         "menu:jobhealth",
         "menu:vaultmap",
+        "menu:tasks",
     } <= callbacks
-    assert len([b for row in home.inline_keyboard for b in row]) == 7
+    assert len([b for row in home.inline_keyboard for b in row]) == 8
     assert [b.callback_data for b in home.inline_keyboard[0]] == ["menu:do"]
     for keyboard in sections:
         assert [b.callback_data for b in keyboard.inline_keyboard[-1]] == [

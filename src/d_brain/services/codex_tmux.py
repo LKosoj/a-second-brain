@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from d_brain.services.cli_models import model_unavailable
+
 logger = logging.getLogger(__name__)
 
 _SESSION_NAME = "dbrain"
@@ -39,6 +41,7 @@ class _RolloutState:
     prompt_seen: bool = False
     turn_finished: bool = False
     assistant_text: str = ""
+    error: str = ""
 
 
 def _tmux(
@@ -122,11 +125,16 @@ def _scan_rollout(path: Path, prompt: str) -> _RolloutState:
             continue
         if record_type != "event_msg":
             continue
+        if payload_type == "error":
+            detail = str(payload.get("message") or payload.get("error") or "")
+            if model_unavailable(detail):
+                state.error = detail
         if payload_type == "task_complete":
             text = str(payload.get("last_agent_message") or "").strip()
             if text:
                 state.assistant_text = text
             state.turn_finished = True
+            state.error = ""
     return state
 
 
@@ -172,6 +180,10 @@ def _fail_if_pane_died(socket: str, env: Mapping[str, str]) -> None:
         raise CodexTmuxError("codex tmux session disappeared before answering")
     dead, _, status = output.splitlines()[0].partition(" ")
     if dead.strip() == "1":
+        screen = _tmux(socket, "capture-pane", "-p", "-t", _SESSION_NAME, env=env)
+        for line in screen.splitlines():
+            if model_unavailable(line):
+                raise CodexTmuxError(line.strip())
         raise CodexTmuxError(
             f"codex exited inside tmux with status {status.strip() or 'unknown'}"
         )
@@ -280,6 +292,8 @@ def _wait_for_answer(
     last_progress = time.monotonic()
     while True:
         state = _scan_rollout(path, prompt)
+        if state.error:
+            raise CodexTmuxError(state.error)
         if state.turn_finished:
             if not state.assistant_text:
                 raise CodexTmuxError("codex finished the turn without any text")
@@ -315,6 +329,8 @@ def run_codex_tmux(
     workdir: Path,
     env: Mapping[str, str],
     timeout: int,
+    *,
+    model: str | None = None,
 ) -> str:
     """Run one isolated Codex TUI session and return final assistant text."""
 
@@ -342,6 +358,7 @@ def run_codex_tmux(
             "-c",
             str(workdir),
             "codex",
+            *(["--model", model] if model else []),
             "--no-alt-screen",
             "-c",
             "check_for_update_on_startup=false",

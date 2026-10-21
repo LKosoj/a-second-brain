@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from d_brain.services.cli_models import model_unavailable
+
 logger = logging.getLogger(__name__)
 
 _SESSION_NAME = "dbrain"
@@ -141,6 +143,8 @@ def _scan_transcript(path: Path) -> _TranscriptState:
             if not isinstance(message, dict):
                 continue
             text = _text_from_content(message.get("content")).strip()
+            if record.get("isApiErrorMessage") and model_unavailable(text):
+                raise ClaudeTmuxError(text)
             if text:
                 state.assistant_text = text
             if str(message.get("stop_reason") or "") == "end_turn":
@@ -175,6 +179,10 @@ def _fail_if_pane_died(socket: str, env: Mapping[str, str]) -> None:
         raise ClaudeTmuxError("claude tmux session disappeared before answering")
     dead, _, status = output.splitlines()[0].partition(" ")
     if dead.strip() == "1":
+        screen = _tmux(socket, "capture-pane", "-p", "-t", _SESSION_NAME, env=env)
+        for line in screen.splitlines():
+            if model_unavailable(line):
+                raise ClaudeTmuxError(line.strip())
         raise ClaudeTmuxError(
             f"claude exited inside tmux with status {status.strip() or 'unknown'}"
         )
@@ -335,6 +343,8 @@ def run_claude_tmux(
     workdir: Path,
     env: Mapping[str, str],
     timeout: int,
+    *,
+    model: str | None = None,
 ) -> str:
     """Run one isolated claude TUI session and return final assistant text."""
 
@@ -364,6 +374,7 @@ def run_claude_tmux(
             "-c",
             str(workdir),
             "claude",
+            *(["--model", model] if model else []),
             "--dangerously-skip-permissions",
             "--session-id",
             session_id,

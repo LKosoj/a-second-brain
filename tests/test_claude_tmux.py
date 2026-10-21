@@ -93,10 +93,23 @@ def _args_of(fake: _FakeTmux, name: str) -> list[list[str]]:
     return [command[3:] for command in fake.commands if command[3] == name]
 
 
+def test_model_error_in_transcript_is_propagated(tmp_path):
+    path = tmp_path / "transcript.jsonl"
+    path.write_text(json.dumps({
+        "type": "assistant",
+        "isApiErrorMessage": True,
+        "message": {"content": [{"type": "text", "text": "unknown model"}]},
+    }))
+    with pytest.raises(ClaudeTmuxError, match="unknown model"):
+        claude_tmux._scan_transcript(path)
+
+
+@pytest.mark.parametrize("model", [None, "haiku"])
 def test_run_claude_tmux_returns_text_from_transcript(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     fast_polling: None,
+    model: str | None,
 ) -> None:
     home = tmp_path / "home"
     fake = _FakeTmux(home)
@@ -107,10 +120,15 @@ def test_run_claude_tmux_returns_text_from_transcript(
         tmp_path / "work",
         {"HOME": str(home)},
         30,
+        model=model,
     )
 
     assert output == "answer text"
     assert fake.pasted_prompt == "line one\nline two"
+    command = _args_of(fake, "new-session")[0]
+    assert ("--model" in command) == (model is not None)
+    if model:
+        assert command[command.index("--model") + 1] == model
 
 
 def test_run_claude_tmux_pastes_prompt_without_argv_and_cleans_up(

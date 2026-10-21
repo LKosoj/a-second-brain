@@ -9,6 +9,16 @@ from d_brain.services import codex_tmux
 from d_brain.services.codex_tmux import run_codex_tmux
 
 
+def test_model_error_in_rollout_is_propagated(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    path.write_text(json.dumps({
+        "type": "event_msg",
+        "payload": {"type": "error", "message": "model_not_found"},
+    }))
+    with pytest.raises(codex_tmux.CodexTmuxError, match="model_not_found"):
+        codex_tmux._wait_for_answer("unused", path, "question", {}, 0)
+
+
 class _FakeTmux:
     def __init__(self, home: Path) -> None:
         self.home = home
@@ -96,9 +106,11 @@ class _FakeTmux:
         )()
 
 
+@pytest.mark.parametrize("model", [None, "example-mini"])
 def test_run_codex_tmux_uses_buffer_reads_rollout_and_cleans_up(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    model: str | None,
 ) -> None:
     fake = _FakeTmux(tmp_path)
     monkeypatch.setattr(codex_tmux.subprocess, "run", fake)
@@ -111,11 +123,15 @@ def test_run_codex_tmux_uses_buffer_reads_rollout_and_cleans_up(
         Path("/work"),
         {"HOME": str(tmp_path)},
         30,
+        model=model,
     )
 
     assert output == "Готово"
     new_session = next(args for args, _ in fake.calls if args[3] == "new-session")
     assert "secret prompt" not in new_session
+    assert ("--model" in new_session) == (model is not None)
+    if model:
+        assert new_session[new_session.index("--model") + 1] == model
     assert "check_for_update_on_startup=false" in new_session
     assert fake.capture_count == 3
     assert any(input_text == "secret prompt" for _, input_text in fake.calls)

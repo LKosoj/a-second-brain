@@ -83,11 +83,13 @@ async def _run_kimi_acp(
     prompt: str,
     workdir: Path,
     env: Mapping[str, str],
+    model: str | None = None,
 ) -> str:
     client = _KimiAcpClient()
     async with spawn_agent_process(
         cast(Client, client),
         "kimi",
+        *(["--model", model] if model else []),
         "acp",
         env=env,
         cwd=workdir,
@@ -115,12 +117,14 @@ def run_kimi_acp(
     workdir: Path,
     env: Mapping[str, str],
     timeout: int,
+    *,
+    model: str | None = None,
 ) -> str:
     """Run one isolated Kimi ACP session and return final assistant text."""
 
     return asyncio.run(
         asyncio.wait_for(
-            _run_kimi_acp(prompt, workdir, env),
+            _run_kimi_acp(prompt, workdir, env, model),
             timeout=timeout,
         )
     )

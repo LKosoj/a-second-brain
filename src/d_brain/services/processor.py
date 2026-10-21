@@ -427,17 +427,19 @@ class CliProcessor:
             restricted=self._restricted_mode,
         )
 
-    def _run_vault_prompt(self, prompt: str) -> str:
+    def _run_vault_prompt(self, prompt: str, *, light: bool = False) -> str:
         """Execute prompt via the configured CLI from the vault root."""
         extra_env = {
             **self._cli_extra_env(),
             "D_BRAIN_CONTEXT_PACK_MODE": "runtime",
         }
+        options: dict[str, Any] = {"light": True} if light else {}
         return self._assistant_runner.run(
             prompt,
             timeout=DEFAULT_TIMEOUT,
             restricted=self._restricted_mode,
             extra_env=extra_env,
+            **options,
         )
 
     def _run_assistant_prompt(self, prompt: str) -> str:
@@ -464,9 +466,14 @@ class CliProcessor:
     def _run_assistant_prompt_with_artifacts(
         self,
         prompt: str,
+        *,
+        light: bool = False,
     ) -> tuple[str, list[str]]:
         """Return only attachments explicitly linked or listed in the final answer."""
-        output = self._run_assistant_prompt(prompt)
+        output = (
+            self._run_vault_prompt(prompt, light=True)
+            if light else self._run_assistant_prompt(prompt)
+        )
         artifact_paths = sorted({
             str(path.resolve())
             for path in self._attachment_snapshot()
@@ -488,15 +495,20 @@ class CliProcessor:
             return prompt
         return prompt.replace(marker, f"{block}\n\n{marker}", 1)
 
-    def _build_auto_recall_block(self, task: str, *, purpose: str) -> str:
+    def _build_auto_recall_block(
+        self, task: str, *, purpose: str, light: bool = False
+    ) -> str:
         """Best-effort auto recall block built before the main CLI run."""
         try:
+            def run_prompt(prompt: str) -> str:
+                return self._run_vault_prompt(prompt, light=True)
+
             return build_qmd_recall_block(
                 self.vault_path,
                 task=task,
                 purpose=purpose,
                 config=self._recall_planner_config,
-                run_prompt=self._run_vault_prompt,
+                run_prompt=run_prompt if light else self._run_vault_prompt,
             )
         except Exception as exc:
             logger.warning("Auto recall planner failed: %s", exc)
@@ -3807,13 +3819,16 @@ or recent vault notes before answering instead of guessing.
         return build_control_plane_question_route_block(question)
 
     def _inject_question_context_blocks(
-        self, prompt: str, question: str, user_id: int = 0
+        self, prompt: str, question: str, user_id: int = 0, *, light: bool = False
     ) -> str:
         """Inject route-aware context blocks before the user question."""
         compiled_block = self._build_compiled_briefings_block(question)
+        options: dict[str, Any] = {"light": True} if light else {}
         recall_block = (
             "" if compiled_block.startswith("=== COMPILED CATALOG ===")
-            else self._build_auto_recall_block(question, purpose="question_answer")
+            else self._build_auto_recall_block(
+                question, purpose="question_answer", **options
+            )
         )
         block_by_name = {
             "compiled": compiled_block,
@@ -3840,7 +3855,9 @@ or recent vault notes before answering instead of guessing.
             prompt = self._inject_prompt_block(prompt, "USER QUESTION:", block)
         return prompt
 
-    def answer_question(self, question: str, user_id: int = 0) -> dict[str, Any]:
+    def answer_question(
+        self, question: str, user_id: int = 0, *, light: bool = False
+    ) -> dict[str, Any]:
         """Answer a plain-text question directly without capturing it as a note."""
         try:
             self._capture_creative_recall(
@@ -3848,8 +3865,14 @@ or recent vault notes before answering instead of guessing.
                 file_name="question-creative-recall.txt",
             )
             prompt = self._build_question_answer_prompt(question, user_id)
-            prompt = self._inject_question_context_blocks(prompt, question, user_id)
-            output, artifact_paths = self._run_assistant_prompt_with_artifacts(prompt)
+            options: dict[str, Any] = {"light": True} if light else {}
+            prompt = self._inject_question_context_blocks(
+                prompt, question, user_id, **options
+            )
+            output, artifact_paths = (
+                self._run_assistant_prompt_with_artifacts(prompt, light=True)
+                if light else self._run_assistant_prompt_with_artifacts(prompt)
+            )
             normalized = self._normalize_owner_report_markdown(output)
             normalized = self._append_question_provenance(normalized, question)
             filed_artifact_path = self._file_output_artifact_if_useful(
