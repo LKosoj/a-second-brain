@@ -33,6 +33,11 @@ function parseArgs(argv) {
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
+    // Everything after "--" is the query, even if it looks like an option.
+    if (arg === "--") {
+      queryParts.push(...argv.slice(index + 1));
+      break;
+    }
     if (arg === "--scope-uri" && index + 1 < argv.length) {
       scope.push(argv[++index]);
       continue;

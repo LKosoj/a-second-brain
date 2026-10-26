@@ -9,12 +9,18 @@ import re
 import shutil
 import subprocess
 import time
-import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from d_brain.services.claude_tmux import (
+    new_socket_name,
+    raise_if_stopping,
+    register_session,
+    sanitize_tmux_prompt,
+    unregister_session,
+)
 from d_brain.services.cli_models import model_unavailable
 
 logger = logging.getLogger(__name__)
@@ -166,6 +172,7 @@ def _find_rollout(
 
 
 def _fail_if_pane_died(socket: str, env: Mapping[str, str]) -> None:
+    raise_if_stopping()
     output = _tmux(
         socket,
         "list-panes",
@@ -337,7 +344,11 @@ def run_codex_tmux(
     if shutil.which("tmux") is None:
         raise CodexTmuxError("tmux is required for the codex-tmux backend")
 
-    socket = f"dbrain-{uuid.uuid4().hex[:12]}"
+    # The rollout stores what the TUI received, so it is matched against the
+    # sanitized text.
+    prompt = sanitize_tmux_prompt(prompt)
+
+    socket = new_socket_name()
     tmux_env = {**env, "TERM": "xterm-256color"}
     root = _rollout_root(env)
     existing = _rollout_paths(root)
@@ -345,6 +356,7 @@ def run_codex_tmux(
     rollout: Path | None = None
 
     try:
+        register_session(socket, tmux_env)
         _tmux(
             socket,
             "new-session",
@@ -365,6 +377,9 @@ def run_codex_tmux(
             "--dangerously-bypass-approvals-and-sandbox",
             env=tmux_env,
         )
+        # Shutdown may have run while the server did not exist yet; finally
+        # below kills the one just created.
+        raise_if_stopping()
         _tmux(
             socket,
             "set-option",
@@ -382,6 +397,7 @@ def run_codex_tmux(
         answer = _wait_for_answer(socket, rollout, prompt, tmux_env, deadline)
     finally:
         _tmux(socket, "kill-server", env=tmux_env, check=False)
+        unregister_session(socket)
     if rollout is not None:
         _cleanup_rollout(rollout)
     return answer

@@ -1,11 +1,12 @@
 """Weekly wiki care for the compiled layer (T5 "Еженедельный уход за вики").
 
 Independent satellite module, built the same way ``compiled_fact_check.py``
-is: it constructs its own ``CompiledBriefingService`` and calls its private
-classmethod/staticmethod helpers directly (``_section_bullets``,
-``_replace_section``, ``_insert_section_before``, ``_has_section``,
-``_render_bullets``, ``_source_links_from_note``, ``_read_page_text``,
-``_write_settled_page``, ...) rather than duplicating that logic.
+is: it constructs its own ``CompiledBriefingService`` and uses the page
+helpers from ``compiled_page`` (``section_bullets``, ``replace_section``,
+``insert_section_before``, ``has_section``, ``source_links_from_note``,
+``read_page_text``, ...) and the service's public forwards
+(``write_settled_page``, ``run_json_dict_prompt``, ...) rather than
+duplicating that logic.
 
 Unlike the nightly compile-enrich pass, this service instance never gets a
 ``CompileEnrichPass`` (``_active_pass`` stays ``None`` for its whole life),
@@ -62,16 +63,19 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from d_brain.clock import owner_now, owner_today
+from d_brain.services import compiled_page
+from d_brain.services.atomic_io import atomic_write_file_text
 from d_brain.services.compiled_briefings import (
     COMPILED_BRIEFING_DOMAINS,
     DATE_ONLY_RE,
     DEFAULT_QUEUE_BATCH_SIZE,
     MAX_SOURCE_EXCERPT_CHARS,
-    WIKILINK_RE,
     CompiledBriefingCandidate,
     CompiledBriefingService,
-    _atomic_write_text,
 )
+from d_brain.services.compiled_page import WIKILINK_RE
+from d_brain.services.json_normalizer import extract_first_json_dict
 from d_brain.services.link_summary import LinkSummaryService
 from d_brain.services.ops_log import append_ops_log
 from d_brain.services.web_archive import WebArchiveService
@@ -202,7 +206,7 @@ def _write_wiki_care_journal(
         "errors": errors,
         "model_calls_used": model_calls_used,
     }
-    _atomic_write_text(
+    atomic_write_file_text(
         vault_path / _JOURNAL_RELATIVE_PATH,
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
     )
@@ -241,9 +245,9 @@ def _collect_wiki_care_pages(service: CompiledBriefingService) -> list[_WikiCare
             continue
         for path in sorted(domain_dir.glob("*.md")):
             rel_path = path.relative_to(service.vault_path).as_posix()
-            text = CompiledBriefingService._read_page_text(path)
-            title = CompiledBriefingService._title_from_text(text).strip() or path.stem
-            sources = frozenset(CompiledBriefingService._source_links_from_note(text))
+            text = compiled_page.read_page_text(path)
+            title = compiled_page.title_from_text(text).strip() or path.stem
+            sources = frozenset(compiled_page.source_links_from_note(text))
             # Every page this one already links to, anywhere in its text --
             # a body link counts as a link just as a Related Pages one does.
             related_targets = frozenset(
@@ -252,7 +256,7 @@ def _collect_wiki_care_pages(service: CompiledBriefingService) -> list[_WikiCare
             )
             scrubbed = text
             for heading in _LINK_SCAN_EXCLUDED_SECTIONS:
-                scrubbed = CompiledBriefingService._replace_section(
+                scrubbed = compiled_page.replace_section(
                     scrubbed, heading, []
                 )
             scrubbed = _WIKILINK_STRIP_RE.sub("", scrubbed)
@@ -369,11 +373,11 @@ def _link_related_page(
     """
     note_path = service.vault_path / rel_path
     try:
-        text = CompiledBriefingService._read_page_text(note_path)
+        text = compiled_page.read_page_text(note_path)
     except FileNotFoundError:
         return False, "page missing"
     target = _related_target(target_rel_path)
-    existing_bullets = CompiledBriefingService._section_bullets(text, "Related Pages")
+    existing_bullets = compiled_page.section_bullets(text, "Related Pages")
     existing_targets = {
         match.strip() for match in WIKILINK_RE.findall("\n".join(existing_bullets))
     }
@@ -381,12 +385,12 @@ def _link_related_page(
         return False, None
     new_bullets = [*existing_bullets, f"[[{target}|{target_title}]]"]
     new_lines = [f"- {bullet}" for bullet in new_bullets]
-    if CompiledBriefingService._has_section(text, "Related Pages"):
-        new_text = CompiledBriefingService._replace_section(
+    if compiled_page.has_section(text, "Related Pages"):
+        new_text = compiled_page.replace_section(
             text, "Related Pages", new_lines
         )
     else:
-        new_text = CompiledBriefingService._insert_section_before(
+        new_text = compiled_page.insert_section_before(
             text,
             heading="Related Pages",
             before_heading="Sources",
@@ -408,7 +412,7 @@ def _link_related_page(
         tier="active",
         text=text,
     )
-    written = service._write_settled_page(candidate, new_text)
+    written = service.write_settled_page(candidate, new_text)
     return written, None
 
 
@@ -435,7 +439,7 @@ def _apply_missing_links(
             break
         batches_run += 1
         try:
-            payload = service._run_json_dict_prompt(
+            payload = service.run_json_dict_prompt(
                 prompt=_missing_links_prompt(batch),
                 timeout=120,
                 error_context="wiki-care-related-links",
@@ -523,7 +527,7 @@ def _find_missing_page_topics(
         if not domain_dir.exists():
             continue
         for path in sorted(domain_dir.glob("*.md")):
-            text = CompiledBriefingService._read_page_text(path)
+            text = compiled_page.read_page_text(path)
             for target in WIKILINK_RE.findall(text):
                 target = target.split("#", 1)[0].strip()
                 if not target.startswith("compiled/"):
@@ -547,10 +551,10 @@ def _find_missing_page_topics(
 
     catalog_path = service.vault_path / "MOC" / "compiled-index.md"
     if catalog_path.exists():
-        catalog_text = CompiledBriefingService._read_page_text(catalog_path)
+        catalog_text = compiled_page.read_page_text(catalog_path)
         if catalog_text.strip() and budget.spend():
             try:
-                payload = service._run_json_dict_prompt(
+                payload = service.run_json_dict_prompt(
                     prompt=_missing_pages_prompt(catalog_text),
                     timeout=120,
                     error_context="wiki-care-missing-pages",
@@ -608,7 +612,7 @@ def _seed_missing_pages(
             source_path = str(result.get("file") or "").strip()
             if not source_path:
                 continue
-            hint = CompiledBriefingService._clip(
+            hint = compiled_page.clip(
                 f"[wiki-care: create or expand the page \"{title}\" in the "
                 f"{domain} domain, if it does not exist yet]\n\n"
                 f"{result.get('snippet', '')}",
@@ -652,11 +656,11 @@ def _find_vault_gap_questions(
     catalog_path = service.vault_path / "MOC" / "compiled-index.md"
     if not catalog_path.exists():
         return []
-    catalog_text = CompiledBriefingService._read_page_text(catalog_path)
+    catalog_text = compiled_page.read_page_text(catalog_path)
     if not catalog_text.strip() or not budget.spend():
         return []
     try:
-        payload = service._run_json_dict_prompt(
+        payload = service.run_json_dict_prompt(
             prompt=_vault_gap_questions_prompt(catalog_text),
             timeout=120,
             error_context="wiki-care-vault-gaps",
@@ -756,6 +760,18 @@ def _web_search_selection_prompt(
     return "\n".join(lines)
 
 
+def _run_untrusted_json_prompt(
+    service: CompiledBriefingService, prompt: str
+) -> dict[str, Any]:
+    """Run a prompt that embeds web search text; the CLI gets no write/fetch tools.
+
+    No JSON-repair retry: it would send the same untrusted text through a
+    second, less restricted call. A bad reply just skips this wiki-care step.
+    """
+    raw = service.runner.run_untrusted(prompt, timeout=120)
+    return extract_first_json_dict(raw, error_context="wiki-care-web-search-selection")
+
+
 def _run_web_search_action(
     service: CompiledBriefingService,
     budget: _ModelCallBudget,
@@ -775,12 +791,12 @@ def _run_web_search_action(
     catalog_path = service.vault_path / "MOC" / "compiled-index.md"
     if not catalog_path.exists():
         return empty_result
-    catalog_text = CompiledBriefingService._read_page_text(catalog_path)
+    catalog_text = compiled_page.read_page_text(catalog_path)
     if not catalog_text.strip() or not budget.spend():
         return empty_result
 
     try:
-        query_payload = service._run_json_dict_prompt(
+        query_payload = service.run_json_dict_prompt(
             prompt=_web_search_queries_prompt(catalog_text),
             timeout=120,
             error_context="wiki-care-web-search-queries",
@@ -810,11 +826,8 @@ def _run_web_search_action(
         else DEFAULT_WIKI_CARE_WEB_IMPORT_LIMIT
     )
     try:
-        selection_payload = service._run_json_dict_prompt(
-            prompt=_web_search_selection_prompt(results, import_limit),
-            timeout=120,
-            error_context="wiki-care-web-search-selection",
-            json_example='{"selected": [{"index": 1, "reason": "..."}]}',
+        selection_payload = _run_untrusted_json_prompt(
+            service, _web_search_selection_prompt(results, import_limit)
         )
     except Exception as exc:
         logger.warning("Wiki-care web-search selection prompt failed: %s", exc)
@@ -865,7 +878,7 @@ def _run_web_search_action(
             archived = web_archive.archive_page(
                 content_result,
                 original_url=url,
-                timestamp=datetime.now(),
+                timestamp=owner_now(),
                 summary="",
                 source=None,
                 refresh_qmd=True,
@@ -934,7 +947,7 @@ def run_weekly_wiki_care(
     """T5 entry point. See the module docstring for the four actions and
     ПОПРАВКА 1 for why a normal run never drains the refresh queue.
     """
-    resolved_today = today or date.today()
+    resolved_today = today or owner_today()
     resolved_vault_path = Path(vault_path).resolve()
     journal = _read_journal(resolved_vault_path)
     previous_last_run = str(journal.get("last_run") or "").strip()

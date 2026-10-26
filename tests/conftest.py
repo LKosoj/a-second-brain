@@ -1,14 +1,18 @@
 import importlib.util
 import json
 import re
-from datetime import date
+import sys
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 from _paths import SKILLS_TEMPLATE_ROOT
 
+from d_brain.config import Settings
 from d_brain.services.cli_runner import CliExecutionError
+from d_brain.services.qmd import QMD_ENV_FORWARD_KEYS
+from d_brain.services.subprocess_group import run_in_process_group
 
 
 @pytest.fixture(autouse=True)
@@ -67,6 +71,82 @@ def _block_real_ai_cli(monkeypatch: pytest.MonkeyPatch) -> None:
         raise CliExecutionError("real AI CLI invocation attempted in tests")
 
     monkeypatch.setattr("d_brain.services.cli_runner.CliRunner.run", _blocked)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "real_env_file: the test reads the ``.env`` of its working directory, "
+        "so the developer-file guard stands down",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _ignore_developer_env_file(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep ``Settings()`` from reading the developer's ``.env``.
+
+    ``Settings`` reads ``env_file=".env"`` from the working directory, so a
+    run from the repository root would pick up the live tokens and owner id and
+    make results depend on that machine. Explicit ``Settings(_env_file=...)``
+    still reads the file it is given; a test that needs the cwd file opts out
+    with ``@pytest.mark.real_env_file``.
+    """
+    if request.node.get_closest_marker("real_env_file"):
+        return
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
+
+
+@pytest.fixture(autouse=True)
+def _scrub_qmd_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop the embedding/model variables ``QmdService`` forwards to qmd.
+
+    The service copies ``os.environ``, so a shell that exports ``EMB_MODEL`` or
+    ``OPENAI_BASE_URL`` would point test runs at the developer's real endpoint.
+    """
+    for key in QMD_ENV_FORWARD_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _block_real_qmd_and_node(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep ``QmdService`` from launching the real ``qmd``/``node`` binaries.
+
+    Every launch goes through ``qmd.run_in_process_group``. Blocked calls raise
+    ``FileNotFoundError``, exactly what a missing binary produces and what the
+    service already handles. Other commands (``touch_notes`` runs
+    ``sys.executable``) still run for real; tests that patch the runner
+    themselves win over this patch.
+    """
+
+    def _guarded(args: Any, *a: Any, **kw: Any) -> Any:
+        if str(args[0]) in {"qmd", "node"}:
+            raise FileNotFoundError(f"real {args[0]} launch attempted in tests")
+        return run_in_process_group(args, *a, **kw)
+
+    monkeypatch.setattr("d_brain.services.qmd.run_in_process_group", _guarded)
+
+
+@pytest.fixture(autouse=True)
+def _detach_bot_routers() -> Any:
+    """Free the module-level bot routers before and after every test.
+
+    An aiogram router joins one dispatcher only, so a test that builds a
+    dispatcher (``create_dispatcher`` or its own) leaves every router it used
+    attached, and the next such test fails with "Router is already attached"
+    depending on run order.
+    """
+
+    def detach() -> None:
+        for name, module in list(sys.modules.items()):
+            router = getattr(module, "router", None)
+            if name.startswith("d_brain.bot.handlers.") and router is not None:
+                router._parent_router = None
+
+    detach()
+    yield
+    detach()
 
 
 def _write_vault_manifest(
@@ -231,3 +311,33 @@ def _load_memory_engine():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.fixture(autouse=True)
+def _reset_owner_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start every test on the system zone, as when ``TIMEZONE`` is unset.
+
+    ``clock`` caches the owner's zone in a module variable, so a test that
+    sets one would otherwise leak it into the next test.
+    """
+    from d_brain import clock
+
+    monkeypatch.delenv("TIMEZONE", raising=False)
+    clock._reset_for_tests()
+    yield
+    clock._reset_for_tests()
+
+
+@pytest.fixture
+def frozen_clock(monkeypatch: pytest.MonkeyPatch) -> datetime:
+    """Pin the moment every service reads as "now" and return it.
+
+    Tests used to take ``datetime.now()`` themselves while the code under test
+    read its own clock a moment later, so a run across midnight or a second
+    boundary compared two different instants. Both clock sources (``clock`` and
+    the PLAUD service's own ``_utc_now``) answer with this one moment.
+    """
+    moment = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("d_brain.clock._utcnow", lambda: moment)
+    monkeypatch.setattr("d_brain.services.plaud._utc_now", lambda: moment)
+    return moment

@@ -17,7 +17,7 @@ import sys
 from types import SimpleNamespace
 
 from d_brain import run_document_extract
-from d_brain.services import web_content
+from d_brain.services import documents, web_content
 from d_brain.services.documents import DocumentArchiveService
 from d_brain.services.link_summary import LinkSummaryService
 from d_brain.services.youtube_transcript import YouTubeTranscriptService
@@ -88,7 +88,7 @@ def test_document_extract_payload_passes_name_as_equals_form(
             stderr="",
         )
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(documents, "run_in_process_group", fake_run)
 
     service._extract_payload(
         original_path="imports/documents/raw/2026/01/report.pdf",

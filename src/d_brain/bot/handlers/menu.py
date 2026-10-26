@@ -3,9 +3,8 @@
 import asyncio
 import logging
 from contextlib import suppress
-from datetime import date
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -17,6 +16,7 @@ from d_brain.bot.dashboard import (
     DashboardScreen,
     close_dashboard,
     file_browser_parent_dir,
+    file_entries_fingerprint,
     get_dashboard_session,
     page_fingerprint,
     reenable_job_step,
@@ -36,7 +36,15 @@ from d_brain.bot.handlers.brief import start_brief_flow
 from d_brain.bot.handlers.do import start_do_flow
 from d_brain.bot.handlers.process import run_full_process, run_interactive_process
 from d_brain.bot.handlers.tasks import show_tasks
-from d_brain.bot.replies import answer_rich_text, answer_text, edit_rich_text, edit_text
+from d_brain.bot.replies import (
+    answer_callback_once,
+    answer_rich_text,
+    answer_text,
+    edit_rich_text,
+    edit_text,
+)
+from d_brain.bot.vault_busy import VaultBusyError, run_with_vault_lock
+from d_brain.clock import owner_today
 from d_brain.config import get_settings
 from d_brain.manifest import load_manifest_for_vault
 from d_brain.services.compiled_briefs import BRIEF_TYPES
@@ -109,7 +117,7 @@ async def _deliver_daily_digest(message: Message, *, vault_path: str | Path) -> 
     """
     resolved_vault_path = Path(vault_path)
     status_msg = await answer_text(message, "⏳ Строю дайджест...")
-    today = date.today()
+    today = owner_today()
 
     try:
         digest = await asyncio.to_thread(
@@ -129,7 +137,8 @@ async def _deliver_daily_digest(message: Message, *, vault_path: str | Path) -> 
 
     try:
         manifest = load_manifest_for_vault(resolved_vault_path)
-        with vault_write_lock(resolved_vault_path) as lock:
+
+        def write_digest(lock: Any) -> None:
             write_validated_vault_markdown(
                 resolved_vault_path,
                 digest_path(resolved_vault_path, today),
@@ -137,6 +146,13 @@ async def _deliver_daily_digest(message: Message, *, vault_path: str | Path) -> 
                 manifest=manifest,
                 existing_lock=lock,
             )
+
+        await run_with_vault_lock(
+            resolved_vault_path, write_digest, lock_factory=vault_write_lock
+        )
+    except VaultBusyError:
+        await edit_text(status_msg, "⏳ Идёт обработка, попробуйте позже.")
+        return
     except Exception:
         logger.exception("Failed to write compiled digest")
         await edit_text(
@@ -471,10 +487,17 @@ async def handle_menu_callback(
             await query.answer()
             return
 
+        raw_index, _, token = data.removeprefix("menu:filesentry:").partition(":")
         try:
-            entry_index = int(data.removeprefix("menu:filesentry:"))
+            entry_index = int(raw_index)
         except ValueError:
             entry_index = -1
+
+        # The button was drawn from some list; refuse it if the session has
+        # moved on to another one (second menu message, page change, refresh).
+        if token != file_entries_fingerprint(session.file_entries):
+            await query.answer("Список устарел, обнови его.", show_alert=True)
+            return
 
         if entry_index < 0 or entry_index >= len(session.file_entries):
             await query.answer("Файл или папка не найдены.", show_alert=True)
@@ -494,7 +517,10 @@ async def handle_menu_callback(
             )
             return
 
-        await query.answer("Отправляю файл…")
+        # The callback can be answered only once and the answer carries the
+        # outcome, so progress is shown as a chat action instead.
+        with suppress(Exception):
+            await bot.send_chat_action(chat_id, "upload_document")
         try:
             file_name = await send_browser_file(
                 bot,
@@ -505,15 +531,20 @@ async def handle_menu_callback(
             )
         except ValueError as error:
             if str(error) == "FILE_TOO_LARGE":
-                await query.answer(
+                await answer_callback_once(
+                    query,
                     "Файл слишком большой для отправки через Telegram.",
                     show_alert=True,
                 )
                 return
-            await query.answer("Не удалось отправить файл.", show_alert=True)
+            await answer_callback_once(
+                query, "Не удалось отправить файл.", show_alert=True
+            )
             return
         except (FileBrowserError, OSError):
-            await query.answer("Не удалось открыть файл.", show_alert=True)
+            await answer_callback_once(
+                query, "Не удалось открыть файл.", show_alert=True
+            )
             return
         except Exception:
             # The send itself fails through aiogram, not the filesystem (code
@@ -522,7 +553,9 @@ async def handle_menu_callback(
             # above ever saw them. They escaped into the dispatcher and left
             # the button spinning until Telegram timed the callback out.
             logger.exception("Failed to send browser file")
-            await query.answer("Не удалось отправить файл.", show_alert=True)
+            await answer_callback_once(
+                query, "Не удалось отправить файл.", show_alert=True
+            )
             return
 
         # Guarded apart from the send above (code review): the document has
@@ -544,10 +577,12 @@ async def handle_menu_callback(
             )
         except Exception:
             logger.exception("Failed to redraw the file browser after a send")
-            await query.answer(_FILE_SENT_REDRAW_FAILED_MESSAGE, show_alert=True)
+            await answer_callback_once(
+                query, _FILE_SENT_REDRAW_FAILED_MESSAGE, show_alert=True
+            )
             return
 
-        await query.answer(f"Отправлен: {file_name}")
+        await answer_callback_once(query, f"Отправлен: {file_name}")
         return
 
     if data == "menu:process":

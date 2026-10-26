@@ -24,10 +24,12 @@ from d_brain.bot.handlers import reminders as reminders_handler
 from d_brain.services.reminders import (
     Reminder,
     add_reminder,
+    cancel_reminder,
     is_reminder_request,
     list_pending,
     mark_sent,
     parse_reminder,
+    postpone_reminder,
 )
 
 # The ticker needs an aiogram Bot to send with, so it lives in the bot layer
@@ -267,14 +269,17 @@ def test_mark_sent_on_unknown_id_is_a_no_op(tmp_path: Path) -> None:
 
 def test_mark_sent_writes_atomically_and_leaves_no_temp_file(tmp_path: Path) -> None:
     """mark_sent rewrites via tempfile + os.replace (предупреждение 3) --
-    the session directory must contain only the final journal afterwards."""
+    the session directory must hold only the journal and its lock file."""
     reminder = Reminder(due_at=datetime(2026, 9, 4, 9, 0, tzinfo=UTC), text="x")
     record = add_reminder(tmp_path, 1, reminder)
 
     mark_sent(tmp_path, record.id)
 
     session_dir = tmp_path / ".session"
-    assert [p.name for p in session_dir.iterdir()] == ["reminders.jsonl"]
+    assert sorted(p.name for p in session_dir.iterdir()) == [
+        "reminders.jsonl",
+        "reminders.jsonl.lock",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +346,55 @@ async def test_ticker_failed_send_leaves_reminder_pending_and_does_not_raise(
     assert bot.sent == []
     pending_ids = {r.id for r in list_pending(tmp_path)}
     assert pending_ids == {record.id}
+
+
+async def _tick_with_change_after_listing(
+    tmp_path: Path, change: Any
+) -> tuple[_FakeBot, Any]:
+    now = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
+    record = add_reminder(
+        tmp_path, 1, Reminder(due_at=now - timedelta(minutes=1), text="due"), now=now
+    )
+    real_list = reminders_handler.list_pending
+
+    def list_then_change(vault_path: Any) -> Any:
+        listed = real_list(vault_path)
+        change(record, now)
+        return listed
+
+    bot = _FakeBot()
+    original = reminders_handler.list_pending
+    reminders_handler.list_pending = list_then_change
+    try:
+        await run_reminder_ticker(bot, tmp_path, now_fn=lambda: now, once=True)
+    finally:
+        reminders_handler.list_pending = original
+    return bot, record
+
+
+async def test_ticker_does_not_send_a_reminder_cancelled_after_listing(
+    tmp_path: Path,
+) -> None:
+    bot, _ = await _tick_with_change_after_listing(
+        tmp_path, lambda record, now: cancel_reminder(tmp_path, record.id)
+    )
+
+    assert bot.sent == []
+    assert list_pending(tmp_path) == []
+
+
+async def test_ticker_does_not_send_a_reminder_postponed_after_listing(
+    tmp_path: Path,
+) -> None:
+    bot, record = await _tick_with_change_after_listing(
+        tmp_path,
+        lambda record, now: postpone_reminder(tmp_path, record.id, now=now),
+    )
+
+    assert bot.sent == []
+    (still,) = list_pending(tmp_path)
+    assert still.id == record.id
+    assert still.due_at > record.due_at
 
 
 async def test_ticker_survives_a_corrupted_journal_file(tmp_path: Path) -> None:
@@ -513,3 +567,94 @@ async def test_reminders_command_reports_empty_list(
         await dp.feed_update(bot, Update(update_id=3, message=message))
 
     assert replies == ["Нет активных напоминаний"]
+
+
+def test_mark_sent_keeps_journal_mode(tmp_path: Path) -> None:
+    import os
+
+    reminder = Reminder(due_at=datetime(2026, 9, 4, 9, 0, tzinfo=UTC), text="x")
+    record = add_reminder(
+        tmp_path, 555, reminder, now=datetime(2026, 9, 3, 8, 0, tzinfo=UTC)
+    )
+    journal = tmp_path / ".session" / "reminders.jsonl"
+    journal.chmod(0o664)
+
+    previous = os.umask(0o077)
+    try:
+        mark_sent(tmp_path, record.id, now=datetime(2026, 9, 4, 9, 1, tzinfo=UTC))
+    finally:
+        os.umask(previous)
+
+    assert journal.stat().st_mode & 0o777 == 0o664
+    assert not [p for p in journal.parent.iterdir() if ".tmp" in p.name]
+
+
+# ---------------------------------------------------------------------------
+# TIMEZONE: "в 9" is the owner's nine o'clock, not the server's
+# ---------------------------------------------------------------------------
+
+
+def _late_evening_message() -> Message:
+    return Message(
+        message_id=7,
+        date=datetime(2026, 3, 10, 22, 30, tzinfo=UTC),
+        chat=Chat(id=100, type="private"),
+        from_user=User(id=42, is_bot=False, first_name="Test"),
+        text="напомни в 9 позвонить Ивану",
+    )
+
+
+def _create_reminder_due_at(monkeypatch, tmp_path: Path, timezone: str) -> datetime:
+    import asyncio
+
+    from d_brain import clock
+
+    if timezone:
+        clock.set_owner_timezone(timezone)
+    monkeypatch.setattr(
+        reminders_handler, "get_settings", lambda: SimpleNamespace(vault_path=tmp_path)
+    )
+    record = asyncio.run(
+        reminders_handler.create_reminder_from_text(
+            _late_evening_message(), "напомни в 9 позвонить Ивану"
+        )
+    )
+    assert record is not None
+    return record.due_at
+
+
+def test_reminder_nine_o_clock_follows_owner_timezone(
+    monkeypatch, tmp_path: Path
+) -> None:
+    due = _create_reminder_due_at(monkeypatch, tmp_path, "Europe/Moscow")
+
+    assert due.astimezone(UTC) == datetime(2026, 3, 11, 6, 0, tzinfo=UTC)
+
+
+def test_reminder_nine_o_clock_in_utc_zone(monkeypatch, tmp_path: Path) -> None:
+    due = _create_reminder_due_at(monkeypatch, tmp_path, "UTC")
+
+    assert due.astimezone(UTC) == datetime(2026, 3, 11, 9, 0, tzinfo=UTC)
+
+
+def test_reminder_without_timezone_uses_system_zone(
+    monkeypatch, tmp_path: Path
+) -> None:
+    due = _create_reminder_due_at(monkeypatch, tmp_path, "")
+
+    message_local = _late_evening_message().date.astimezone()
+    expected = parse_reminder("напомни в 9 позвонить Ивану", message_local)
+    assert expected is not None
+    assert due == expected.due_at
+
+
+def test_reminder_inside_berlin_spring_gap_does_not_fail(
+    monkeypatch,
+) -> None:
+    from zoneinfo import ZoneInfo
+
+    now = datetime(2026, 3, 28, 12, 0, tzinfo=ZoneInfo("Europe/Berlin"))
+    reminder = parse_reminder("напомни завтра в 2:30 проверить", now)
+
+    assert reminder is not None
+    assert reminder.due_at > now

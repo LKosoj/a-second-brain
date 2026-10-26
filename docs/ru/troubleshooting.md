@@ -36,8 +36,9 @@ a-second-brain init /path/to/instance
 ## Отсутствует обязательная переменная
 
 Отредактируйте `.env`; не экспортируйте секреты в историю shell. Обязательны
-`TELEGRAM_BOT_TOKEN`, `DEEPGRAM_API_KEY` и положительный
-`OWNER_TELEGRAM_ID`.
+`TELEGRAM_BOT_TOKEN` и положительный `OWNER_TELEGRAM_ID`. `DEEPGRAM_API_KEY`
+необязателен: без него голосовые сохраняются аудио, а `doctor` только
+предупреждает.
 
 ## Права `.env` равны 644
 
@@ -105,7 +106,8 @@ systemctl --user list-timers 'a-second-brain-*'
 journalctl --user -u a-second-brain-process.service --since yesterday
 ```
 
-Проверьте часовой пояс хоста, включён ли lingering и не завершилось ли ошибкой
+Проверьте часовой пояс хоста и `TIMEZONE` в `.env` (таймеры используют пояс,
+записанный установщиком: после смены `TIMEZONE` запустите его заново), включён ли lingering и не завершилось ли ошибкой
 резервное копирование перед обработкой.
 
 ## Результаты поиска устарели

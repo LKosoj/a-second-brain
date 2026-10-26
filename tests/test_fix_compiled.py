@@ -472,6 +472,52 @@ def test_rollback_restores_source_state_for_an_existing_page(
     assert "daily/2026-08-05.md" not in restored_entry.get("applied_chunks", {})
 
 
+def test_rollback_refuses_symlinked_page_and_restores_broken_frontmatter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page swapped for a symlink is skipped, the file behind the link is
+    left alone; a snapshot with broken frontmatter still comes back
+    byte for byte (the rollback does not validate)."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_atomic_vault_write(monkeypatch)
+
+    page_path = vault_path / "compiled" / "projects" / "demo-project.md"
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    broken = (
+        b"---\ndomain: [unclosed\n---\n\n# Demo Project\n\n"
+        b"## Current State\nOld state.\n\n"
+        b"## Recent Changes\n(none)\n\n"
+        b"## Open Loops\n(none)\n\n"
+        b"## Key Decisions\n(none)\n\n"
+        b"## Next Check\nLater.\n\n"
+        b"## Sources\n- [[daily/2026-08-01.md]]\n"
+    )
+    page_path.write_bytes(broken)
+    service._active_pass = CompileEnrichPass(pass_id="pass-sl", snapshot_enabled=True)
+    after = b"changed by the pass\n"
+    service._snapshot_pass_page(
+        "compiled/projects/demo-project.md", before=broken, after=after
+    )
+    page_path.write_bytes(after)
+
+    rollback = service.rollback_compile_enrich_pass("pass-sl")
+    assert rollback["restored"] == ["compiled/projects/demo-project.md"]
+    assert page_path.read_bytes() == broken
+
+    # Second pass, but now the page is a symlink to a file outside the vault.
+    outside = tmp_path / "outside.md"
+    outside.write_bytes(after)
+    page_path.unlink()
+    page_path.symlink_to(outside)
+    rollback = service.rollback_compile_enrich_pass("pass-sl")
+    assert rollback["restored"] == []
+    assert rollback["skipped"] == ["compiled/projects/demo-project.md"]
+    assert outside.read_bytes() == after
+    assert page_path.is_symlink()
+
+
 # --- E) the conflict retry must not report a false "inferred" trust ------
 
 

@@ -15,14 +15,15 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 
+from d_brain.services import compiled_page
 from d_brain.services.compiled_briefings import (
     MAX_ENRICHMENTS_PER_PAGE_PER_MONTH,
     MAX_MODEL_CALLS_PER_PASS,
     MAX_PAGES_PER_PASS,
-    TOKEN_RE,
     CompiledBriefingCandidate,
     CompiledBriefingService,
 )
+from d_brain.services.compiled_page import TOKEN_RE
 from d_brain.services.decisions_queue import (
     CONFLICT_POINTER_KINDS,
     DECISIONS_QUEUE_RELATIVE_PATH,
@@ -217,9 +218,11 @@ class _DecisionItem:
 
 
 def _parse_date_field(value: object) -> date | None:
-    """Best-effort YYYY-MM-DD parse; ``_page_fields`` always returns plain
-    strings, but tolerate a native ``date`` too rather than assuming one
-    representation. Never raises: an unparsable value returns ``None``."""
+    """Best-effort YYYY-MM-DD parse; ``compiled_page.frontmatter_fields``
+    always returns plain strings (and never raises on a broken page, so one
+    bad page cannot take down the digest), but tolerate a native ``date``
+    too rather than assuming one representation. Never raises: an
+    unparsable value returns ``None``."""
     if isinstance(value, date):
         return value
     if isinstance(value, str):
@@ -228,19 +231,6 @@ def _parse_date_field(value: object) -> date | None:
         except ValueError:
             return None
     return None
-
-
-def _page_fields(text: str) -> dict[str, str]:
-    """Parse frontmatter tolerantly instead of raising on a malformed page.
-
-    One broken page in ``compiled/`` (missing closing ``---``, invalid YAML,
-    a duplicate key) must not take down the whole digest (ТЗ 7.1: a failed
-    pass must still yield a message with a reason, not no message at all).
-    ``CompiledBriefingService._iter_candidates`` already reads every
-    ``compiled/**`` page with this same regex-based parser for exactly that
-    reason -- reuse it here instead of the strict ``parse_frontmatter_bytes``.
-    """
-    return CompiledBriefingService._frontmatter_fields(text)
 
 
 # Sentence-final punctuation a page's "что добавилось" cell may already end
@@ -306,7 +296,7 @@ def _collect_changes(
     when a window row is the winning side of a temporal supersession (a
     "Claim History" row whose "Superseded By" source is one of the window's
     sources), show it as a replacement of the prior formulation instead of a
-    plain addition (uses ``CompiledBriefingService._claim_history_rows``).
+    plain addition (uses ``compiled_page.claim_history_rows``).
     """
     window_days = frozenset(
         (start + timedelta(days=offset)).isoformat()
@@ -314,12 +304,12 @@ def _collect_changes(
     )
     changes: list[_ChangeItem] = []
     for candidate in candidates:
-        rows = CompiledBriefingService._sources_shaped_rows(candidate.text)
+        rows = compiled_page.sources_shaped_rows(candidate.text)
         window_rows = [row for row in rows if row[0] in window_days]
         if not window_rows:
             continue
 
-        history_rows = CompiledBriefingService._claim_history_rows(candidate.text)
+        history_rows = compiled_page.claim_history_rows(candidate.text)
         superseded_by_source: dict[str, list[tuple[str, str]]] = {}
         for _, old_source, old_claim, superseded_by in history_rows:
             replaced = (old_claim, old_source)
@@ -327,7 +317,7 @@ def _collect_changes(
             if replaced not in replacements:
                 replacements.append(replaced)
 
-        fields = _page_fields(candidate.text)
+        fields = compiled_page.frontmatter_fields(candidate.text)
         created = _parse_date_field(fields.get("created"))
 
         what_parts: list[str] = []
@@ -375,7 +365,7 @@ def _collect_conflicts(
     """Open conflicts (both sides) from every page's "Open Conflicts" table."""
     items: list[_DecisionItem] = []
     for candidate in candidates:
-        rows = CompiledBriefingService._open_conflicts_rows(candidate.text)
+        rows = compiled_page.open_conflicts_rows(candidate.text)
         for since, existing_claim, existing_source, new_claim, new_source in rows:
             summary = (
                 f"«{existing_claim}» ({existing_source}) "
@@ -507,7 +497,7 @@ def _collect_revisit(
             continue
         if candidate.tier not in COLD_REVISIT_TIERS:
             continue
-        fields = _page_fields(candidate.text)
+        fields = compiled_page.frontmatter_fields(candidate.text)
         last_accessed = _parse_date_field(fields.get("last_accessed"))
         if last_accessed is None:
             continue
@@ -661,7 +651,7 @@ def build_daily_digest(
     The full decisions queue and weekly review retain their existing content.
     """
     service = CompiledBriefingService(Path(vault_path))
-    changes = _collect_changes(service._iter_candidates(), day, day)
+    changes = _collect_changes(service.iter_candidates(), day, day)
     decisions = _merge_decisions(
         [],
         [
@@ -778,7 +768,7 @@ def collect_weekly_review(vault_path: Path, end: date) -> WeeklyReview:
     vault_path = Path(vault_path)
     start = end - timedelta(days=6)
     service = CompiledBriefingService(vault_path)
-    candidates = service._iter_candidates()
+    candidates = service.iter_candidates()
 
     changes = _collect_changes(candidates, start, end)
     revisit = _collect_revisit(candidates, changes, end, limit=1)

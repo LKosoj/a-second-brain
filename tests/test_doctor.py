@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import stat
 import subprocess
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -342,3 +343,278 @@ def test_shell_doctor_is_a_thin_cli_wrapper() -> None:
     assert "a-second-brain doctor" in script
     assert "TELEGRAM_BOT_TOKEN" not in script
     assert "OWNER_TELEGRAM_ID" not in script
+
+
+def _doctor_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    environment: dict[str, str],
+    **kwargs: object,
+) -> tuple[int, str]:
+    monkeypatch.setattr(doctor.shutil, "which", _installed_core_command)
+    output = io.StringIO()
+    status = doctor.run_doctor(
+        tmp_path, environ=environment, stream=output, **kwargs  # type: ignore[arg-type]
+    )
+    return status, output.getvalue()
+
+
+def test_doctor_warns_when_deepgram_key_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initialize_project(tmp_path)
+    environment = _valid_environment()
+    del environment["DEEPGRAM_API_KEY"]
+
+    status, rendered = _doctor_output(tmp_path, monkeypatch, environment)
+
+    assert status == 0
+    assert "Result: PASS" in rendered
+    assert "[WARN] DEEPGRAM_API_KEY" in rendered
+
+
+def test_doctor_telegram_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    initialize_project(tmp_path)
+
+    status, rendered = _doctor_output(
+        tmp_path,
+        monkeypatch,
+        _valid_environment(),
+        telegram_probe=lambda token: ("ok", "@d_brain_bot"),
+    )
+
+    assert status == 0
+    assert "[OK] Telegram accepted TELEGRAM_BOT_TOKEN (@d_brain_bot)" in rendered
+    assert "telegram-secret" not in rendered
+
+
+def test_doctor_telegram_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initialize_project(tmp_path)
+
+    status, rendered = _doctor_output(
+        tmp_path,
+        monkeypatch,
+        _valid_environment(),
+        telegram_probe=lambda token: ("rejected", ""),
+    )
+
+    assert status == 1
+    assert "[ERR] Telegram rejected TELEGRAM_BOT_TOKEN" in rendered
+    assert "Result: FAIL" in rendered
+
+
+def test_doctor_telegram_unreachable_is_only_a_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initialize_project(tmp_path)
+
+    status, rendered = _doctor_output(
+        tmp_path,
+        monkeypatch,
+        _valid_environment(),
+        telegram_probe=lambda token: ("unreachable", "ConnectError"),
+    )
+
+    assert status == 0
+    assert "[WARN] Could not reach Telegram" in rendered
+    assert "ConnectError" in rendered
+
+
+def test_doctor_skips_telegram_probe_when_environ_is_explicit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initialize_project(tmp_path)
+
+    def no_network(*args: object, **kwargs: object) -> None:
+        raise AssertionError("doctor must not call the network here")
+
+    monkeypatch.setattr(doctor.httpx, "get", no_network)
+
+    status, rendered = _doctor_output(tmp_path, monkeypatch, _valid_environment())
+
+    assert status == 0
+    assert "Telegram" not in rendered.replace("TELEGRAM_BOT_TOKEN", "")
+
+
+def test_doctor_real_probe_unreachable_does_not_leak_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(url: str, **kwargs: object) -> None:
+        raise doctor.httpx.ConnectError(f"{url} unreachable")
+
+    monkeypatch.setattr(doctor.httpx, "get", fail)
+
+    outcome, detail = doctor._probe_telegram("secret-token")
+
+    assert outcome == "unreachable"
+    assert "secret-token" not in detail
+
+
+@pytest.mark.parametrize(
+    ("status_code", "payload", "expected"),
+    [
+        (200, {"ok": True, "result": {"username": "d_brain_bot"}}, "ok"),
+        (401, {"ok": False}, "rejected"),
+        (404, {"ok": False}, "rejected"),
+        (429, {"ok": False}, "unreachable"),
+        (502, {}, "unreachable"),
+    ],
+)
+def test_doctor_real_probe_maps_responses(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    payload: dict[str, object],
+    expected: str,
+) -> None:
+    def respond(url: str, **kwargs: object) -> doctor.httpx.Response:
+        return doctor.httpx.Response(status_code, json=payload)
+
+    monkeypatch.setattr(doctor.httpx, "get", respond)
+
+    assert doctor._probe_telegram("secret-token")[0] == expected
+
+
+def test_doctor_warns_about_invalid_schedule_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initialize_project(tmp_path)
+    environment = {
+        **_valid_environment(),
+        "DAILY_PROCESS_TIME": "25:00",
+        "MORNING_BRIEF_TIME": "08:00",
+    }
+
+    status, rendered = _doctor_output(tmp_path, monkeypatch, environment)
+
+    assert status == 0
+    assert "[WARN] DAILY_PROCESS_TIME must be HH:MM" in rendered
+    assert "MORNING_BRIEF_TIME must" not in rendered
+
+
+def test_doctor_warns_about_small_hours_process_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initialize_project(tmp_path)
+    environment = {**_valid_environment(), "DAILY_PROCESS_TIME": "03:30"}
+
+    status, rendered = _doctor_output(tmp_path, monkeypatch, environment)
+
+    assert status == 0
+    assert "[WARN] DAILY_PROCESS_TIME 03:30" in rendered
+
+
+def test_doctor_accepts_evening_process_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initialize_project(tmp_path)
+    environment = {**_valid_environment(), "DAILY_PROCESS_TIME": "21:00"}
+
+    _, rendered = _doctor_output(tmp_path, monkeypatch, environment)
+
+    assert "DAILY_PROCESS_TIME 21:00" not in rendered
+
+
+def test_doctor_probe_invalid_url_does_not_leak_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(url: str, **kwargs: object) -> None:
+        raise doctor.httpx.InvalidURL(f"bad url {url}")
+
+    monkeypatch.setattr(doctor.httpx, "get", fail)
+
+    outcome, detail = doctor._probe_telegram("secret-token\n")
+
+    assert outcome == "unreachable"
+    assert detail == "InvalidURL"
+
+
+def test_doctor_warns_about_legacy_openai_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initialize_project(tmp_path)
+    environment = {
+        **_valid_environment(),
+        "BASE_URL": "https://secret-gateway.example/v1",
+        "MODEL": "secret-model",
+    }
+
+    status, rendered = _doctor_output(tmp_path, monkeypatch, environment)
+
+    assert status == 0
+    assert "BASE_URL is the legacy name; rename it to OPENAI_BASE_URL" in rendered
+    assert "MODEL is the legacy name; rename it to OPENAI_MODEL" in rendered
+    assert "secret-gateway" not in rendered
+    assert "secret-model" not in rendered
+
+
+def test_doctor_warns_when_both_openai_names_differ(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initialize_project(tmp_path)
+    environment = {
+        **_valid_environment(),
+        "BASE_URL": "https://old.example/v1",
+        "OPENAI_BASE_URL": "https://new.example/v1",
+        "MODEL": "same",
+        "OPENAI_MODEL": "same",
+    }
+
+    _status, rendered = _doctor_output(tmp_path, monkeypatch, environment)
+
+    assert "both BASE_URL and OPENAI_BASE_URL are set; OPENAI_BASE_URL wins" in rendered
+    assert "both MODEL and OPENAI_MODEL" not in rendered
+
+
+def test_doctor_timezone_unset_reports_system_zone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initialize_project(tmp_path)
+    monkeypatch.setattr(doctor, "system_timezone_name", lambda: "Europe/Moscow")
+
+    _, rendered = _doctor_output(tmp_path, monkeypatch, _valid_environment())
+
+    assert "[OK] TIMEZONE is not set; the system zone Europe/Moscow" in rendered
+
+
+def test_doctor_rejects_unknown_timezone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initialize_project(tmp_path)
+    environment = {**_valid_environment(), "TIMEZONE": "Mars/Base"}
+
+    status, rendered = _doctor_output(tmp_path, monkeypatch, environment)
+
+    assert status == 1
+    assert "[ERR] TIMEZONE must be an IANA name" in rendered
+
+
+def test_doctor_warns_when_timezone_differs_from_system(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initialize_project(tmp_path)
+    monkeypatch.setattr(doctor, "system_timezone_name", lambda: "UTC")
+    monkeypatch.setattr(doctor, "_system_utc_offset", lambda: timedelta(0))
+    environment = {**_valid_environment(), "TIMEZONE": "Asia/Tokyo"}
+
+    status, rendered = _doctor_output(tmp_path, monkeypatch, environment)
+
+    assert status == 0
+    assert "[WARN] TIMEZONE Asia/Tokyo differs from the system zone UTC" in rendered
+    assert "launchd" in rendered
+    assert "daylight" in rendered
+
+
+def test_doctor_accepts_timezone_matching_system(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initialize_project(tmp_path)
+    monkeypatch.setattr(doctor, "system_timezone_name", lambda: "Etc/UTC")
+    monkeypatch.setattr(doctor, "_system_utc_offset", lambda: timedelta(0))
+    environment = {**_valid_environment(), "TIMEZONE": "UTC"}
+
+    _, rendered = _doctor_output(tmp_path, monkeypatch, environment)
+
+    assert "[OK] TIMEZONE UTC" in rendered
+    assert "differs from the system zone" not in rendered

@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from zoneinfo import ZoneInfo
@@ -426,3 +426,185 @@ async def test_loading_does_not_reopen_menu_after_user_closes_it(tmp_path, monke
     monkeypatch.setattr(tasks, "render_tasks", render)
     await tasks.show_tasks(None, 1, 42)
     render.assert_not_awaited()
+
+
+NOW = datetime(2026, 10, 21, 12, 0, tzinfo=ZoneInfo("UTC"))
+
+
+def reopen_view(seconds_ago, recurring=False):
+    task = TodoistTask(
+        "example",
+        "Example task",
+        "2026-10-21",
+        recurring=recurring,
+        completed=True,
+        completed_at=NOW - timedelta(seconds=seconds_ago),
+    )
+    return task, tasks.build_tasks_view([task], 0, NOW)
+
+
+def test_recent_completion_shows_reopen_button():
+    task, (_text, keyboard, rich) = reopen_view(30)
+    callback = f"tasks:reopen:example:{task.fingerprint}"
+    assert callback in [b.callback_data for b in keyboard.inline_keyboard[0]]
+    assert callback in rich.html
+    assert "Вернуть" in rich.html
+    assert len(callback.encode()) <= 64
+    assert keyboard.inline_keyboard[0][0].callback_data == "menu:noop"
+
+
+@pytest.mark.parametrize("seconds_ago,recurring", [(180, False), (30, True)])
+def test_old_or_recurring_completion_has_no_reopen_button(seconds_ago, recurring):
+    _task, (_text, keyboard, rich) = reopen_view(seconds_ago, recurring)
+    assert "tasks:reopen:" not in rich.html
+    assert all(
+        "reopen" not in b.callback_data for b in keyboard.inline_keyboard[0]
+    )
+
+
+def patch_client(monkeypatch, **methods):
+    client = SimpleNamespace(**methods)
+    monkeypatch.setattr(
+        tasks,
+        "get_settings",
+        lambda: SimpleNamespace(vault_path="/f", todoist_api_key=""),
+    )
+    monkeypatch.setattr(tasks, "TodoistTasks", lambda *a: client)
+    render = AsyncMock()
+    monkeypatch.setattr(tasks, "render_tasks", render)
+    return client, render
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recurring", [False, True])
+async def test_complete_records_time_and_explains_recurring(monkeypatch, recurring):
+    task, _session, query = task_and_query()
+    task.recurring = recurring
+    patch_client(monkeypatch, complete=Mock())
+    reply = AsyncMock()
+    monkeypatch.setattr(tasks, "answer_text", reply)
+    await tasks.handle_task_callback(query, None, SimpleNamespace(clear=AsyncMock()))
+    assert task.completed_at is not None
+    if recurring:
+        assert "срок уже перенесён" in reply.await_args.args[1]
+    else:
+        reply.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reopen_within_window_reopens_and_redraws(monkeypatch):
+    task, session, query = task_and_query("reopen")
+    task.completed = True
+    task.completed_at = datetime.now(ZoneInfo("UTC")) - timedelta(seconds=10)
+    client, render = patch_client(monkeypatch, reopen=Mock())
+    await tasks.handle_task_callback(query, None, SimpleNamespace(clear=AsyncMock()))
+    client.reopen.assert_called_once_with(task)
+    assert not task.completed
+    assert task.completed_at is None
+    assert not session.task_busy
+    assert render.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_reopen_after_two_minutes_says_time_is_up(monkeypatch):
+    task, _session, query = task_and_query("reopen")
+    task.completed = True
+    task.completed_at = datetime.now(ZoneInfo("UTC")) - timedelta(seconds=121)
+    client, render = patch_client(monkeypatch, reopen=Mock())
+    await tasks.handle_task_callback(query, None, SimpleNamespace(clear=AsyncMock()))
+    client.reopen.assert_not_called()
+    assert task.completed
+    assert "Время вышло" in query.answer.await_args.args[0]
+    assert render.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_reopen_failure_keeps_task_completed(monkeypatch):
+    task, session, query = task_and_query("reopen")
+    task.completed = True
+    task.completed_at = datetime.now(ZoneInfo("UTC")) - timedelta(seconds=10)
+    client, _render = patch_client(
+        monkeypatch, reopen=Mock(side_effect=TodoistTaskError("Не подтверждено"))
+    )
+    reply = AsyncMock()
+    monkeypatch.setattr(tasks, "answer_text", reply)
+    await tasks.handle_task_callback(query, None, SimpleNamespace(clear=AsyncMock()))
+    assert task.completed
+    assert not session.task_busy
+    assert "Не подтверждено" in reply.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_reopen_of_stale_fingerprint_does_nothing(monkeypatch):
+    task, _session, query = task_and_query("reopen")
+    task.completed = True
+    task.completed_at = datetime.now(ZoneInfo("UTC"))
+    task.due = "2026-10-22"
+    client = Mock()
+    monkeypatch.setattr(tasks, "TodoistTasks", client)
+    await tasks.handle_task_callback(query, None, SimpleNamespace(clear=AsyncMock()))
+    client.assert_not_called()
+    assert "устарел" in query.answer.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_reopen_of_open_task_says_already_open(monkeypatch):
+    task, session, query = task_and_query("reopen")
+    client, render = patch_client(monkeypatch, reopen=Mock())
+    await tasks.handle_task_callback(query, None, SimpleNamespace(clear=AsyncMock()))
+    client.reopen.assert_not_called()
+    assert not task.completed
+    assert not session.task_busy
+    assert "уже открыта" in query.answer.await_args.args[0]
+    render.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_reopen_taps_do_not_send_two_mutations(monkeypatch):
+    task, session, query = task_and_query("reopen")
+    task.completed = True
+    task.completed_at = datetime.now(ZoneInfo("UTC")) - timedelta(seconds=10)
+    client, _render = patch_client(monkeypatch, reopen=Mock())
+    # The busy flag must already be up while the first tap is still at its
+    # first await, otherwise a second tap slips through.
+    gate = asyncio.Event()
+
+    async def slow_answer(*_args):
+        await gate.wait()
+
+    query.answer = AsyncMock(side_effect=slow_answer)
+    state = SimpleNamespace(clear=AsyncMock())
+    first = asyncio.create_task(tasks.handle_task_callback(query, None, state))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    second_query = SimpleNamespace(**{**vars(query), "answer": AsyncMock()})
+    await tasks.handle_task_callback(second_query, None, state)
+    assert "Подождите" in second_query.answer.await_args.args[0]
+    gate.set()
+    await first
+    assert client.reopen.call_count == 1
+    assert not session.task_busy
+
+
+@pytest.mark.asyncio
+async def test_complete_sets_busy_before_first_await(monkeypatch):
+    task, session, query = task_and_query()
+    client, _render = patch_client(monkeypatch, complete=Mock())
+    gate = asyncio.Event()
+
+    async def slow_answer(*_args):
+        await gate.wait()
+
+    query.answer = AsyncMock(side_effect=slow_answer)
+    state = SimpleNamespace(clear=AsyncMock())
+    first = asyncio.create_task(tasks.handle_task_callback(query, None, state))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    second_query = SimpleNamespace(**{**vars(query), "answer": AsyncMock()})
+    await tasks.handle_task_callback(second_query, None, state)
+    assert "Подождите" in second_query.answer.await_args.args[0]
+    gate.set()
+    await first
+    assert client.complete.call_count == 1
+    assert task.completed
+    assert not session.task_busy

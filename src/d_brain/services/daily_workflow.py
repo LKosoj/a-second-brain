@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from datetime import date
 from typing import TYPE_CHECKING, Any
 
+from d_brain.clock import owner_today
 from d_brain.services.json_normalizer import extract_first_json_dict
 
 if TYPE_CHECKING:
@@ -69,7 +70,7 @@ class DailyWorkflow:
         mode: str = INTERACTIVE_MODE,
     ) -> dict[str, Any]:
         """Run the interactive preview or scheduled daily workflow."""
-        target_day = day or date.today()
+        target_day = day or owner_today()
         if mode not in VALID_PROCESS_MODES:
             return {"error": f"Unknown process mode: {mode}", "processed_entries": 0}
 
@@ -171,6 +172,9 @@ class DailyWorkflow:
         day: date,
         capture_data: dict[str, Any],
     ) -> dict[str, Any]:
+        # Fingerprint what CAPTURE saw before EXECUTE runs: only these blocks
+        # may be marked processed afterwards.
+        claimed_entries = self._host._claim_capture_entries(day, capture_data)
         self._host._write_session_json("capture.json", capture_data)
         execute_data = self._host._run_json_phase(
             self._host._build_execute_prompt(day),
@@ -188,6 +192,9 @@ class DailyWorkflow:
         }
         self._host._write_session_json("execute.json", execute_data)
         self._host._normalize_saved_thoughts(execute_data, day=day)
+        # Deferred tasks (tasks_pending) are delivered by the retry file, so
+        # their entries are marked too; re-classifying them would duplicate.
+        self._host._mark_daily_entries_processed(day, claimed_entries)
         return execute_data
 
     def _reflect(

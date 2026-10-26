@@ -42,14 +42,72 @@ The enable step runs `doctor` first.
 | Unit | Purpose |
 |---|---|
 | `a-second-brain.service` | Telegram bot |
-| `a-second-brain-process.timer` | Daily processing at 21:00 |
-| `a-second-brain-morning-brief.timer` | Morning brief at 08:00 |
+| `a-second-brain-process.timer` | Daily processing at 21:00 by default (`DAILY_PROCESS_TIME`) |
+| `a-second-brain-morning-brief.timer` | Morning brief at 08:00 by default (`MORNING_BRIEF_TIME`) |
 | `a-second-brain-plaud-sync.timer` | Hourly PLAUD sync when configured |
 | `a-second-brain-qmd-maintenance.timer` | Weekly QMD cleanup when `qmd` exists |
+| `a-second-brain-backup-verify.timer` | Weekly backup check, Sunday 04:15 |
+
+To change the times, set `DAILY_PROCESS_TIME` / `MORNING_BRIEF_TIME` (`HH:MM`)
+in `.env` and re-run `scripts/install-systemd-user.sh`; it refuses a malformed
+value. With `TIMEZONE` set, the two timers carry the zone
+(`OnCalendar=*-*-* 21:00:00 Europe/Moscow`), so the time is the owner's whatever
+the server zone is; re-run the installer after changing `TIMEZONE`. Before classification the nightly run also retries transcription of
+voice entries marked "Не распознано" for yesterday and today.
 
 The daily processing service runs an encrypted backup preflight before
 write-heavy processing. With no GPG recipient configured, that preflight
 reports a skip and exits successfully.
+
+## Telegram commands
+
+| Command | Action |
+|---|---|
+| `/do` | Run a free-form request (text, voice, audio file, video note, photo or document) |
+| `/why` | Explain why a compiled page states a claim |
+| `/find` | Search notes by keywords, no model call |
+| `/undo` | Remove the last entry of today |
+| `/reminders` | List pending reminders |
+| `/process`, `/process_full` | Preview or run the daily processing |
+| `/menu` | Open the dashboard |
+| `/stats` | Capture statistics (`/status` is an old alias) |
+| `/files` | Browse vault files |
+| `/help` | Show the command list (`/start` shows the same text) |
+
+`/find <query>` runs `qmd search` (keyword search, no model) and shows up to
+five results with a path and a snippet; the "📄 N" buttons send the file. Without
+a query the bot waits for the text for 10 minutes; `-` or a repeated `/find`
+cancels, and commands (`/...`) reset the wait and run as usual. `qmd` must be in `PATH`, otherwise the bot answers that search is
+unavailable. The query is not written to the session or the daily note. Hidden
+directories (such as `.session`) and `skills/` are never returned. Limits: the
+search matches words (no morphology or meaning), depends on the qmd index (a
+fresh note may not be found yet). qmd normalizes file names in its addresses
+(`Заметка Проба #1.md` comes back as `Заметка-Проба-1.md`); the bot recovers
+the name with qmd's own rule. If one normalized name fits two files of the
+same collection, the hit is skipped rather than guessed.
+
+`/undo` shows the newest entry of today and asks for confirmation. It removes
+only the daily entry (not attachments or compiled pages), only for the current
+day of the owner (`TIMEZONE`, see [Configuration](configuration.md)), and not
+for an entry the nightly run has already processed.
+
+Editing a plain text message or a photo caption in Telegram updates the saved
+entry. If the nightly run has already processed the entry, or the photo had
+no caption, the correction is added to the daily note as a separate entry.
+If the edit arrives before the bot has logged the message to the session, the
+bot waits up to 5 seconds for that record; if it does not appear but the
+message is already in the daily note, the correction is also added as a
+separate entry. Commands ("/...") are not entries, and an edit does not revive an entry
+removed with `/undo`.
+
+A photo or document sent in `/do` mode is saved as usual (attachment and daily
+entry), and its caption runs as a request on that file. Without a caption the
+bot just reviews the file. The caption of a forwarded message is never treated
+as a request. An album is saved as one entry, and the request runs once over
+all of its photos.
+
+`/reminders` lists pending reminders. Create one with a phrase such as
+"напомни завтра в 9 позвонить".
 
 ## Service control
 
@@ -59,6 +117,16 @@ systemctl --user restart a-second-brain.service
 systemctl --user stop a-second-brain.service
 systemctl --user start a-second-brain.service
 ```
+
+The bot unit uses `KillMode=mixed`: on stop or restart the bot gets SIGTERM
+first and closes its tmux sessions, then systemd kills anything left in the
+unit. A running unit keeps its old `KillMode` until you re-run
+`scripts/install-systemd-user.sh` (it reinstalls the template) and
+`systemctl --user daemon-reload`. Note that `mixed` also terminates the
+bot's child processes on stop or restart, so any CLI run in progress is
+interrupted. If the bot died without closing them (crash, SIGKILL), the next
+bot start removes the leftover tmux servers of dead owners; sessions of a live
+process, such as the nightly run, are left alone.
 
 Timer inspection:
 

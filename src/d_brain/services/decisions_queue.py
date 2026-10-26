@@ -192,9 +192,8 @@ the decisions queue at all, so it does not call ``write_queue_document``.
 Writes go through the same two techniques already used elsewhere in this
 codebase: ``patch_validated_vault_frontmatter``/``write_validated_vault_markdown``
 for anything that touches a page (both already take the vault lock
-internally and check identity/hash before writing), and the plain
-tempfile+``os.replace`` ``_atomic_write_text`` (imported from
-``compiled_briefings``) for the JSON queue file, nested inside a
+internally and check identity/hash before writing), and the shared
+``atomic_write_file_text`` (from ``atomic_io``) for the JSON queue file, nested inside a
 ``vault_write_lock`` this module holds when a page write and a queue-file
 write must happen as one unit (ТЗ: "все записи атомарны, под vault-lock, с
 fingerprint-защитой от гонок").
@@ -281,11 +280,13 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from d_brain.clock import owner_today
 from d_brain.manifest import VaultManifest, load_manifest_for_vault
+from d_brain.services import compiled_page
+from d_brain.services.atomic_io import atomic_write_file_text
 from d_brain.services.compiled_briefings import (
     CompiledBriefingCandidate,
     CompiledBriefingService,
-    _atomic_write_text,
 )
 from d_brain.services.frontmatter import (
     UnsafeVaultPathError,
@@ -356,7 +357,7 @@ class QueueItem:
 
     ``conflict_row`` is only set for ``kind == "conflict"``: the exact
     5-tuple (date, existing_claim, existing_source, new_claim, new_source)
-    ``CompiledBriefingService._open_conflicts_rows`` parsed it from, kept so
+    ``compiled_page.open_conflicts_rows`` parsed it from, kept so
     a later response can re-locate (and verify the continued presence of)
     this exact row rather than a row index that could shift under a
     concurrent edit.
@@ -672,7 +673,7 @@ def append_decision_queue_entries(
     ]
     combined, existing_evicted = _evict_overflow(kept, new_entries)
     evicted_count = batch_evicted + existing_evicted
-    _atomic_write_text(
+    atomic_write_file_text(
         path, json.dumps(combined, ensure_ascii=False, indent=2) + "\n"
     )
     _regenerate_queue_document_after_append(vault_path, existing_lock=existing_lock)
@@ -738,7 +739,7 @@ def _remove_queue_entry(vault_path: Path, *, kind: str, page: str) -> None:
     ]
     if len(remaining) == len(existing):
         return
-    _atomic_write_text(
+    atomic_write_file_text(
         path, json.dumps(remaining, ensure_ascii=False, indent=2) + "\n"
     )
 
@@ -774,7 +775,7 @@ def remove_queue_entries_for_page(
     removed = len(existing) - len(remaining)
     if not removed:
         return 0
-    _atomic_write_text(
+    atomic_write_file_text(
         path, json.dumps(remaining, ensure_ascii=False, indent=2) + "\n"
     )
     _regenerate_queue_document_after_append(vault_path, existing_lock=existing_lock)
@@ -820,7 +821,7 @@ def prune_stale_queue_entries(vault_path: Path) -> list[tuple[str, str]]:
             kept.append(entry)
         if not pruned:
             return []
-        _atomic_write_text(
+        atomic_write_file_text(
             path, json.dumps(kept, ensure_ascii=False, indent=2) + "\n"
         )
         write_queue_document(vault_path, manifest=manifest, existing_lock=lock)
@@ -862,7 +863,7 @@ def _json_backed_items(vault_path: Path) -> list[QueueItem]:
 def _conflict_items(candidates: list[CompiledBriefingCandidate]) -> list[QueueItem]:
     items: list[QueueItem] = []
     for candidate in candidates:
-        rows = CompiledBriefingService._open_conflicts_rows(candidate.text)
+        rows = compiled_page.open_conflicts_rows(candidate.text)
         for row in rows:
             since, existing_claim, existing_source, new_claim, new_source = row
             summary = (
@@ -911,7 +912,7 @@ def list_queue_items(vault_path: Path) -> list[QueueItem]:
     """
     vault_path = Path(vault_path)
     service = CompiledBriefingService(vault_path)
-    candidates = service._iter_candidates()
+    candidates = service.iter_candidates()
     json_items = [
         item
         for item in _json_backed_items(vault_path)
@@ -1144,7 +1145,7 @@ def render_queue_document_note(items: list[QueueItem]) -> bytes:
     """Wrap the queue document body in the frontmatter the ``derived``
     profile requires for anything under ``summaries/`` (mirrors
     ``compiled_enrich_report.render_digest_note``)."""
-    today = date.today().isoformat()
+    today = owner_today().isoformat()
     header = (
         "---\n"
         "type: compiled-decisions-queue\n"
@@ -1220,7 +1221,7 @@ def _append_response_journal(
 def _find_candidate_by_path(
     service: CompiledBriefingService, rel_path: str
 ) -> CompiledBriefingCandidate | None:
-    for candidate in service._iter_candidates():
+    for candidate in service.iter_candidates():
         if candidate.rel_path == rel_path:
             return candidate
     return None
@@ -1275,7 +1276,7 @@ def _apply_fact_check_reject(vault_path: Path, item: QueueItem) -> ResponseOutco
     if candidate is not None:
         # Unlocked, top-level call on purpose -- see module docstring on
         # why this cannot be nested inside a lock this module holds.
-        archived_rel_path = service._archive_candidate(candidate)
+        archived_rel_path = service.archive_candidate(candidate)
     manifest = load_manifest_for_vault(vault_path)
     with vault_write_lock(vault_path) as lock:
         _remove_queue_entry(vault_path, kind=item.kind, page=item.page)
@@ -1342,7 +1343,7 @@ def _retire_losing_claim(
         loser_claim, loser_source = existing_claim, existing_source
         winner_source = new_source
 
-    shaped_rows = CompiledBriefingService._sources_shaped_rows(text)
+    shaped_rows = compiled_page.sources_shaped_rows(text)
     remaining = [
         row
         for row in shaped_rows
@@ -1358,26 +1359,26 @@ def _retire_losing_claim(
 
     # Only now that something is actually being retired: a page that keeps
     # its ledger unchanged should come back byte-identical, section or no.
-    text = CompiledBriefingService._ensure_claim_history_section(text)
-    if not CompiledBriefingService._has_section(text, "Claim History"):
+    text = compiled_page.ensure_claim_history_section(text)
+    if not compiled_page.has_section(text, "Claim History"):
         return text
 
-    history_rows = CompiledBriefingService._claim_history_rows(text)
+    history_rows = compiled_page.claim_history_rows(text)
     history_row = (loser_date, loser_source, loser_claim, winner_source)
     # Same dedup contract as the write path: the date column is ignored, so
     # re-retiring the same claim never adds a second history row.
     if not any(row[1:] == history_row[1:] for row in history_rows):
         history_rows = [*history_rows, history_row]
 
-    text = CompiledBriefingService._replace_section(
+    text = compiled_page.replace_section(
         text,
         "Sources That Shaped This Page",
-        CompiledBriefingService._render_sources_shaped_table(remaining),
+        compiled_page.render_sources_shaped_table(remaining),
     )
-    return CompiledBriefingService._replace_section(
+    return compiled_page.replace_section(
         text,
         "Claim History",
-        CompiledBriefingService._render_claim_history(history_rows),
+        compiled_page.render_claim_history(history_rows),
     )
 
 
@@ -1421,7 +1422,7 @@ def _apply_conflict_choice(
                     "UTF-8 — конфликт не тронут, почините кодировку файла."
                 ),
             )
-        current_rows = CompiledBriefingService._open_conflicts_rows(text)
+        current_rows = compiled_page.open_conflicts_rows(text)
         try:
             row_index = current_rows.index(item.conflict_row)
         except ValueError:
@@ -1431,10 +1432,10 @@ def _apply_conflict_choice(
                 message=f"Конфликт на {item.page} уже разрешён.",
             )
         remaining_rows = current_rows[:row_index] + current_rows[row_index + 1 :]
-        new_text = CompiledBriefingService._replace_section(
+        new_text = compiled_page.replace_section(
             text,
             "Open Conflicts",
-            CompiledBriefingService._render_open_conflicts_table(remaining_rows),
+            compiled_page.render_open_conflicts_table(remaining_rows),
         )
         new_text = _retire_losing_claim(
             new_text,
@@ -1578,7 +1579,7 @@ def _apply_verify_rejected_retry(vault_path: Path, item: QueueItem) -> ResponseO
             )
     manifest = load_manifest_for_vault(vault_path)
     with vault_write_lock(vault_path) as lock:
-        service._clear_verify_rejection(item.page)
+        service.clear_verify_rejection(item.page)
         _remove_queue_entry(vault_path, kind=item.kind, page=item.page)
         _append_response_journal(
             vault_path,
@@ -1621,7 +1622,7 @@ def mark_page_human_reviewed(
     This is not a decisions-queue response -- it does not touch the queue,
     so it does not call ``write_queue_document``.
     """
-    resolved_today = today or date.today()
+    resolved_today = today or owner_today()
     manifest = load_manifest_for_vault(vault_path)
     page_path = vault_path / rel_path
     with vault_write_lock(vault_path) as lock:
@@ -1687,7 +1688,7 @@ def apply_response(
         return outcome
 
     if item.kind == FACT_CHECK_REJECTED_KIND:
-        resolved_today = today or date.today()
+        resolved_today = today or owner_today()
         if action_id == "confirm":
             return _apply_fact_check_confirm(vault_path, item, today=resolved_today)
         return _apply_fact_check_reject(vault_path, item)

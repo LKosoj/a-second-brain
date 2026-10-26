@@ -1,22 +1,20 @@
+import functools
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
+from _helpers import patch_get_settings
 
 from d_brain import run_compiled_pass
 from d_brain.services.compiled_briefings import CompiledSourceStateError
 
-
-def _patch_settings(monkeypatch, vault: Path) -> None:
-    monkeypatch.setattr(
-        run_compiled_pass,
-        "get_settings",
-        lambda: SimpleNamespace(
-            vault_path=vault, content_language="ru", ai_cli="claude"
-        ),
-    )
+_patch_settings = functools.partial(
+    patch_get_settings,
+    module=run_compiled_pass,
+    content_language="ru",
+    ai_cli="claude",
+)
 
 
 class FakeService:
@@ -61,8 +59,8 @@ class FakeService:
         self.calls.append(("rollback_compile_enrich_pass", {"pass_id": pass_id}))
         return dict(self.rollback_result)
 
-    def _refresh_qmd_index(self) -> None:
-        self.calls.append(("_refresh_qmd_index", {}))
+    def refresh_qmd_index(self) -> None:
+        self.calls.append(("refresh_qmd_index", {}))
 
 
 @pytest.fixture(autouse=True)
@@ -207,7 +205,7 @@ def test_rollback_calls_service_directly_and_reports_pass_id(
     service = FakeService.created[0]
     assert service.calls == [
         ("rollback_compile_enrich_pass", {"pass_id": "pass-xyz"}),
-        ("_refresh_qmd_index", {}),
+        ("refresh_qmd_index", {}),
     ]
     out = json.loads(capsys.readouterr().out)
     assert out == {
@@ -315,7 +313,7 @@ def test_dry_run_previews_sources_and_queue_without_enqueueing(
     tmp_path: Path, monkeypatch, capsys, write_vault_manifest
 ) -> None:
     """Uses the real ``CompiledBriefingService`` (not ``FakeService``):
-    ``_normalize_rel_path``/``_load_queue`` are pure/read-only, so this
+    ``normalize_rel_path``/``load_queue`` are pure/read-only, so this
     exercises the same normalization ``enqueue_refresh`` would actually
     apply instead of a hand-rolled approximation of it."""
     vault = tmp_path / "vault"

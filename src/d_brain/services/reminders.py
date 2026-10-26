@@ -13,20 +13,27 @@ simpler of the two options the task allows for marking an entry sent -- but
 does it via a tempfile-in-the-same-directory + ``os.replace``, so a crash
 mid-write leaves either the old or the new full file, never a half-written
 one.
+
+Every read-modify-write (and the append) runs under ``_reminders_lock``, a
+``flock`` on a sibling ``.lock`` file: without it a reminder appended between
+``mark_sent``'s read and its ``os.replace`` was silently dropped.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
-import os
 import re
-import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+
+from d_brain.clock import owner_now
+from d_brain.services.atomic_io import atomic_write_file_text
 
 logger = logging.getLogger(__name__)
 
@@ -298,6 +305,23 @@ def _read_all(path: Path) -> list[ReminderRecord]:
     return records
 
 
+@contextmanager
+def _reminders_lock(path: Path) -> Iterator[None]:
+    """Exclusive lock for the journal, taken on a separate file.
+
+    The journal itself cannot carry the lock: ``os.replace`` swaps its inode,
+    so a lock held on the old file would no longer protect anything.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def add_reminder(
     vault_path: Path | str,
     chat_id: int,
@@ -307,17 +331,19 @@ def add_reminder(
 ) -> ReminderRecord:
     """Append one pending reminder to reminders.jsonl, creating .session if needed."""
     path = _reminders_path(vault_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     record = ReminderRecord(
         id=str(uuid.uuid4()),
         chat_id=chat_id,
         due_at=reminder.due_at,
         text=reminder.text,
-        created_at=now or datetime.now().astimezone(),
+        created_at=now or owner_now(),
         sent_at=None,
     )
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(_record_to_dict(record), ensure_ascii=False) + "\n")
+    with _reminders_lock(path):
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(_record_to_dict(record), ensure_ascii=False) + "\n"
+            )
     return record
 
 
@@ -331,26 +357,34 @@ def list_pending(vault_path: Path | str) -> list[ReminderRecord]:
 
 
 def _write_all(path: Path, records: list[ReminderRecord]) -> None:
-    """Rewrite the whole journal atomically (tempfile in the same dir +
-    ``os.replace``), so a crash mid-write never leaves a half-written file.
+    """Rewrite the whole journal atomically (mode and group are kept), so a
+    crash mid-write never leaves a half-written file.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    atomic_write_file_text(
+        path,
+        "".join(
+            json.dumps(_record_to_dict(record), ensure_ascii=False) + "\n"
+            for record in records
+        ),
     )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            for record in records:
-                handle.write(
-                    json.dumps(_record_to_dict(record), ensure_ascii=False) + "\n"
-                )
-        os.replace(tmp_name, path)
-    except Exception:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
+
+
+def is_pending_at(
+    vault_path: Path | str, reminder_id: str, due_at: datetime
+) -> bool:
+    """True while the reminder exists, is unsent and still has this ``due_at``.
+
+    Read under the lock so a cancel/postpone that already landed is seen; the
+    ticker calls it right before sending a reminder it listed earlier.
+    """
+    path = _reminders_path(vault_path)
+    with _reminders_lock(path):
+        return any(
+            record.id == reminder_id
+            and record.sent_at is None
+            and record.due_at == due_at
+            for record in _read_all(path)
+        )
 
 
 def mark_sent(
@@ -358,16 +392,70 @@ def mark_sent(
     reminder_id: str,
     *,
     now: datetime | None = None,
+    due_at: datetime | None = None,
 ) -> None:
-    """Mark one reminder sent by atomically rewriting the (small) journal."""
+    """Mark one reminder sent by atomically rewriting the (small) journal.
+
+    With ``due_at`` only a record that still has that time is marked: one
+    postponed after it was listed has not been delivered at its new time.
+    """
     path = _reminders_path(vault_path)
-    records = _read_all(path)
-    sent_at = now or datetime.now().astimezone()
-    updated = False
-    for record in records:
-        if record.id == reminder_id:
-            record.sent_at = sent_at
-            updated = True
-    if not updated:
-        return
-    _write_all(path, records)
+    sent_at = now or owner_now()
+    with _reminders_lock(path):
+        records = _read_all(path)
+        updated = False
+        for record in records:
+            if record.id == reminder_id and (due_at is None or record.due_at == due_at):
+                record.sent_at = sent_at
+                updated = True
+        if not updated:
+            return
+        _write_all(path, records)
+
+
+def cancel_reminder(vault_path: Path | str, reminder_id: str) -> bool:
+    """Drop one reminder from the journal; False when the id is unknown.
+
+    Removed rather than marked sent, so a cancelled reminder is never
+    mistaken for a delivered one.
+    """
+    path = _reminders_path(vault_path)
+    with _reminders_lock(path):
+        records = _read_all(path)
+        kept = [record for record in records if record.id != reminder_id]
+        if len(kept) == len(records):
+            return False
+        _write_all(path, kept)
+    return True
+
+
+def postpone_reminder(
+    vault_path: Path | str,
+    reminder_id: str,
+    *,
+    now: datetime | None = None,
+) -> ReminderRecord | None:
+    """Push a pending reminder back by a day, keeping its time of day.
+
+    A reminder still in the future moves one day past its own due date, so the
+    button never makes it fire earlier. An overdue one moves to tomorrow. The
+    clock time is read in ``now``'s timezone. None when the id is unknown or
+    the reminder was already sent.
+    """
+    path = _reminders_path(vault_path)
+    now = now or owner_now()
+    with _reminders_lock(path):
+        records = _read_all(path)
+        for record in records:
+            if record.id != reminder_id:
+                continue
+            if record.sent_at is not None:
+                return None
+            local = record.due_at.astimezone(now.tzinfo)
+            base = local.date() if record.due_at > now else now.date()
+            record.due_at = datetime.combine(
+                base + timedelta(days=1), local.timetz()
+            )
+            _write_all(path, records)
+            return record
+    return None

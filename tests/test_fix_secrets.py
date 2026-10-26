@@ -485,6 +485,7 @@ def test_document_archive_scrubs_secret_from_extracted_text(
         file_size=64,
         timestamp=datetime(2026, 4, 4, 19, 50),
         source=source,
+        refresh_qmd=False,
     )
 
     text_path = vault_path / result.text_path

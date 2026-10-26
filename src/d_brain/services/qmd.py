@@ -16,12 +16,15 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from d_brain.clock import owner_today
 from d_brain.manifest import load_manifest_for_vault
+from d_brain.services.atomic_io import atomic_write_file_text
 from d_brain.services.epistemic_memory import (
     EpistemicMemoryError,
     parse_epistemic_note,
 )
 from d_brain.services.memory_entries import DailyEntryMemoryStore
+from d_brain.services.subprocess_group import run_in_process_group
 
 DEFAULT_QMD_EMBED_MODEL = (
     "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf"
@@ -76,7 +79,7 @@ class QmdService:
         return self._state_root / "qmd.lock"
 
     @property
-    def _db_path(self) -> Path:
+    def db_path(self) -> Path:
         return self._cache_home / "qmd" / f"{self._manifest.qmd_index}.sqlite"
 
     @property
@@ -230,7 +233,7 @@ class QmdService:
                     f'      "/": "{context}"',
                 ]
             )
-        self._config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        atomic_write_file_text(self._config_path, "\n".join(lines) + "\n")
         return self._config_path
 
     def _load_project_env(self) -> dict[str, str]:
@@ -294,9 +297,13 @@ class QmdService:
         env = self._resolved_env()
         env["QMD_CONFIG_DIR"] = str(self._config_dir)
         env["XDG_CACHE_HOME"] = str(self._cache_home)
-        env["QMD_DB_PATH"] = str(self._db_path)
+        env["QMD_DB_PATH"] = str(self.db_path)
         env["QMD_EMBED_MODEL"] = self._desired_embed_model(env)
         env["QMD_RERANK_MODEL"] = self._desired_rerank_model(env)
+        # External qmd reads only BASE_URL, while the project setting is
+        # OPENAI_BASE_URL; the new name wins, as in Settings and doctor.
+        if env.get("OPENAI_BASE_URL"):
+            env["BASE_URL"] = env["OPENAI_BASE_URL"]
         env.setdefault("NODE_LLAMA_CPP_GPU", "off")
         env.setdefault("NO_COLOR", "1")
         env.setdefault("TERM", "dumb")
@@ -314,17 +321,26 @@ class QmdService:
                 roots[name] = Path(".")
         return roots
 
-    def _uri_to_rel_path(self, uri: str) -> str | None:
-        """Map qmd://collection/path.md back to a vault-relative markdown path."""
+    def split_uri(self, uri: str) -> tuple[Path, str] | None:
+        """Split qmd://collection/path.md into (vault-relative root, path in it)."""
         if not uri.startswith("qmd://"):
             return None
-        location = uri[len("qmd://") :]
+        # qmd appends ``?index=<name>`` under --index (and may add a fragment).
+        location = uri[len("qmd://") :].split("#", 1)[0].split("?", 1)[0]
         collection, sep, remainder = location.partition("/")
         if not sep:
             return None
         root = self._collection_roots().get(collection)
         if root is None:
             return None
+        return root, remainder
+
+    def uri_to_rel_path(self, uri: str) -> str | None:
+        """Map qmd://collection/path.md back to a vault-relative markdown path."""
+        parts = self.split_uri(uri)
+        if parts is None:
+            return None
+        root, remainder = parts
         rel_path = (root / remainder) if str(root) != "." else Path(remainder)
         return rel_path.as_posix()
 
@@ -452,7 +468,7 @@ class QmdService:
 
     def _today(self) -> date:
         """Clock seam for reproducible ranking tests."""
-        return date.today()
+        return owner_today()
 
     def _age_adjustment(
         self,
@@ -543,12 +559,12 @@ class QmdService:
             command = [
                 "node",
                 str(self._remote_query_script_path),
-                query,
                 "--limit",
                 str(max(limit * 4, 12)),
             ]
             for uri in uris:
                 command.extend(["--scope-uri", uri])
+            command.extend(["--", query])
             attempts = [("query", command, QMD_RECALL_TIMEOUT_SECONDS)]
         elif self._uses_remote_embeddings():
             attempts = [
@@ -557,9 +573,10 @@ class QmdService:
                     [
                         "node",
                         str(self._remote_query_script_path),
-                        query,
                         "--limit",
                         str(max(limit * 4, 12)),
+                        "--",
+                        query,
                     ],
                     QMD_RECALL_TIMEOUT_SECONDS,
                 ),
@@ -570,10 +587,11 @@ class QmdService:
                         "--index",
                         self._manifest.qmd_index,
                         "search",
-                        query,
                         "--json",
                         "-n",
                         str(max(limit * 4, 12)),
+                        "--",
+                        query,
                     ],
                     QMD_RECALL_TIMEOUT_SECONDS,
                 ),
@@ -587,12 +605,13 @@ class QmdService:
                         "--index",
                         self._manifest.qmd_index,
                         "query",
-                        query,
                         "--json",
                         "-n",
                         str(max(limit * 4, 12)),
                         "-C",
                         "16",
+                        "--",
+                        query,
                     ],
                     QMD_RECALL_TIMEOUT_SECONDS,
                 ),
@@ -603,22 +622,20 @@ class QmdService:
                         "--index",
                         self._manifest.qmd_index,
                         "search",
-                        query,
                         "--json",
                         "-n",
                         str(max(limit * 4, 12)),
+                        "--",
+                        query,
                     ],
                     QMD_RECALL_TIMEOUT_SECONDS,
                 ),
             ]
         for backend, command, timeout in attempts:
             try:
-                proc = subprocess.run(
+                proc = run_in_process_group(
                     command,
                     cwd=self.vault_path,
-                    capture_output=True,
-                    text=True,
-                    check=False,
                     env=self.build_env(),
                     timeout=timeout,
                 )
@@ -711,7 +728,7 @@ class QmdService:
         ranked: list[dict[str, Any]] = []
         for candidate in candidates:
             uri = str(candidate.get("file", ""))
-            rel_path = self._uri_to_rel_path(uri)
+            rel_path = self.uri_to_rel_path(uri)
             signal = self._memory_signal_for_rel_path(rel_path) if rel_path else None
             tier = str(signal.get("tier", "")) if signal else ""
             relevance = float(signal.get("relevance", 0.0)) if signal else 0.0
@@ -852,10 +869,10 @@ class QmdService:
 
     def _index_counts(self) -> dict[str, int] | None:
         """Read lightweight qmd index stats directly from SQLite."""
-        if not self._db_path.exists():
+        if not self.db_path.exists():
             return None
         try:
-            with sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True) as conn:
+            with sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True) as conn:
                 documents = conn.execute(
                     "SELECT COUNT(*) FROM documents WHERE active = 1"
                 ).fetchone()[0]
@@ -888,10 +905,10 @@ class QmdService:
     def _write_embed_model_state(self, model_uri: str) -> None:
         """Persist the last successfully used embed model URI."""
         self._state_root.mkdir(parents=True, exist_ok=True)
-        self._embed_state_path.write_text(
+        atomic_write_file_text(
+            self._embed_state_path,
             json.dumps({"embed_model_uri": model_uri}, ensure_ascii=False, indent=2)
             + "\n",
-            encoding="utf-8",
         )
 
     def _embed_force_required(self, desired_model: str) -> bool:
@@ -906,12 +923,9 @@ class QmdService:
         if force:
             args.append("--force")
         try:
-            return subprocess.run(
+            return run_in_process_group(
                 args,
                 cwd=self.vault_path,
-                capture_output=True,
-                text=True,
-                check=False,
                 env=self.build_env(),
                 timeout=_EMBED_PROCESS_TIMEOUT,
             )
@@ -962,12 +976,9 @@ class QmdService:
         timeout: float | None = _EMBED_PROCESS_TIMEOUT,
     ) -> subprocess.CompletedProcess[str]:
         """Execute qmd against the project-local index."""
-        return subprocess.run(
+        return run_in_process_group(
             ["qmd", "--index", self._manifest.qmd_index, *args],
             cwd=self.vault_path,
-            capture_output=True,
-            text=True,
-            check=False,
             env=self.build_env(),
             timeout=timeout,
         )
@@ -1075,7 +1086,7 @@ class QmdService:
                 self.vault_path.parent / "skills/agent-memory/scripts/memory-engine.py"
             )
             try:
-                result = subprocess.run(
+                result = run_in_process_group(
                     [
                         sys.executable,
                         str(memory_engine),
@@ -1083,9 +1094,6 @@ class QmdService:
                         str(relative),
                     ],
                     cwd=self.vault_path,
-                    capture_output=True,
-                    text=True,
-                    check=False,
                     timeout=60,
                 )
             except FileNotFoundError:

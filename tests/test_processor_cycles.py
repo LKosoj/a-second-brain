@@ -5,9 +5,13 @@ from typing import Any
 import pytest
 from conftest import _markdown_section, _write_vault_manifest
 
+from d_brain.run_daily_process import _build_scheduled_digest
 from d_brain.services.processor import (
+    JOB_HEALTH_DISABLE_THRESHOLD,
     SCHEDULED_MODE,
     CliProcessor,
+    load_job_health,
+    save_job_health,
 )
 from d_brain.services.vault_lock import vault_write_lock
 
@@ -15,6 +19,14 @@ from d_brain.services.vault_lock import vault_write_lock
 @pytest.fixture(autouse=True)
 def _cycle_manifest(tmp_path: Path) -> None:
     _write_vault_manifest(tmp_path / "vault")
+
+
+def _write_handoff_observations(handoff_path: Path, bullets: list[str]) -> None:
+    """Replace the trailing Observations section, as a concurrent writer would."""
+    head = handoff_path.read_text(encoding="utf-8").split("## Observations")[0]
+    handoff_path.write_text(
+        head + "## Observations\n" + "\n".join(bullets) + "\n", encoding="utf-8"
+    )
 
 
 def _setup_weekly_digest_context(
@@ -59,7 +71,7 @@ def test_generate_weekly_refreshes_qmd_after_summary_write(tmp_path: Path) -> No
     processor._run_prompt = lambda prompt: "📅 **Недельный дайджест**"  # type: ignore[method-assign]
     processor._refresh_qmd_index = lambda: maintenance.__setitem__("qmd", True)  # type: ignore[method-assign]
 
-    result = processor.generate_weekly()
+    result = processor.generate_weekly_digest()
 
     assert result["report"] == "📅 **Недельный дайджест**"
     assert maintenance == {"qmd": True}
@@ -113,7 +125,7 @@ def test_generate_weekly_prompt_reads_core_context_and_forbids_goal_rewrites(
 
     processor._run_prompt = fake_run  # type: ignore[method-assign]
 
-    result = processor.generate_weekly()
+    result = processor.generate_weekly_digest()
 
     prompt = captured["prompt"]
     assert result["report"] == "📅 **Недельный дайджест**"
@@ -561,7 +573,9 @@ def test_weekly_reflection_preserves_observation_added_during_llm(
 
     def fake_llm(prompt: str, phase_name: str) -> dict[str, Any]:
         del prompt, phase_name
-        processor._write_handoff_observations([*snapshot, concurrent])
+        _write_handoff_observations(
+            session_path / "handoff.md", [*snapshot, concurrent]
+        )
         return {
             "create_reflection": False,
             "title": "",
@@ -944,36 +958,6 @@ def test_build_weekly_system_report_markdown_is_deterministic(
     assert "65.5 → 94.2 (+28.7)" in report
     assert "Fix 1 broken link next week." in report
     assert "### Наблюдения на перенос" in report
-
-
-def test_run_weekly_cycle_combines_digest_and_system_reflection_reports(
-    tmp_path: Path,
-) -> None:
-    vault_path = tmp_path / "vault"
-    processor = CliProcessor(vault_path)
-    refresh_calls = {"count": 0}
-
-    processor.generate_weekly_digest = lambda refresh_qmd=False: {  # type: ignore[method-assign]
-        "report": "📅 **Недельный дайджест**\n\nDigest body",
-        "processed_entries": 1,
-    }
-    processor.generate_weekly_system_reflection = (  # type: ignore[method-assign]
-        lambda refresh_qmd=False: {
-            "report": "🛠 **Системная рефлексия**\n\nReflection body",
-            "processed_entries": 2,
-        }
-    )
-    processor._refresh_qmd_index = lambda: refresh_calls.__setitem__(  # type: ignore[method-assign]
-        "count",
-        refresh_calls["count"] + 1,
-    )
-
-    result = processor.run_weekly_cycle()
-
-    assert "📅 **Недельный дайджест**" in result["report"]
-    assert "🛠 **Системная рефлексия**" in result["report"]
-    assert result["processed_entries"] == 3
-    assert refresh_calls["count"] == 1
 
 
 def test_generate_weekly_system_reflection_clears_identical_carry_forward(
@@ -1718,6 +1702,142 @@ def test_run_scheduled_cycle_survives_one_maintenance_workflow_raising(
     assert "boom" in result["report"]
 
 
+def test_weekly_goals_rollover_failure_records_health_and_reports_error(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    processor = CliProcessor(vault_path)
+    audited: list[str] = []
+
+    processor.process_daily = lambda day, mode=SCHEDULED_MODE: {  # type: ignore[method-assign]
+        "report": "📊 **Daily**",
+        "processed_entries": 1,
+    }
+    processor._scheduled_cycle_names_for_day = lambda day: []  # type: ignore[method-assign]
+
+    def _raise(**kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("rollover boom")
+
+    processor.rollover_weekly_goals = _raise  # type: ignore[method-assign]
+
+    def _audit(cycle_name: str, day: date, result: dict[str, Any]) -> dict[str, Any]:
+        audited.append(cycle_name)
+        return {"cycle_name": cycle_name, "task_candidates": [], "tasks_created": []}
+
+    processor.audit_cycle_result = _audit  # type: ignore[method-assign]
+    processor._refresh_qmd_index = lambda: None  # type: ignore[method-assign]
+    processor._run_control_plane_maintenance_workflow = lambda name: {  # type: ignore[method-assign]
+        "report": "",
+        "processed_entries": 0,
+    }
+
+    result = processor.run_scheduled_cycle(date(2026, 4, 5))  # Sunday
+
+    assert load_job_health(vault_path)["weekly_goals_rollover"][
+        "consecutive_failures"
+    ] == 1
+    assert "❌" in result["report"]
+    assert "rollover boom" in result["report"]
+    rollover = [
+        c for c in result["periodic_cycles"] if c["name"] == "weekly_goals_rollover"
+    ]
+    assert len(rollover) == 1
+    assert rollover[0]["result"]["error"] == "rollover boom"
+    assert "weekly_goals_rollover" in audited
+
+
+def _stub_cycle_around_failed_daily(processor: CliProcessor) -> None:
+    processor.process_daily = lambda day, mode=SCHEDULED_MODE: {  # type: ignore[method-assign]
+        "error": "Processing timed out",
+        "processed_entries": 0,
+    }
+    processor._scheduled_cycle_names_for_day = lambda day: []  # type: ignore[method-assign]
+    processor.audit_cycle_result = lambda cycle_name, day, result: {  # type: ignore[method-assign]
+        "cycle_name": cycle_name,
+        "task_candidates": [],
+        "tasks_created": [],
+    }
+    processor._refresh_qmd_index = lambda: None  # type: ignore[method-assign]
+
+
+def test_scheduled_cycle_keeps_daily_error_out_of_top_level_error(
+    tmp_path: Path,
+) -> None:
+    processor = CliProcessor(tmp_path / "vault")
+    _stub_cycle_around_failed_daily(processor)
+    processor._run_control_plane_maintenance_workflow = lambda name: {  # type: ignore[method-assign]
+        "report": "",
+        "processed_entries": 0,
+    }
+
+    result = processor.run_scheduled_cycle(date(2026, 4, 4))
+
+    # Top-level "error" means "the cycle did not run"; a failed daily part
+    # must not hide the maintenance results next to it.
+    assert "error" not in result
+    assert result["daily_error"] == "Processing timed out"
+    assert result["daily"]["error"] == "Processing timed out"
+    assert [cycle["name"] for cycle in result["periodic_cycles"]] == [
+        "maintenance.compiled-nightly",
+        "maintenance.vault-health",
+        "maintenance.compiled-fact-check",
+        "maintenance.compiled-wiki-care",
+        "maintenance.compiled-digest",
+    ]
+    assert "Processing timed out" in result["report"]
+    assert "VERIFY" in result["report"]
+    assert "handoff" in result["report"]
+
+
+def test_daily_error_does_not_hide_disabled_step_notice(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    processor = CliProcessor(vault_path)
+    _stub_cycle_around_failed_daily(processor)
+    save_job_health(
+        vault_path,
+        {
+            "maintenance.vault-health": {
+                "consecutive_failures": JOB_HEALTH_DISABLE_THRESHOLD - 1,
+                "last_error": "boom",
+                "last_failure_at": "2026-04-03T21:00:00+00:00",
+                "disabled": False,
+            }
+        },
+    )
+    processor._run_control_plane_maintenance_workflow = lambda name: (  # type: ignore[method-assign]
+        {"error": "x", "processed_entries": 0}
+        if name == "maintenance.vault-health"
+        else {"report": "", "processed_entries": 0}
+    )
+
+    result = processor.run_scheduled_cycle(date(2026, 4, 4))
+
+    assert "error" not in result
+    assert "отключён после" in result["report"]
+    # The Telegram digest must carry the notice too, not only the report.
+    assert result["disabled_steps_notice"].startswith("⛔ Отключены:")
+    digest = _build_scheduled_digest(date(2026, 4, 4), result, {})
+    assert result["disabled_steps_notice"] in digest
+
+
+def test_scheduled_cycle_empty_daily_error_is_still_an_error(tmp_path: Path) -> None:
+    processor = CliProcessor(tmp_path / "vault")
+    _stub_cycle_around_failed_daily(processor)
+    processor.process_daily = lambda day, mode=SCHEDULED_MODE: {  # type: ignore[method-assign]
+        "error": "",
+        "processed_entries": 0,
+    }
+    processor._run_control_plane_maintenance_workflow = lambda name: {  # type: ignore[method-assign]
+        "report": "",
+        "processed_entries": 0,
+    }
+
+    result = processor.run_scheduled_cycle(date(2026, 4, 4))
+
+    assert result["daily_error"] == "unknown error"
+    assert "`unknown error`" in result["report"]
+
+
 def test_run_scheduled_cycle_uses_control_plane_labels_for_maintenance(
     tmp_path: Path,
 ) -> None:
@@ -2217,7 +2337,7 @@ def test_run_vault_health_cycle_repairs_low_health_with_broken_links(
         },
     ]
 
-    processor._rebuild_graph = lambda: calls.append(("analyze",))  # type: ignore[method-assign]
+    processor._rebuild_graph = lambda: calls.append(("analyze",)) or True  # type: ignore[method-assign]
     processor._load_graph_stats = lambda: stats_queue.pop(0)  # type: ignore[method-assign]
     processor._run_uv_script = lambda *args: calls.append(args)  # type: ignore[method-assign]
 
@@ -2233,6 +2353,83 @@ def test_run_vault_health_cycle_repairs_low_health_with_broken_links(
         ("skills/vault-health/scripts/fix_links.py", "--apply"),
         ("analyze",),
     ]
+
+
+def test_run_vault_health_cycle_returns_error_when_analyze_fails(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    processor = CliProcessor(vault_path)
+    reads: list[int] = []
+    processor._run_uv_script = lambda *args: False  # type: ignore[method-assign]
+    # The previous graph must not be read after a failed rebuild.
+    processor._load_graph_stats = lambda: reads.append(1) or {}  # type: ignore[method-assign]
+
+    result = processor._run_vault_health_cycle()
+
+    assert "error" in result
+    assert "report" not in result
+    assert reads == []
+    assert not (vault_path / "attachments" / "vault-map.html").exists()
+
+
+def test_run_vault_health_cycle_returns_error_when_rebuild_after_repair_fails(
+    tmp_path: Path,
+) -> None:
+    processor = CliProcessor(tmp_path / "vault")
+    rebuilds = iter([True, False])
+    reads: list[int] = []
+
+    def load_stats() -> dict[str, Any]:
+        reads.append(1)
+        return {"health_score": 50.0, "broken_link_count": 3}
+
+    processor._rebuild_graph = lambda: next(rebuilds)  # type: ignore[method-assign]
+    processor._load_graph_stats = load_stats  # type: ignore[method-assign]
+    processor._run_uv_script = lambda *args: True  # type: ignore[method-assign]
+
+    result = processor._run_vault_health_cycle()
+
+    assert "error" in result
+    assert "report" not in result
+    assert len(reads) == 1  # only the pre-repair read; no stale final read
+
+
+def test_failed_graph_rebuild_counts_towards_vault_health_self_disable(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    processor = CliProcessor(vault_path)
+    processor.process_daily = lambda day, mode=SCHEDULED_MODE: {  # type: ignore[method-assign]
+        "report": "📊 **Daily**",
+        "processed_entries": 0,
+    }
+    processor._scheduled_cycle_names_for_day = lambda day: []  # type: ignore[method-assign]
+    processor.audit_cycle_result = lambda cycle_name, day, result: {  # type: ignore[method-assign]
+        "cycle_name": cycle_name,
+        "task_candidates": [],
+        "tasks_created": [],
+    }
+    processor._refresh_qmd_index = lambda: None  # type: ignore[method-assign]
+    processor._run_uv_script = lambda *args: False  # type: ignore[method-assign]
+
+    def workflow(name: str) -> dict[str, Any]:
+        if name == "maintenance.vault-health":
+            return processor._run_vault_health_cycle()
+        return {"report": "", "processed_entries": 0}
+
+    processor._run_control_plane_maintenance_workflow = workflow  # type: ignore[method-assign]
+
+    first = processor.run_scheduled_cycle(date(2026, 4, 4))
+    assert load_job_health(vault_path)["maintenance.vault-health"][
+        "consecutive_failures"
+    ] == 1
+    assert "❌ **Здоровье vault**" in first["report"]
+    assert "Vault graph rebuild failed" in first["report"]
+
+    for _ in range(2):
+        processor.run_scheduled_cycle(date(2026, 4, 4))
+    assert load_job_health(vault_path)["maintenance.vault-health"]["disabled"] is True
 
 
 def test_run_scheduled_cycle_skips_maintenance_when_lock_is_busy(
@@ -2266,7 +2463,7 @@ def test_run_vault_health_cycle_reports_daily_structure_issues_in_russian(
 ) -> None:
     vault_path = tmp_path / "vault"
     processor = CliProcessor(vault_path)
-    processor._rebuild_graph = lambda: None  # type: ignore[method-assign]
+    processor._rebuild_graph = lambda: True  # type: ignore[method-assign]
     processor._load_graph_stats = lambda: {  # type: ignore[method-assign]
         "health_score": 91.0,
         "broken_link_count": 1,
@@ -2339,3 +2536,34 @@ def test_compiled_wiki_care_cycle_survives_an_exception(
     result = processor._run_compiled_wiki_care_cycle()
 
     assert result == {"error": "wiki care exploded", "processed_entries": 0}
+
+
+def test_audit_result_includes_unconfirmed(tmp_path: Path) -> None:
+    processor = CliProcessor(tmp_path / "vault", todoist_api_key="token")
+    processor._run_json_phase = lambda prompt, phase_name: {  # type: ignore[method-assign]
+        "summary": "One problem",
+        "issues": [
+            {
+                "title": "Broken",
+                "severity": "high",
+                "evidence": "e",
+                "action": "Починить",
+                "due": "2026-04-06",
+                "project_hint": "Inbox",
+            }
+        ],
+    }
+
+    def fake_create(tasks: list[dict[str, Any]], **kwargs: Any) -> list[Any]:
+        processor._todoist_unconfirmed = list(tasks)
+        return []
+
+    processor._create_todoist_tasks = fake_create  # type: ignore[method-assign]
+
+    result = processor.audit_cycle_result(
+        cycle_name="weekly_system_reflection",
+        day=date(2026, 4, 5),
+        result={"report": "ok"},
+    )
+
+    assert [t["content"] for t in result["tasks_unconfirmed"]] == ["Починить"]

@@ -8,10 +8,14 @@ instead of the pane keeps the result free of ANSI escapes and TUI chrome.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
+import re
 import shutil
 import subprocess
+import threading
 import time
 import uuid
 from collections.abc import Mapping
@@ -50,6 +54,19 @@ _DEFAULT_STALL_SECONDS = 1500.0
 
 class ClaudeTmuxError(RuntimeError):
     """Raised when the tmux session cannot deliver a prompt or an answer."""
+
+
+_SOCKET_RE = re.compile(r"^dbrain-(?:(\d{1,10})-)?[0-9a-f]{12}$")
+# Sockets from older versions carry no owner pid. 6 hours is longer than the
+# longest run (process.service has TimeoutStartSec=4h), so a younger one may
+# still belong to a live nightly run.
+_LEGACY_SOCKET_MAX_AGE = 6 * 3600.0
+
+# Sockets of the sessions started by this process, so the bot can close them on
+# stop instead of waiting for the CLI timeout.
+_ACTIVE: dict[str, Mapping[str, str]] = {}
+_ACTIVE_LOCK = threading.Lock()
+_stopping = False
 
 
 @dataclass
@@ -165,6 +182,7 @@ def _read_state(root: Path, session_id: str) -> _TranscriptState:
 def _fail_if_pane_died(socket: str, env: Mapping[str, str]) -> None:
     """Turn a crashed or vanished claude process into a readable error."""
 
+    raise_if_stopping()
     output = _tmux(
         socket,
         "list-panes",
@@ -206,10 +224,34 @@ def _wait_for_composer(socket: str, env: Mapping[str, str], deadline: float) -> 
     # prompt is pasted anyway and verified through the transcript.
 
 
+# Everything except \n and \t: C0 controls, DEL and C1 controls.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def sanitize_tmux_prompt(text: str) -> str:
+    """Make text safe to paste into a TUI composer.
+
+    tmux hands the buffer to the application byte for byte, so a stray \r
+    submits the prompt, \x1b opens an escape sequence and \x03 is Ctrl-C.
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return _CONTROL_CHARS.sub("", text)
+
+
 def _paste_prompt(socket: str, prompt: str, env: Mapping[str, str]) -> None:
     # load-buffer keeps the prompt out of argv (128 KB per-argument limit) and
     # `-r` stops tmux from turning its newlines into Enter presses.
-    _tmux(socket, "load-buffer", "-b", _BUFFER_NAME, "-", env=env, input_text=prompt)
+    # `-p` is not used: bracketed paste support of the claude/codex TUIs was
+    # not verified; control characters are stripped instead.
+    _tmux(
+        socket,
+        "load-buffer",
+        "-b",
+        _BUFFER_NAME,
+        "-",
+        env=env,
+        input_text=sanitize_tmux_prompt(prompt),
+    )
     _tmux(
         socket,
         "paste-buffer",
@@ -338,6 +380,120 @@ def _cleanup_transcript(root: Path, session_id: str) -> None:
         logger.warning("Failed to remove claude tmux transcript %s: %s", path, exc)
 
 
+def new_socket_name() -> str:
+    """Name a private tmux socket after the process that owns the session.
+
+    The pid lets a later start tell an abandoned session (owner dead) from a
+    live one, e.g. the nightly run, which shares the same socket directory.
+    """
+
+    return f"dbrain-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+
+
+def register_session(socket: str, env: Mapping[str, str]) -> None:
+    with _ACTIVE_LOCK:
+        if _stopping:
+            raise ClaudeTmuxError("bot is stopping, tmux session not started")
+        _ACTIVE[socket] = env
+
+
+def raise_if_stopping() -> None:
+    """Abort a session thread once the bot has begun shutting down.
+
+    register_session only guards the start: a thread that passed it before
+    shutdown_tmux_sessions ran has no server to kill yet, and would otherwise
+    create one and wait for the CLI timeout.
+    """
+
+    with _ACTIVE_LOCK:
+        stopping = _stopping
+    if stopping:
+        raise ClaudeTmuxError("bot is stopping, tmux session aborted")
+
+
+def unregister_session(socket: str) -> None:
+    with _ACTIVE_LOCK:
+        _ACTIVE.pop(socket, None)
+
+
+def shutdown_tmux_sessions() -> None:
+    """Kill every tmux server this process started and refuse new ones.
+
+    The worker threads then see "session disappeared" on their next poll and
+    exit within seconds instead of waiting for the CLI timeout.
+    """
+
+    global _stopping
+    with _ACTIVE_LOCK:
+        _stopping = True
+        active = dict(_ACTIVE)
+    for socket, env in active.items():
+        try:
+            _tmux(socket, "kill-server", env=env, check=False)
+        except Exception as exc:
+            logger.warning("Failed to stop tmux session %s: %s", socket, exc)
+
+
+def _socket_dir(env: Mapping[str, str]) -> Path:
+    # Same place tmux builds its socket path from.
+    return Path(env.get("TMUX_TMPDIR") or "/tmp") / f"tmux-{os.getuid()}"
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, OverflowError):
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def cleanup_orphan_sessions(env: Mapping[str, str] | None = None) -> int:
+    """Kill tmux servers left by a bot that died without closing them.
+
+    Needed at start because SIGKILL, a crash, or launchd (no cgroup kill) leave
+    the detached tmux server running next to the new bot. Sessions whose owner
+    pid is alive (the nightly run, this process) are left alone. Returns the
+    number of servers removed.
+    """
+
+    if env is None:
+        # Sessions are created with build_subprocess_env, which drops
+        # TMUX_TMPDIR, so their sockets live in the default /tmp/tmux-<uid>.
+        env = {k: v for k, v in os.environ.items() if k != "TMUX_TMPDIR"}
+    if shutil.which("tmux") is None:
+        return 0
+    try:
+        entries = list(_socket_dir(env).iterdir())
+    except OSError:
+        return 0
+    killed = 0
+    for path in entries:
+        match = _SOCKET_RE.match(path.name)
+        if match is None:
+            continue
+        if match.group(1) is not None:
+            if _pid_alive(int(match.group(1))):
+                continue
+        else:
+            try:
+                age = time.time() - path.stat().st_mtime
+            except OSError:
+                continue
+            if age < _LEGACY_SOCKET_MAX_AGE:
+                continue
+        try:
+            _tmux(path.name, "kill-server", env=env, check=False)
+        except Exception as exc:
+            logger.warning("Failed to kill tmux session %s: %s", path.name, exc)
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
+        logger.warning("Killed abandoned tmux session %s", path.name)
+        killed += 1
+    return killed
+
+
 def run_claude_tmux(
     prompt: str,
     workdir: Path,
@@ -352,7 +508,7 @@ def run_claude_tmux(
         raise ClaudeTmuxError("tmux is required for the claude-tmux backend")
 
     session_id = str(uuid.uuid4())
-    socket = f"dbrain-{uuid.uuid4().hex[:12]}"
+    socket = new_socket_name()
     # A private socket keeps this session away from the user's own tmux server
     # and lets the tmux server inherit the environment prepared for the CLI.
     # TERM=dumb (fine for headless) would break the TUI.
@@ -361,6 +517,7 @@ def run_claude_tmux(
     deadline = time.monotonic() + timeout
 
     try:
+        register_session(socket, tmux_env)
         _tmux(
             socket,
             "new-session",
@@ -380,6 +537,9 @@ def run_claude_tmux(
             session_id,
             env=tmux_env,
         )
+        # Shutdown may have run while the server did not exist yet; finally
+        # below kills the one just created.
+        raise_if_stopping()
         # Keep a crashed pane readable so its exit status reaches the caller.
         _tmux(
             socket,
@@ -396,8 +556,19 @@ def run_claude_tmux(
         answer = _wait_for_answer(socket, root, session_id, tmux_env, deadline)
     finally:
         _tmux(socket, "kill-server", env=tmux_env, check=False)
+        unregister_session(socket)
     _cleanup_transcript(root, session_id)
     return answer
 
 
-__all__ = ["ClaudeTmuxError", "run_claude_tmux"]
+__all__ = [
+    "ClaudeTmuxError",
+    "cleanup_orphan_sessions",
+    "new_socket_name",
+    "raise_if_stopping",
+    "register_session",
+    "run_claude_tmux",
+    "sanitize_tmux_prompt",
+    "shutdown_tmux_sessions",
+    "unregister_session",
+]

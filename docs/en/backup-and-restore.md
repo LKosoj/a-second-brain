@@ -12,6 +12,21 @@ before changing data. Backups are optional but strongly recommended.
 - The backup directory is outside `VAULT_PATH`.
 - Each encrypted archive has a neighboring SHA-256 checksum file.
 - Rotation keeps the newest `VAULT_BACKUP_RETENTION` snapshots.
+- The archive is streamed straight into `gpg`; no unencrypted archive is ever
+  written to disk. Leftover `.vault-snapshot-*` files from older versions are
+  deleted automatically, as are `.partial` files older than one hour.
+- Temporary write-staging directories (`.dbrain-write-*.stage`) and files that
+  disappear while the archive is being written are skipped. Files and
+  directories the service account cannot read (`PermissionError`) are skipped
+  too: their number goes to the manifest as `unreadable`, the backup prints a
+  warning and still exits with code 0.
+- A neighboring `.manifest.json` holds only counts (files, skipped,
+  unreadable), never file names.
+- The checksum and the manifest are written before the snapshot is published,
+  so a published snapshot always has both. After a hard stop, orphaned
+  `.sha256` and `.manifest.json` files and their temporary write files
+  (`.vault-*.tar.gz.gpg.*.tmp`) older than one hour are cleaned up on the
+  next run. Other files in the backup directory are left alone.
 
 An encrypted archive still exposes metadata such as filename, timestamp, and
 size. Protect the backup directory accordingly.
@@ -47,6 +62,26 @@ sha256sum --check vault-YYYYMMDDTHHMMSSZ.tar.gz.gpg.sha256
 ```
 
 Do not continue if verification fails.
+
+## Weekly verification
+
+`a-second-brain-backup-verify.timer` runs
+`python -m d_brain.run_vault_backup --verify` every Sunday at 04:15. It checks
+the newest snapshot (by modification time) in two levels:
+
+- With the secret key on the host: the snapshot is decrypted as a stream
+  (nothing is written to disk), the tar is read to the end, and the file count
+  is compared with the manifest. The key must have no passphrase.
+- Without the secret key (the intended setup): decryption is impossible, so
+  the command checks the SHA-256, the OpenPGP structure, and that the archive
+  is encrypted to the configured recipient. It exits successfully but prints
+  `Warning: decryption not verified ...`. Snapshots made before the manifest
+  existed produce a warning about the missing manifest.
+
+A failed check exits non-zero, so the unit is marked failed. The verification
+does not replace a real restoration drill on the machine that holds the
+private key (see below). With an empty `VAULT_BACKUP_GPG_RECIPIENT` the
+command does nothing.
 
 ## Restore safely
 

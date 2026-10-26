@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import json
@@ -12,7 +13,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import traceback
@@ -24,12 +24,24 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 from uuid import uuid4
 
+from d_brain.clock import owner_now, owner_today
 from d_brain.manifest import VaultManifest, load_manifest_for_vault
+from d_brain.services import compiled_page
+from d_brain.services.atomic_io import atomic_write_file_bytes, atomic_write_file_text
 from d_brain.services.cli_runner import (
     CliExecutionError,
     CliRunner,
     detect_terminal_backend_message,
     normalize_ai_cli,
+)
+from d_brain.services.compiled_page import (
+    FRONTMATTER_RE,
+    NOT_ENRICHMENT_SOURCE_MARKER,
+    TRUST_RANK,
+    WIKILINK_RE,
+)
+from d_brain.services.compiled_page import (
+    defuse_human_zone_markers as _defuse_human_zone_markers,
 )
 from d_brain.services.frontmatter import (
     FrontmatterError,
@@ -212,14 +224,6 @@ CORE_FRONTMATTER_FIELDS = frozenset(
         "source_event_dates",
     }
 )
-# ТЗ 4.4: trust is determined by code, never by the model, and is never used
-# to pick a conflict winner (only dates/claim kind do that, see
-# _effective_conflict_type). The ТЗ states own/integration are strong enough
-# for automated consequential actions while forwarded/inferred are not (4.4
-# "Правила"), which only fixes a two-tier grouping, not a total order; the
-# order within each tier (own > integration, forwarded > inferred) is this
-# implementation's own assumption, not stated verbatim in the ТЗ.
-TRUST_RANK = {"own": 4, "integration": 3, "forwarded": 2, "inferred": 1}
 # ТЗ 4.4 "Правила": the two trust levels strong enough, alone, to justify an
 # automatic action with consequences (task creation, CRM edit, silently
 # superseding an existing claim). forwarded/inferred must not, alone,
@@ -479,13 +483,6 @@ SNAPSHOT_RETENTION_DAYS = 14
 # ТЗ 5.6 "Значимый сигнал для уровня warm": the cheap half of the check
 # (precomputed from the sources table, see ``_warm_recent_source_signal``).
 WARM_SIGNAL_WINDOW_DAYS = 7
-# Marks a "Sources That Shaped This Page" row added without enrichment (ТЗ
-# 6.1: `cold` tier, and a `warm` page whose speculative compile turned out
-# insignificant) -- styled like the existing "(not captured)" placeholder so
-# it reads the same way in the table. Excluded from the monthly-enrichment
-# count (see ``_upsert_briefing``) and from ``enrichment_count`` (see
-# ``_record_non_enrichment_source``).
-NOT_ENRICHMENT_SOURCE_MARKER = "(not enrichment)"
 # ТЗ 6.3 "Сжатие при остывании": how many most-recent Recent Changes items
 # stay in place; the rest move to History.
 RECENT_CHANGES_KEEP = 5
@@ -532,87 +529,6 @@ MAX_AUTO_VERIFY_RETRIES = 2
 ARCHIVE_TIER_IDLE_DAYS = 180
 
 
-def _atomic_write_text(path: Path, payload: str) -> None:
-    """Write text atomically via tempfile + os.replace to survive crashes."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    mode = path.stat().st_mode & 0o777 if path.exists() else 0o660
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=str(path.parent),
-    )
-    try:
-        os.fchmod(fd, mode)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, path)
-    except Exception:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
-
-
-def _atomic_write_bytes(path: Path, payload: bytes) -> None:
-    """Byte-exact sibling of ``_atomic_write_text`` for pass snapshots (G4).
-
-    A rollback must restore the exact original bytes of a compiled page, so
-    a lossy UTF-8 decode/encode round-trip is not acceptable here the way it
-    is for the rest of this module's text handling.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    mode = path.stat().st_mode & 0o777 if path.exists() else 0o660
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=str(path.parent),
-    )
-    try:
-        os.fchmod(fd, mode)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, path)
-    except Exception:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
-
-
-TOKEN_RE = re.compile(
-    r"[0-9A-Za-zА-Яа-яЁё][0-9A-Za-zА-Яа-яЁё_-]{2,}"
-)
-# A leading BOM (\ufeff) is tolerated: e.g. Notepad's "Save As
-# UTF-8" on Windows writes one (the owner edits these files by hand).
-# Without it, `^` (no re.MULTILINE) never matches and every caller below
-# silently treats the whole frontmatter block, including `tier`, as absent.
-FRONTMATTER_RE = re.compile(r"^\ufeff?---\n(.*?)\n---\n*", re.DOTALL)
-# Sibling of FRONTMATTER_RE used only by _body_without_frontmatter (code
-# review defect 2): that function's return value must preserve the original
-# bytes past the frontmatter block verbatim, including any CRLF line endings
-# inside the owner's human zone -- so, unlike every other FRONTMATTER_RE
-# caller here (which normalizes CRLF to LF first purely to make the match
-# succeed, then only reads matched group text, never slices the input),
-# it cannot match against a normalized copy and slice from that copy. This
-# pattern tolerates "\r\n" *and* a bare "\r" (classic Mac line endings --
-# frontmatter.py::_detect_newline already recognizes this style, and
-# patch_frontmatter_bytes preserves it on point-edits, so a page saved once
-# in this format stays in it) directly, so it can match the real,
-# un-normalized text and hand back a slice of that same text. The
-# alternation order matters: "\r\n" must be tried before the bare "\r"
-# branch, or a CRLF input would match only its "\r" half and leave the "\n"
-# dangling in the slice.
-_FRONTMATTER_BOUNDARY_RE = re.compile(
-    r"^\ufeff?---(?:\r\n|\r|\n).*?(?:\r\n|\r|\n)---(?:\r\n|\r|\n)*", re.DOTALL
-)
-TITLE_RE = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
-WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]")
 DAILY_ENTRY_SPLIT_RE = re.compile(
     r"(?=^##\s+\d{2}:\d{2}\s+\[[^\]]+\]\s*$)",
     re.MULTILINE,
@@ -622,24 +538,6 @@ DAILY_ENTRY_SPLIT_RE = re.compile(
 # wrap survives every recompilation, archival, and link-repair pass verbatim.
 HUMAN_ZONE_START = "<!-- human:start -->"
 HUMAN_ZONE_END = "<!-- human:end -->"
-# Model-authored text that happens to contain one of the markers above --
-# quoted from a forwarded message, echoed back from an injection attempt,
-# or simply describing this very mechanism -- must not turn into a second
-# marker pair on the page. Unlike daily entries, where a marker only counts
-# as one when it owns a whole line (storage.escape_embedded_runtime_markup
-# defuses those by indenting), the human zone is found with a plain
-# substring count, so indenting would change nothing and the substring
-# itself has to be broken. Dropping the "--" after the "<!" does that
-# while keeping the text readable and its meaning obvious.
-#
-# The replacement deliberately adds no character of its own: the callers
-# below collapse runs of whitespace *before* defusing, and a claim's text
-# is later matched byte for byte against the copy the model was shown
-# (see _apply_claims_and_conflicts). Inserting a space here would make
-# defusing non-idempotent -- the second cleaning pass would collapse the
-# doubled space, the strings would stop matching, and the conflict
-# pointing at that claim would be silently dropped as stale.
-_HUMAN_ZONE_MARKER_LOOKALIKE_RE = re.compile(r"<!--(\s*human:(?:start|end)\s*)-->")
 # Model-authored text that starts a line with "## " is the same class of
 # forgery one level up: _section_text/_replace_section/_insert_section_before
 # find every section of a compiled page with "^##\s+" (MULTILINE), and take
@@ -652,12 +550,6 @@ _HUMAN_ZONE_MARKER_LOOKALIKE_RE = re.compile(r"<!--(\s*human:(?:start|end)\s*)--
 # rendered as a bare line and therefore defuses its own value (see
 # _render_briefing). Any new field rendered that way has to do the same.
 _EMBEDDED_HEADING_RE = re.compile(r"^(##\s)", re.MULTILINE)
-
-
-def _defuse_human_zone_markers(text: str) -> str:
-    """Break any human-zone marker embedded in model-authored text."""
-
-    return _HUMAN_ZONE_MARKER_LOOKALIKE_RE.sub(r"<!\1-->", text)
 
 
 def _defuse_embedded_headings(text: str) -> str:
@@ -1218,7 +1110,7 @@ class CompiledBriefingService:
         self._ensure_state_dirs()
         now = datetime.now().astimezone()
         due_at = now.timestamp() + max(0, debounce_seconds)
-        clipped_excerpt = self._clip(source_excerpt, MAX_SOURCE_EXCERPT_CHARS)
+        clipped_excerpt = compiled_page.clip(source_excerpt, MAX_SOURCE_EXCERPT_CHARS)
 
         def mutate_queue() -> None:
             queue = self._load_queue()
@@ -1677,7 +1569,7 @@ class CompiledBriefingService:
                     consolidation_events.append(
                         CompiledBatchConsolidationEvent(
                             source_rel_path=source_rel_path,
-                            source_excerpt=self._clip(
+                            source_excerpt=compiled_page.clip(
                                 source_excerpt,
                                 BATCH_CONSOLIDATION_EXCERPT_CHARS,
                             ),
@@ -2108,7 +2000,7 @@ class CompiledBriefingService:
             except Exception as exc:  # noqa: BLE001 - see below
                 # Unguarded, this call decided the fate of everything after
                 # it in this ``finally`` (code review): a failing journal
-                # write (``_atomic_write_text`` -- a full disk, a read-only
+                # write (``atomic_write_file_text`` -- a full disk, a read-only
                 # ``.session/``) aborted the rest of the block, so the
                 # dropped-source clears below never ran and ``_active_pass``
                 # was never reset. A pass that had in fact just compiled the
@@ -2188,7 +2080,7 @@ class CompiledBriefingService:
                         "detail": ",".join(sorted(required_sections - sections)),
                     }
                 )
-            sources = self._source_links_from_note(candidate.text)
+            sources = compiled_page.source_links_from_note(candidate.text)
             if not sources:
                 issues.append(
                     {
@@ -2279,10 +2171,10 @@ class CompiledBriefingService:
 
         if not self.should_file_output_artifact(request, output_markdown):
             return None
-        now = datetime.now().astimezone()
+        now = owner_now()
         dir_path = self.answers_root / now.strftime("%Y") / now.strftime("%m")
         title = self._artifact_title(request)
-        slug = self._slugify(title) or "assistant-output"
+        slug = compiled_page.slugify(title) or "assistant-output"
         note = self._render_output_artifact(
             title=title,
             request=request,
@@ -2308,7 +2200,7 @@ class CompiledBriefingService:
             rel_path = path.relative_to(self.vault_path).as_posix()
             self.enqueue_refresh(
                 source_path=rel_path,
-                source_excerpt=self._clip(
+                source_excerpt=compiled_page.clip(
                     f"{request.strip()}\n\n{output_markdown.strip()}",
                     MAX_SOURCE_EXCERPT_CHARS,
                 ),
@@ -2429,7 +2321,7 @@ class CompiledBriefingService:
         payload: dict[str, Any],
         events: list[CompiledBatchConsolidationEvent],
     ) -> str:
-        now = datetime.now().astimezone()
+        now = owner_now()
         dir_path = (
             self.vault_path
             / "summaries"
@@ -2441,7 +2333,7 @@ class CompiledBriefingService:
             self._clean_line(payload.get("headline"))
             or "Compiled Batch Consolidation"
         )
-        slug = self._slugify(headline) or "compiled-batch-consolidation"
+        slug = compiled_page.slugify(headline) or "compiled-batch-consolidation"
         note = self._render_batch_consolidation(
             headline=headline,
             payload=payload,
@@ -2626,7 +2518,7 @@ class CompiledBriefingService:
                 "kind": "entity-identity", "page": source_rel_path,
                 "summary": "Нужно уточнить, кто или какой проект имеется в виду: "
                            + ", ".join(unclear_entities),
-                "since": date.today().isoformat(), "source_path": source_rel_path,
+                "since": owner_today().isoformat(), "source_path": source_rel_path,
             }])
             self._record_queue_eviction(evicted)
 
@@ -2663,7 +2555,7 @@ class CompiledBriefingService:
         if not target_path.is_file():
             return
         try:
-            note_text = self._read_page_text(target_path)
+            note_text = compiled_page.read_page_text(target_path)
         except OSError:
             return
         rel_path = target_path.relative_to(self.vault_path).as_posix()
@@ -2810,7 +2702,7 @@ class CompiledBriefingService:
         selected = list(ranked[:limit])
         if not selected:
             return CompiledQuestionContext("", ())
-        if len(self._tokens(question.lower())) >= 4:
+        if len(compiled_page.tokens(question.lower())) >= 4:
             related = self._one_hop_related_candidates(question, selected)
             related_slots = min(len(related), max(0, limit - 1))
             if related_slots:
@@ -2877,7 +2769,7 @@ class CompiledBriefingService:
         source_evidence: list[str] = []
         examined_sources: set[str] = set()
         for candidate, issue in candidates_with_issues:
-            sources = self._source_links_from_note(candidate.text)
+            sources = compiled_page.source_links_from_note(candidate.text)
             if issue["issue"] == "source-changed":
                 changed_sources = set(
                     issue["detail"].removeprefix("changed_sources=").split(",")
@@ -2974,7 +2866,7 @@ class CompiledBriefingService:
         self, question: str, roots: Sequence[CompiledBriefingCandidate]
     ) -> list[CompiledBriefingCandidate]:
         """One bounded hop through explicit Related Pages links only."""
-        query_tokens = self._tokens(question.lower())
+        query_tokens = compiled_page.tokens(question.lower())
         seen = {candidate.rel_path for candidate in roots}
         added: list[CompiledBriefingCandidate] = []
         for root in roots:
@@ -2995,9 +2887,11 @@ class CompiledBriefingService:
                     or not path.is_file()
                 ):
                     continue
-                text = self._read_page_text(path)
-                fields = self._frontmatter_fields(text)
-                title = self._title_from_text(text) or path.stem.replace("-", " ")
+                text = compiled_page.read_page_text(path)
+                fields = compiled_page.frontmatter_fields(text)
+                title = compiled_page.title_from_text(text) or path.stem.replace(
+                    "-", " "
+                )
                 candidate = CompiledBriefingCandidate(
                     rel_path=rel_path,
                     domain=str(fields.get("domain") or path.parent.name),
@@ -3010,10 +2904,10 @@ class CompiledBriefingService:
                     tier=str(fields.get("tier") or ""),
                     text=text,
                 )
-                relevant_tokens = self._tokens(
+                relevant_tokens = compiled_page.tokens(
                     f"{candidate.title} {candidate.description}".lower()
-                ) | self._tokens(
-                    self._clip(candidate.text, MAX_BODY_SNIPPET_CHARS).lower()
+                ) | compiled_page.tokens(
+                    compiled_page.clip(candidate.text, MAX_BODY_SNIPPET_CHARS).lower()
                 )
                 if query_tokens.isdisjoint(relevant_tokens):
                     continue
@@ -3077,7 +2971,9 @@ class CompiledBriefingService:
         }
         for item in updates:
             if isinstance(item, dict) and item.get("domain") == "projects":
-                slug = self._slugify(str(item.get("slug") or item.get("title") or ""))
+                slug = compiled_page.slugify(
+                    str(item.get("slug") or item.get("title") or "")
+                )
                 project_paths.add(f"compiled/projects/{slug}.md")
         for item in updates:
             if not isinstance(item, dict):
@@ -3089,7 +2985,7 @@ class CompiledBriefingService:
             if not title:
                 continue
             description = self._clean_line(item.get("description"))
-            slug = self._slugify(str(item.get("slug") or title))
+            slug = compiled_page.slugify(str(item.get("slug") or title))
             if not slug:
                 continue
             key = (domain, slug)
@@ -3108,13 +3004,17 @@ class CompiledBriefingService:
                     description=description,
                     reason=self._clean_line(item.get("reason")),
                     existing_path=self._clean_line(item.get("existing_path")),
-                    aliases=tuple(self._normalize_list(item.get("aliases"))),
+                    aliases=tuple(compiled_page.normalize_list(item.get("aliases"))),
                     directions=tuple(
-                        name for name in self._normalize_list(item.get("directions"))
+                        name
+                        for name in compiled_page.normalize_list(
+                            item.get("directions")
+                        )
                         if name in directions
                     ),
                     projects=tuple(
-                        path for path in self._normalize_list(item.get("projects"))
+                        path
+                        for path in compiled_page.normalize_list(item.get("projects"))
                         if path in project_paths
                     ),
                 )
@@ -3154,7 +3054,7 @@ class CompiledBriefingService:
                     "path": candidate.rel_path,
                     "domain": candidate.domain,
                     "title": candidate.title,
-                    "aliases": self._normalize_list(fields.get("aliases")),
+                    "aliases": compiled_page.normalize_list(fields.get("aliases")),
                     "description": candidate.description,
                 }
             )
@@ -3242,7 +3142,9 @@ class CompiledBriefingService:
         except FrontmatterError:
             prior = {}
         result = {
-            key: list(dict.fromkeys((*self._normalize_list(prior.get(key)), *values)))
+            key: list(
+                dict.fromkeys((*compiled_page.normalize_list(prior.get(key)), *values))
+            )
             for key, values in (
                 ("aliases", target.aliases),
                 ("directions", target.directions),
@@ -3333,7 +3235,7 @@ class CompiledBriefingService:
                 raise CompiledPageEncodingError(
                     f"compiled page is not valid UTF-8: {rel_path}"
                 ) from exc
-            existing_meta = self._frontmatter_fields(existing_text)
+            existing_meta = compiled_page.frontmatter_fields(existing_text)
 
         if existing_meta.get("tier") == "archive":
             signal = {**(signal or {}), "tier": "warm"}
@@ -3410,7 +3312,7 @@ class CompiledBriefingService:
         # (``_sources_shaped_rows``), per the task instructions. ТЗ 6.1:
         # rows marked ``NOT_ENRICHMENT_SOURCE_MARKER`` (cold, or a `warm`
         # page that turned out insignificant) do not consume this budget.
-        month_prefix = date.today().isoformat()[:7]
+        month_prefix = owner_today().isoformat()[:7]
         # Counted by distinct (date, source) pair, not by row: ТЗ 5.6 budgets
         # *enrichments*, and one enrichment appends one row per claim it
         # contributed, so counting rows charged a single pass 3-4 times over.
@@ -3426,7 +3328,9 @@ class CompiledBriefingService:
                 and what != NOT_ENRICHMENT_SOURCE_MARKER
             }
         )
-        page_tier = self._frontmatter_fields(existing_text).get("tier", "").strip()
+        page_tier = (
+            compiled_page.frontmatter_fields(existing_text).get("tier", "").strip()
+        )
         if (monthly_enrichments >= MAX_ENRICHMENTS_PER_PAGE_PER_MONTH
                 and page_tier not in {"core", "active"}):
             if pass_obj is not None:
@@ -3632,7 +3536,7 @@ class CompiledBriefingService:
                 current_bytes = note_path.read_bytes()
             except FileNotFoundError:
                 return False
-            fields = self._frontmatter_fields(
+            fields = compiled_page.frontmatter_fields(
                 current_bytes.decode("utf-8", errors="replace")
             )
             if fields.get("tier") != "archive":
@@ -3714,7 +3618,7 @@ class CompiledBriefingService:
                 written=False,
                 requeueable=requeueable_if_ambiguous,
             )
-        today = date.today().isoformat()
+        today = owner_today().isoformat()
         shaped_rows = self._sources_shaped_rows(existing_text)
         existing_pairs = {(row[0], row[1]) for row in shaped_rows}
         if (today, source_rel_path) not in existing_pairs:
@@ -3722,7 +3626,7 @@ class CompiledBriefingService:
                 *shaped_rows,
                 (today, source_rel_path, NOT_ENRICHMENT_SOURCE_MARKER),
             ]
-        old_sources = self._source_links_from_note(existing_text)
+        old_sources = compiled_page.source_links_from_note(existing_text)
         all_sources = self._merge_paths(old_sources, [source_rel_path])
         new_text = self._replace_section(
             existing_text, "Sources", self._render_sources(all_sources)
@@ -3730,7 +3634,7 @@ class CompiledBriefingService:
         new_text = self._replace_section(
             new_text,
             "Sources That Shaped This Page",
-            self._render_sources_shaped_table(shaped_rows),
+            compiled_page.render_sources_shaped_table(shaped_rows),
         )
         shaped_source_count = len(
             {
@@ -3775,7 +3679,7 @@ class CompiledBriefingService:
         about to be recorded, that reaches the ">=2 sources in 7 days"
         signal without a model call.
         """
-        cutoff = date.today() - timedelta(days=WARM_SIGNAL_WINDOW_DAYS)
+        cutoff = owner_today() - timedelta(days=WARM_SIGNAL_WINDOW_DAYS)
         for row_date, _source, _what in self._sources_shaped_rows(existing_text):
             try:
                 parsed = date.fromisoformat(row_date)
@@ -3851,13 +3755,13 @@ class CompiledBriefingService:
         after_hex = fingerprint_after.hex() if fingerprint_after is not None else None
         if rel_path in pass_obj.snapshot_manifest:
             pass_obj.snapshot_manifest[rel_path]["fingerprint_after"] = after_hex
-            _atomic_write_text(
+            atomic_write_file_text(
                 self._pass_snapshot_manifest_path(pass_obj.pass_id),
                 json.dumps(pass_obj.snapshot_manifest, ensure_ascii=False, indent=2),
             )
             return
         if before is not None:
-            _atomic_write_bytes(
+            atomic_write_file_bytes(
                 self._pass_snapshot_blob_path(pass_obj.pass_id, rel_path), before
             )
         fingerprint_before = self._full_content_fingerprint(before)
@@ -3875,7 +3779,7 @@ class CompiledBriefingService:
             "fingerprint_after": after_hex,
             "source_state_before": source_state_before,
         }
-        _atomic_write_text(
+        atomic_write_file_text(
             self._pass_snapshot_manifest_path(pass_obj.pass_id),
             json.dumps(pass_obj.snapshot_manifest, ensure_ascii=False, indent=2),
         )
@@ -3942,6 +3846,8 @@ class CompiledBriefingService:
         manifest = self._read_pass_snapshot_manifest(pass_id)
         restored: list[str] = []
         skipped: list[str] = []
+        # Why each skipped page was left alone, for the ops journal line.
+        skip_reasons: dict[str, str] = {}
         if not manifest:
             return {
                 "restored": restored,
@@ -3974,6 +3880,7 @@ class CompiledBriefingService:
                 after_fingerprint = bytes.fromhex(after_hex) if after_hex else None
                 if current_fingerprint != after_fingerprint:
                     skipped.append(rel_path)
+                    skip_reasons[rel_path] = "изменена после прохода"
                     continue
                 if entry.get("existed"):
                     blob_path = self._pass_snapshot_blob_path(pass_id, rel_path)
@@ -3981,8 +3888,22 @@ class CompiledBriefingService:
                         original_bytes = blob_path.read_bytes()
                     except FileNotFoundError:
                         skipped.append(rel_path)
+                        skip_reasons[rel_path] = "нет снимка"
                         continue
-                    _atomic_write_bytes(file_path, original_bytes)
+                    # Byte-exact on purpose: a snapshot with broken frontmatter
+                    # must come back as it was, so no markdown validation here.
+                    # A symlink in place of the page is refused (ELOOP).
+                    try:
+                        atomic_write_file_bytes(file_path, original_bytes)
+                    except OSError as exc:
+                        if exc.errno != errno.ELOOP:
+                            raise
+                        logger.warning(
+                            "Pass %s rollback skipped %s: %s", pass_id, rel_path, exc
+                        )
+                        skipped.append(rel_path)
+                        skip_reasons[rel_path] = "симлинк"
+                        continue
                 elif file_path.exists():
                     file_path.unlink()
                 restored.append(rel_path)
@@ -3998,6 +3919,17 @@ class CompiledBriefingService:
                         else:
                             state["entries"][restored_rel_path] = source_state_before
                     self._write_source_state_unlocked(state)
+        # Paths only, never page content; ``append_ops_log`` is best-effort,
+        # so a failed journal write cannot fail a rollback that already ran.
+        skipped_detail = "; ".join(
+            f"{rel_path}: {skip_reasons[rel_path]}" for rel_path in sorted(skipped)
+        )
+        append_ops_log(
+            self.vault_path,
+            "compile",
+            f"откат прохода {pass_id}: восстановлено {len(restored)}, "
+            f"пропущено {len(skipped)}" + (f" ({skipped_detail})" if skipped else ""),
+        )
         return {
             "restored": sorted(restored),
             "skipped": sorted(skipped),
@@ -4060,7 +3992,7 @@ class CompiledBriefingService:
             "rollback": rollback,
         }
         journal_path = self.vault_path / ".session" / "compile-enrich.json"
-        _atomic_write_text(
+        atomic_write_file_text(
             journal_path,
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         )
@@ -4162,7 +4094,7 @@ class CompiledBriefingService:
             "[EXPECTED_JSON_SHAPE]\n"
             f"{json_example}\n\n"
             "[RAW_OUTPUT]\n"
-            f"{self._clip(raw_output, MAX_JSON_REPAIR_CHARS)}\n"
+            f"{compiled_page.clip(raw_output, MAX_JSON_REPAIR_CHARS)}\n"
             "[END_RAW_OUTPUT]\n"
         )
 
@@ -4179,7 +4111,9 @@ class CompiledBriefingService:
         else:
             candidate = self.compiled_root / target.domain / f"{target.slug}.md"
         if candidate.exists():
-            fields = self._frontmatter_fields(self._read_page_text(candidate))
+            fields = compiled_page.frontmatter_fields(
+                compiled_page.read_page_text(candidate)
+            )
             canonical = str(fields.get("canonical_path") or "")
             if canonical.startswith(f"compiled/{target.domain}/"):
                 primary = (self.vault_path / canonical).resolve()
@@ -4313,8 +4247,8 @@ class CompiledBriefingService:
 
         The import is deferred (function-local, not module-level):
         ``decisions_queue`` imports from this module at module scope
-        (``CompiledBriefingCandidate``, ``CompiledBriefingService``,
-        ``_atomic_write_text``), so importing it back at module scope here
+        (``CompiledBriefingCandidate``, ``CompiledBriefingService``), so
+        importing it back at module scope here
         would be a circular import.
         """
         from d_brain.services.decisions_queue import append_decision_queue_entries
@@ -4331,7 +4265,7 @@ class CompiledBriefingService:
                     "page": page_rel_path,
                     "candidate_page": candidate_rel_path,
                     "summary": summary,
-                    "since": date.today().isoformat(),
+                    "since": owner_today().isoformat(),
                 }
             ],
             existing_lock=existing_lock,
@@ -4372,7 +4306,7 @@ class CompiledBriefingService:
                         "kind": "drift",
                         "page": page_rel_path,
                         "summary": summary,
-                        "since": date.today().isoformat(),
+                        "since": owner_today().isoformat(),
                     }
                 ],
                 existing_lock=lock,
@@ -4417,7 +4351,7 @@ class CompiledBriefingService:
                         "kind": "verify-rejected",
                         "page": page_rel_path,
                         "summary": summary,
-                        "since": date.today().isoformat(),
+                        "since": owner_today().isoformat(),
                         "source_path": source_rel_path,
                         "source_excerpt": source_excerpt,
                         "max_updates": str(max_updates),
@@ -4480,7 +4414,7 @@ class CompiledBriefingService:
                         "kind": UNDECIDED_CONFLICT_KIND,
                         "page": page_rel_path,
                         "summary": summary,
-                        "since": date.today().isoformat(),
+                        "since": owner_today().isoformat(),
                     }
                 ],
                 existing_lock=lock,
@@ -4553,7 +4487,7 @@ class CompiledBriefingService:
                         "kind": HUMAN_ZONE_AMBIGUOUS_KIND,
                         "page": rel_path,
                         "summary": summary,
-                        "since": date.today().isoformat(),
+                        "since": owner_today().isoformat(),
                     }
                 ],
                 existing_lock=lock,
@@ -4603,7 +4537,7 @@ class CompiledBriefingService:
                 "kind": PAGE_ENCODING_BROKEN_KIND,
                 "page": rel_path,
                 "summary": summary,
-                "since": date.today().isoformat(),
+                "since": owner_today().isoformat(),
             }
         ]
         if existing_lock is not None:
@@ -4764,6 +4698,7 @@ class CompiledBriefingService:
         signal: dict[str, Any] | None,
         existing_text: str,
     ) -> str:
+        existing_briefing = compiled_page.clip(existing_text, MAX_EXISTING_NOTE_CHARS)
         return (
             "Maintain one compiled briefing for a personal assistant knowledge base.\n"
             "Write all generated text in "
@@ -4899,7 +4834,7 @@ class CompiledBriefingService:
             "[SOURCE_MEMORY_SIGNAL]\n"
             f"{json.dumps(signal or {}, ensure_ascii=False, indent=2)}\n\n"
             "[EXISTING_BRIEFING_MARKDOWN]\n"
-            f"{self._clip(existing_text, MAX_EXISTING_NOTE_CHARS) or '(none)'}\n\n"
+            f"{existing_briefing or '(none)'}\n\n"
             "[EXISTING_CLAIMS]\n"
             f"{self._existing_claims_catalog(existing_text)}\n\n"
             "[CHANGED_SOURCE_EXCERPT]\n"
@@ -4935,7 +4870,7 @@ class CompiledBriefingService:
             len(HUMAN_ZONE_START) : len(human_zone) - len(HUMAN_ZONE_END)
         ].strip()
         human_zone_tokens = (
-            self._tokens(human_zone_inner) if human_zone_inner else set()
+            compiled_page.tokens(human_zone_inner) if human_zone_inner else set()
         )
         # Code review defect 1: sticky once true (see _HUMAN_ZONE_POPULATED_RE
         # / human_zone_markers_look_corrupted) -- sets the frontmatter flag
@@ -4964,7 +4899,7 @@ class CompiledBriefingService:
                 if conflict["new_claim"] in kept_claim_texts
             ]
 
-        today = date.today().isoformat()
+        today = owner_today().isoformat()
         compiled_at = datetime.now().astimezone().isoformat(timespec="seconds")
         # Needed below only to queue a "blocked-action" owner decision when
         # ``_apply_claims_and_conflicts`` blocks a low-trust supersession
@@ -5015,10 +4950,10 @@ class CompiledBriefingService:
             return [item for item in cleaned if item]
 
         recent_changes = without_leading_date(
-            self._normalize_list(payload.get("recent_changes"))
+            compiled_page.normalize_list(payload.get("recent_changes"))
         )
         open_loops = without_leading_date(
-            self._normalize_list(payload.get("open_loops"))
+            compiled_page.normalize_list(payload.get("open_loops"))
         )
         # Filtered here, before any accepted-decision restoration below can
         # overwrite it with immutable existing-page content: the duplicate
@@ -5026,7 +4961,8 @@ class CompiledBriefingService:
         # text that was already on the page (see the accepted-decision
         # branch further down).
         key_decisions = self._filter_list_duplicating_human_zone(
-            self._normalize_list(payload.get("key_decisions")), human_zone_tokens
+            compiled_page.normalize_list(payload.get("key_decisions")),
+            human_zone_tokens,
         )
         # The one _clean_line field rendered as a bare line of its own (see
         # "## Next Check" below), so unlike every other one it can forge a
@@ -5054,13 +4990,13 @@ class CompiledBriefingService:
         corrective_actions: list[str] = []
         generalizable_learning = ""
         if target.domain == "decisions":
-            existing_record_kind = self._metadata_value(
+            existing_record_kind = compiled_page.metadata_value(
                 existing_meta.get("record_kind")
             )
-            existing_decision_status = self._metadata_value(
+            existing_decision_status = compiled_page.metadata_value(
                 existing_meta.get("decision_status")
             )
-            record_kind = self._metadata_value(
+            record_kind = compiled_page.metadata_value(
                 payload.get("record_kind")
                 or existing_record_kind
                 or "decision"
@@ -5073,14 +5009,14 @@ class CompiledBriefingService:
             if record_kind not in RECORD_KIND_VALUES:
                 record_kind = "decision"
             if record_kind == "decision":
-                decision_status = self._metadata_value(
+                decision_status = compiled_page.metadata_value(
                     payload.get("decision_status")
                     or existing_meta.get("decision_status")
                     or "proposed"
                 )
                 if decision_status not in DECISION_STATUS_VALUES:
                     decision_status = "proposed"
-                decision_owner = self._metadata_value(
+                decision_owner = compiled_page.metadata_value(
                     payload.get("decision_owner")
                     or existing_meta.get("decision_owner")
                 )
@@ -5097,10 +5033,10 @@ class CompiledBriefingService:
                     self._paragraph(payload.get("rationale")), human_zone_tokens
                 )
                 alternatives = self._filter_list_duplicating_human_zone(
-                    self._normalize_list(payload.get("alternatives_considered")),
+                    compiled_page.normalize_list(payload.get("alternatives_considered")),
                     human_zone_tokens,
                 )
-                supersedes = self._normalize_list(payload.get("supersedes"))
+                supersedes = compiled_page.normalize_list(payload.get("supersedes"))
                 superseded_by = self._clean_line(payload.get("superseded_by"))
                 decision_evidence = self._normalize_paths(
                     payload.get("decision_evidence")
@@ -5111,7 +5047,7 @@ class CompiledBriefingService:
                 )
                 if existing_decision_status == "accepted" and not explicit_supersession:
                     decision_status = "accepted"
-                    decision_owner = self._metadata_value(
+                    decision_owner = compiled_page.metadata_value(
                         existing_meta.get("decision_owner")
                     ) or decision_owner
                     decision_date = self._validated_date_field(
@@ -5139,7 +5075,7 @@ class CompiledBriefingService:
                     field="incident_date",
                     page_path=f"compiled/{target.domain}/{target.slug}.md",
                 )
-                severity = self._metadata_value(
+                severity = compiled_page.metadata_value(
                     payload.get("severity") or existing_meta.get("severity")
                 )
                 if severity and severity not in INCIDENT_SEVERITY_VALUES:
@@ -5150,13 +5086,13 @@ class CompiledBriefingService:
                         severity,
                     )
                     severity = ""
-                timeline = self._normalize_list(payload.get("timeline"))
+                timeline = compiled_page.normalize_list(payload.get("timeline"))
                 root_cause = self._paragraph(payload.get("root_cause"))
-                what_worked = self._normalize_list(payload.get("what_worked"))
-                what_did_not_work = self._normalize_list(
+                what_worked = compiled_page.normalize_list(payload.get("what_worked"))
+                what_did_not_work = compiled_page.normalize_list(
                     payload.get("what_did_not_work")
                 )
-                corrective_actions = self._normalize_list(
+                corrective_actions = compiled_page.normalize_list(
                     payload.get("corrective_actions")
                 )
                 generalizable_learning = self._paragraph(
@@ -5248,7 +5184,7 @@ class CompiledBriefingService:
             generalizable_learning, human_zone_tokens
         )
 
-        old_sources = self._source_links_from_note(existing_text)
+        old_sources = compiled_page.source_links_from_note(existing_text)
         new_sources = self._normalize_paths(payload.get("source_links"))
         all_sources = self._merge_paths(old_sources, [source_rel_path, *new_sources])
         created = existing_meta.get("created") or today
@@ -5355,7 +5291,9 @@ class CompiledBriefingService:
             # floor every new page's first claims-bearing pass at
             # DEFAULT_SOURCES_TRUST regardless of the real source).
             if existing_sources_trust in SOURCES_TRUST_VALUES:
-                sources_trust = self._min_trust(existing_sources_trust, current_trust)
+                sources_trust = compiled_page.min_trust(
+                    existing_sources_trust, current_trust
+                )
             else:
                 sources_trust = current_trust
         elif existing_sources_trust in SOURCES_TRUST_VALUES:
@@ -5371,7 +5309,8 @@ class CompiledBriefingService:
         if claims and quality_status != "needs_review":
             last_verified = today
         enrichment_count = (
-            self._int_value(existing_meta.get("enrichment_count"), default=0) + 1
+            compiled_page.int_value(existing_meta.get("enrichment_count"), default=0)
+            + 1
         )
         # The delta is negative when a pass closes more conflicts than it
         # opens (a superseded side leaves the ledger, see
@@ -5379,7 +5318,7 @@ class CompiledBriefingService:
         # counter lower than its table must still never go below zero.
         conflicts_open = max(
             0,
-            self._int_value(existing_meta.get("conflicts_open"), default=0)
+            compiled_page.int_value(existing_meta.get("conflicts_open"), default=0)
             + new_open_conflicts,
         )
         if open_conflict_rows and confidence == "high":
@@ -5591,13 +5530,13 @@ class CompiledBriefingService:
                 *self._render_sources(all_sources),
                 "",
                 "## Sources That Shaped This Page",
-                *self._render_sources_shaped_table(shaped_rows),
+                *compiled_page.render_sources_shaped_table(shaped_rows),
                 "",
                 "## Open Conflicts",
-                *self._render_open_conflicts_table(open_conflict_rows),
+                *compiled_page.render_open_conflicts_table(open_conflict_rows),
                 "",
                 "## Claim History",
-                *self._render_claim_history(claim_history_rows),
+                *compiled_page.render_claim_history(claim_history_rows),
                 "",
             ]
         )
@@ -5645,7 +5584,9 @@ class CompiledBriefingService:
                     and human_span[0] <= match.start() < human_span[1]):
                 return match.group(0)
             return match.group(0).replace(
-                match.group(1), self._canonical_source_reference(match.group(1)), 1
+                match.group(1),
+                compiled_page.canonical_source_reference(match.group(1)),
+                1,
             )
 
         return WIKILINK_RE.sub(canonical_link, rendered)
@@ -5741,20 +5682,6 @@ class CompiledBriefingService:
             )
         return rendered
 
-    def _catalog(self) -> list[dict[str, str]]:
-        catalog: list[dict[str, str]] = []
-        for candidate in self._iter_candidates():
-            catalog.append(
-                {
-                    "path": candidate.rel_path,
-                    "domain": candidate.domain,
-                    "slug": candidate.slug,
-                    "title": candidate.title,
-                    "description": candidate.description,
-                }
-            )
-        return catalog
-
     def _impact_catalog(
         self,
         *,
@@ -5764,11 +5691,11 @@ class CompiledBriefingService:
         max_chars: int = IMPACT_CATALOG_MAX_CHARS,
     ) -> list[dict[str, str]]:
         """Return a bounded, source-aware compiled catalog for impact routing."""
-        query_tokens = self._tokens(f"{source_rel_path}\n{source_excerpt}")
+        query_tokens = compiled_page.tokens(f"{source_rel_path}\n{source_excerpt}")
         scored: list[tuple[tuple[int, int, float, str], dict[str, str]]] = []
 
         for candidate in self._iter_candidates():
-            source_links = self._source_links_from_note(candidate.text)
+            source_links = compiled_page.source_links_from_note(candidate.text)
             source_link_match = 1 if source_rel_path in source_links else 0
             haystack = " ".join(
                 [
@@ -5779,7 +5706,7 @@ class CompiledBriefingService:
                     " ".join(source_links),
                 ]
             )
-            overlap = len(query_tokens & self._tokens(haystack))
+            overlap = len(query_tokens & compiled_page.tokens(haystack))
             item = {
                 "path": candidate.rel_path,
                 "domain": candidate.domain,
@@ -5824,11 +5751,11 @@ class CompiledBriefingService:
             rel_path = path.relative_to(self.vault_path).as_posix()
             if rel_path.startswith("compiled/archive/"):
                 continue
-            text = self._read_page_text(path)
-            fields = self._frontmatter_fields(text)
+            text = compiled_page.read_page_text(path)
+            fields = compiled_page.frontmatter_fields(text)
             if fields.get("canonical_path"):
                 continue
-            title = self._title_from_text(text) or path.stem.replace("-", " ")
+            title = compiled_page.title_from_text(text) or path.stem.replace("-", " ")
             candidates.append(
                 CompiledBriefingCandidate(
                     rel_path=rel_path,
@@ -5868,15 +5795,15 @@ class CompiledBriefingService:
         if not query:
             return []
         query_lower = query.lower()
-        query_tokens = self._tokens(query_lower)
+        query_tokens = compiled_page.tokens(query_lower)
         scored: list[tuple[float, CompiledBriefingCandidate]] = []
         for candidate in self._iter_candidates():
             if domain is not None and candidate.domain != domain:
                 continue
             title_lower = candidate.title.lower()
             description_lower = candidate.description.lower()
-            body_lower = self._clip(
-                self._body_without_frontmatter(candidate.text).lower(),
+            body_lower = compiled_page.clip(
+                compiled_page.body_without_frontmatter(candidate.text).lower(),
                 MAX_BODY_SNIPPET_CHARS,
             )
             score = 0.0
@@ -5899,9 +5826,9 @@ class CompiledBriefingService:
                 score += 8.0
             if candidate.slug and candidate.slug.replace("-", " ") in query_lower:
                 score += 5.0
-            title_tokens = self._tokens(title_lower)
-            description_tokens = self._tokens(description_lower)
-            body_tokens = self._tokens(body_lower)
+            title_tokens = compiled_page.tokens(title_lower)
+            description_tokens = compiled_page.tokens(description_lower)
+            body_tokens = compiled_page.tokens(body_lower)
             score += 2.4 * len(query_tokens & title_tokens)
             score += 1.2 * len(query_tokens & description_tokens)
             score += 0.25 * len(query_tokens & body_tokens)
@@ -6075,7 +6002,7 @@ class CompiledBriefingService:
         return payload
 
     def _write_source_state_unlocked(self, state: dict[str, Any]) -> None:
-        _atomic_write_text(
+        atomic_write_file_text(
             self.source_state_path,
             json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         )
@@ -6094,7 +6021,7 @@ class CompiledBriefingService:
         return payload if isinstance(payload, dict) else {}
 
     def _save_worker_state(self, payload: dict[str, Any]) -> None:
-        _atomic_write_text(
+        atomic_write_file_text(
             self.worker_state_path,
             json.dumps(payload, ensure_ascii=False, indent=2),
         )
@@ -6212,7 +6139,7 @@ class CompiledBriefingService:
             or self._active_queue_worker_journal_path is None
         ):
             return
-        _atomic_write_text(
+        atomic_write_file_text(
             self._active_queue_worker_journal_path,
             json.dumps(
                 self._active_queue_worker_journal,
@@ -6318,7 +6245,7 @@ class CompiledBriefingService:
         }
         journal_path = self.vault_path / ".session" / "compile-queue-worker.json"
         try:
-            _atomic_write_text(
+            atomic_write_file_text(
                 journal_path,
                 json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             )
@@ -6412,7 +6339,7 @@ class CompiledBriefingService:
                         "errors": [str(item) for item in errors],
                     }
                 )
-                _atomic_write_text(
+                atomic_write_file_text(
                     self._dropped_sources_journal_path(),
                     json.dumps({"sources": entries}, ensure_ascii=False, indent=2)
                     + "\n",
@@ -6483,7 +6410,7 @@ class CompiledBriefingService:
                 ]
                 if len(remaining) == len(entries):
                     return
-                _atomic_write_text(
+                atomic_write_file_text(
                     self._dropped_sources_journal_path(),
                     json.dumps({"sources": remaining}, ensure_ascii=False, indent=2)
                     + "\n",
@@ -6506,7 +6433,7 @@ class CompiledBriefingService:
         return [item for item in payload if isinstance(item, dict)]
 
     def _save_queue(self, payload: list[dict[str, Any]]) -> None:
-        _atomic_write_text(
+        atomic_write_file_text(
             self.queue_path,
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         )
@@ -6833,7 +6760,7 @@ class CompiledBriefingService:
                 self.vault_path / rel_path,
                 {
                     "compile_state": state,
-                    "compile_checked": date.today().isoformat(),
+                    "compile_checked": owner_today().isoformat(),
                 },
                 manifest=self._manifest(),
             )
@@ -6874,7 +6801,9 @@ class CompiledBriefingService:
                 continue
             for path in sorted(root_path.glob("**/*.md")):
                 rel_path = path.relative_to(self.vault_path).as_posix()
-                fields = self._frontmatter_fields(self._read_page_text(path))
+                fields = compiled_page.frontmatter_fields(
+                    compiled_page.read_page_text(path)
+                )
                 if str(fields.get("compile_state") or "").strip():
                     continue
                 if rel_path in referenced:
@@ -6991,7 +6920,7 @@ class CompiledBriefingService:
         return candidates[0] if candidates else None
 
     def _normalize_lint_source(self, source: str) -> str:
-        raw = self._canonical_source_reference(str(source or "").strip())
+        raw = compiled_page.canonical_source_reference(str(source or "").strip())
         raw = raw.split("#", 1)[0].strip()
         raw = self._strip_relative_prefix(raw)
         if raw.startswith("vault/"):
@@ -7072,7 +7001,7 @@ class CompiledBriefingService:
 
     def _source_snapshot(self, note_text: str) -> dict[str, str]:
         snapshot: dict[str, str] = {}
-        for source in self._source_links_from_note(note_text):
+        for source in compiled_page.source_links_from_note(note_text):
             raw = self._normalize_lint_source(source)
             if not raw or Path(raw).is_absolute():
                 continue
@@ -7184,7 +7113,7 @@ class CompiledBriefingService:
         current = self._sources_digest(self._source_snapshot(note_text))
         if rejection.get("sources") != current:
             return False
-        return self._int_value(rejection.get("count"), default=0) >= (
+        return compiled_page.int_value(rejection.get("count"), default=0) >= (
             MAX_VERIFY_REJECTED_RETRIES
         )
 
@@ -7213,7 +7142,7 @@ class CompiledBriefingService:
             rejection = entry.get("verify_rejected")
             previous = 0
             if isinstance(rejection, dict) and rejection.get("sources") == digest:
-                previous = self._int_value(rejection.get("count"), default=0)
+                previous = compiled_page.int_value(rejection.get("count"), default=0)
             new_count = previous + 1
             entry["verify_rejected"] = {"sources": digest, "count": new_count}
             state["entries"][rel_path] = entry
@@ -7282,13 +7211,13 @@ class CompiledBriefingService:
         return hashlib.sha256(source_excerpt.encode("utf-8")).hexdigest()
 
     def _source_excerpt(self, source_rel_path: str, source_excerpt: str) -> str:
-        clipped = self._clip(source_excerpt, MAX_SOURCE_EXCERPT_CHARS)
+        clipped = compiled_page.clip(source_excerpt, MAX_SOURCE_EXCERPT_CHARS)
         if clipped:
             return clipped
         source_path = self._resolve_lint_source_path(source_rel_path)
         if source_path is None or not source_path.exists():
             return ""
-        return self._clip(
+        return compiled_page.clip(
             source_path.read_text(encoding="utf-8", errors="replace"),
             MAX_SOURCE_EXCERPT_CHARS,
         )
@@ -7298,7 +7227,7 @@ class CompiledBriefingService:
         if not text:
             return []
         if not source_rel_path.startswith("daily/"):
-            return [self._clip(text, MAX_SOURCE_EXCERPT_CHARS)]
+            return [compiled_page.clip(text, MAX_SOURCE_EXCERPT_CHARS)]
 
         blocks = self._daily_entry_blocks(text)
         if not blocks:
@@ -7490,12 +7419,6 @@ class CompiledBriefingService:
                         break
         return "claude"
 
-    @staticmethod
-    def _clip(text: str, limit: int) -> str:
-        source = str(text or "").strip()
-        if limit <= 0 or len(source) <= limit:
-            return source
-        return source[:limit].rstrip() + "\n...[truncated]"
 
     @staticmethod
     def _clean_line(value: Any) -> str:
@@ -7517,60 +7440,7 @@ class CompiledBriefingService:
             _defuse_human_zone_markers(re.sub(r"\n{3,}", "\n\n", text))
         )
 
-    @staticmethod
-    def _slugify(value: str) -> str:
-        source = str(value or "").strip().lower()
-        translit = source.maketrans(
-            {
-                "а": "a",
-                "б": "b",
-                "в": "v",
-                "г": "g",
-                "д": "d",
-                "е": "e",
-                "ё": "e",
-                "ж": "zh",
-                "з": "z",
-                "и": "i",
-                "й": "y",
-                "к": "k",
-                "л": "l",
-                "м": "m",
-                "н": "n",
-                "о": "o",
-                "п": "p",
-                "р": "r",
-                "с": "s",
-                "т": "t",
-                "у": "u",
-                "ф": "f",
-                "х": "h",
-                "ц": "ts",
-                "ч": "ch",
-                "ш": "sh",
-                "щ": "sch",
-                "ъ": "",
-                "ы": "y",
-                "ь": "",
-                "э": "e",
-                "ю": "yu",
-                "я": "ya",
-            }
-        )
-        normalized = source.translate(translit)
-        normalized = re.sub(r"[^0-9a-z]+", "-", normalized).strip("-")
-        return normalized[:80]
 
-    @staticmethod
-    def _normalize_list(value: Any) -> list[str]:
-        if not isinstance(value, list):
-            return []
-        lines: list[str] = []
-        for item in value:
-            cleaned = " ".join(str(item or "").split()).strip()
-            if cleaned:
-                lines.append(_defuse_human_zone_markers(cleaned))
-        return lines[:7]
 
     def _normalize_paths(self, value: Any) -> list[str]:
         if not isinstance(value, list):
@@ -7578,7 +7448,7 @@ class CompiledBriefingService:
         paths: list[str] = []
         project_root = self.vault_path.parent.resolve()
         for item in value:
-            raw = self._canonical_source_reference(str(item or "").strip())
+            raw = compiled_page.canonical_source_reference(str(item or "").strip())
             if not raw:
                 continue
             if raw.startswith("/"):
@@ -7599,24 +7469,6 @@ class CompiledBriefingService:
                 paths.append(raw)
         return paths
 
-    @staticmethod
-    def _canonical_source_reference(raw: str) -> str:
-        is_qmd = raw.startswith("qmd:/")
-        if is_qmd:
-            raw = re.sub(r"^qmd:/+", "", raw)
-            if raw.startswith("core/"):
-                raw = raw[len("core/"):]
-            for collection, folder in (
-                ("youtube", "imports/youtube/notes"),
-                ("documents", "imports/documents/notes"),
-                ("documents_forwarded", "imports/documents/forwarded"),
-            ):
-                if raw.startswith(f"{collection}/"):
-                    raw = folder + raw[len(collection):]
-                    break
-        if raw.startswith("plaud/"):
-            raw = "imports/plaud/notes/" + raw[len("plaud/"):]
-        return raw
 
     @staticmethod
     def _strip_relative_prefix(raw: str) -> str:
@@ -7654,22 +7506,6 @@ class CompiledBriefingService:
     def _sections_from_text(text: str) -> set[str]:
         return set(re.findall(r"^##\s+(.+?)\s*$", text or "", re.MULTILINE))
 
-    @staticmethod
-    def _source_links_from_note(text: str) -> list[str]:
-        if not text:
-            return []
-        match = re.search(
-            r"^##\s+Sources\s*$\n([\s\S]*?)(?:^##\s+|\Z)",
-            text,
-            re.MULTILINE,
-        )
-        if match is None:
-            return []
-        return [
-            path.strip()
-            for path in WIKILINK_RE.findall(match.group(1))
-            if path.strip()
-        ]
 
     @staticmethod
     def _explicit_event_date(text: str) -> str:
@@ -7731,27 +7567,13 @@ class CompiledBriefingService:
             if match is None:
                 continue
             date_value, source_value, what_value = match.groups()
-            source_text = cls._unescape_table_cell(source_value)
-            what_text = cls._unescape_table_cell(what_value)
+            source_text = compiled_page.unescape_table_cell(source_value)
+            what_text = compiled_page.unescape_table_cell(what_value)
             if what_text == NOT_ENRICHMENT_SOURCE_MARKER:
                 continue
             rows.append((date_value, source_text, what_text))
         return rows
 
-    @classmethod
-    def _render_sources_shaped_table(
-        cls,
-        rows: list[tuple[str, str, str]],
-    ) -> list[str]:
-        rows = [row for row in rows if row[2] != NOT_ENRICHMENT_SOURCE_MARKER]
-        if not rows:
-            return ["(no sources recorded yet)"]
-        lines = ["| Date | Source | What Added |", "| --- | --- | --- |"]
-        for date_value, source_value, what_value in rows:
-            source_cell = cls._escape_table_cell(source_value)
-            what_cell = cls._escape_table_cell(what_value)
-            lines.append(f"| {date_value} | [[{source_cell}]] | {what_cell} |")
-        return lines
 
     @classmethod
     def _dated_rows(
@@ -7775,7 +7597,8 @@ class CompiledBriefingService:
         """
         section = cls._section_text(text, heading)
         fallback_date = (
-            cls._frontmatter_fields(text).get("updated") or date.today().isoformat()
+            compiled_page.frontmatter_fields(text).get("updated")
+            or owner_today().isoformat()
         )
         rows: list[tuple[str, str, str]] = []
         for line in section.splitlines():
@@ -7836,30 +7659,13 @@ class CompiledBriefingService:
             rows.append(
                 (
                     date_value,
-                    cls._unescape_table_cell(source_value),
-                    cls._unescape_table_cell(claim_value),
-                    cls._unescape_table_cell(superseded_value),
+                    compiled_page.unescape_table_cell(source_value),
+                    compiled_page.unescape_table_cell(claim_value),
+                    compiled_page.unescape_table_cell(superseded_value),
                 )
             )
         return rows
 
-    @classmethod
-    def _render_claim_history(cls, rows: list[tuple[str, str, str, str]]) -> list[str]:
-        if not rows:
-            return ["(no superseded claims yet)"]
-        lines = [
-            "| Date | Source | Claim | Superseded By |",
-            "| --- | --- | --- | --- |",
-        ]
-        for date_value, source_value, claim_value, superseded_value in rows:
-            source_cell = cls._escape_table_cell(source_value)
-            claim_cell = cls._escape_table_cell(claim_value)
-            superseded_cell = cls._escape_table_cell(superseded_value)
-            lines.append(
-                f"| {date_value} | [[{source_cell}]] | {claim_cell} | "
-                f"[[{superseded_cell}]] |"
-            )
-        return lines
 
     @classmethod
     def _open_conflicts_rows(
@@ -7881,43 +7687,16 @@ class CompiledBriefingService:
             rows.append(
                 (
                     date_value,
-                    cls._unescape_table_cell(existing_claim),
-                    cls._unescape_table_cell(existing_source),
-                    cls._unescape_table_cell(new_claim),
-                    cls._unescape_table_cell(new_source),
+                    compiled_page.unescape_table_cell(existing_claim),
+                    compiled_page.unescape_table_cell(existing_source),
+                    compiled_page.unescape_table_cell(new_claim),
+                    compiled_page.unescape_table_cell(new_source),
                 )
             )
         return rows
 
-    @classmethod
-    def _render_open_conflicts_table(
-        cls, rows: list[tuple[str, str, str, str, str]]
-    ) -> list[str]:
-        if not rows:
-            return ["(no open conflicts)"]
-        lines = [
-            "| Date | Existing Claim | Existing Source | New Claim | New Source |",
-            "| --- | --- | --- | --- | --- |",
-        ]
-        for date_value, existing_claim, existing_source, new_claim, new_source in rows:
-            existing_claim_cell = cls._escape_table_cell(existing_claim)
-            existing_source_cell = cls._escape_table_cell(existing_source)
-            new_claim_cell = cls._escape_table_cell(new_claim)
-            new_source_cell = cls._escape_table_cell(new_source)
-            lines.append(
-                f"| {date_value} | {existing_claim_cell} | "
-                f"[[{existing_source_cell}]] | {new_claim_cell} | "
-                f"[[{new_source_cell}]] |"
-            )
-        return lines
 
-    @staticmethod
-    def _escape_table_cell(value: str) -> str:
-        return str(value or "").replace("|", "\\|")
 
-    @staticmethod
-    def _unescape_table_cell(value: str) -> str:
-        return str(value or "").replace("\\|", "|")
 
     @staticmethod
     def _human_zone_span(text: str) -> tuple[int, int] | None:
@@ -8122,7 +7901,7 @@ class CompiledBriefingService:
             text,
             heading="Claim History",
             before_heading=anchor,
-            new_lines=cls._render_claim_history([]),
+            new_lines=compiled_page.render_claim_history([]),
         )
 
     @classmethod
@@ -8158,16 +7937,6 @@ class CompiledBriefingService:
         block = f"## {heading}\n" + "\n".join(new_lines) + "\n\n"
         return text[: before_match.start()] + block + text[before_match.start() :]
 
-    @staticmethod
-    def _metadata_value(value: Any) -> str:
-        raw = str(value or "").strip()
-        if raw.startswith('"') and raw.endswith('"'):
-            try:
-                decoded = json.loads(raw)
-            except json.JSONDecodeError:
-                return raw.strip('"')
-            return str(decoded).strip()
-        return raw
 
     @classmethod
     def _validated_date_field(
@@ -8187,7 +7956,7 @@ class CompiledBriefingService:
         and freezes the page silently. Anything that is not a plain date is
         dropped instead, with a warning so the loss is visible.
         """
-        value = cls._metadata_value(raw_value)
+        value = compiled_page.metadata_value(raw_value)
         if not value:
             return ""
         if DATE_ONLY_RE.match(value):
@@ -8200,37 +7969,6 @@ class CompiledBriefingService:
         )
         return ""
 
-    @classmethod
-    def _frontmatter_fields(cls, text: str) -> dict[str, str]:
-        # CRLF line endings (e.g. from Windows' `git config core.autocrlf
-        # true`) break FRONTMATTER_RE's literal `\n` right after the
-        # opening `---`, same as _semantic_source_text normalizes above --
-        # without this every field, including `tier`, would read as absent.
-        match = FRONTMATTER_RE.match((text or "").replace("\r\n", "\n"))
-        if match is None:
-            return {}
-        fields: dict[str, str] = {}
-        for line in match.group(1).splitlines():
-            if ":" not in line:
-                continue
-            key, _, value = line.partition(":")
-            # Point-edit write paths (see _promote_archive_tier,
-            # _record_non_enrichment_source) patch single fields with
-            # patch_frontmatter_bytes, which always JSON-quotes string
-            # values (e.g. `tier: "warm"`) -- unlike _render_briefing's own
-            # plain `f"tier: {tier}"` convention used for the same fields.
-            # Decode through ``_metadata_value`` -- the one place that
-            # unescapes a JSON-quoted value -- instead of naively stripping
-            # one wrapping pair of quotes: a naive strip leaves any escaped
-            # inner quote untouched, so a value like `"Иван \"Ваня\"
-            # Петров"` comes out with the backslashes still in it, and each
-            # later json.dumps re-escapes what is already escaped. Every
-            # reader of this dict (and every direct caller of
-            # ``_metadata_value`` that later re-wraps one of these values)
-            # sees the same fully-decoded value regardless of which write
-            # path produced it.
-            fields[key.strip()] = cls._metadata_value(value)
-        return fields
 
     @classmethod
     def _extra_frontmatter_lines(
@@ -8284,49 +8022,9 @@ class CompiledBriefingService:
             lines.append(f"{key}: {encoded}")
         return lines
 
-    @staticmethod
-    def _decode_page_bytes(raw: bytes) -> str:
-        """Decode one compiled page's bytes the way every reader here does."""
 
-        return raw.decode("utf-8", errors="replace")
 
-    @classmethod
-    def _read_page_text(cls, path: Path) -> str:
-        """Read one compiled page the way ``_upsert_briefing`` writes it.
 
-        Deliberately not ``read_text``: its universal-newline translation
-        turns every "\\r" on the page into "\\n", so the same file parses
-        into different sections depending on which reader opened it, and
-        the text compares unequal to the bytes on disk -- which is how
-        ``_compress_cooled_pages``'s compare-and-swap decides the page
-        changed under it and silently skips the page forever. The owner
-        only has to write a note with CRLF endings inside their own zone
-        for that to happen.
-        """
-
-        return cls._decode_page_bytes(path.read_bytes())
-
-    @staticmethod
-    def _title_from_text(text: str) -> str:
-        match = TITLE_RE.search(text or "")
-        return str(match.group(1)).strip() if match else ""
-
-    @staticmethod
-    def _body_without_frontmatter(text: str) -> str:
-        # Code review defect 2: the body this returns feeds
-        # _extract_human_zone, whose output must survive recompilation
-        # byte-for-byte -- so the slice below always comes from the
-        # *original* ``text``, never from a CRLF-normalized copy (a
-        # normalized copy would silently turn every "\r\n" inside the
-        # owner's zone into "\n"). ``_FRONTMATTER_BOUNDARY_RE`` tolerates
-        # "\r\n" directly (see _frontmatter_fields for why plain "\n"
-        # alone isn't enough), so it can match ``text`` as-is with no
-        # normalization step at all.
-        text = text or ""
-        match = _FRONTMATTER_BOUNDARY_RE.match(text)
-        if match is None:
-            return text
-        return text[match.end() :]
 
     @classmethod
     def _extract_human_zone(cls, text: str) -> str:
@@ -8357,7 +8055,7 @@ class CompiledBriefingService:
         frontmatter too, so the corresponding body is derived here instead
         of by the caller.
         """
-        body = cls._body_without_frontmatter(text)
+        body = compiled_page.body_without_frontmatter(text)
         starts = body.count(HUMAN_ZONE_START)
         ends = body.count(HUMAN_ZONE_END)
         if starts == 0 and ends == 0:
@@ -8388,28 +8086,7 @@ class CompiledBriefingService:
         except ValueError:
             return default
 
-    @staticmethod
-    def _int_value(value: str | None, *, default: int) -> int:
-        raw = str(value or "").strip()
-        try:
-            parsed = int(raw)
-        except ValueError:
-            if raw:
-                logger.warning(
-                    "Compiled briefing has non-numeric counter value %r; "
-                    "using default %d",
-                    raw,
-                    default,
-                )
-            return default
-        # Counters (enrichment_count, conflicts_open) are never meaningful
-        # below zero; clamp instead of letting a corrupted negative value
-        # keep counting further away from zero on every write.
-        return max(parsed, 0)
 
-    @staticmethod
-    def _tokens(text: str) -> set[str]:
-        return {token.lower() for token in TOKEN_RE.findall(text or "")}
 
     @classmethod
     def _text_duplicates_human_zone(
@@ -8419,7 +8096,7 @@ class CompiledBriefingService:
     ) -> bool:
         if not human_zone_tokens or not text:
             return False
-        text_tokens = cls._tokens(text)
+        text_tokens = compiled_page.tokens(text)
         if len(text_tokens) < HUMAN_ZONE_DUPLICATE_MIN_TOKENS:
             return False
         overlap = len(text_tokens & human_zone_tokens)
@@ -8558,21 +8235,14 @@ class CompiledBriefingService:
             level = "own"
             for header in headers:
                 if FORWARD_MARK_RE.match(header):
-                    level = cls._min_trust(level, "forwarded")
+                    level = compiled_page.min_trust(level, "forwarded")
                 elif OWN_ENTRY_MARK_RE.match(header):
-                    level = cls._min_trust(level, "own")
+                    level = compiled_page.min_trust(level, "own")
                 else:
-                    level = cls._min_trust(level, "inferred")
+                    level = compiled_page.min_trust(level, "inferred")
             return level
         return "inferred"
 
-    @staticmethod
-    def _min_trust(first: str, second: str) -> str:
-        """Weaker of two trust levels (page-level trust is the fail-closed
-        minimum across all of a page's sources, ТЗ 4.3/4.4)."""
-        if TRUST_RANK.get(second, 0) < TRUST_RANK.get(first, 0):
-            return second
-        return first
 
     @classmethod
     def _trust_allows_consequential_action(cls, trust: str) -> bool:
@@ -9161,7 +8831,7 @@ class CompiledBriefingService:
             "- Если оба утверждения об одном и том же и одно явно отменяет "
             'другое — это не "both_valid".\n\n'
             f"[СТРАНИЦА] {page_rel_path}\n"
-            f"{self._clip(page_state, MAX_BODY_SNIPPET_CHARS) or '(пусто)'}\n\n"
+            f"{compiled_page.clip(page_state, MAX_BODY_SNIPPET_CHARS) or '(пусто)'}\n\n"
             "[СТАРОЕ УТВЕРЖДЕНИЕ]\n"
             f"текст: {existing_claim}\n"
             f"источник: {existing_source}\n"
@@ -9438,13 +9108,13 @@ class CompiledBriefingService:
         text = self._replace_section(
             text,
             "Sources That Shaped This Page",
-            self._render_sources_shaped_table(shaped_rows),
+            compiled_page.render_sources_shaped_table(shaped_rows),
         )
         text = self._replace_section(
-            text, "Claim History", self._render_claim_history(history_rows)
+            text, "Claim History", compiled_page.render_claim_history(history_rows)
         )
         text = self._replace_section(
-            text, "Open Conflicts", self._render_open_conflicts_table(kept_rows)
+            text, "Open Conflicts", compiled_page.render_open_conflicts_table(kept_rows)
         )
         return text, settled
 
@@ -9493,7 +9163,7 @@ class CompiledBriefingService:
                 current_bytes = note_path.read_bytes()
             except FileNotFoundError:
                 return False
-            if self._decode_page_bytes(current_bytes) != candidate.text:
+            if compiled_page.decode_page_bytes(current_bytes) != candidate.text:
                 return False
             if current_bytes != candidate.text.encode("utf-8"):
                 logger.warning(
@@ -9584,7 +9254,7 @@ class CompiledBriefingService:
         for item in pending:
             page_path = self.vault_path / item.page
             try:
-                text = self._read_page_text(page_path)
+                text = compiled_page.read_page_text(page_path)
             except FileNotFoundError:
                 text = ""
             if not text:
@@ -9592,7 +9262,7 @@ class CompiledBriefingService:
                 # answered and no longer means anything.
                 self._drop_drift_entry(item.page)
                 continue
-            month_prefix = (item.since or date.today().isoformat())[:7]
+            month_prefix = (item.since or owner_today().isoformat())[:7]
             verdict, reason = self._judge_page_drift(
                 page_rel_path=item.page,
                 text=text,
@@ -9619,9 +9289,10 @@ class CompiledBriefingService:
             if row_date.startswith(month_prefix)
             and what != NOT_ENRICHMENT_SOURCE_MARKER
         )
-        page_state = self._clip(
+        page_state = compiled_page.clip(
             self._section_text(text, "Current State"), MAX_BODY_SNIPPET_CHARS
         )
+        month_rows_excerpt = compiled_page.clip(month_rows, MAX_BODY_SNIPPET_CHARS)
         prompt = (
             "Ты ведёшь скомпилированную базу знаний личного ассистента.\n"
             "Верни ТОЛЬКО JSON.\n\n"
@@ -9640,7 +9311,7 @@ class CompiledBriefingService:
             f"[СТРАНИЦА] {page_rel_path}\n"
             f"{page_state or '(пусто)'}\n\n"
             f"[ЧТО ДОБАВЛЯЛОСЬ В {month_prefix}]\n"
-            f"{self._clip(month_rows, MAX_BODY_SNIPPET_CHARS) or '(ничего)'}\n\n"
+            f"{month_rows_excerpt or '(ничего)'}\n\n"
             "Верни JSON строго такого вида:\n"
             f"{DRIFT_JSON_EXAMPLE}"
         )
@@ -9686,7 +9357,7 @@ class CompiledBriefingService:
                 current_bytes = note_path.read_bytes()
             except FileNotFoundError:
                 return False
-            if self._decode_page_bytes(current_bytes) != text:
+            if compiled_page.decode_page_bytes(current_bytes) != text:
                 return False
             new_bytes = patch_frontmatter_bytes(
                 current_bytes,
@@ -9875,7 +9546,7 @@ class CompiledBriefingService:
         """
         from d_brain.services.decisions_queue import queue_kind_label
 
-        page_state = self._clip(
+        page_state = compiled_page.clip(
             self._section_text(
                 self._read_page_text_or_empty(self.vault_path / item.page),
                 "Current State",
@@ -9884,7 +9555,7 @@ class CompiledBriefingService:
         )
         other_page_block = ""
         if item.candidate_page:
-            other_state = self._clip(
+            other_state = compiled_page.clip(
                 self._section_text(
                     self._read_page_text_or_empty(
                         self.vault_path / item.candidate_page
@@ -9905,6 +9576,7 @@ class CompiledBriefingService:
             {"action": actions[0][0], "reason": "Обоснование по данным ниже"},
             ensure_ascii=False,
         )
+        summary_excerpt = compiled_page.clip(item.summary, MAX_BODY_SNIPPET_CHARS)
         prompt = (
             "Ты ведёшь скомпилированную базу знаний личного ассистента.\n"
             "Верни ТОЛЬКО JSON.\n\n"
@@ -9920,7 +9592,7 @@ class CompiledBriefingService:
             f"[СТРАНИЦА] {item.page}\n"
             f"{page_state or '(пусто)'}\n"
             f"{other_page_block}\n"
-            f"[ЧТО СЛУЧИЛОСЬ]\n{self._clip(item.summary, MAX_BODY_SNIPPET_CHARS)}\n\n"
+            f"[ЧТО СЛУЧИЛОСЬ]\n{summary_excerpt}\n\n"
             f"[ВАРИАНТЫ]\n{options}\n\n"
             f'В поле "action" верни ровно одно из: {allowed}. '
             'В "reason" — одной фразой, почему.\n\n'
@@ -9963,7 +9635,7 @@ class CompiledBriefingService:
         an item pointing at a page that vanished mid-pass must not raise out
         of an automated decision."""
         try:
-            return self._read_page_text(path)
+            return compiled_page.read_page_text(path)
         except (OSError, ValueError):
             return ""
 
@@ -10279,7 +9951,7 @@ class CompiledBriefingService:
         for candidate in self._iter_candidates():
             if len(archived) >= limit:
                 break
-            status = self._frontmatter_fields(candidate.text).get("status", "")
+            status = compiled_page.frontmatter_fields(candidate.text).get("status", "")
             stale_trigger = (
                 candidate.freshness_state == "stale"
                 and status in {"done", "inactive"}
@@ -10307,7 +9979,7 @@ class CompiledBriefingService:
         """
         if candidate.tier != "archive":
             return False
-        last_accessed_raw = self._frontmatter_fields(candidate.text).get(
+        last_accessed_raw = compiled_page.frontmatter_fields(candidate.text).get(
             "last_accessed"
         )
         try:
@@ -10318,7 +9990,7 @@ class CompiledBriefingService:
             last_accessed = None
         if last_accessed is None:
             return False
-        if (date.today() - last_accessed).days < ARCHIVE_TIER_IDLE_DAYS:
+        if (owner_today() - last_accessed).days < ARCHIVE_TIER_IDLE_DAYS:
             return False
         return not self._has_incoming_links(candidate, link_index)
 
@@ -10509,7 +10181,7 @@ class CompiledBriefingService:
             written = written or upsert_result.written
         if not updated_path:
             raise ValueError("no readable source for freshness refresh")
-        updated_text = self._read_page_text(self.vault_path / updated_path)
+        updated_text = compiled_page.read_page_text(self.vault_path / updated_path)
         self._record_source_state(updated_path, updated_text)
         return BriefingUpsertResult(path=updated_path, written=written)
 
@@ -10535,7 +10207,7 @@ class CompiledBriefingService:
                 return ""
             source_content = original_content
             document = parse_frontmatter_bytes(source_content)
-            today = date.today().isoformat()
+            today = owner_today().isoformat()
             metadata_updates = {
                 key: value
                 for key, value in {
@@ -10639,7 +10311,7 @@ class CompiledBriefingService:
                 # these bytes survive a decode?" got silently answered as
                 # one. Decoding the current bytes the same way the candidate
                 # was decoded keeps the freshness check in one space.
-                if self._decode_page_bytes(current_bytes) != candidate.text:
+                if compiled_page.decode_page_bytes(current_bytes) != candidate.text:
                     # Changed since _iter_candidates() ran this pass (e.g.
                     # enriched earlier in the same pass) -- skip rather than
                     # risk clobbering it with a stale compression diff.
@@ -10697,7 +10369,7 @@ class CompiledBriefingService:
             recent_rows
         ) > RECENT_CHANGES_KEEP else []
 
-        today = date.today()
+        today = owner_today()
         kept_open: list[tuple[str, str, str]] = []
         abandoned_open: list[tuple[str, str, str]] = []
         for row_date, row_text, row_source in open_rows:
@@ -10789,7 +10461,7 @@ class CompiledBriefingService:
         artifact_type: str,
         created_at: datetime,
     ) -> str:
-        body = self._clip(output_markdown.strip(), MAX_OUTPUT_ARTIFACT_CHARS)
+        body = compiled_page.clip(output_markdown.strip(), MAX_OUTPUT_ARTIFACT_CHARS)
         return (
             "---\n"
             f"date: {created_at.date().isoformat()}\n"
@@ -10821,8 +10493,8 @@ class CompiledBriefingService:
             self._paragraph(payload.get("summary"))
             or "No durable cross-source pattern captured yet."
         )
-        themes = self._normalize_list(payload.get("themes"))
-        follow_ups = self._normalize_list(payload.get("follow_ups"))
+        themes = compiled_page.normalize_list(payload.get("themes"))
+        follow_ups = compiled_page.normalize_list(payload.get("follow_ups"))
         source_paths = self._merge_paths([event.source_rel_path for event in events])
         updated_paths = self._merge_paths(
             *[list(event.updated_paths) for event in events]
@@ -10862,3 +10534,58 @@ class CompiledBriefingService:
             "## Sources\n"
             f"{sources_block}\n"
         )
+
+    # Public surface for the sibling ``compiled_*`` modules and the runners.
+    # One-line forwards on purpose: the implementations keep their private
+    # names, so tests that patch ``_archive_candidate`` & co. still intercept
+    # every call, wherever it comes from.
+
+    def iter_candidates(self) -> list[CompiledBriefingCandidate]:
+        return self._iter_candidates()
+
+    def rank_candidates(
+        self,
+        question: str,
+        *,
+        limit: int,
+        domain: str | None = None,
+    ) -> list[CompiledBriefingCandidate]:
+        return self._rank_candidates(question, limit=limit, domain=domain)
+
+    def archive_candidate(self, candidate: CompiledBriefingCandidate) -> str:
+        return self._archive_candidate(candidate)
+
+    def clear_verify_rejection(self, rel_path: str) -> None:
+        self._clear_verify_rejection(rel_path)
+
+    def write_settled_page(
+        self, candidate: CompiledBriefingCandidate, new_text: str
+    ) -> bool:
+        return self._write_settled_page(candidate, new_text)
+
+    def run_json_dict_prompt(
+        self,
+        *,
+        prompt: str,
+        timeout: int,
+        error_context: str,
+        json_example: str,
+    ) -> dict[str, Any]:
+        return self._run_json_dict_prompt(
+            prompt=prompt,
+            timeout=timeout,
+            error_context=error_context,
+            json_example=json_example,
+        )
+
+    def resolve_lint_source_path(self, source: str) -> Path | None:
+        return self._resolve_lint_source_path(source)
+
+    def refresh_qmd_index(self) -> None:
+        self._refresh_qmd_index()
+
+    def load_queue(self) -> list[dict[str, Any]]:
+        return self._load_queue()
+
+    def normalize_rel_path(self, value: str | Path) -> str:
+        return self._normalize_rel_path(value)

@@ -20,7 +20,7 @@ def test_document_summary_marks_partial_input_and_keeps_source_boundary(
 ) -> None:
     service = DocumentArchiveService(tmp_path / "vault", ai_cli="qwen")
     captured: list[str] = []
-    service.runner.run = lambda prompt, timeout: (  # type: ignore[method-assign]
+    service.runner.run = lambda prompt, timeout, **kwargs: (  # type: ignore[method-assign]
         captured.append(prompt) or '{"summary":"Короткое резюме."}'
     )
     body = "A" * DOCUMENT_SUMMARY_INPUT_CHARS + "TAIL_MUST_NOT_APPEAR"
@@ -48,7 +48,7 @@ def test_document_summary_marks_small_complete_input_without_inventing_details(
 ) -> None:
     service = DocumentArchiveService(tmp_path / "vault", ai_cli="qwen")
     captured: list[str] = []
-    service.runner.run = lambda prompt, timeout: (  # type: ignore[method-assign]
+    service.runner.run = lambda prompt, timeout, **kwargs: (  # type: ignore[method-assign]
         captured.append(prompt) or '{"summary":"Точный итог."}'
     )
     extraction = DocumentExtractionResult(

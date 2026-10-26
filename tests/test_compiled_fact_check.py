@@ -18,9 +18,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from _helpers import make_page_writer
 
 import d_brain.run_compiled_monthly_verify as run_compiled_monthly_verify_cli
 import d_brain.services.compiled_fact_check as compiled_fact_check
+from d_brain.services import compiled_page
 from d_brain.services.compiled_briefings import CompiledBriefingService
 from d_brain.services.compiled_fact_check import (
     CLAIM_CATEGORY_ENVIRONMENT,
@@ -93,17 +95,14 @@ def _page_text(
         "---\n\n"
     )
     body = ["# Тестовая страница", "", "## Sources That Shaped This Page", ""]
-    body += CompiledBriefingService._render_sources_shaped_table(sources_rows)
+    body += compiled_page.render_sources_shaped_table(sources_rows)
     if conflicts_rows:
         body += ["", "## Open Conflicts", ""]
-        body += CompiledBriefingService._render_open_conflicts_table(conflicts_rows)
+        body += compiled_page.render_open_conflicts_table(conflicts_rows)
     return frontmatter + "\n".join(body) + "\n"
 
 
-def _write_page(vault: Path, rel_path: str, **kwargs: object) -> None:
-    path = vault / rel_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_page_text(**kwargs), encoding="utf-8")  # type: ignore[arg-type]
+_write_page = make_page_writer(_page_text)
 
 
 def _candidate_for(vault: Path, rel_path: str):

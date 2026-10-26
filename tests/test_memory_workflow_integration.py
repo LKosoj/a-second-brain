@@ -3,6 +3,7 @@ from pathlib import Path
 
 from conftest import _setup_daily_processing_vault
 
+from d_brain import clock
 from d_brain.services.compiled_briefings import (
     CompiledBriefingCandidate,
     CompiledBriefingService,
@@ -71,8 +72,10 @@ def test_empty_daily_still_learns_before_refresh(tmp_path: Path, monkeypatch) ->
     assert events == ["learn", "refresh"]
 
 
-def test_conditional_lessons_reach_question_and_do(tmp_path: Path, monkeypatch) -> None:
-    day = date.today()
+def test_conditional_lessons_reach_question_and_do(
+    tmp_path: Path, monkeypatch, frozen_clock
+) -> None:
+    day = clock.owner_today()
     vault_path = tmp_path / "vault"
     _setup_daily_processing_vault(vault_path, day)
     processor = CliProcessor(vault_path)
@@ -105,7 +108,9 @@ def test_conditional_lessons_reach_question_and_do(tmp_path: Path, monkeypatch) 
 def test_nightly_correction_is_applied_with_original_source(
     tmp_path: Path, monkeypatch
 ) -> None:
-    day = date.today()
+    # No ``frozen_clock``: ``SessionStore`` stamps answers with the real
+    # ``owner_now()`` and the nightly pass selects them by that owner date.
+    day = clock.owner_today()
     vault_path = tmp_path / "vault"
     _setup_daily_processing_vault(vault_path, day)
     store = SessionStore(vault_path)
@@ -145,9 +150,11 @@ def test_nightly_correction_is_applied_with_original_source(
     assert processor._learn_from_conversations(day) == []
 
 
-def test_stale_source_snapshot_reaches_answer_provenance(tmp_path: Path, monkeypatch):
+def test_stale_source_snapshot_reaches_answer_provenance(
+    tmp_path: Path, monkeypatch, frozen_clock
+):
     vault_path = tmp_path / "vault"
-    _setup_daily_processing_vault(vault_path, date.today())
+    _setup_daily_processing_vault(vault_path, clock.owner_today())
     source = vault_path / "daily/new-evidence.md"
     source.write_text("Updated budget is 200.", encoding="utf-8")
     candidate = CompiledBriefingCandidate(

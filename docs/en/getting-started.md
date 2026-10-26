@@ -10,7 +10,8 @@ public code repository.
 - Linux or macOS (see [macOS deployment](macos.md)) and Python 3.12 or newer
 - `uv` and `jq`
 - a Telegram bot token from BotFather
-- a Deepgram API key for voice transcription
+- a Deepgram API key for voice transcription (optional; without it voice is
+  saved and transcribed later)
 - one supported AI CLI: Claude Code, Codex CLI, Qwen Code, Gemini CLI, Kimi
   Code, Grok CLI, or opencode
 - an unprivileged account
@@ -45,7 +46,7 @@ with `uv build`. Install it into a Python environment, then create a private
 instance:
 
 ```bash
-python -m pip install a_second_brain-0.1.0-py3-none-any.whl
+python -m pip install a_second_brain-0.2.0-py3-none-any.whl
 a-second-brain init /srv/a-second-brain-instance
 cd /srv/a-second-brain-instance
 ```
@@ -56,10 +57,11 @@ It refuses to overwrite an existing vault.
 
 ## Configure the minimum settings
 
-Edit `.env` and set the three required values:
+Edit `.env` and set the required values:
 
 ```dotenv
 TELEGRAM_BOT_TOKEN=
+# Optional: without it voice is saved as audio and transcribed later
 DEEPGRAM_API_KEY=
 OWNER_TELEGRAM_ID=
 ```

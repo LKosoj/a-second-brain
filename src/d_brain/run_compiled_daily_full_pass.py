@@ -13,15 +13,14 @@ from pathlib import Path
 from typing import Any
 
 from d_brain.config import get_settings
+from d_brain.services.atomic_io import atomic_write_file_text
 from d_brain.services.cli_runner import detect_terminal_backend_message
 from d_brain.services.compiled_briefings import CompiledBriefingService
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+    atomic_write_file_text(
+        path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
     )
 
 
@@ -267,12 +266,12 @@ def main() -> int:
                 _write_json(progress_path, state)
                 return 1
             if updates_since_refresh >= max(1, args.refresh_every):
-                service._refresh_qmd_index()
+                service.refresh_qmd_index()
                 updates_since_refresh = 0
                 sys.stdout.write("QMD_REFRESH_DONE\n")
                 sys.stdout.flush()
 
-        service._refresh_qmd_index()
+        service.refresh_qmd_index()
         state["finished"] = True
         state["finished_at"] = datetime.now().astimezone().isoformat()
         state["last_activity_at"] = state["finished_at"]

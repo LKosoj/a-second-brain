@@ -2,9 +2,11 @@
 
 import fcntl
 import logging
+import os
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
@@ -12,11 +14,20 @@ from d_brain.manifest import (
     VaultManifest,
     load_manifest_for_vault,
 )
+from d_brain.services.atomic_io import atomic_write_file_bytes
 from d_brain.services.compiled_briefings import CompiledBriefingService
-from d_brain.services.entry_status import format_entry_status_comments
+from d_brain.services.entry_status import (
+    ENTRY_STATUS_ALREADY_PROCESSED,
+    entry_block_digest,
+    entry_spans,
+    extract_entry_statuses,
+    format_entry_status_comments,
+    normalize_entry_type,
+)
 from d_brain.services.frontmatter import (
     FrontmatterDocument,
     FrontmatterError,
+    UnsafeVaultPathError,
     parse_frontmatter_bytes,
     patch_frontmatter_bytes,
     write_validated_vault_markdown,
@@ -34,9 +45,39 @@ from d_brain.services.vault_lock import VaultWriteLock, vault_write_lock
 
 logger = logging.getLogger(__name__)
 
+# The source line of an entry saved from Telegram ("> Идентификатор источника:
+# `telegram:<chat>:<msg>`"); the ":edit" tail marks a correction entry, so a
+# search for the original message never lands on its correction.
+_TELEGRAM_REF_RE = re.compile(
+    r"^>[^\n`]*`(telegram:-?\d+:\d+(?::edit)?)`[ \t]*\r?$", re.MULTILINE
+)
+_PREVIEW_LIMIT = 80
+
 
 class ManagedBlockError(ValueError):
     """Raised when existing managed-block markers are unsafe to modify."""
+
+
+@dataclass(frozen=True, slots=True)
+class DailyEntrySummary:
+    """What /undo shows about the entry it offers to remove."""
+
+    time: str
+    entry_type: str
+    preview: str
+    digest: str
+    processed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _EntryBlock:
+    """One "## HH:MM [type]" entry: [start, end) is heading plus body."""
+
+    start: int
+    heading_end: int
+    end: int
+    time: str
+    entry_type: str
 
 
 class VaultStorage:
@@ -574,6 +615,227 @@ class VaultStorage:
             refresh_compiled=False,
         )
 
+    @staticmethod
+    def _entry_blocks(content: str) -> list[_EntryBlock]:
+        """Split a daily file into entries; offsets index ``content`` as is."""
+        return [
+            _EntryBlock(
+                start=match.start(),
+                heading_end=match.end(),
+                end=end,
+                time=match.group("time"),
+                entry_type=normalize_entry_type(match.group("type")),
+            )
+            for match, end in entry_spans(content)
+        ]
+
+    @classmethod
+    def _find_telegram_entry(
+        cls, content: str, source_ref: str, *, first_ref_only: bool
+    ) -> _EntryBlock | None:
+        """Last entry carrying ``source_ref``; the managed [d-brain] block never.
+
+        A text entry has exactly one genuine source line, right under its
+        heading, so only that one counts there: a ref line quoted further
+        down in someone else's words must not redirect an edit. An album
+        holds one source line per photo, hence ``first_ref_only=False``.
+        """
+        for block in reversed(cls._entry_blocks(content)):
+            if block.entry_type == "d-brain":
+                continue
+            refs = [
+                match.group(1)
+                for match in _TELEGRAM_REF_RE.finditer(
+                    content, block.heading_end, block.end
+                )
+            ]
+            if first_ref_only:
+                refs = refs[:1]
+            if source_ref in refs:
+                return block
+        return None
+
+    @staticmethod
+    def _is_processed(block_text: str) -> bool:
+        return ENTRY_STATUS_ALREADY_PROCESSED in extract_entry_statuses(block_text)
+
+    def _replace_entry_body(
+        self, old_block: str, body: str, newline: bytes
+    ) -> str:
+        """Keep heading, status comments and source line; swap everything below."""
+        ref_match = _TELEGRAM_REF_RE.search(old_block)
+        if ref_match is None:
+            return old_block
+        trailing = old_block[len(old_block.rstrip()) :]
+        rendered = self._render_with_newline(body, newline).decode("utf-8")
+        nl = newline.decode("ascii")
+        return f"{old_block[: ref_match.end()]}{nl}{nl}{rendered}{trailing}"
+
+    def _replace_caption(
+        self, old_block: str, old_caption: str, caption: str, newline: bytes
+    ) -> str | None:
+        """Swap the old caption for the new one, but only as a whole line.
+
+        A bare substring match could hit the attachment path or the AI
+        description that happens to contain the same words.
+        """
+        old = old_caption.strip()
+        if not old:
+            return None
+        position = old_block.find(old)
+        while position != -1:
+            end = position + len(old)
+            if (position == 0 or old_block[position - 1] == "\n") and (
+                end == len(old_block) or old_block[end] in "\r\n"
+            ):
+                rendered = self._render_with_newline(caption, newline).decode("utf-8")
+                return old_block[:position] + rendered + old_block[end:]
+            position = old_block.find(old, position + 1)
+        return None
+
+    def edit_daily_entry(
+        self,
+        day: date,
+        source_ref: str,
+        new_text: str,
+        *,
+        old_caption: str | None = None,
+    ) -> str:
+        """Rewrite one saved Telegram entry after the owner edited the message.
+
+        Returns "replaced", "unchanged", "processed" (the nightly pass has
+        already read the entry, so it is left alone), "no_caption" (the photo
+        entry exists but had no caption to replace) or "missing" (no entry
+        with this ref, or the old caption is not in it). Search, status check
+        and write happen under the same locks, so a parallel append or the
+        nightly marking cannot slip in between. ``old_caption`` switches from
+        replacing the entry text to replacing a photo caption.
+        """
+        file_path = self.get_daily_file(day)
+        if not file_path.exists():
+            return "missing"
+        body = escape_embedded_runtime_markup(
+            escape_embedded_daily_headers(new_text.strip())
+        )
+        with vault_write_lock(self.vault_path) as lock:
+            with self._daily_lock(day):
+                content = file_path.read_bytes().decode("utf-8")
+                block = self._find_telegram_entry(
+                    content, source_ref, first_ref_only=old_caption is None
+                )
+                if block is None:
+                    return "missing"
+                old_block = content[block.start : block.end]
+                if self._is_processed(old_block):
+                    return "processed"
+                newline = parse_frontmatter_bytes(content.encode("utf-8")).newline
+                if old_caption is None:
+                    new_block = self._replace_entry_body(old_block, body, newline)
+                elif not old_caption.strip():
+                    return "no_caption"
+                else:
+                    replaced = self._replace_caption(
+                        old_block, old_caption, body, newline
+                    )
+                    if replaced is None:
+                        return "missing"
+                    new_block = replaced
+                if new_block == old_block:
+                    return "unchanged"
+                updated = content[: block.start] + new_block + content[block.end :]
+                self._write_daily_markdown(file_path, updated, lock)
+        self._post_daily_write(
+            file_path,
+            refresh_qmd=True,
+            refresh_compiled=True,
+            source_excerpt=new_block.replace("\r\n", "\n").strip(),
+        )
+        return "replaced"
+
+    def last_undoable_entry(self, day: date) -> DailyEntrySummary | None:
+        """The newest entry saved from Telegram that day, for /undo.
+
+        Entries without a Telegram ref (PLAUD, the managed [d-brain] block)
+        are skipped: /undo only takes back what the owner just sent.
+        """
+        file_path = self.get_daily_file(day)
+        if not file_path.exists():
+            return None
+        with self._daily_lock(day):
+            content = file_path.read_bytes().decode("utf-8")
+        for block in reversed(self._entry_blocks(content)):
+            if block.entry_type == "d-brain":
+                continue
+            ref_match = _TELEGRAM_REF_RE.search(content, block.heading_end, block.end)
+            if ref_match is None:
+                continue
+            body = content[block.heading_end : block.end]
+            preview = " ".join(content[ref_match.end() : block.end].split())
+            if len(preview) > _PREVIEW_LIMIT:
+                preview = preview[: _PREVIEW_LIMIT - 1] + "…"
+            return DailyEntrySummary(
+                time=block.time,
+                entry_type=block.entry_type,
+                preview=preview,
+                digest=entry_block_digest(body),
+                processed=self._is_processed(body),
+            )
+        return None
+
+    def entry_ref_by_digest(self, day: date, digest: str) -> str | None:
+        """Telegram ref of the entry with this body fingerprint, if still there."""
+        file_path = self.get_daily_file(day)
+        if not file_path.exists():
+            return None
+        with self._daily_lock(day):
+            content = file_path.read_bytes().decode("utf-8")
+        for block in self._entry_blocks(content):
+            if block.entry_type == "d-brain":
+                continue
+            if entry_block_digest(content[block.heading_end : block.end]) != digest:
+                continue
+            ref_match = _TELEGRAM_REF_RE.search(content, block.heading_end, block.end)
+            if ref_match is not None:
+                return ref_match.group(1)
+        return None
+
+    def delete_daily_entry(self, day: date, digest: str) -> str:
+        """Remove the Telegram entry whose body fingerprint is ``digest``.
+
+        Returns "deleted", "processed" or "missing". The fingerprint doubles as
+        a compare-and-swap: if the entry was edited after /undo showed it, the
+        digest no longer matches and nothing is removed. Attachment files stay.
+        """
+        file_path = self.get_daily_file(day)
+        if not file_path.exists():
+            return "missing"
+        with vault_write_lock(self.vault_path) as lock:
+            with self._daily_lock(day):
+                content = file_path.read_bytes().decode("utf-8")
+                for block in self._entry_blocks(content):
+                    body = content[block.heading_end : block.end]
+                    if (
+                        block.entry_type == "d-brain"
+                        or entry_block_digest(body) != digest
+                        or _TELEGRAM_REF_RE.search(body) is None
+                    ):
+                        continue
+                    if self._is_processed(body):
+                        return "processed"
+                    before = content[: block.start]
+                    after = content[block.end :]
+                    if not after:
+                        newline = parse_frontmatter_bytes(
+                            content.encode("utf-8")
+                        ).newline.decode("ascii")
+                        before = before.rstrip("\r\n") + newline
+                    self._write_daily_markdown(file_path, before + after, lock)
+                    break
+                else:
+                    return "missing"
+        self._post_daily_write(file_path, refresh_qmd=True, refresh_compiled=False)
+        return "deleted"
+
     def _refresh_compiled_briefings(
         self,
         file_path: Path,
@@ -640,6 +902,14 @@ class VaultStorage:
             Relative path for Obsidian embed: attachments/YYYY-MM-DD/img-HHMMSS.ext
         """
         dir_path = self.get_attachments_dir(day)
+        # No vault lock here on purpose: the bot must not wait for the nightly
+        # run just to store a photo. Names are unique (``require_absent``), so
+        # the only thing to guard is a symlinked directory leading outside.
+        for directory in (self.attachments_path, dir_path):
+            if directory.is_symlink():
+                raise UnsafeVaultPathError(
+                    f"attachments directory is a symlink: {directory}"
+                )
         time_str = timestamp.strftime("%H%M%S")
         suffix = ""
         if name_hint:
@@ -650,11 +920,16 @@ class VaultStorage:
         filename = f"{base}.{extension}"
         file_path = dir_path / filename
         counter = 1
-        while file_path.exists():
+        while True:
+            # ``lexists``: a dangling symlink also occupies the name.
+            if not os.path.lexists(file_path):
+                try:
+                    atomic_write_file_bytes(file_path, data, require_absent=True)
+                    break
+                except FileExistsError:
+                    pass
             filename = f"{base}-{counter}.{extension}"
             file_path = dir_path / filename
             counter += 1
-
-        file_path.write_bytes(data)
 
         return f"attachments/{day.isoformat()}/{filename}"

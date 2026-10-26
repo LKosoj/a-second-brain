@@ -9,7 +9,7 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
-from zipfile import ZipFile
+from zipfile import BadZipFile, ZipFile
 
 from d_brain.services.json_normalizer import extract_first_json_dict
 
@@ -21,6 +21,7 @@ DOCUMENT_DOWNLOAD_MAX_BYTES = 20 * 1024 * 1024
 DOCUMENT_MAX_PDF_PAGES = 1000
 DOCUMENT_MAX_PPTX_SLIDES = 80
 DOCUMENT_MAX_XLSX_SHEETS = 20
+DOCUMENT_MAX_UNPACKED_BYTES = 200 * 1024 * 1024
 DOCUMENT_EXTRACTION_TIMEOUT_SECONDS = 600
 MPP_READER_TIMEOUT_SECONDS = max(10, DOCUMENT_EXTRACTION_TIMEOUT_SECONDS - 5)
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -163,6 +164,13 @@ def _extract_binary_document(
     warnings: list[str] = []
     if file_format == "mpp":
         return _extract_mpp_document(path, original_name=original_name)
+
+    # Checked before any conversion: markitdown and its readers unpack the
+    # whole archive on their own.
+    unpacked_warning = _unpacked_size_warning(path, file_format)
+    if unpacked_warning:
+        warnings.append(unpacked_warning)
+        return "", _title_from_name(original_name), {}, warnings
 
     metadata = _binary_metadata(path, file_format, warnings)
     limit_warning = _limit_warning(file_format, metadata)
@@ -387,6 +395,25 @@ def _binary_metadata(
     except Exception as exc:
         warnings.append(f"Metadata extraction failed: {exc}")
     return metadata
+
+
+def _unpacked_size_warning(path: Path, file_format: str) -> str:
+    if file_format not in {"docx", "xlsx", "pptx"}:
+        return ""
+    try:
+        with ZipFile(path) as archive:
+            total = sum(info.file_size for info in archive.infolist())
+    except (BadZipFile, OSError):
+        # Later stages report the broken archive themselves.
+        return ""
+    if total <= DOCUMENT_MAX_UNPACKED_BYTES:
+        return ""
+    return (
+        f"{file_format.upper()} unpacked size limit exceeded "
+        f"({total // (1024 * 1024)} MB > "
+        f"{DOCUMENT_MAX_UNPACKED_BYTES // (1024 * 1024)} MB); "
+        "text extraction skipped."
+    )
 
 
 def _limit_warning(file_format: str, metadata: dict[str, Any]) -> str:

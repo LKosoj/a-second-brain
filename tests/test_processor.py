@@ -56,8 +56,8 @@ def test_todoist_failure_is_saved_and_retried(
             args[0], 0, '{"tasks": [{"id": "42", "content": "Позвонить"}]}', ""
         )
 
-    monkeypatch.setattr("d_brain.services.processor.subprocess.run", fake_run)
-    monkeypatch.setattr("d_brain.services.processor.time.sleep", lambda _: None)
+    monkeypatch.setattr("d_brain.services.todoist_tasks.run_in_process_group", fake_run)
+    monkeypatch.setattr("d_brain.services.todoist_tasks.time.sleep", lambda _: None)
 
     assert processor._create_todoist_tasks([{"content": "Позвонить"}]) == []
     assert processor._load_pending_todoist_tasks() == [{"content": "Позвонить"}]
@@ -184,11 +184,48 @@ def test_run_uv_script_uses_configured_absolute_path(
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setenv("UV_BIN", "/opt/uv/bin/uv")
-    monkeypatch.setattr("d_brain.services.processor.subprocess.run", fake_run)
+    monkeypatch.setattr("d_brain.services.processor.run_in_process_group", fake_run)
 
     processor._run_uv_script("--version")
 
     assert calls == [["/opt/uv/bin/uv", "run", "--version"]]
+
+
+def test_run_uv_script_returns_true_on_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = CliProcessor(tmp_path / "vault")
+    monkeypatch.setattr(
+        "d_brain.services.processor.run_in_process_group",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, "", ""),
+    )
+
+    assert processor._run_uv_script("--version") is True
+
+
+def test_run_uv_script_returns_false_on_nonzero_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = CliProcessor(tmp_path / "vault")
+    monkeypatch.setattr(
+        "d_brain.services.processor.run_in_process_group",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 1, "", "bad"),
+    )
+
+    assert processor._run_uv_script("--version") is False
+
+
+def test_run_uv_script_returns_false_on_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = CliProcessor(tmp_path / "vault")
+
+    def fake_run(command: list[str], **kwargs: object) -> None:
+        raise subprocess.TimeoutExpired(command, 1)
+
+    monkeypatch.setattr("d_brain.services.processor.run_in_process_group", fake_run)
+
+    assert processor._run_uv_script("--version") is False
 
 
 def test_do_processor_uses_vault_scoped_runner(tmp_path: Path) -> None:
@@ -1052,87 +1089,6 @@ tier: active
     assert "конкурентное наблюдение" in observations
 
 
-def test_write_handoff_observations_preserves_cooperative_concurrent_update(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    vault_path = tmp_path / "vault"
-    _write_vault_manifest(vault_path)
-    handoff_path = vault_path / ".session" / "handoff.md"
-    handoff_path.parent.mkdir(parents=True, exist_ok=True)
-    handoff_path.write_text(
-        """---
-type: note
-last_accessed: 2026-04-05
-relevance: 1.0
-tier: active
----
-# Передача сессии
-
-## Last Session
-исходный блок
-
-## Key Decisions
-- исходное решение
-
-## In Progress
-- текущий хвост
-
-## Next Steps
-- следующий шаг
-
-## Observations
-- [pattern] 2026-04-05: исходное наблюдение
-""",
-        encoding="utf-8",
-    )
-    processor = CliProcessor(vault_path)
-    normalization_started = threading.Event()
-    writer_attempted = threading.Event()
-    writer_errors: list[Exception] = []
-    original_normalize = processor._normalized_handoff_sections
-
-    def pause_after_read(text: str) -> tuple[str, dict[str, str]]:
-        result = original_normalize(text)
-        normalization_started.set()
-        assert writer_attempted.wait(timeout=5)
-        return result
-
-    monkeypatch.setattr(processor, "_normalized_handoff_sections", pause_after_read)
-
-    def cooperative_writer() -> None:
-        try:
-            assert normalization_started.wait(timeout=5)
-            writer_attempted.set()
-            with vault_write_lock(vault_path) as lock:
-                frontmatter, sections = original_normalize(
-                    handoff_path.read_text(encoding="utf-8")
-                )
-                sections["Key Decisions"] += "\n- конкурентное решение"
-                processor._write_vault_markdown(
-                    handoff_path,
-                    processor._render_handoff_sections(frontmatter, sections),
-                    lock=lock,
-                )
-        except Exception as exc:
-            writer_errors.append(exc)
-
-    writer = threading.Thread(target=cooperative_writer)
-    writer.start()
-    processor._write_handoff_observations(
-        ["- [pattern] 2026-04-05: обновлённое наблюдение"]
-    )
-    writer.join(timeout=5)
-
-    assert not writer.is_alive()
-    assert writer_errors == []
-    content = handoff_path.read_text(encoding="utf-8")
-    assert "конкурентное решение" in _markdown_section(content, "Key Decisions")
-    observations = _markdown_section(content, "Observations")
-    assert "обновлённое наблюдение" in observations
-    assert "исходное наблюдение" not in observations
-
-
 def test_question_prompt_reads_core_business_and_projects_context(
     tmp_path: Path,
 ) -> None:
@@ -1757,6 +1713,11 @@ def test_process_daily_scheduled_preserves_side_effect_order(tmp_path: Path) -> 
     processor._normalize_saved_thoughts = (  # type: ignore[method-assign]
         lambda execute_data, day: events.append("normalize-thoughts")
     )
+    # Used to be hidden behind the stubbed _normalize_saved_thoughts; the
+    # fixture daily file has no frontmatter, so a real write would be rejected.
+    processor._mark_daily_entries_processed = (  # type: ignore[method-assign]
+        lambda day, claimed: None
+    )
     processor._run_memory_decay = lambda: events.append("memory-decay")  # type: ignore[method-assign]
     processor._capture_creative_recall = lambda: events.append("creative-recall")  # type: ignore[method-assign]
     processor._run_vault_health_maintenance = (  # type: ignore[method-assign]
@@ -1842,7 +1803,7 @@ def test_process_daily_scheduled_does_not_retry_malformed_execute_output(
 
 
 def test_process_daily_entry_status_already_processed_forces_skip_before_execute(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     vault_path = tmp_path / "vault"
     day = date(2026, 4, 4)
@@ -1858,6 +1819,8 @@ def test_process_daily_entry_status_already_processed_forces_skip_before_execute
     )
 
     processor = CliProcessor(vault_path)
+    # The vault-graph refresh would otherwise run a real ``uv run analyze.py``.
+    monkeypatch.setattr(processor, "_run_uv_script", lambda *args: True)
 
     def fake_run(prompt: str) -> str:
         if "capture.md" in prompt:
@@ -2149,9 +2112,6 @@ def test_answer_question_does_not_depend_on_uv_for_memory_steps(
 
     processor._load_memory_engine_module = lambda: FakeMemoryEngine()  # type: ignore[method-assign]
     processor._run_uv_script = lambda *args: (_ for _ in ()).throw(  # type: ignore[method-assign]
-        AssertionError("uv helper should not be used in answer_question")
-    )
-    processor._run_uv_script_capture = lambda *args: (_ for _ in ()).throw(  # type: ignore[method-assign]
         AssertionError("uv helper should not be used in answer_question")
     )
     processor._run_assistant_prompt = lambda prompt: "🎯 **Ответ**"  # type: ignore[method-assign]
@@ -2935,3 +2895,335 @@ def test_run_compiled_nightly_maintenance_adds_imports_line_for_sweep_only_activ
     result = processor._run_compiled_nightly_maintenance()
 
     assert "- Импорты: обработано 0, пусто 0, ошибок 0" in result["report"]
+
+
+# --- Todoist delivery states: pending, unconfirmed, no key ---------------------
+
+
+def _todoist_processor(tmp_path: Path, api_key: str = "token") -> CliProcessor:
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir(exist_ok=True)
+    processor = CliProcessor(vault_path, todoist_api_key=api_key)
+    processor._project_catalog.get_catalog = lambda **kwargs: {  # type: ignore[method-assign]
+        "available": False,
+        "catalog": None,
+        "errors": [],
+    }
+    processor._project_router.route_task = lambda *args, **kwargs: {}  # type: ignore[method-assign]
+    return processor
+
+
+_CAPTURE = {
+    "entries": [
+        {
+            "classification": "task",
+            "task_content": "Позвонить",
+            "task_priority": 2,
+            "task_due": "tomorrow",
+        }
+    ]
+}
+
+
+def test_timeout_does_not_retry_and_does_not_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = _todoist_processor(tmp_path)
+    calls: list[int] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> None:
+        calls.append(1)
+        raise subprocess.TimeoutExpired(command, 300)
+
+    monkeypatch.setattr(
+        "d_brain.services.todoist_tasks.run_in_process_group", fake_run
+    )
+    monkeypatch.setattr("d_brain.services.todoist_tasks.time.sleep", lambda _: None)
+    tasks = [{"content": "Позвонить"}]
+
+    assert processor._create_todoist_tasks(tasks) == []
+    assert processor._load_pending_todoist_tasks() == []
+    assert len(calls) == 1
+    assert processor._todoist_unconfirmed == tasks
+
+
+def test_reconcile_marks_unconfirmed_not_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = _todoist_processor(tmp_path)
+    monkeypatch.setattr(
+        "d_brain.services.todoist_tasks.run_in_process_group",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, "oops", ""),
+    )
+    execute_data: dict[str, object] = {"tasks_created": []}
+
+    processor._reconcile_capture_todoist_tasks(_CAPTURE, execute_data)
+
+    assert "tasks_pending" not in execute_data
+    unconfirmed = execute_data["tasks_unconfirmed"]
+    assert isinstance(unconfirmed, list)
+    assert [task["content"] for task in unconfirmed] == ["Позвонить"]
+
+
+def test_no_api_key_keeps_capture_tasks_in_retry_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = _todoist_processor(tmp_path, api_key="")
+    calls: list[int] = []
+    monkeypatch.setattr(
+        "d_brain.services.todoist_tasks.run_in_process_group",
+        lambda *args, **kwargs: calls.append(1),
+    )
+    execute_data: dict[str, object] = {"tasks_created": []}
+
+    processor._reconcile_capture_todoist_tasks(_CAPTURE, execute_data)
+
+    assert calls == []
+    assert [t["content"] for t in processor._load_pending_todoist_tasks()] == [
+        "Позвонить"
+    ]
+    assert execute_data["tasks_pending"]
+
+
+def test_pending_file_does_not_grow_with_same_task_and_no_key(
+    tmp_path: Path,
+) -> None:
+    processor = _todoist_processor(tmp_path, api_key="")
+    processor._create_todoist_tasks(
+        [{"content": "Позвонить", "priority": 2, "due_hint": "tomorrow"}]
+    )
+    path = processor._todoist_retry_path()
+    before = path.read_text(encoding="utf-8")
+    path.touch()
+    mtime = path.stat().st_mtime_ns
+
+    processor._create_todoist_tasks(
+        [{"content": "позвонить", "priority": 4, "due_hint": "tomorrow"}]
+    )
+    processor._create_todoist_tasks([])
+
+    assert path.read_text(encoding="utf-8") == before
+    assert path.stat().st_mtime_ns == mtime
+    assert len(processor._load_pending_todoist_tasks()) == 1
+
+
+def test_pending_sent_after_key_appears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = _todoist_processor(tmp_path, api_key="")
+    processor._create_todoist_tasks([{"content": "Позвонить"}])
+    processor.todoist_api_key = "token"
+    monkeypatch.setattr(
+        "d_brain.services.todoist_tasks.run_in_process_group",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0, '{"tasks": [{"id": "7", "content": "Позвонить"}]}', ""
+        ),
+    )
+
+    assert processor._retry_pending_todoist_tasks() == [
+        {"id": "7", "content": "Позвонить"}
+    ]
+    assert processor._load_pending_todoist_tasks() == []
+
+
+def test_reflect_block_lists_pending_and_unconfirmed(tmp_path: Path) -> None:
+    processor = _todoist_processor(tmp_path, api_key="")
+    day = date(2026, 4, 4)
+    _write_vault_manifest(processor.vault_path)
+    daily = processor.vault_path / "daily" / f"{day:%Y-%m-%d}.md"
+    daily.parent.mkdir(parents=True, exist_ok=True)
+
+    processor._write_reflect_daily_block(day, {"tasks_created": []})
+    plain = daily.read_text(encoding="utf-8")
+    assert "Todoist" not in plain
+
+    daily.unlink()
+    processor._create_todoist_tasks([{"content": "Отложенная"}])
+    processor._write_reflect_daily_block(
+        day, {"tasks_unconfirmed": [{"content": "Неясная\nзадача"}]}
+    )
+    text = daily.read_text(encoding="utf-8")
+    assert "Не отправлено в Todoist (ждёт повтора):** 1" in text
+    assert "Не подтверждено, проверить в Todoist:** 1" in text
+    assert '- "Неясная задача"' in text
+
+
+def test_partial_todoist_ids_expose_unconfirmed_without_retry_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = _todoist_processor(tmp_path)
+    monkeypatch.setattr(
+        "d_brain.services.todoist_tasks.run_in_process_group",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            0,
+            '{"tasks": [{"id": "1", "content": "A"}, {"id": "2", "content": "B"}]}',
+            "",
+        ),
+    )
+
+    created = processor._create_todoist_tasks(
+        [{"content": "A"}, {"content": "B"}, {"content": "C"}]
+    )
+
+    assert [item["id"] for item in created] == ["1", "2"]
+    assert processor._todoist_unconfirmed == [{"content": "C"}]
+    assert processor._load_pending_todoist_tasks() == []
+
+
+def test_cycle_retry_unconfirmed_reaches_execute_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = _todoist_processor(tmp_path)
+    processor._save_pending_todoist_tasks([{"content": "Позвонить"}])
+    monkeypatch.setattr(
+        "d_brain.services.todoist_tasks.run_in_process_group",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0, '{"tasks": []}', ""
+        ),
+    )
+    # The graph refresh would otherwise run a real ``uv run analyze.py``.
+    monkeypatch.setattr(processor, "_run_uv_script", lambda *args: True)
+    seen: dict[str, object] = {}
+
+    def fake_daily(day: date, mode: str = "") -> dict[str, object]:
+        execute_data: dict[str, object] = {}
+        processor._reconcile_capture_todoist_tasks({"entries": []}, execute_data)
+        seen.update(execute_data)
+        return {"error": "stop"}
+
+    monkeypatch.setattr(processor, "process_daily", fake_daily)
+    monkeypatch.setattr(processor, "_safe_audit_cycle_result", lambda **kw: {})
+    try:
+        processor._run_scheduled_cycle_locked(date(2026, 4, 4))
+    except Exception:
+        pass
+
+    assert seen["tasks_unconfirmed"] == [{"content": "Позвонить"}]
+
+
+def test_second_cycle_does_not_inherit_unconfirmed_tasks_of_the_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = _todoist_processor(tmp_path)
+    # Left over from the previous cycle; no retry file exists now.
+    processor._todoist_unconfirmed = [{"content": "Старая"}]
+    seen: list[list[dict[str, object]]] = []
+
+    def fake_daily(day: date, mode: str = "") -> dict[str, object]:
+        seen.append(list(processor._carried_unconfirmed_tasks))
+        return {"error": "stop"}
+
+    monkeypatch.setattr(processor, "process_daily", fake_daily)
+    monkeypatch.setattr(processor, "_run_uv_script", lambda *args: True)
+    monkeypatch.setattr(processor, "_safe_audit_cycle_result", lambda **kw: {})
+    try:
+        processor._run_scheduled_cycle_locked(date(2026, 4, 4))
+    except Exception:
+        pass
+
+    assert seen == [[]]
+
+
+def test_cycle_retry_unconfirmed_survives_a_day_without_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = _todoist_processor(tmp_path)
+    processor._save_pending_todoist_tasks([{"content": "Позвонить"}])
+    monkeypatch.setattr(
+        "d_brain.services.todoist_tasks.run_in_process_group",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0, '{"tasks": []}', ""
+        ),
+    )
+    # An empty day returns before capture reconciliation ever runs.
+    monkeypatch.setattr(
+        processor,
+        "process_daily",
+        lambda day, mode="": {"empty_daily": True, "report": "", "mode": mode},
+    )
+    monkeypatch.setattr(processor, "_safe_audit_cycle_result", lambda **kw: {})
+    monkeypatch.setattr(
+        processor,
+        "_run_control_plane_maintenance_workflow",
+        lambda name: {"report": "", "processed_entries": 0},
+    )
+    monkeypatch.setattr(processor, "_refresh_qmd_index", lambda: None)
+
+    result = processor.run_scheduled_cycle(date(2026, 4, 4))
+
+    assert result["retry_tasks_unconfirmed"] == [{"content": "Позвонить"}]
+
+
+@pytest.mark.parametrize("writer", ["job_health", "todoist", "audit", "session"])
+def test_state_writers_keep_file_mode_and_leave_no_tmp(
+    tmp_path: Path, writer: str
+) -> None:
+    from d_brain.services.processor import job_health_path, save_job_health
+
+    processor = _todoist_processor(tmp_path)
+    if writer == "job_health":
+        target = job_health_path(processor.vault_path)
+
+        def write() -> None:
+            save_job_health(processor.vault_path, {"a": 1})
+
+    elif writer == "todoist":
+        target = processor._todoist_retry_path()
+
+        def write() -> None:
+            processor._save_pending_todoist_tasks([{"content": "x"}])
+
+    elif writer == "audit":
+        target = processor._process_audit_state_path()
+
+        def write() -> None:
+            processor._save_process_audit_state({"issues": {}})
+
+    else:
+        target = processor._session_dir() / "capture.json"
+
+        def write() -> None:
+            processor._write_session_json("capture.json", {"a": 1})
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("{}", encoding="utf-8")
+    target.chmod(0o664)
+    previous = os.umask(0o077)
+    try:
+        write()
+    finally:
+        os.umask(previous)
+
+    assert target.stat().st_mode & 0o777 == 0o664
+    assert json.loads(target.read_text(encoding="utf-8")) != {}
+    assert not [p for p in target.parent.iterdir() if ".tmp" in p.name]
+
+
+def test_handoff_section_spans_edge_cases() -> None:
+    from d_brain.services.processor import handoff_section_spans
+
+    assert handoff_section_spans("") == []
+    assert handoff_section_spans("just text\n## Other\nx\n") == []
+
+    text = "intro\n## Last Session\nA\n\n## Other\nB\n## Next Steps\n- c"
+    spans = handoff_section_spans(text)
+    assert [t for t, _, _ in spans] == ["Last Session", "Next Steps"]
+    title, start, end = spans[0]
+    # Non-canonical heading stays inside the previous body; intro is dropped.
+    assert text[start:end] == "\nA\n\n## Other\nB\n"
+    title, start, end = spans[1]
+    assert text[start:end] == "\n- c"
+    assert end == len(text)
+
+
+def test_handoff_section_spans_crlf_offsets_are_raw() -> None:
+    from d_brain.services.processor import handoff_section_spans
+
+    text = "## Last Session\r\nA\r\n## Observations\r\n- x\r\n"
+    spans = handoff_section_spans(text)
+    assert [t for t, _, _ in spans] == ["Last Session", "Observations"]
+    _, start, end = spans[0]
+    assert text[start:end].strip() == "A"
+    _, start, end = spans[1]
+    assert text[start:end].strip() == "- x"

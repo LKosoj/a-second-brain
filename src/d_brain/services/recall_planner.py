@@ -14,6 +14,7 @@ from typing import Any, NotRequired, TypedDict
 import httpx
 from openai import OpenAI
 
+from d_brain.clock import owner_today
 from d_brain.services.localization import normalize_language
 from d_brain.services.qmd import (
     DEFAULT_RECALL_LIMIT,
@@ -445,7 +446,7 @@ def _history_analysis_start(plan: RecallPlan) -> str:
     if plan.history_scope == "full":
         return ""
     lookback_days = _history_scope_lookback_days(plan.history_scope)
-    return (date.today() - timedelta(days=lookback_days)).isoformat()
+    return (owner_today() - timedelta(days=lookback_days)).isoformat()
 
 
 def _normalize_plan(
@@ -816,7 +817,7 @@ def _needs_history_backfill(
         if start_date is not None:
             required_oldest_age = max(
                 required_oldest_age,
-                max(0, (date.today() - start_date).days),
+                max(0, (owner_today() - start_date).days),
             )
     return (
         len(distinct_months) < required_months
@@ -846,7 +847,7 @@ def plan_qmd_recall(
         return RecallPlan()
     state = (
         f"Content language: {normalize_language(config.language)}\n"
-        f"Current date: {date.today().isoformat()}\n"
+        f"Current date: {owner_today().isoformat()}\n"
         f"Purpose: {purpose}\nTask:\n{normalized_task}"
     )
     if config.classification_model:

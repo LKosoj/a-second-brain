@@ -71,3 +71,30 @@ def test_scope_filters_vectors_and_text_before_top_results():
     assert payload["directory"] == [expected, expected]
     assert payload["files"] == [expected, expected]
     assert payload["missing"] == [[], []]
+
+
+def test_query_script_treats_args_after_double_dash_as_query():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    script = Path(__file__).parents[1] / "src/d_brain/scripts/qmd_query_vec.mjs"
+    # The script imports the optional qmd package at load time, so evaluate
+    # only the argument parser.
+    source = """
+      const text = require('fs').readFileSync(process.argv[1], 'utf8');
+      const match = text.match(/function parseArgs[\\s\\S]*?\\n}\\n/);
+      const parseArgs = eval('(' + match[0] + ')');
+      console.log(JSON.stringify(parseArgs(JSON.parse(process.argv[2]))));
+    """
+    argv = ["--limit", "5", "--scope-uri", "qmd://a/b", "--", "--limit", "99", "-n x"]
+    result = subprocess.run(
+        ["node", "-e", source, str(script), json.dumps(argv)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    assert json.loads(result.stdout) == {
+        "limit": 5,
+        "scope": ["qmd://a/b"],
+        "query": "--limit 99 -n x",
+    }

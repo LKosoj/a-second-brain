@@ -27,8 +27,8 @@ if str(PROJECT_SRC) not in sys.path:
     sys.path.insert(0, str(PROJECT_SRC))
 
 from d_brain.manifest import VaultManifest, load_manifest_for_vault  # noqa: E402
+from d_brain.services import compiled_page  # noqa: E402
 from d_brain.services.compiled_briefings import (  # noqa: E402
-    CompiledBriefingService,
     HUMAN_ZONE_END,
     HUMAN_ZONE_START,
     human_zone_markers_look_corrupted,
@@ -138,7 +138,7 @@ def suggest_fix(
     stem_index: dict[str, list[str]],
 ) -> tuple[str | None, str]:
     target = broken_to.rstrip("\\")
-    canonical = CompiledBriefingService._canonical_source_reference(target)
+    canonical = compiled_page.canonical_source_reference(target)
     if canonical != target:
         if _existing_note(canonical) is not None:
             return canonical, "replace"

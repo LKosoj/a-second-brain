@@ -9,7 +9,7 @@ def test_youtube_summary_prompt_allows_short_complete_transcript(
     service = LinkSummaryService(str(tmp_path), "qwen", "ru")
     captured: list[str] = []
 
-    def fake_run(prompt: str, timeout: int) -> str:
+    def fake_run(prompt: str, timeout: int, **kwargs: object) -> str:
         captured.append(prompt)
         return '{"summary":"Сегодня открывается мастерская."}'
 
@@ -36,7 +36,7 @@ def test_youtube_summary_prompt_treats_quoted_commands_as_data(tmp_path: Path) -
     service = LinkSummaryService(str(tmp_path), "qwen", "en")
     captured: list[str] = []
 
-    def fake_run(prompt: str, timeout: int) -> str:
+    def fake_run(prompt: str, timeout: int, **kwargs: object) -> str:
         captured.append(prompt)
         return '{"summary":"The speaker demonstrates an instruction attack."}'
 

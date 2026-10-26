@@ -1,11 +1,29 @@
 """Application configuration using Pydantic Settings."""
 
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
-from pydantic import Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from d_brain.clock import resolve_timezone, set_owner_timezone
+
+_CLOCK_TIME_RE = re.compile(r"([01]\d|2[0-3]):([0-5]\d)")
+
+
+def parse_clock_time(raw: str) -> tuple[int, int] | None:
+    """Parse a strict 24h ``HH:MM`` string, ``None`` when it is not one.
+
+    Shared by doctor and the nightly runner: a typo in the schedule must not
+    crash either of them, so callers decide what to do with ``None``.
+    """
+    match = _CLOCK_TIME_RE.fullmatch((raw or "").strip())
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
 
 
 class Settings(BaseSettings):
@@ -15,10 +33,19 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        # Validation errors would otherwise echo the rejected value, and the
+        # calendar link (like every key here) is a secret.
+        hide_input_in_errors=True,
     )
 
     telegram_bot_token: str = Field(description="Telegram Bot API token")
-    deepgram_api_key: str = Field(description="Deepgram API key for transcription")
+    deepgram_api_key: str = Field(
+        default="",
+        description=(
+            "Deepgram API key for transcription; "
+            "empty keeps voice as unrecognized audio"
+        ),
+    )
     todoist_api_key: str = Field(default="", description="Todoist API key for tasks")
     openai_api_key: str = Field(
         default="",
@@ -26,22 +53,22 @@ class Settings(BaseSettings):
     )
     openai_base_url: str = Field(
         default="",
-        validation_alias="BASE_URL",
+        validation_alias=AliasChoices("OPENAI_BASE_URL", "BASE_URL"),
         description="OpenAI-compatible base URL for the recall planner helper",
     )
     openai_model: str = Field(
         default="",
-        validation_alias="MODEL",
+        validation_alias=AliasChoices("OPENAI_MODEL", "MODEL"),
         description=(
             "Chat model for classification and recall "
-            "when CLASSIFICATION_MODEL is empty"
+            "when CLASSIFICATION_MODEL is empty; OPENAI_MODEL, legacy MODEL"
         ),
     )
     classification_model: str = Field(
         default="",
         description=(
             "Decisions API model for classification and recall; "
-            "empty uses MODEL or CLI"
+            "empty uses OPENAI_MODEL (or legacy MODEL) or CLI"
         ),
     )
     recall_planner_disable_thinking: bool = Field(
@@ -122,6 +149,38 @@ class Settings(BaseSettings):
     owner_telegram_id: int = Field(
         description="Telegram user ID allowed to use the bot",
     )
+    timezone: str = Field(
+        default="",
+        description=(
+            "IANA zone name for the owner's day, such as Europe/Moscow; "
+            "empty uses the system zone"
+        ),
+    )
+
+    calendar_ics_url: str = Field(
+        default="",
+        description=(
+            "Private ICS feed URL of the owner's calendar (read-only); "
+            "empty disables the calendar blocks"
+        ),
+    )
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, value: str) -> str:
+        value = value.strip()
+        resolve_timezone(value)
+        return value
+
+    @field_validator("calendar_ics_url")
+    @classmethod
+    def _validate_calendar_ics_url(cls, value: str) -> str:
+        value = value.strip()
+        # The link is a secret: the error must not repeat it.
+        schemes = {"http", "https", "webcal", "webcals"}
+        if value and urlsplit(value).scheme.lower() not in schemes:
+            raise ValueError("CALENDAR_ICS_URL must be an http(s) or webcal link")
+        return value
 
     @property
     def daily_path(self) -> Path:
@@ -133,13 +192,10 @@ class Settings(BaseSettings):
         """Path to attachments directory."""
         return self.vault_path / "attachments"
 
-    @property
-    def thoughts_path(self) -> Path:
-        """Path to thoughts directory."""
-        return self.vault_path / "thoughts"
-
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     """Get application settings instance."""
-    return Settings()  # type: ignore[call-arg]
+    settings = Settings()  # type: ignore[call-arg]
+    set_owner_timezone(settings.timezone)
+    return settings

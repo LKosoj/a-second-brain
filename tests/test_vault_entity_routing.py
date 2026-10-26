@@ -12,6 +12,7 @@ from test_compiled_briefings import (
     _minimal_compile_payload,
 )
 
+from d_brain.services import compiled_page
 from d_brain.services.compiled_briefings import BriefingUpsertResult
 from d_brain.services.compiled_index import write_entity_indexes
 from d_brain.services.frontmatter import parse_frontmatter_bytes
@@ -194,7 +195,7 @@ def test_render_preserves_directions_aliases_and_links_project(
         payload=_minimal_compile_payload(),
         source_rel_path="daily/2026-10-10.md",
         existing_text=text,
-        existing_meta=service._frontmatter_fields(text),
+        existing_meta=compiled_page.frontmatter_fields(text),
         signal=None,
     )
     assert parse_frontmatter_bytes(rewritten.encode()).fields["directions"] == [

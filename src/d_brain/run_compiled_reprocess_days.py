@@ -14,16 +14,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from d_brain.clock import owner_now
 from d_brain.config import get_settings
+from d_brain.services.atomic_io import atomic_write_file_text
 from d_brain.services.cli_runner import detect_terminal_backend_message
 from d_brain.services.compiled_briefings import CompiledBriefingService
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+    atomic_write_file_text(
+        path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
     )
 
 
@@ -62,7 +62,7 @@ def _spawn_full_pass(
     if shutil.which("systemd-run"):
         unit_name = (
             "dbrain-compiled-full-pass-"
-            f"{datetime.now().astimezone().strftime('%Y%m%d%H%M%S')}"
+            f"{owner_now().strftime('%Y%m%d%H%M%S')}"
         )
         shell_command = (
             f"cd {shlex.quote(str(project_root))} && "
@@ -139,7 +139,7 @@ def main() -> int:
         / ".compiled"
         / (
             "manual-reprocess-"
-            f"{datetime.now().astimezone().strftime('%Y-%m-%d-%H%M%S')}.json"
+            f"{owner_now().strftime('%Y-%m-%d-%H%M%S')}.json"
         )
     )
 
@@ -246,7 +246,7 @@ def main() -> int:
             _write_json(progress_path, state)
             break
 
-    service._refresh_qmd_index()
+    service.refresh_qmd_index()
     report["finished_at"] = datetime.now().astimezone().isoformat()
     report["updated_total"] = updated_total
     report["had_updates"] = bool(updated_total)
@@ -258,7 +258,7 @@ def main() -> int:
     state["updated_notes"] = len(updated_total)
 
     if args.resume_full_pass_from and not terminal_backend_error:
-        ts = datetime.now().astimezone().strftime("%Y-%m-%d-%H%M%S")
+        ts = owner_now().strftime("%Y-%m-%d-%H%M%S")
         log_path = Path(f"/tmp/compiled-daily-full-pass-{ts}-resume.log")
         state["resumed_full_pass_log"] = str(log_path)
         resumed_pid, resumed_unit = _spawn_full_pass(

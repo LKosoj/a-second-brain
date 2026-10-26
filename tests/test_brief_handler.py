@@ -2,15 +2,21 @@
 7.6) -- same FakeState/FakeMessage approach ``tests/test_do_cancel.py`` and
 ``tests/test_why_handler.py`` use."""
 
+import asyncio
+import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from aiogram.dispatcher.event.bases import SkipHandler
 
+from d_brain.bot import vault_busy
 from d_brain.bot.handlers import brief as brief_handler
 from d_brain.bot.states import BriefCommandState
 from d_brain.services.compiled_briefs import BriefResult
+from d_brain.services.vault_lock import VaultLockTimeout
 
 
 class FakeState:
@@ -42,6 +48,9 @@ class FakeState:
 class FakeMessage:
     def __init__(self, text: str | None = None) -> None:
         self.text = text
+        self.forward_origin = None
+        self.chat = SimpleNamespace(id=1)
+        self.bot = object()
         self.from_user = SimpleNamespace(id=42)
         self.answers: list[tuple[str, dict]] = []
 
@@ -56,7 +65,7 @@ def _stub_settings(monkeypatch, vault_path: str = "vault") -> None:
 
 
 @contextmanager
-def _fake_vault_write_lock(vault_path):  # noqa: ANN001
+def _fake_vault_write_lock(vault_path, timeout=None):  # noqa: ANN001
     yield SimpleNamespace()
 
 
@@ -94,24 +103,188 @@ async def test_handle_brief_query_dash_cancels_without_processing(monkeypatch) -
     assert "отменён" in message.answers[0][0].lower()
 
 
-async def test_handle_brief_query_rejects_non_text_and_keeps_waiting(
-    monkeypatch,
-) -> None:
+def _prepare_release(monkeypatch):  # noqa: ANN001, ANN202
     calls: list[tuple[str, str]] = []
+    rendered: list[int] = []
 
     async def fake_process(message, brief_type, query) -> None:  # noqa: ANN001
         calls.append((brief_type, query))
 
+    async def fake_render_section(bot, **kwargs) -> None:  # noqa: ANN001, ANN003
+        rendered.append(kwargs["preferred_message_id"])
+
     monkeypatch.setattr(brief_handler, "process_brief_request", fake_process)
-    message = FakeMessage(text=None)
+    monkeypatch.setattr(brief_handler, "render_section", fake_render_section)
     state = FakeState(BriefCommandState.waiting_for_query.state)
-    state.data["brief_type"] = "decision"
+    state.data.update(brief_type="decision", menu_message_id=77)
+    return calls, rendered, state
+
+
+async def test_handle_brief_query_non_text_releases_state_and_skips(
+    monkeypatch,
+) -> None:
+    calls, rendered, state = _prepare_release(monkeypatch)
+    message = FakeMessage(text=None)
+
+    with pytest.raises(SkipHandler):
+        await brief_handler.handle_brief_query(message, state)
+
+    assert state.cleared is True
+    assert calls == []
+    assert message.answers == []
+    assert rendered == [77]
+
+
+async def test_handle_brief_query_forwarded_text_releases_state(monkeypatch) -> None:
+    calls, rendered, state = _prepare_release(monkeypatch)
+    message = FakeMessage(text="пересланное")
+    message.forward_origin = object()
+
+    with pytest.raises(SkipHandler):
+        await brief_handler.handle_brief_query(message, state)
+
+    assert state.cleared is True
+    assert calls == []
+    assert rendered == [77]
+
+
+async def test_handle_brief_query_expired_text_goes_to_capture(monkeypatch) -> None:
+    calls, rendered, state = _prepare_release(monkeypatch)
+    state.data["brief_entered_at"] = time.time() - 601
+
+    with pytest.raises(SkipHandler):
+        await brief_handler.handle_brief_query(FakeMessage(text="заметка"), state)
+
+    assert state.cleared is True
+    assert calls == []
+    assert rendered == [77]
+
+
+async def test_handle_brief_query_expired_dash_just_cancels(monkeypatch) -> None:
+    calls, rendered, state = _prepare_release(monkeypatch)
+    state.data["brief_entered_at"] = time.time() - 601
+    message = FakeMessage(text="-")
 
     await brief_handler.handle_brief_query(message, state)
 
-    assert state.cleared is False
+    assert state.cleared is True
     assert calls == []
-    assert "текстовый запрос" in message.answers[0][0]
+    assert "отменён" in message.answers[0][0].lower()
+
+
+async def test_handle_brief_query_fresh_stamp_is_processed(monkeypatch) -> None:
+    calls, rendered, state = _prepare_release(monkeypatch)
+    state.data["brief_entered_at"] = time.time() - 5
+
+    await brief_handler.handle_brief_query(FakeMessage(text="цены"), state)
+
+    assert calls == [("decision", "цены")]
+
+
+async def test_start_brief_flow_stamps_entry_time() -> None:
+    state = FakeState()
+    before = time.time()
+
+    await brief_handler.start_brief_flow(FakeMessage(), state, "decision")
+
+    assert before <= state.data["brief_entered_at"] <= time.time()
+
+
+class _BlockedLock:
+    """Lock factory imitating the nightly pass holding the vault lock."""
+
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self.done = threading.Event()
+
+    @contextmanager
+    def __call__(self, vault_path, timeout=None):  # noqa: ANN001, ANN204
+        if not self.release.wait(10 if timeout is None else timeout):
+            self.done.set()
+            raise VaultLockTimeout
+        assert self.release.wait(10)
+        try:
+            yield SimpleNamespace()
+        finally:
+            self.done.set()
+
+
+async def test_run_with_vault_lock_does_not_block_event_loop() -> None:
+    lock = _BlockedLock()
+    ticks: list[int] = []
+
+    async def ticker() -> None:
+        for i in range(3):
+            await asyncio.sleep(0.01)
+            ticks.append(i)
+        lock.release.set()
+
+    result, _ = await asyncio.gather(
+        vault_busy.run_with_vault_lock(
+            Path("v"), lambda held: "done", lock_factory=lock, timeout=5
+        ),
+        ticker(),
+    )
+
+    assert result == "done"
+    assert ticks == [0, 1, 2]
+
+
+async def test_run_with_vault_lock_busy_vault_raises_and_never_runs_work() -> None:
+    lock = _BlockedLock()
+    ran: list[str] = []
+
+    with pytest.raises(vault_busy.VaultBusyError):
+        await vault_busy.run_with_vault_lock(
+            Path("v"), lambda held: ran.append("x"), lock_factory=lock, timeout=0.05
+        )
+    lock.release.set()
+    assert await asyncio.to_thread(lock.done.wait, 5)
+
+    assert ran == []
+
+
+async def test_run_with_vault_lock_slow_work_after_acquire_still_returns() -> None:
+    def slow_work(held):  # noqa: ANN001, ANN202
+        time.sleep(0.2)
+        return "written"
+
+    result = await vault_busy.run_with_vault_lock(
+        Path("v"), slow_work, lock_factory=_fake_vault_write_lock, timeout=0.05
+    )
+
+    assert result == "written"
+
+
+async def test_process_brief_request_reports_busy_when_lock_times_out(
+    monkeypatch,
+) -> None:
+    _stub_settings(monkeypatch)
+    lock = _BlockedLock()
+    monkeypatch.setattr(vault_busy, "VAULT_LOCK_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(brief_handler, "vault_write_lock", lock)
+    monkeypatch.setattr(
+        brief_handler, "build_brief",
+        lambda vault_path, *, brief_type, query: _sample_brief_result(),
+    )
+    monkeypatch.setattr(
+        brief_handler, "load_manifest_for_vault", lambda vault_path: None
+    )
+    written: list[object] = []
+    monkeypatch.setattr(
+        brief_handler, "write_validated_vault_markdown",
+        lambda *args, **kwargs: written.append(args),
+    )
+    monkeypatch.setattr(brief_handler, "brief_path", lambda *a: Path("b.md"))
+    message = FakeMessage()
+
+    await brief_handler.process_brief_request(message, "decision", "q")
+    lock.release.set()
+    assert await asyncio.to_thread(lock.done.wait, 5)
+
+    assert len(message.answers) == 1
+    assert "Идёт обработка" in message.answers[0][0]
+    assert written == []
 
 
 async def test_handle_brief_query_missing_type_cancels_defensively(monkeypatch) -> None:
@@ -340,3 +513,20 @@ async def test_process_brief_request_delivery_failure_still_names_the_saved_file
         "❌ Справка сохранена в `summaries/briefs/b.md`, "
         "но отправить его в чат не удалось."
     ]
+
+
+async def test_handle_brief_query_restore_menu_failure_still_skips(
+    monkeypatch, caplog
+) -> None:
+    calls, rendered, state = _prepare_release(monkeypatch)
+
+    async def boom(*args, **kwargs) -> None:  # noqa: ANN002, ANN003
+        raise RuntimeError("telegram down")
+
+    monkeypatch.setattr(brief_handler, "render_section", boom)
+
+    with caplog.at_level("ERROR"), pytest.raises(SkipHandler):
+        await brief_handler.handle_brief_query(FakeMessage(text=None), state)
+
+    assert state.cleared is True
+    assert "telegram down" in caplog.text

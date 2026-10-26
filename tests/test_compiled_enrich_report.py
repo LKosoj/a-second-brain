@@ -14,14 +14,15 @@ writing these tests) -- an environment limitation (see the task's report),
 not something these tests should assert as correct behavior.
 """
 
+import functools
 import hashlib
 import json
 import logging
 from datetime import date, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
+from _helpers import make_page_writer, patch_get_settings
 
 from d_brain import run_compiled_digest
 from d_brain.manifest import load_manifest_for_vault
@@ -154,10 +155,7 @@ def _compiled_page_text(
     return frontmatter + "\n".join(body) + "\n"
 
 
-def _write_page(vault: Path, rel_path: str, **kwargs: object) -> None:
-    path = vault / rel_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_compiled_page_text(**kwargs), encoding="utf-8")  # type: ignore[arg-type]
+_write_page = make_page_writer(_compiled_page_text)
 
 
 def _write_queue(vault: Path, items: list[dict[str, str]]) -> None:
@@ -175,8 +173,9 @@ def test_broken_page_frontmatter_does_not_crash_digest(tmp_path, write_vault_man
     """ТЗ 7.1: a failed pass must still yield a message with a reason -- one
     malformed page in ``compiled/`` (missing closing ``---``) must not take
     down the whole digest build. ``CompiledBriefingService._iter_candidates``
-    already tolerates this for directory traversal; ``_page_fields`` must
-    too, instead of raising ``FrontmatterError`` via the strict parser."""
+    already tolerates this for directory traversal;
+    ``compiled_page.frontmatter_fields`` must too, instead of raising
+    ``FrontmatterError`` via the strict parser."""
     vault = tmp_path / "vault"
     write_vault_manifest(vault)
     _write_page(
@@ -1361,10 +1360,7 @@ def test_collect_weekly_review_no_changes_means_no_revisit_pick(
 # --- run_compiled_digest CLI --------------------------------------------
 
 
-def _patch_settings(monkeypatch, vault: Path) -> None:
-    monkeypatch.setattr(
-        run_compiled_digest, "get_settings", lambda: SimpleNamespace(vault_path=vault)
-    )
+_patch_settings = functools.partial(patch_get_settings, module=run_compiled_digest)
 
 
 def test_render_note_passes_write_time_frontmatter_validation(

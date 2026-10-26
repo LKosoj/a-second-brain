@@ -161,7 +161,7 @@ def test_main_updated_notes_counter_ignores_duplicate_skip_days(
                 "source_rel_path": source_path,
             }
 
-        def _refresh_qmd_index(self) -> None:
+        def refresh_qmd_index(self) -> None:
             pass
 
     monkeypatch.setattr(
@@ -240,7 +240,7 @@ def test_the_same_page_updated_on_two_days_is_counted_once(
                 "source_rel_path": source_path,
             }
 
-        def _refresh_qmd_index(self) -> None:
+        def refresh_qmd_index(self) -> None:
             pass
 
     monkeypatch.setattr(

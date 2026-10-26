@@ -1,22 +1,19 @@
+import functools
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+
+from _helpers import patch_get_settings
 
 from d_brain import run_compiled_wiki_care
 
-
-def _patch_settings(monkeypatch, vault: Path, *, tavily_api_key: str = "") -> None:
-    monkeypatch.setattr(
-        run_compiled_wiki_care,
-        "get_settings",
-        lambda: SimpleNamespace(
-            vault_path=vault,
-            content_language="ru",
-            ai_cli="claude",
-            tavily_api_key=tavily_api_key,
-        ),
-    )
+_patch_settings = functools.partial(
+    patch_get_settings,
+    module=run_compiled_wiki_care,
+    content_language="ru",
+    ai_cli="claude",
+    tavily_api_key="",
+)
 
 
 def _stub_run_weekly_wiki_care(monkeypatch, *, result: dict, calls: list[dict]):

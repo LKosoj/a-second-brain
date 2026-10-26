@@ -97,7 +97,7 @@ def test_graph_refresh_also_exports_html(tmp_path):
     calls = []
     host = SimpleNamespace(
         vault_path=tmp_path,
-        _run_uv_script=calls.append,
+        _run_uv_script=lambda path: calls.append(path) or True,
         _load_graph_stats=lambda: {"notes": {}, "links_from": {}},
     )
     CliProcessor._rebuild_graph(host)

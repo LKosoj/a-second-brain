@@ -23,6 +23,7 @@ import sys
 from datetime import date
 from pathlib import Path
 
+from d_brain.clock import owner_today
 from d_brain.config import get_settings
 from d_brain.manifest import load_manifest_for_vault
 from d_brain.services.compiled_enrich_report import build_daily_digest, read_pass_status
@@ -43,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 def _parse_date(value: str | None) -> date:
     if not value:
-        return date.today()
+        return owner_today()
     return date.fromisoformat(value)
 
 
@@ -59,8 +60,9 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    day = _parse_date(args.day)
+    # Settings first: loading them fixes the owner's timezone for "today".
     settings = get_settings()
+    day = _parse_date(args.day)
     vault_path = Path(settings.vault_path)
 
     digest = build_daily_digest(

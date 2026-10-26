@@ -464,6 +464,35 @@ def test_atomic_replace_rejects_target_swap_before_replace(
     assert outside.read_bytes() == b"# Outside\n"
 
 
+def test_atomic_replace_survives_unprivileged_chown(
+    migration_vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    note = migration_vault / "daily/2026-07-29.md"
+    note.write_text("# Original\n", encoding="utf-8")
+    note.chmod(0o640)
+    original_gid = note.stat().st_gid
+    real_fchown = os.fchown
+
+    def fchown_without_root(fd: int, uid: int, gid: int) -> None:
+        if uid != -1:
+            raise PermissionError(1, "Operation not permitted")
+        real_fchown(fd, uid, gid)
+
+    monkeypatch.setattr(os, "fchown", fchown_without_root)
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+
+    atomic_replace_vault_markdown(
+        migration_vault,
+        "daily/2026-07-29.md",
+        expected_full_sha256=frontmatter_migration._sha256(b"# Original\n"),
+        content=b"# Replacement\n",
+    )
+
+    assert note.read_bytes() == b"# Replacement\n"
+    assert note.stat().st_mode & 0o7777 == 0o640
+    assert note.stat().st_gid == original_gid
+
+
 def test_inventory_records_invalid_yaml_as_parse_error_with_hashes(
     migration_vault: Path,
 ) -> None:

@@ -28,7 +28,7 @@ uv sync --frozen --no-dev
 # 2. Create the private vault and .env (mode 0600 is set by init)
 uv run --frozen --no-dev a-second-brain init ~/second-brain/repo
 $EDITOR .env
-# Required: TELEGRAM_BOT_TOKEN, DEEPGRAM_API_KEY, OWNER_TELEGRAM_ID
+# Required: TELEGRAM_BOT_TOKEN, OWNER_TELEGRAM_ID (DEEPGRAM_API_KEY is optional)
 # Pick your brain: AI_CLI=opencode (default in .env.example is claude)
 # VAULT_PATH=$HOME/second-brain/repo/vault
 # CONTENT_LANGUAGE=ru
@@ -45,15 +45,16 @@ bash scripts/install-launchd-user.sh --enable
 sudo pmset -a sleep 0 disksleep 0 displaysleep 0
 ```
 
-The `--enable` step renders up to five plists from `deploy/*.plist.in`:
+The `--enable` step renders up to six plists from `deploy/*.plist.in`:
 
 | Label | Schedule | Command |
 | --- | --- | --- |
 | `com.second-brain.bot` | `RunAtLoad` + `KeepAlive` | `a-second-brain run` |
-| `com.second-brain.process` | daily 21:00 | `python -m d_brain.run_daily_process --mode scheduled` |
-| `com.second-brain.morning-brief` | daily 08:00 | `python -m d_brain.run_morning_brief` |
+| `com.second-brain.process` | daily 21:00 by default (`DAILY_PROCESS_TIME`) | `python -m d_brain.run_daily_process --mode scheduled` |
+| `com.second-brain.morning-brief` | daily 08:00 by default (`MORNING_BRIEF_TIME`) | `python -m d_brain.run_morning_brief` |
 | `com.second-brain.plaud-sync` | hourly (only if `PLAUD_BEARER_TOKEN` is set) | `python -m d_brain.run_plaud_sync` |
 | `com.second-brain.qmd-maintenance` | weekly Sun 03:30 (only if `qmd` is on `PATH`) | `a-second-brain qmd cleanup` |
+| `com.second-brain.backup-verify` | weekly Sun 04:15 | `python -m d_brain.run_vault_backup --verify` |
 
 ## Inspecting and managing
 
@@ -97,11 +98,22 @@ sudo pmset -a sleep 1 disksleep 1 displaysleep 1   # restore defaults
 | --- | --- |
 | `EnvironmentFile=@PROJECT_DIR@/.env` | `scripts/lib/run_with_env.sh` (sourced by the plist's `ProgramArguments[0]`) |
 | `Restart=on-failure` + `RestartSec=10` | `KeepAlive.Crashed: true` + `ThrottleInterval: 10` |
-| `OnCalendar=*-*-* 21:00:00` | `StartCalendarInterval { Hour: 21, Minute: 0 }` |
+| `OnCalendar=*-*-* 21:00:00` (`DAILY_PROCESS_TIME`) | `StartCalendarInterval { Hour: 21, Minute: 0 }` (same variable, rendered by the installer) |
 | `OnCalendar=hourly` | `StartInterval: 3600` |
 | `OnCalendar=Sun 03:30:00` | `StartCalendarInterval { Weekday: 0, Hour: 3, Minute: 30 }` |
 | `journalctl -u a-second-brain` | `~/Library/Logs/com.second-brain/*.log` |
 
+launchd cannot take a zone. When `TIMEZONE` differs from the Mac's zone, the
+installer converts `DAILY_PROCESS_TIME` / `MORNING_BRIEF_TIME` to the system
+clock as of the install day and prints a warning; `doctor` warns about the
+mismatch too. The converted hour is fixed in the plist, so after a
+daylight-saving change in either zone re-run `scripts/install-launchd-user.sh`.
+The processes themselves get `TZ=<TIMEZONE>` through `EnvironmentVariables` in
+the plist and count time in the owner's zone.
+
 The plists reference `run_with_env.sh` so they pick up `.env` the same way
 `EnvironmentFile` does on Linux. Logs land in `~/Library/Logs/` per
 Apple's convention instead of systemd's journal.
+
+launchd has no equivalent of `KillMode=mixed`: a tmux session abandoned by a
+killed or crashed bot is removed only by the cleanup at the next bot start.

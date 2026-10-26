@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import cast
 
 from aiogram import F, Router
+from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
@@ -24,7 +25,7 @@ from aiogram.types import (
 )
 
 from d_brain.bot.replies import answer_rich_text, answer_text
-from d_brain.bot.states import WhyCommandState
+from d_brain.bot.states import WhyCommandState, wait_expired, wait_started_at
 from d_brain.config import get_settings
 from d_brain.services.compiled_why import (
     WhyChoice,
@@ -40,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 async def start_why_flow(message: Message, state: FSMContext) -> None:
     """Prompt the user for the next /why query."""
+    await state.update_data(why_entered_at=wait_started_at())
     await state.set_state(WhyCommandState.waiting_for_input)
     await answer_text(
         message,
@@ -53,10 +55,14 @@ async def start_why_flow(message: Message, state: FSMContext) -> None:
 async def cmd_why(message: Message, command: CommandObject, state: FSMContext) -> None:
     """Handle /why command."""
     current_state = await state.get_state()
+    data = await state.get_data()
 
+    # An expired wait counts as absent, so one /why starts a new flow instead
+    # of "cancelling" a prompt the owner has long forgotten.
     if (
         not command.args
         and current_state == WhyCommandState.waiting_for_input.state
+        and not wait_expired(data.get("why_entered_at"))
     ):
         await state.clear()
         await answer_text(message, "❌ **/why отменён**")
@@ -73,15 +79,26 @@ async def cmd_why(message: Message, command: CommandObject, state: FSMContext) -
 @router.message(WhyCommandState.waiting_for_input)
 async def handle_why_input(message: Message, state: FSMContext) -> None:
     """Handle input after /why command -- text only (ТЗ: no voice for /why)."""
-    if not message.text:
-        await answer_text(
-            message,
-            "❌ `/why` понимает только текст. "
-            "Отправь текстовый запрос или `-` для отмены.",
-        )
-        return  # stay in waiting_for_input -- owner can just retry with text
+    data = await state.get_data()
+    expired = wait_expired(data.get("why_entered_at"))
+    text = (message.text or "").strip()
 
-    text = message.text.strip()
+    # Anything but a plain text message (voice, photo, document, forward)
+    # leaves the wait and goes on to the regular capture handlers, so it is
+    # saved as a normal entry instead of being refused. Same for text that
+    # arrives after the wait has expired.
+    if message.text is None or message.forward_origin is not None:
+        await state.clear()
+        raise SkipHandler
+    if expired and text != "-":
+        await state.clear()
+        raise SkipHandler
+    # A command that a later router handles ("/reminders", unknown "/foo")
+    # must not be taken for the query (same rule as /find).
+    if text.startswith("/"):
+        await state.clear()
+        raise SkipHandler
+
     if text == "-":
         await state.clear()
         await answer_text(message, "❌ **/why отменён**")
@@ -168,6 +185,7 @@ async def process_why_request(message: Message, query: str, state: FSMContext) -
                 for choice in outcome.choices
             ],
             why_choices_token=token,
+            why_entered_at=wait_started_at(),
         )
         await state.set_state(WhyCommandState.waiting_for_input)
         await answer_text(
@@ -234,6 +252,11 @@ async def handle_why_choice(query: CallbackQuery, state: FSMContext) -> None:
     # since started -- their next message went to the plain capture
     # handlers instead, with nothing said about it either way.
     if await state.get_state() != WhyCommandState.waiting_for_input.state:
+        await query.answer("Устарело, отправь /why ещё раз.", show_alert=True)
+        return
+
+    if wait_expired(data.get("why_entered_at")):
+        await state.clear()
         await query.answer("Устарело, отправь /why ещё раз.", show_alert=True)
         return
 

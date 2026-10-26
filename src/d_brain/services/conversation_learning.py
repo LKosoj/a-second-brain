@@ -9,6 +9,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from d_brain.clock import to_owner
 from d_brain.manifest import load_manifest_for_vault
 from d_brain.services.frontmatter import (
     parse_frontmatter_bytes,
@@ -58,7 +59,7 @@ class ConversationLearningService:
     @staticmethod
     def _on_day(value: object, day: date) -> bool:
         try:
-            return datetime.fromisoformat(str(value)).astimezone().date() == day
+            return to_owner(datetime.fromisoformat(str(value))).date() == day
         except ValueError:
             return False
 
@@ -511,7 +512,7 @@ Empty arrays are correct when evidence is absent or a reusable lesson is unsuppo
                         limit=max(limit * 4, 12),
                         scope=("thoughts/learnings",),
                     )
-                    if qmd._db_path.is_file()
+                    if qmd.db_path.is_file()
                     else {}
                 )
                 semantic_scores = {

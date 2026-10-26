@@ -12,7 +12,13 @@ from typing import Any, cast
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import BufferedInputFile, FSInputFile, InputRichMessage, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    FSInputFile,
+    InputRichMessage,
+    Message,
+)
 
 from d_brain.bot.formatters import (
     TELEGRAM_TEXT_LIMIT,
@@ -35,6 +41,21 @@ RICH_MEDIA_MARKUP_RE = re.compile(
     re.IGNORECASE,
 )
 MAX_INLINE_IMAGE_BYTES = 10 * 1024 * 1024
+
+
+async def answer_callback_once(
+    query: CallbackQuery, text: str | None = None, *, show_alert: bool = False
+) -> None:
+    """Final callback answer that tolerates an expired callback.
+
+    A large file can take longer to send than Telegram keeps the callback
+    alive; the file is already delivered by then, so a refused answer is only
+    worth a log line.
+    """
+    try:
+        await query.answer(text, show_alert=show_alert)
+    except TelegramBadRequest as error:
+        logger.warning("Callback answer was rejected: %s", error)
 
 
 def _resolve_attachment_image_data_uri(href: str) -> str | None:

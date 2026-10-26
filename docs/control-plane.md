@@ -158,6 +158,17 @@ The Bash guard is defense in depth, not a sandbox against deliberately
 obfuscated same-UID shell code. The intended posture is warning-first for soft
 issues and hard-block only for control-plane invariants.
 
+Known limitation: Kimi ACP auto-approval. Kimi is started without a sandbox,
+and every permission it asks for (`allow_once` / `allow_always`) is approved
+automatically by `services/kimi_acp.py`. The only protection is the other
+launch and environment barriers (allowlisted environment, working directory,
+process-group cleanup on timeout); Kimi writes into the vault are not separated
+from the rest of the workflow.
+
+Public-address checks (link summary, compiled wiki care) make their direct
+requests without the system `HTTP(S)_PROXY` variables, so the check sees the
+real destination rather than a proxy.
+
 ## Security Profiles
 
 Future risky integrations should not invent trust rules ad hoc.

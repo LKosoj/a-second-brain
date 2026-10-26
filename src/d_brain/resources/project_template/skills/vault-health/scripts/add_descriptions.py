@@ -34,7 +34,6 @@ if str(PROJECT_SRC) not in sys.path:
 from d_brain.manifest import load_manifest_for_vault  # noqa: E402
 from d_brain.services.frontmatter import (  # noqa: E402
     parse_frontmatter_bytes,
-    patch_frontmatter_bytes,
     patch_validated_vault_frontmatter,
     route_profile,
 )
@@ -283,13 +282,6 @@ def generate_description(rel_path: str, content: str, fm: dict) -> str | None:
         return truncate(para)
 
     return None
-
-
-def add_description_to_frontmatter(content: str, description: str) -> str:
-    """Losslessly add a description without serializing unrelated YAML."""
-    return patch_frontmatter_bytes(
-        content.encode("utf-8"), {"description": description}
-    ).decode("utf-8")
 
 
 def collect_candidate_files() -> list[Path]:

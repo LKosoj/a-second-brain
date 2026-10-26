@@ -30,6 +30,8 @@ uv build
 git diff --check
 ```
 
+CI also reports coverage and fails below 86 %.
+
 Tests must create temporary vaults or read the packaged vault and project
 templates. They must never depend on a local runtime `vault/`.
 

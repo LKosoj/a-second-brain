@@ -9,8 +9,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from d_brain.services.atomic_io import atomic_write_file_text
 from d_brain.services.cli_runner import CliRunner, build_subprocess_env
 from d_brain.services.json_normalizer import extract_first_json_dict
+from d_brain.services.subprocess_group import run_in_process_group
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +84,7 @@ class TodoistProjectCatalog:
     def refresh(self) -> dict[str, Any]:
         payload = {"limit": TODOIST_PROJECTS_LIMIT}
         try:
-            result = subprocess.run(
+            result = run_in_process_group(
                 [
                     "mcp-cli",
                     "call",
@@ -91,9 +93,6 @@ class TodoistProjectCatalog:
                     json.dumps(payload, ensure_ascii=False),
                 ],
                 cwd=self.vault_path,
-                capture_output=True,
-                text=True,
-                check=False,
                 env=build_subprocess_env(self.build_env()),
                 timeout=TODOIST_FIND_PROJECTS_TIMEOUT,
             )
@@ -139,10 +138,9 @@ class TodoistProjectCatalog:
             "inbox_project_id": inbox_project_id,
             "projects": projects,
         }
-        self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-        self._cache_path.write_text(
+        atomic_write_file_text(
+            self._cache_path,
             json.dumps(catalog, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
         )
         return catalog
 

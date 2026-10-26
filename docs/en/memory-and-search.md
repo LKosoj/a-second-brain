@@ -64,7 +64,8 @@ The full daily cycle then runs three phases in separate agent contexts:
    vault-health maintenance, and refreshes QMD.
 
 `/process` stops after a read-only preview. `/process_full` runs the write-heavy
-cycle immediately. The installed timer runs the same full cycle at 21:00.
+cycle immediately. The installed timer runs the same full cycle at 21:00 by default
+(`DAILY_PROCESS_TIME`).
 
 Not every daily entry needs a separate card. A durable card is useful when a
 fact, decision, relationship, lesson, or project state should be found and
@@ -587,7 +588,7 @@ not the routine retrieval path.
 |---|---|
 | Capture persistence | On each accepted Telegram message |
 | Direct question retrieval | When the text classifier returns `high` confidence for the question route |
-| Full daily processing | At 21:00 in the host's local time when the supplied timer is enabled, or manually with `/process_full` |
+| Full daily processing | At 21:00 by default (`DAILY_PROCESS_TIME`), in the owner's `TIMEZONE` (host zone if unset), when the supplied timer is enabled, or manually with `/process_full` |
 | Memory decay and creative recall | During the full reflection phase |
 | Vault-health and compiled-briefing maintenance | During the full reflection phase and scheduled post-cycle maintenance |
 | Compiled fact-check | Nightly, during scheduled post-cycle maintenance, after compiled maintenance and vault health, on a bounded batch of the stalest pages |

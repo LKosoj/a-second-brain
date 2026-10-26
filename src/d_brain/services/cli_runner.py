@@ -5,8 +5,8 @@ from __future__ import annotations
 import logging
 import os
 import re
-import signal
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -21,6 +21,10 @@ from d_brain.services.cli_json_stream import (
 from d_brain.services.cli_models import model_unavailable, resolve_light_model
 from d_brain.services.codex_tmux import run_codex_tmux
 from d_brain.services.kimi_acp import run_kimi_acp
+from d_brain.services.subprocess_group import (
+    PROCESS_STOP_GRACE_SECONDS,
+    stop_process_group,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +152,33 @@ class CliSpec:
     # of inventing one.
     restricted_argv_prefix: tuple[str, ...] | None = None
     restricted_stdin_prefix: tuple[str, ...] | None = None
+    # Stricter variant for ``run_untrusted`` (prompt embeds third-party
+    # content): on top of ``restricted`` it also denies writing files. The
+    # caller stores the result itself, so the CLI has nothing to write.
+    untrusted_argv_prefix: tuple[str, ...] | None = None
+    untrusted_stdin_prefix: tuple[str, ...] | None = None
 
+
+_UNTRUSTED_CLAUDE_WRITE_TOOLS = (
+    "Bash,PowerShell,Task,Agent,WebFetch,WebSearch,Write,Edit,MultiEdit,NotebookEdit"
+)
+# Reading is denied too: the scratch cwd does not stop absolute paths, so a
+# prompt-injected Read could pull vault notes or secrets into the reply.
+# Unknown names are ignored by claude, so older tool names are listed as well.
+_UNTRUSTED_CLAUDE_DENIED_TOOLS = (
+    _UNTRUSTED_CLAUDE_WRITE_TOOLS + ",Read,Glob,Grep,LS,NotebookRead"
+)
+_WARNED_UNTRUSTED_CLIS: set[str] = set()
+
+
+def _allow_read_prefix(prefix: tuple[str, ...]) -> tuple[str, ...]:
+    """Untrusted prefix without the read-tool denial (caller opted in)."""
+    return tuple(
+        _UNTRUSTED_CLAUDE_WRITE_TOOLS
+        if part == _UNTRUSTED_CLAUDE_DENIED_TOOLS
+        else part
+        for part in prefix
+    )
 
 CLI_SPECS: dict[AiCliName, CliSpec] = {
     "claude": CliSpec(
@@ -194,6 +224,28 @@ CLI_SPECS: dict[AiCliName, CliSpec] = {
             "--dangerously-skip-permissions",
             "--disallowedTools",
             "Bash,WebFetch,WebSearch",
+        ),
+        # Read tools are denied unless the caller passes ``allow_read``
+        # (image analysis reads a staged copy by path).
+        untrusted_argv_prefix=(
+            "claude",
+            "-p",
+            "--verbose",
+            "--output-format",
+            "stream-json",
+            "--dangerously-skip-permissions",
+            "--disallowedTools",
+            _UNTRUSTED_CLAUDE_DENIED_TOOLS,
+        ),
+        untrusted_stdin_prefix=(
+            "claude",
+            "-p",
+            "--verbose",
+            "--output-format",
+            "stream-json",
+            "--dangerously-skip-permissions",
+            "--disallowedTools",
+            _UNTRUSTED_CLAUDE_DENIED_TOOLS,
         ),
     ),
     "claude-tmux": CliSpec(
@@ -244,6 +296,24 @@ CLI_SPECS: dict[AiCliName, CliSpec] = {
             "workspace-write",
             "-c",
             "sandbox_workspace_write.network_access=true",
+            "--json",
+        ),
+        # Read-only sandbox (verified against `codex exec --help`): no file
+        # writes and no network for model-run commands.
+        untrusted_argv_prefix=(
+            "codex",
+            "exec",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "--json",
+        ),
+        untrusted_stdin_prefix=(
+            "codex",
+            "exec",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
             "--json",
         ),
     ),
@@ -362,34 +432,6 @@ def normalize_ai_cli(value: str) -> AiCliName:
     return normalized
 
 
-_PROCESS_STOP_GRACE_SECONDS = 5.0
-
-
-def _stop_process_group(
-    proc: subprocess.Popen[str], *, grace: float = _PROCESS_STOP_GRACE_SECONDS
-) -> None:
-    """Stop a timed-out CLI together with the children it spawned."""
-
-    try:
-        pgid = os.getpgid(proc.pid)
-    except OSError:
-        proc.kill()
-        return
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except OSError:
-        return
-    try:
-        proc.wait(timeout=grace)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except OSError:
-        pass
-
-
 def _terminal_message_head(raw_lower: str) -> str:
     """First line or first sentence of a message, whichever ends first.
 
@@ -474,10 +516,23 @@ class CliRunner:
         return CLI_SPECS[self.ai_cli]
 
     def _warn_if_restricted_unsupported(
-        self, restricted: bool, *, has_restricted_variant: bool
+        self,
+        restricted: bool,
+        *,
+        has_restricted_variant: bool,
+        untrusted: bool = False,
     ) -> None:
         """Log once when ``restricted=True`` has nothing to change for this backend."""
-        if restricted and not has_restricted_variant:
+        if restricted and not has_restricted_variant and untrusted:
+            if self.ai_cli in _WARNED_UNTRUSTED_CLIS:
+                return
+            _WARNED_UNTRUSTED_CLIS.add(self.ai_cli)
+            logger.warning(
+                "CLI backend %s has no restricted mode; untrusted call is "
+                "isolated only by a scratch working directory",
+                self.ai_cli,
+            )
+        elif restricted and not has_restricted_variant:
             logger.warning(
                 "CLI backend %s has no restricted mode; nightly cycle runs "
                 "unrestricted",
@@ -485,7 +540,13 @@ class CliRunner:
             )
 
     def build_command(
-        self, prompt: str, *, restricted: bool = False, model: str | None = None
+        self,
+        prompt: str,
+        *,
+        restricted: bool = False,
+        model: str | None = None,
+        untrusted: bool = False,
+        allow_read: bool = False,
     ) -> list[str]:
         """Build argv for backend execution.
 
@@ -500,7 +561,7 @@ class CliRunner:
 
         if self.ai_cli in _EXTERNAL_RUNNERS:
             self._warn_if_restricted_unsupported(
-                restricted, has_restricted_variant=False
+                restricted, has_restricted_variant=False, untrusted=untrusted
             )
             command = list(self.spec.argv_prefix)
             if model:
@@ -508,10 +569,16 @@ class CliRunner:
             return command
         prefix = self.spec.argv_prefix
         restricted_prefix = self.spec.restricted_argv_prefix
+        if untrusted and self.spec.untrusted_argv_prefix is not None:
+            restricted_prefix = self.spec.untrusted_argv_prefix
+            if allow_read:
+                restricted_prefix = _allow_read_prefix(restricted_prefix)
         if restricted and restricted_prefix is not None:
             prefix = restricted_prefix
         self._warn_if_restricted_unsupported(
-            restricted, has_restricted_variant=restricted_prefix is not None
+            restricted,
+            has_restricted_variant=restricted_prefix is not None,
+            untrusted=untrusted,
         )
         command = [*prefix, prompt]
         if model:
@@ -556,11 +623,20 @@ class CliRunner:
         extra_env: Mapping[str, str] | None = None,
         restricted: bool = False,
         light: bool = False,
+        cwd: Path | None = None,
+        untrusted: bool = False,
+        allow_read: bool = False,
     ) -> str:
         """Run with the normal model, or try a light model then the default."""
         if not light:
             return self._run_once(
-                prompt, timeout=timeout, extra_env=extra_env, restricted=restricted
+                prompt,
+                timeout=timeout,
+                extra_env=extra_env,
+                restricted=restricted,
+                cwd=cwd,
+                untrusted=untrusted,
+                allow_read=allow_read,
             )
 
         deadline = time.monotonic() + timeout
@@ -582,6 +658,9 @@ class CliRunner:
                     extra_env=extra_env,
                     restricted=restricted,
                     model=model,
+                    cwd=cwd,
+                    untrusted=untrusted,
+                    allow_read=allow_read,
                 )
             except CliExecutionError as error:
                 if not model_unavailable(f"{error}\n{error.stderr}"):
@@ -597,8 +676,53 @@ class CliRunner:
         if remaining <= 0:
             raise TimeoutError("CLI timeout exhausted before default-model fallback")
         return self._run_once(
-            prompt, timeout=remaining, extra_env=extra_env, restricted=restricted
+            prompt,
+            timeout=remaining,
+            extra_env=extra_env,
+            restricted=restricted,
+            cwd=cwd,
+            untrusted=untrusted,
+            allow_read=allow_read,
         )
+
+    def run_untrusted(
+        self,
+        prompt: str,
+        *,
+        timeout: int,
+        extra_env: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
+        allow_read: bool = False,
+    ) -> str:
+        """Run a prompt that embeds third-party content (web, documents, PLAUD).
+
+        The CLI only returns text and the caller saves it, so it gets no
+        write or fetch tools where the backend has a flag for that, and runs
+        in a scratch directory instead of the vault. The directory is the only
+        boundary for backends without such flags. Pass ``cwd`` when the caller
+        already owns a scratch directory (image analysis stages a copy there).
+        ``allow_read`` lifts the read-tool denial for that case only.
+        """
+        if cwd is not None:
+            return self.run(
+                prompt,
+                timeout=timeout,
+                extra_env=extra_env,
+                restricted=True,
+                cwd=cwd,
+                untrusted=True,
+                allow_read=allow_read,
+            )
+        with tempfile.TemporaryDirectory(prefix="d-brain-untrusted-") as scratch:
+            return self.run(
+                prompt,
+                timeout=timeout,
+                extra_env=extra_env,
+                restricted=True,
+                cwd=Path(scratch),
+                untrusted=True,
+                allow_read=allow_read,
+            )
 
     def _run_once(
         self,
@@ -608,8 +732,15 @@ class CliRunner:
         extra_env: Mapping[str, str] | None = None,
         restricted: bool = False,
         model: str | None = None,
+        cwd: Path | None = None,
+        untrusted: bool = False,
+        allow_read: bool = False,
     ) -> str:
         """Execute prompt and return stdout text.
+
+        ``cwd`` overrides the working directory (untrusted calls use a scratch
+        directory); ``untrusted`` selects the no-write variant of the
+        restricted flags where the backend has one.
 
         ``restricted=True`` is for the unattended scheduled cycle -- see
         ``build_command`` for which backends (claude, codex) actually declare
@@ -620,19 +751,18 @@ class CliRunner:
         """
 
         env = build_subprocess_env(extra_env)
+        workdir = cwd or self.workdir
 
         external_runner = _EXTERNAL_RUNNERS.get(self.ai_cli)
         if external_runner is not None:
             self._warn_if_restricted_unsupported(
-                restricted, has_restricted_variant=False
+                restricted, has_restricted_variant=False, untrusted=untrusted
             )
             try:
                 if model:
-                    output = external_runner(
-                        prompt, self.workdir, env, timeout, model=model
-                    )
+                    output = external_runner(prompt, workdir, env, timeout, model=model)
                 else:
-                    output = external_runner(prompt, self.workdir, env, timeout)
+                    output = external_runner(prompt, workdir, env, timeout)
             except TimeoutError:
                 raise
             except Exception as exc:
@@ -647,16 +777,30 @@ class CliRunner:
         if use_stdin:
             stdin_prefix = self.spec.stdin_prefix
             restricted_stdin_prefix = self.spec.restricted_stdin_prefix
+            if untrusted and self.spec.untrusted_stdin_prefix is not None:
+                restricted_stdin_prefix = self.spec.untrusted_stdin_prefix
+                if allow_read:
+                    restricted_stdin_prefix = _allow_read_prefix(
+                        restricted_stdin_prefix
+                    )
             if restricted and restricted_stdin_prefix is not None:
                 stdin_prefix = restricted_stdin_prefix
             self._warn_if_restricted_unsupported(
-                restricted, has_restricted_variant=restricted_stdin_prefix is not None
+                restricted,
+                has_restricted_variant=restricted_stdin_prefix is not None,
+                untrusted=untrusted,
             )
             cmd = list(stdin_prefix)
             if model:
                 cmd[1:1] = ["--model", model]
         else:
-            cmd = self.build_command(prompt, restricted=restricted, model=model)
+            cmd = self.build_command(
+                prompt,
+                restricted=restricted,
+                model=model,
+                untrusted=untrusted,
+                allow_read=allow_read,
+            )
 
         try:
             # start_new_session puts the CLI into its own process group so a
@@ -664,7 +808,7 @@ class CliRunner:
             # helper processes the CLI spawned.
             proc = subprocess.Popen(
                 cmd,
-                cwd=self.workdir,
+                cwd=workdir,
                 stdin=subprocess.PIPE if use_stdin else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -688,18 +832,18 @@ class CliRunner:
                     timeout=timeout,
                 )
             except subprocess.TimeoutExpired as exc:
-                _stop_process_group(proc)
+                stop_process_group(proc)
                 try:
                     # Drain the pipes so the process can be reaped, but bound
                     # the wait: a grandchild in another process group (e.g. an
                     # MCP server the CLI spawned) can keep holding stdout open
                     # even after the CLI itself is gone, which would hang an
                     # untimed communicate() forever.
-                    proc.communicate(timeout=_PROCESS_STOP_GRACE_SECONDS)
+                    proc.communicate(timeout=PROCESS_STOP_GRACE_SECONDS)
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     try:
-                        proc.communicate(timeout=_PROCESS_STOP_GRACE_SECONDS)
+                        proc.communicate(timeout=PROCESS_STOP_GRACE_SECONDS)
                     except subprocess.TimeoutExpired:
                         # A grandchild is still holding a pipe open even
                         # after SIGKILL to the CLI itself. The output is

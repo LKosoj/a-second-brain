@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -71,11 +73,19 @@ class ImageAnalysisService:
         if not image_path.exists():
             raise FileNotFoundError(f"Image not found: {image_path}")
 
-        output = self.runner.run(
-            self._build_prompt(image_path),
-            timeout=IMAGE_ANALYSIS_TIMEOUT,
-            extra_env=self._cli_extra_env(),
-        )
+        # The CLI reads a copy in a scratch directory: it runs there instead of
+        # the vault, and the chat-supplied file name never reaches the prompt.
+        with tempfile.TemporaryDirectory(prefix="d-brain-image-") as scratch:
+            staged = Path(scratch) / f"image{image_path.suffix.lower()}"
+            shutil.copyfile(image_path, staged)
+            output = self.runner.run_untrusted(
+                self._build_prompt(staged),
+                timeout=IMAGE_ANALYSIS_TIMEOUT,
+                extra_env=self._cli_extra_env(),
+                cwd=Path(scratch),
+                # The CLI has to read the staged copy by path.
+                allow_read=True,
+            )
         payload = extract_first_json_dict(
             output,
             error_context="image analysis output",

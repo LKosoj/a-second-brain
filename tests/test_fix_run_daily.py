@@ -14,7 +14,7 @@ C) A systemd ``Persistent=true`` catch-up run (timer fires late, e.g. the
 
 import json
 import sys
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,6 +23,104 @@ from conftest import _write_vault_manifest
 
 from d_brain import run_daily_process
 from d_brain.services.processor import INTERACTIVE_MODE, SCHEDULED_MODE, CliProcessor
+
+
+def test_scheduled_digest_shows_tasks_missing_from_todoist():
+    text = run_daily_process._build_scheduled_digest(
+        date(2026, 10, 15),
+        {
+            "daily": {"processed_entries": 2},
+            "audit_tasks_unconfirmed": [{"content": "Проверить аудит"}],
+            "retry_tasks_unconfirmed": [{"content": "Повтор"}],
+        },
+        {
+            "tasks_pending": [{"content": "Позвонить"}],
+            "tasks_unconfirmed": [{"content": "Написать"}],
+        },
+    )
+    assert "Не отправлено в Todoist (ждёт повтора): **1**" in text
+    assert "Не подтверждено, проверьте в Todoist: **3**" in text
+    assert "ничего нового" not in text
+
+
+def test_scheduled_digest_shows_daily_error_and_maintenance_sections():
+    text = run_daily_process._build_scheduled_digest(
+        date(2026, 10, 15),
+        {
+            "daily_error": "Processing timed out",
+            "daily": {"error": "Processing timed out", "processed_entries": 0},
+            "periodic_cycles": [
+                {"label": "Здоровье vault", "result": {"error": "boom"}},
+            ],
+        },
+        {},
+    )
+    assert "Ежедневная обработка: ошибка" in text
+    assert "`Processing timed out`" in text
+    assert "Здоровье vault: ошибка" in text
+    assert "Ежедневная обработка завершена" not in text
+    assert "ничего нового" not in text
+
+
+def test_main_exits_nonzero_but_still_notifies_when_only_daily_failed(
+    tmp_path, monkeypatch, capsys
+):
+    sent: list[tuple[str, bool]] = []
+
+    class FakeProcessor:
+        def run_scheduled_cycle(self, day):  # noqa: ANN001, ANN202
+            return {
+                "daily_error": "Processing timed out",
+                "daily": {"error": "Processing timed out", "processed_entries": 0},
+                "report": "ОТЧЁТ-ЦИКЛОВ",
+                "periodic_cycles": [
+                    {"label": "Здоровье vault", "result": {"status": "ok"}},
+                ],
+                "processed_entries": 0,
+            }
+
+    monkeypatch.setattr(
+        run_daily_process,
+        "get_settings",
+        lambda: SimpleNamespace(
+            vault_path=tmp_path,
+            todoist_api_key="",
+            ai_cli="qwen",
+            owner_full_name="Иван",
+            content_language="ru",
+            openai_api_key="",
+            openai_base_url="",
+            openai_model="",
+            telegram_bot_token="bot-token",
+            owner_telegram_id=42,
+        ),
+    )
+    monkeypatch.setattr(run_daily_process, "CliProcessor", lambda *a: FakeProcessor())
+    monkeypatch.setattr(
+        run_daily_process,
+        "_build_digest_takeaways",
+        lambda *a, **k: [],
+    )
+    monkeypatch.setattr(
+        run_daily_process,
+        "send_telegram_text_sync",
+        lambda text, *, parse_mode=None, rich=False: sent.append((text, rich)),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_daily_process.py", "--mode", "scheduled", "--date", "2026-04-05"],
+    )
+
+    exit_code = run_daily_process.main()
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Processing timed out" in captured.err
+    assert "ОТЧЁТ-ЦИКЛОВ" in captured.out
+    assert "Ежедневная обработка: ошибка" in sent[0][0]
+    assert "Здоровье vault" in sent[0][0]
+    assert sent[0][1] is True
 
 
 def test_scheduled_digest_distinguishes_interval_skip_from_execution():
@@ -473,17 +571,8 @@ def test_compiled_digest_cycle_uses_pinned_scheduled_cycle_day(
 # --- C) systemd Persistent=true catch-up must process yesterday -----------
 
 
-class _FixedDatetime(datetime):
-    _fixed_now: datetime
-
-    @classmethod
-    def now(cls, tz=None):  # noqa: ANN001
-        return cls._fixed_now
-
-
 def _freeze_now(monkeypatch: pytest.MonkeyPatch, moment: datetime) -> None:
-    frozen = type("FrozenDatetime", (_FixedDatetime,), {"_fixed_now": moment})
-    monkeypatch.setattr(run_daily_process, "datetime", frozen)
+    monkeypatch.setattr(run_daily_process, "owner_now", lambda: moment)
 
 
 def test_resolve_processing_day_before_scheduled_hour_is_catchup(
@@ -609,3 +698,163 @@ def test_main_scheduled_catchup_without_explicit_date_processes_yesterday(
     run_daily_process.main()
 
     assert seen_days == [date(2026, 9, 2)]
+
+
+def test_resolve_processing_day_uses_daily_process_time_hour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The timer moves with DAILY_PROCESS_TIME, so the catch-up cut-off must
+    move with it or every early run would process yesterday."""
+    monkeypatch.delenv("SCHEDULED_PROCESS_HOUR", raising=False)
+    monkeypatch.setenv("DAILY_PROCESS_TIME", "06:30")
+
+    _freeze_now(monkeypatch, datetime(2026, 9, 3, 7, 0))
+    assert run_daily_process._resolve_processing_day(SCHEDULED_MODE) == date(
+        2026, 9, 3
+    )
+    _freeze_now(monkeypatch, datetime(2026, 9, 3, 5, 0))
+    assert run_daily_process._resolve_processing_day(SCHEDULED_MODE) == date(
+        2026, 9, 2
+    )
+
+
+def test_scheduled_process_hour_env_beats_daily_process_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SCHEDULED_PROCESS_HOUR", "7")
+    monkeypatch.setenv("DAILY_PROCESS_TIME", "22:00")
+
+    assert run_daily_process._read_scheduled_process_hour() == 7
+
+
+@pytest.mark.parametrize("raw", ["25:00", "9", "abc", ""])
+def test_invalid_daily_process_time_falls_back_to_21(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    monkeypatch.delenv("SCHEDULED_PROCESS_HOUR", raising=False)
+    monkeypatch.setenv("DAILY_PROCESS_TIME", raw)
+
+    assert run_daily_process._read_scheduled_process_hour() == 21
+
+
+def _run_main_recording_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    retry_error: Exception | None = None,
+) -> list[str]:
+    order: list[str] = []
+
+    class FakeProcessor:
+        def process_daily(self, day: date, *, mode: str):  # noqa: ANN202
+            order.append("process")
+            return {"report": "", "processed_entries": 0}
+
+    def fake_retry(settings, day):  # noqa: ANN001, ANN202
+        order.append("retry")
+        if retry_error is not None:
+            raise retry_error
+
+    monkeypatch.setattr(
+        run_daily_process, "get_settings", lambda: _fake_settings(tmp_path)
+    )
+    monkeypatch.setattr(
+        run_daily_process, "CliProcessor", lambda *args: FakeProcessor()
+    )
+    monkeypatch.setattr(run_daily_process, "_retry_unrecognized_voice", fake_retry)
+    monkeypatch.setattr(
+        sys, "argv", ["run_daily_process.py", "--mode", mode, "--skip-notify"]
+    )
+    run_daily_process.main()
+    return order
+
+
+def test_main_retries_voice_before_processing_in_scheduled_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order = _run_main_recording_order(tmp_path, monkeypatch, SCHEDULED_MODE)
+    assert order == ["retry", "process"]
+
+
+def test_main_does_not_retry_voice_in_interactive_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order = _run_main_recording_order(tmp_path, monkeypatch, INTERACTIVE_MODE)
+    assert order == ["process"]
+
+
+def test_voice_retry_failure_does_not_stop_processing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The helper swallows a failure of the retry step itself.
+    real = run_daily_process._retry_unrecognized_voice
+    settings = _fake_settings(tmp_path)
+    settings.deepgram_api_key = "key"
+
+    def boom(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise RuntimeError("deepgram down")
+
+    monkeypatch.setattr(run_daily_process, "retry_unrecognized_voice", boom)
+
+    real(settings, date(2026, 9, 3))  # must not raise
+
+
+def test_voice_retry_uses_fresh_transcriber_per_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Each asyncio.run() makes a new event loop; a transcriber (and its HTTP
+    # client) reused across files stays bound to the first, closed loop.
+    import asyncio
+
+    class LoopBoundTranscriber:
+        def __init__(self, api_key: str, language: str) -> None:
+            self.loop: asyncio.AbstractEventLoop | None = None
+
+        async def transcribe(self, data: bytes) -> str:
+            loop = asyncio.get_running_loop()
+            if self.loop is None:
+                self.loop = loop
+            elif self.loop is not loop:
+                raise RuntimeError("Event loop is closed")
+            return "text"
+
+    results: list[str] = []
+
+    def fake_retry(vault, days, transcribe):  # noqa: ANN001, ANN202
+        results.extend(transcribe(b"a") for _ in range(2))
+        return SimpleNamespace(recognized=2, failed=0, skipped=0)
+
+    monkeypatch.setattr(run_daily_process, "DeepgramTranscriber", LoopBoundTranscriber)
+    monkeypatch.setattr(run_daily_process, "retry_unrecognized_voice", fake_retry)
+    settings = _fake_settings(tmp_path)
+    settings.deepgram_api_key = "key"
+
+    run_daily_process._retry_unrecognized_voice(settings, date(2026, 9, 3))
+
+    assert results == ["text", "text"]
+
+
+def test_resolve_processing_day_uses_owner_hour_on_utc_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """18:30 UTC is 21:30 in Moscow: past the 21:00 run, so "today"; 17:30 UTC
+    is 20:30 there, so the run is still the catch-up for yesterday."""
+    from d_brain import clock
+
+    clock.set_owner_timezone("Europe/Moscow")
+    monkeypatch.setenv("DAILY_PROCESS_TIME", "21:00")
+    monkeypatch.delenv("SCHEDULED_PROCESS_HOUR", raising=False)
+
+    monkeypatch.setattr(
+        clock, "_utcnow", lambda: datetime(2026, 9, 3, 18, 30, tzinfo=UTC)
+    )
+    assert run_daily_process._resolve_processing_day(SCHEDULED_MODE) == date(
+        2026, 9, 3
+    )
+
+    monkeypatch.setattr(
+        clock, "_utcnow", lambda: datetime(2026, 9, 3, 17, 30, tzinfo=UTC)
+    )
+    assert run_daily_process._resolve_processing_day(SCHEDULED_MODE) == date(
+        2026, 9, 2
+    )

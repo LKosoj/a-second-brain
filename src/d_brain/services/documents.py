@@ -40,11 +40,15 @@ from d_brain.services.ops_log import append_ops_log
 from d_brain.services.qmd import QmdService
 from d_brain.services.secrets import scrub_secrets
 from d_brain.services.source_links import SourceInfo, format_source_markdown
+from d_brain.services.subprocess_group import run_in_process_group
 
 logger = logging.getLogger(__name__)
 DOCUMENT_SUMMARY_TIMEOUT = 120
 DOCUMENT_SUMMARY_INPUT_CHARS = 40_000
 DOCUMENT_SUMMARY_FALLBACK_CHARS = 12_000
+# The extractor parses untrusted files, so it gets a minimal environment
+# instead of the bot's secrets (tokens, API keys).
+_EXTRACT_ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "JAVA_HOME")
 
 
 class UnsupportedDocumentError(ValueError):
@@ -494,9 +498,9 @@ class DocumentArchiveService:
         original_name: str,
     ) -> dict[str, Any]:
         raw_path = self.vault_path / original_path
-        env = os.environ.copy()
+        env = {k: os.environ[k] for k in _EXTRACT_ENV_ALLOWLIST if k in os.environ}
         src_path = str(Path(__file__).resolve().parents[2])
-        current_pythonpath = env.get("PYTHONPATH", "").strip()
+        current_pythonpath = os.environ.get("PYTHONPATH", "").strip()
         env["PYTHONPATH"] = (
             f"{src_path}:{current_pythonpath}" if current_pythonpath else src_path
         )
@@ -511,12 +515,9 @@ class DocumentArchiveService:
             f"--name={original_name}",
         ]
         try:
-            proc = subprocess.run(
+            proc = run_in_process_group(
                 command,
                 cwd=self.vault_path,
-                capture_output=True,
-                text=True,
-                check=False,
                 env=env,
                 timeout=DOCUMENT_EXTRACTION_TIMEOUT_SECONDS,
             )
@@ -768,7 +769,7 @@ class DocumentArchiveService:
             f"{extraction.plain_text[:DOCUMENT_SUMMARY_INPUT_CHARS]}\n"
             "[END CONTENT]\n"
         )
-        output = self.runner.run(prompt, timeout=DOCUMENT_SUMMARY_TIMEOUT)
+        output = self.runner.run_untrusted(prompt, timeout=DOCUMENT_SUMMARY_TIMEOUT)
         payload = extract_first_json_dict(
             output,
             error_context="document summary output",

@@ -4,20 +4,23 @@ Scheduled catch-up: systemd's ``Persistent=true`` can fire this process late
 (e.g. at 09:00 the next morning for a missed 21:00 run). Without ``--date``,
 a ``--mode scheduled`` run observed before the scheduled hour is treated as a
 delayed catch-up and processes yesterday instead of today. The scheduled
-hour is read from the ``SCHEDULED_PROCESS_HOUR`` env var (default
-``DEFAULT_SCHEDULED_PROCESS_HOUR`` below); pass ``--date`` to override.
+hour is read from the ``SCHEDULED_PROCESS_HOUR`` env var, else from the hour
+of ``DAILY_PROCESS_TIME`` (the timer time), else
+``DEFAULT_SCHEDULED_PROCESS_HOUR`` below; pass ``--date`` to override.
 """
 
 import argparse
+import asyncio
 import json
 import logging
 import os
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, cast
 
-from d_brain.config import get_settings
+from d_brain.clock import owner_now
+from d_brain.config import get_settings, parse_clock_time
 from d_brain.services.frontmatter import ensure_run_identity
 from d_brain.services.processor import (
     INTERACTIVE_MODE,
@@ -26,6 +29,8 @@ from d_brain.services.processor import (
 )
 from d_brain.services.reflection_digest import ReflectionDigestService
 from d_brain.services.telegram_delivery import send_telegram_text_sync
+from d_brain.services.transcription import DeepgramTranscriber
+from d_brain.services.voice_retry import retry_unrecognized_voice
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +42,7 @@ def _parse_date(value: str | None) -> date | None:
 
 
 DEFAULT_SCHEDULED_PROCESS_HOUR = 21
-"""Fallback scheduled run hour (local time, 24h) used to detect a delayed
+"""Fallback scheduled run hour (owner's time, 24h) used to detect a delayed
 systemd ``Persistent=true`` catch-up run when ``SCHEDULED_PROCESS_HOUR`` is
 unset."""
 
@@ -46,14 +51,18 @@ def _resolve_processing_day(mode: str) -> date:
     """Pick the day to process when ``--date`` is not given.
 
     A systemd timer with ``Persistent=true`` can fire late -- e.g. at 09:00
-    the next morning for a missed 21:00 run. ``date.today()`` would then pick
+    the next morning for a missed 21:00 run. Today's date would then pick
     the new day and leave yesterday's entries unprocessed. For
     ``--mode scheduled`` runs, a run observed before the scheduled hour
-    (``SCHEDULED_PROCESS_HOUR`` env var, default
-    ``DEFAULT_SCHEDULED_PROCESS_HOUR``) is treated as a delayed catch-up for
-    yesterday.
+    (``SCHEDULED_PROCESS_HOUR`` env var, else the hour of
+    ``DAILY_PROCESS_TIME``, else ``DEFAULT_SCHEDULED_PROCESS_HOUR``) is
+    treated as a delayed catch-up for yesterday.
+
+    Limitation: with a cut-off hour of 0 (timer at 00:00-00:59) no run can
+    be earlier than the scheduled hour, so a late run after midnight is
+    never recognised as a catch-up and takes the new, empty day.
     """
-    now = datetime.now()
+    now = owner_now()
     if mode != SCHEDULED_MODE:
         return now.date()
     hour = _read_scheduled_process_hour()
@@ -68,7 +77,20 @@ def _read_scheduled_process_hour() -> int:
     is notified."""
     raw_hour = os.environ.get("SCHEDULED_PROCESS_HOUR")
     if raw_hour is None:
-        return DEFAULT_SCHEDULED_PROCESS_HOUR
+        # The timer fires at DAILY_PROCESS_TIME; a cut-off left at 21 would
+        # make every run of an earlier timer look like a late catch-up.
+        raw_time = os.environ.get("DAILY_PROCESS_TIME")
+        if raw_time is None:
+            return DEFAULT_SCHEDULED_PROCESS_HOUR
+        parsed = parse_clock_time(raw_time)
+        if parsed is None:
+            logger.warning(
+                "Invalid DAILY_PROCESS_TIME=%r, using default hour %s",
+                raw_time,
+                DEFAULT_SCHEDULED_PROCESS_HOUR,
+            )
+            return DEFAULT_SCHEDULED_PROCESS_HOUR
+        return parsed[0]
     try:
         hour = int(raw_hour)
     except ValueError:
@@ -86,6 +108,36 @@ def _read_scheduled_process_hour() -> int:
         )
         return DEFAULT_SCHEDULED_PROCESS_HOUR
     return hour
+
+
+def _retry_unrecognized_voice(settings: Any, day: date) -> None:
+    """Transcribe voice saved as unrecognized audio; never stops the run."""
+    api_key = getattr(settings, "deepgram_api_key", "")
+    if not api_key:
+        logger.info("DEEPGRAM_API_KEY is not set, voice retry skipped")
+        return
+    try:
+        result = retry_unrecognized_voice(
+            settings.vault_path,
+            (day - timedelta(days=1), day),
+            # main() has no running event loop, so asyncio.run is safe here.
+            # A new transcriber per file: its HTTP client binds to the event
+            # loop of the first call, and asyncio.run closes that loop.
+            lambda data: asyncio.run(
+                DeepgramTranscriber(api_key, settings.content_language).transcribe(
+                    data
+                )
+            ),
+        )
+    except Exception:
+        logger.exception("Voice retry failed")
+        return
+    logger.info(
+        "Voice retry: %d recognized, %d failed, %d skipped",
+        result.recognized,
+        result.failed,
+        result.skipped,
+    )
 
 
 def _load_execute_payload(vault_path: Path) -> dict[str, Any]:
@@ -162,8 +214,15 @@ def _build_scheduled_digest(
         daily_result = result
     processed_entries = int(daily_result.get("processed_entries") or 0)
 
+    daily_error = str(result.get("daily_error") or "").strip()
     lines = [heading, ""]
-    if daily_empty:
+    if daily_error:
+        # Only the daily part failed: say so, and still show the rest below.
+        lines.extend(["**Ежедневная обработка: ошибка**", f"`{daily_error}`"])
+        disabled_notice = str(result.get("disabled_steps_notice") or "").strip()
+        if disabled_notice:
+            lines.extend(["", disabled_notice])
+    elif daily_empty:
         lines.append("Сегодня новых записей не было.")
     else:
         lines.extend(
@@ -178,8 +237,32 @@ def _build_scheduled_digest(
             ]
         )
 
+    # Tasks that never reached Todoist (or whose creation was not confirmed)
+    # must stay visible: otherwise the owner believes they are tracked.
+    tasks_pending = _dict_list(execute_payload, "tasks_pending")
+    tasks_unconfirmed = [
+        *_dict_list(execute_payload, "tasks_unconfirmed"),
+        *[
+            item
+            for key in ("retry_tasks_unconfirmed", "audit_tasks_unconfirmed")
+            for item in result.get(key, [])
+            if isinstance(item, dict)
+        ],
+    ]
+    if tasks_pending:
+        lines.append(
+            f"⚠️ Не отправлено в Todoist (ждёт повтора): **{len(tasks_pending)}**"
+        )
+    if tasks_unconfirmed:
+        lines.append(
+            f"⚠️ Не подтверждено, проверьте в Todoist: **{len(tasks_unconfirmed)}**"
+        )
+
     if (
-        not tasks_created
+        not daily_error
+        and not tasks_created
+        and not tasks_pending
+        and not tasks_unconfirmed
         and not thoughts_saved
         and not crm_updated
         and not periodic_cycles
@@ -373,8 +456,13 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    day = _parse_date(args.day) or _resolve_processing_day(args.mode)
+    # Settings first: loading them fixes the owner's timezone for the day below.
     settings = get_settings()
+    day = _parse_date(args.day) or _resolve_processing_day(args.mode)
+    if args.mode == SCHEDULED_MODE:
+        # Before classification, so a recording recognized now is processed
+        # with the rest of the day.
+        _retry_unrecognized_voice(settings, day)
     processor = CliProcessor(
         settings.vault_path,
         settings.todoist_api_key,
@@ -400,6 +488,9 @@ def main() -> int:
         sys.stderr.write(str(result["error"]).rstrip() + "\n")
         exit_code = 1
     else:
+        if result.get("daily_error"):
+            sys.stderr.write(str(result["daily_error"]).rstrip() + "\n")
+            exit_code = 1
         report = str(result.get("report", ""))
         if report:
             sys.stdout.write(report)

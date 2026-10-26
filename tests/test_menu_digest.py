@@ -4,17 +4,23 @@ decisions-queue action buttons' fingerprint check (задача L code review,
 defect 4) -- same FakeMessage/monkeypatch approach as
 ``tests/test_do_cancel.py``'s ``process_request`` tests."""
 
+import asyncio
 import json
 import shutil
+import threading
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 
+from d_brain.bot import vault_busy
 from d_brain.bot.dashboard import (
+    build_file_directory_keyboard,
+    file_entries_fingerprint,
     get_dashboard_session,
     page_fingerprint,
     render_file_directory,
@@ -26,6 +32,7 @@ from d_brain.services.decisions_queue import (
     ResponseOutcome,
     queue_item_fingerprint,
 )
+from d_brain.services.vault_lock import VaultLockTimeout
 
 
 class FakeMessage:
@@ -58,11 +65,14 @@ class FakeCallbackQuery:
         self.answer_calls: list[tuple[str | None, bool]] = []
 
     async def answer(self, text: str | None = None, show_alert: bool = False) -> None:
+        # Telegram accepts one answer per callback and rejects the rest.
+        if self.answer_calls:
+            raise TelegramBadRequest(method=None, message="query already answered")
         self.answer_calls.append((text, show_alert))
 
 
 @contextmanager
-def _fake_vault_write_lock(vault_path):  # noqa: ANN001
+def _fake_vault_write_lock(vault_path, timeout=None):  # noqa: ANN001
     yield SimpleNamespace()
 
 
@@ -1043,7 +1053,11 @@ class FakeBrowserBot:
 
     def __init__(self, on_send=None) -> None:  # noqa: ANN001
         self.sent: list[str] = []
+        self.chat_actions: list[tuple[int, str]] = []
         self.on_send = on_send
+
+    async def send_chat_action(self, chat_id: int, action: str) -> None:
+        self.chat_actions.append((chat_id, action))
 
     async def edit_message_text(self, **kwargs) -> None:  # noqa: ANN003
         return None
@@ -1052,6 +1066,12 @@ class FakeBrowserBot:
         self.sent.append(str(document.path))
         if self.on_send is not None:
             self.on_send()
+
+
+def _entry_data(chat_id: int, index: int) -> str:
+    """The callback_data the rendered keyboard puts on the button."""
+    session = get_dashboard_session(chat_id)
+    return f"menu:filesentry:{index}:{file_entries_fingerprint(session.file_entries)}"
 
 
 def _make_browser_vault(root: Path) -> Path:
@@ -1118,13 +1138,11 @@ async def test_handle_menu_callback_filesentry_answers_a_failed_telegram_send(
         page=0,
         preferred_message_id=42,
     )
-    query = FakeCallbackQuery("menu:filesentry:0", chat_id, message_id=42)
+    query = FakeCallbackQuery(_entry_data(chat_id, 0), chat_id, message_id=42)
 
     await menu_handler.handle_menu_callback(query, bot=bot, state=AsyncMock())
 
-    assert query.answer_calls == [
-        ("Отправляю файл…", False), ("Не удалось отправить файл.", True),
-    ]
+    assert query.answer_calls == [("Не удалось отправить файл.", True)]
 
 
 async def test_handle_menu_callback_filesentry_sent_file_is_not_reported_as_a_failure(
@@ -1151,12 +1169,228 @@ async def test_handle_menu_callback_filesentry_sent_file_is_not_reported_as_a_fa
         page=0,
         preferred_message_id=42,
     )
-    query = FakeCallbackQuery("menu:filesentry:0", chat_id, message_id=42)
+    query = FakeCallbackQuery(_entry_data(chat_id, 0), chat_id, message_id=42)
 
     await menu_handler.handle_menu_callback(query, bot=bot, state=AsyncMock())
 
     assert len(bot.sent) == 1
     assert query.answer_calls == [
-        ("Отправляю файл…", False),
         (menu_handler._FILE_SENT_REDRAW_FAILED_MESSAGE, True),
     ]
+
+
+def _settings(monkeypatch, vault: Path) -> None:
+    monkeypatch.setattr(
+        menu_handler, "get_settings", lambda: SimpleNamespace(vault_path=str(vault))
+    )
+
+
+async def _open_folder(bot, vault: Path, chat_id: int, folder: str) -> None:  # noqa: ANN001
+    await render_file_directory(
+        bot, chat_id=chat_id, vault_path=str(vault), root_id="daily",
+        current_dir=folder, page=0, preferred_message_id=42,
+    )
+
+
+async def test_filesentry_success_answers_once_and_shows_upload_action(
+    monkeypatch, tmp_path: Path
+) -> None:
+    vault = _make_browser_vault(tmp_path)
+    _settings(monkeypatch, vault)
+    chat_id = 900030
+    bot = FakeBrowserBot()
+    await _open_folder(bot, vault, chat_id, "2026-08")
+    query = FakeCallbackQuery(_entry_data(chat_id, 0), chat_id, message_id=42)
+
+    await menu_handler.handle_menu_callback(query, bot=bot, state=AsyncMock())
+
+    assert query.answer_calls == [("Отправлен: note.md", False)]
+    assert bot.chat_actions == [(chat_id, "upload_document")]
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (ValueError("FILE_TOO_LARGE"),
+         ("Файл слишком большой для отправки через Telegram.", True)),
+        (ValueError("x"), ("Не удалось отправить файл.", True)),
+        (menu_handler.FileBrowserError("x"), ("Не удалось открыть файл.", True)),
+        (OSError("x"), ("Не удалось открыть файл.", True)),
+        (RuntimeError("x"), ("Не удалось отправить файл.", True)),
+    ],
+)
+async def test_filesentry_one_answer_per_failure_branch(
+    monkeypatch, tmp_path: Path, error: Exception, expected: tuple[str, bool]
+) -> None:
+    vault = _make_browser_vault(tmp_path)
+    _settings(monkeypatch, vault)
+    chat_id = 900031
+
+    async def failing_send(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise error
+
+    monkeypatch.setattr(menu_handler, "send_browser_file", failing_send)
+    bot = FakeBrowserBot()
+    await _open_folder(bot, vault, chat_id, "2026-08")
+    query = FakeCallbackQuery(_entry_data(chat_id, 0), chat_id, message_id=42)
+
+    await menu_handler.handle_menu_callback(query, bot=bot, state=AsyncMock())
+
+    assert query.answer_calls == [expected]
+
+
+async def test_filesentry_index_out_of_range_answers_once(
+    monkeypatch, tmp_path: Path
+) -> None:
+    vault = _make_browser_vault(tmp_path)
+    _settings(monkeypatch, vault)
+    chat_id = 900032
+    bot = FakeBrowserBot()
+    await _open_folder(bot, vault, chat_id, "2026-08")
+    query = FakeCallbackQuery(_entry_data(chat_id, 99), chat_id, message_id=42)
+
+    await menu_handler.handle_menu_callback(query, bot=bot, state=AsyncMock())
+
+    assert query.answer_calls == [("Файл или папка не найдены.", True)]
+
+
+async def test_filesentry_late_callback_answer_does_not_leak_exception(
+    monkeypatch, tmp_path: Path
+) -> None:
+    vault = _make_browser_vault(tmp_path)
+    _settings(monkeypatch, vault)
+    chat_id = 900033
+    bot = FakeBrowserBot()
+    await _open_folder(bot, vault, chat_id, "2026-08")
+    query = FakeCallbackQuery(_entry_data(chat_id, 0), chat_id, message_id=42)
+
+    async def too_old(text=None, show_alert=False):  # noqa: ANN001, ANN202
+        raise TelegramBadRequest(method=None, message="query is too old")
+
+    query.answer = too_old  # type: ignore[method-assign]
+
+    await menu_handler.handle_menu_callback(query, bot=bot, state=AsyncMock())
+
+    assert len(bot.sent) == 1
+
+
+async def test_file_directory_keyboard_buttons_carry_list_fingerprint(
+    monkeypatch, tmp_path: Path
+) -> None:
+    vault = _make_browser_vault(tmp_path)
+    chat_id = 900034
+    await _open_folder(FakeBrowserBot(), vault, chat_id, "2026-08")
+    session = get_dashboard_session(chat_id)
+    token = file_entries_fingerprint(session.file_entries)
+    keyboard = build_file_directory_keyboard(
+        current_dir="2026-08",
+        page_entries=session.file_entries,
+        page=0,
+        total_entries=len(session.file_entries),
+    )
+
+    data = [
+        button.callback_data
+        for row in keyboard.inline_keyboard
+        if (button := row[0]).callback_data
+        and button.callback_data.startswith("menu:filesentry:")
+    ]
+    assert data == [f"menu:filesentry:0:{token}"]
+    assert len(token) == 8
+    assert len(f"menu:filesentry:99:{token}") <= 64
+
+
+async def test_filesentry_stale_list_does_not_send_wrong_file(
+    monkeypatch, tmp_path: Path
+) -> None:
+    vault = _make_browser_vault(tmp_path)
+    (vault / "daily" / "2026-09").mkdir()
+    (vault / "daily" / "2026-09" / "other.md").write_text("y", encoding="utf-8")
+    _settings(monkeypatch, vault)
+    chat_id = 900035
+    bot = FakeBrowserBot()
+    await _open_folder(bot, vault, chat_id, "2026-08")
+    stale = _entry_data(chat_id, 0)
+    await _open_folder(bot, vault, chat_id, "2026-09")
+    query = FakeCallbackQuery(stale, chat_id, message_id=42)
+
+    await menu_handler.handle_menu_callback(query, bot=bot, state=AsyncMock())
+
+    assert bot.sent == []
+    assert query.answer_calls == [("Список устарел, обнови его.", True)]
+
+
+async def test_filesentry_without_token_is_rejected(
+    monkeypatch, tmp_path: Path
+) -> None:
+    vault = _make_browser_vault(tmp_path)
+    _settings(monkeypatch, vault)
+    chat_id = 900036
+    bot = FakeBrowserBot()
+    await _open_folder(bot, vault, chat_id, "2026-08")
+    query = FakeCallbackQuery("menu:filesentry:0", chat_id, message_id=42)
+
+    await menu_handler.handle_menu_callback(query, bot=bot, state=AsyncMock())
+
+    assert bot.sent == []
+    assert query.answer_calls == [("Список устарел, обнови его.", True)]
+
+
+async def test_deliver_daily_digest_reports_busy_when_lock_times_out(
+    monkeypatch, tmp_path: Path
+) -> None:
+    status = FakeStatusMessage()
+    _stub_answer_text(monkeypatch, status)
+    release, done = threading.Event(), threading.Event()
+
+    @contextmanager
+    def blocked_lock(vault_path, timeout=None):  # noqa: ANN001
+        if not release.wait(10 if timeout is None else timeout):
+            done.set()
+            raise VaultLockTimeout
+        assert release.wait(10)
+        try:
+            yield SimpleNamespace()
+        finally:
+            done.set()
+
+    monkeypatch.setattr(menu_handler, "build_daily_digest", lambda *a, **k: "digest")
+    monkeypatch.setattr(menu_handler, "load_manifest_for_vault", lambda v: None)
+    monkeypatch.setattr(menu_handler, "vault_write_lock", blocked_lock)
+    monkeypatch.setattr(vault_busy, "VAULT_LOCK_WAIT_SECONDS", 0.05)
+    written: list[object] = []
+    monkeypatch.setattr(
+        menu_handler, "write_validated_vault_markdown",
+        lambda *a, **k: written.append(a),
+    )
+    monkeypatch.setattr(menu_handler, "digest_path", lambda v, d: "x.md")
+    monkeypatch.setattr(menu_handler, "render_digest_note", lambda d, t: b"r")
+
+    await menu_handler._deliver_daily_digest(FakeMessage(), vault_path=tmp_path)
+    release.set()
+    assert await asyncio.to_thread(done.wait, 5)
+
+    assert len(status.edits) == 1
+    assert "Идёт обработка" in status.edits[0][0]
+    assert written == []
+
+
+def test_jobhealthenable_callback_data_fits_telegram_limit(tmp_path: Path) -> None:
+    """Guard: a new workflow/cycle name must keep the button under 64 bytes."""
+    from d_brain.bot.dashboard import build_disabled_steps_keyboard
+    from d_brain.control_plane.registry import CONTROL_PLANE_REGISTRY
+    from d_brain.services.processor import save_job_health
+
+    names = {w.name for w in CONTROL_PLANE_REGISTRY} | {
+        "daily", "weekly_digest", "weekly_system_reflection",
+        "weekly_goals_rollover", "monthly", "yearly",
+    }
+    vault = tmp_path / "vault"
+    save_job_health(vault, {name: {"disabled": True} for name in names})
+
+    keyboard = build_disabled_steps_keyboard(vault)
+    data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    enable = [d for d in data if (d or "").startswith("menu:jobhealthenable:")]
+
+    assert len(enable) == len(names)
+    assert all(len((d or "").encode()) <= 64 for d in data)

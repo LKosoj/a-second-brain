@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import html
+import ipaddress
 import logging
 import re
+import socket
 import time
-from collections.abc import Callable
+import typing
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
+import httpcore
 import httpx
 
 DEFAULT_HEADERS = {
@@ -42,7 +46,114 @@ BOILERPLATE_MARKERS = (
     "log in",
     "sign up",
 )
+CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 logger = logging.getLogger(__name__)
+
+
+def is_public_ip(value: str) -> bool:
+    """True for a globally routable address; raises ValueError for non-IPs."""
+    ip = ipaddress.ip_address(value)
+    if isinstance(ip, ipaddress.IPv4Address) and ip in CGNAT_NETWORK:
+        return False
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def _is_allowed_ip(value: str) -> bool:
+    try:
+        return is_public_ip(value)
+    except ValueError:
+        return False
+
+
+class _PinnedPublicBackend(httpcore.NetworkBackend):
+    """Resolve once, check every answer, and connect to the checked address.
+
+    Checking the name before the request and letting the client resolve it again
+    leaves a window for DNS rebinding (public answer first, internal second).
+    The TLS server name and Host header still come from the URL, so
+    certificates and virtual hosts work as usual.
+    """
+
+    def __init__(
+        self,
+        is_allowed: Callable[[str], bool] = _is_allowed_ip,
+        inner: httpcore.NetworkBackend | None = None,
+    ) -> None:
+        self._is_allowed = is_allowed
+        self._inner = inner or httpcore.SyncBackend()
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[typing.Any] | None = None,
+    ) -> httpcore.NetworkStream:
+        try:
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise httpcore.ConnectError(f"cannot resolve {host}") from exc
+        addresses = [str(info[4][0]) for info in infos]
+        if not addresses or not all(self._is_allowed(a) for a in addresses):
+            raise httpcore.ConnectError(f"{host} resolves to a non-public address")
+        last_error: Exception | None = None
+        for address in addresses:
+            try:
+                return self._inner.connect_tcp(
+                    address,
+                    port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
+                # ConnectTimeout is not a ConnectError; a dead first address
+                # (say an unreachable IPv6) must not hide the working ones.
+                last_error = exc
+        if isinstance(last_error, httpcore.ConnectTimeout):
+            raise httpcore.ConnectTimeout(f"cannot connect to {host}") from last_error
+        raise httpcore.ConnectError(f"cannot connect to {host}") from last_error
+
+    def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Iterable[typing.Any] | None = None,
+    ) -> httpcore.NetworkStream:
+        raise httpcore.ConnectError("unix sockets are not allowed")
+
+    def sleep(self, seconds: float) -> None:
+        self._inner.sleep(seconds)
+
+
+class _PublicOnlyTransport(httpx.HTTPTransport):
+    """HTTP transport that can only reach public addresses (see backend)."""
+
+    def __init__(
+        self,
+        *,
+        is_allowed: Callable[[str], bool] = _is_allowed_ip,
+        backend: _PinnedPublicBackend | None = None,
+    ) -> None:
+        super().__init__()
+        # `_pool` is private in httpx, but there is no public way to pass a
+        # network backend; the tests with real connections catch a change.
+        self._pool = httpcore.ConnectionPool(
+            ssl_context=httpx.create_ssl_context(),
+            network_backend=backend or _PinnedPublicBackend(is_allowed),
+        )
+
+
+# Used by calendar_ics: the same address check for another downloader.
+PublicOnlyTransport = _PublicOnlyTransport
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,11 +301,17 @@ def _direct_extract(
     allowed_url: Callable[[str], bool] | None = None,
 ) -> WebContentResult:
     final_url = url
+    # An explicit transport also stops httpx from reading HTTP(S)_PROXY, so with
+    # a caller-supplied address check pages are fetched directly: a proxy would
+    # resolve the name itself and bypass the pinned address. The PROXY_URL
+    # reader (`_proxy_extract`) is a separate client and is not affected.
+    transport = _PublicOnlyTransport() if allowed_url is not None else None
     try:
         with httpx.Client(
             follow_redirects=False,
             timeout=timeout,
             headers=DEFAULT_HEADERS,
+            transport=transport,
         ) as client:
             request = client.build_request("GET", url)
             for _ in range(MAX_DIRECT_REDIRECTS + 1):

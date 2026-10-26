@@ -19,6 +19,7 @@ themselves, but cannot accidentally pick up a host install of ``qmd``.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -86,6 +87,7 @@ def _prepare_project(project_dir: Path) -> None:
         "com.second-brain.morning-brief.plist.in",
         "com.second-brain.plaud-sync.plist.in",
         "com.second-brain.qmd-maintenance.plist.in",
+        "com.second-brain.backup-verify.plist.in",
     ):
         shutil.copy(
             REPO_ROOT / "deploy" / name,
@@ -169,6 +171,7 @@ def test_install_skips_optional_plists(tmp_path: Path, fake_path: Path) -> None:
     agent_dir = home / "Library" / "LaunchAgents"
     assert (agent_dir / "com.second-brain.bot.plist").exists()
     assert (agent_dir / "com.second-brain.process.plist").exists()
+    assert (agent_dir / "com.second-brain.backup-verify.plist").exists()
     assert not (agent_dir / "com.second-brain.plaud-sync.plist").exists()
     assert not (
         agent_dir / "com.second-brain.qmd-maintenance.plist"
@@ -319,3 +322,212 @@ def test_wrapper_loads_env(tmp_path: Path) -> None:
     assert "FOO=bar" in result.stdout
     assert "QUOTED=hello world" in result.stdout
     assert "comment line" not in result.stdout
+
+
+def _render_with_env(tmp_path: Path, env_lines: str) -> Path:
+    project_dir = tmp_path / "project"
+    _prepare_project(project_dir)
+    env_file = project_dir / ".env"
+    env_file.write_text(
+        env_file.read_text(encoding="utf-8") + env_lines, encoding="utf-8"
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    subprocess.run(
+        ["bash", str(project_dir / "scripts" / "install-launchd-user.sh")],
+        cwd=tmp_path,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return home / "Library" / "LaunchAgents"
+
+
+def test_install_renders_schedule_from_env_without_leading_zero(
+    tmp_path: Path, fake_path: Path
+) -> None:
+    agent_dir = _render_with_env(
+        tmp_path, "DAILY_PROCESS_TIME=08:05\nMORNING_BRIEF_TIME=07:00\n"
+    )
+
+    process = (agent_dir / "com.second-brain.process.plist").read_text("utf-8")
+    brief = (agent_dir / "com.second-brain.morning-brief.plist").read_text("utf-8")
+    assert "<integer>8</integer>" in process
+    assert "<integer>5</integer>" in process
+    assert "<integer>7</integer>" in brief
+    assert "<integer>0</integer>" in brief
+    assert "@DAILY_PROCESS" not in process
+    assert "@MORNING_BRIEF" not in brief
+
+
+def test_install_keeps_default_schedule(tmp_path: Path, fake_path: Path) -> None:
+    agent_dir = _render_with_env(tmp_path, "")
+
+    process = (agent_dir / "com.second-brain.process.plist").read_text("utf-8")
+    brief = (agent_dir / "com.second-brain.morning-brief.plist").read_text("utf-8")
+    assert "<integer>21</integer>" in process
+    assert "<integer>8</integer>" in brief
+    assert "@DAILY_PROCESS" not in process
+    assert "@MORNING_BRIEF" not in brief
+
+
+def test_install_rejects_invalid_schedule(tmp_path: Path, fake_path: Path) -> None:
+    with pytest.raises(subprocess.CalledProcessError) as excinfo:
+        _render_with_env(tmp_path, "MORNING_BRIEF_TIME=8:00\n")
+
+    assert "MORNING_BRIEF_TIME" in excinfo.value.stderr
+
+
+def _install_with_timezone(
+    tmp_path: Path, env_lines: list[str], system_tz: str
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    project_dir = tmp_path / "project"
+    _prepare_project(project_dir)
+    env_file = project_dir / ".env"
+    env_file.write_text(
+        env_file.read_text(encoding="utf-8") + "\n".join(env_lines) + "\n",
+        encoding="utf-8",
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["TZ"] = system_tz
+    result = subprocess.run(
+        ["bash", str(project_dir / "scripts" / "install-launchd-user.sh")],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    return result, home / "Library" / "LaunchAgents"
+
+
+def _plist_clock(plist: Path) -> tuple[int, int]:
+    import re
+
+    body = plist.read_text(encoding="utf-8")
+    hour = re.search(r"<key>Hour</key>\s*<integer>(\d+)</integer>", body)
+    minute = re.search(r"<key>Minute</key>\s*<integer>(\d+)</integer>", body)
+    assert hour and minute
+    return int(hour.group(1)), int(minute.group(1))
+
+
+def test_install_converts_schedule_to_system_zone(
+    tmp_path: Path, fake_path: Path
+) -> None:
+    # 21:00 and 08:00 Moscow (UTC+3, no daylight saving) on a UTC system.
+    result, agent_dir = _install_with_timezone(
+        tmp_path, ["TIMEZONE=Europe/Moscow"], "UTC"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _plist_clock(agent_dir / "com.second-brain.process.plist") == (18, 0)
+    assert _plist_clock(agent_dir / "com.second-brain.morning-brief.plist") == (5, 0)
+    assert "differs from the system zone" in result.stderr
+    assert "daylight-saving" in result.stderr
+
+
+def test_install_converts_half_hour_offsets(tmp_path: Path, fake_path: Path) -> None:
+    # India is UTC+5:30: 21:00 there is 15:30 UTC.
+    result, agent_dir = _install_with_timezone(
+        tmp_path, ["TIMEZONE=Asia/Kolkata"], "UTC"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _plist_clock(agent_dir / "com.second-brain.process.plist") == (15, 30)
+
+
+def test_install_keeps_schedule_when_zones_match(
+    tmp_path: Path, fake_path: Path
+) -> None:
+    result, agent_dir = _install_with_timezone(
+        tmp_path, ["TIMEZONE=Europe/Moscow"], "Europe/Moscow"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _plist_clock(agent_dir / "com.second-brain.process.plist") == (21, 0)
+    assert "differs from the system zone" not in result.stderr
+
+
+def test_install_without_timezone_does_not_convert(
+    tmp_path: Path, fake_path: Path
+) -> None:
+    result, agent_dir = _install_with_timezone(tmp_path, [], "Asia/Tokyo")
+
+    assert result.returncode == 0, result.stderr
+    assert _plist_clock(agent_dir / "com.second-brain.process.plist") == (21, 0)
+    assert _plist_clock(agent_dir / "com.second-brain.morning-brief.plist") == (8, 0)
+
+
+def _env_vars(plist: Path) -> dict[str, str]:
+    body = plist.read_text(encoding="utf-8")
+    block = re.search(
+        r"<key>EnvironmentVariables</key>\s*<dict>(.*?)</dict>", body, re.S
+    )
+    assert block
+    return dict(
+        re.findall(r"<key>(\w+)</key>\s*<string>(.*?)</string>", block.group(1))
+    )
+
+
+def test_install_puts_tz_into_every_plist(tmp_path: Path, fake_path: Path) -> None:
+    (fake_path / "qmd").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    (fake_path / "qmd").chmod(stat.S_IRWXU)
+    result, agent_dir = _install_with_timezone(
+        tmp_path, ["TIMEZONE=Europe/Moscow", "PLAUD_BEARER_TOKEN=token"], "UTC"
+    )
+
+    assert result.returncode == 0, result.stderr
+    plists = sorted(agent_dir.glob("*.plist"))
+    assert len(plists) == 6
+    for plist in plists:
+        env_vars = _env_vars(plist)
+        assert env_vars.get("TZ") == "Europe/Moscow", plist.name
+        assert "UV_BIN" in env_vars, plist.name
+
+
+def test_install_has_no_tz_without_timezone(tmp_path: Path, fake_path: Path) -> None:
+    result, agent_dir = _install_with_timezone(tmp_path, ["TIMEZONE="], "Asia/Tokyo")
+
+    assert result.returncode == 0, result.stderr
+    for plist in agent_dir.glob("*.plist"):
+        assert "<key>TZ</key>" not in plist.read_text(encoding="utf-8")
+
+
+def test_install_schedule_conversion_ignores_tz_from_env_file(
+    tmp_path: Path, fake_path: Path
+) -> None:
+    # launchd's calendar follows the system clock, not the job's TZ: a TZ line
+    # in .env must not shift the converted hour.
+    result, agent_dir = _install_with_timezone(
+        tmp_path, ["TIMEZONE=Europe/Moscow", "TZ=Asia/Tokyo"], "UTC"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _plist_clock(agent_dir / "com.second-brain.process.plist") == (18, 0)
+
+
+def test_install_rejects_invalid_timezone(tmp_path: Path, fake_path: Path) -> None:
+    result, agent_dir = _install_with_timezone(tmp_path, ["TIMEZONE=Mars/Base"], "UTC")
+
+    assert result.returncode == 1
+    assert "TIMEZONE" in result.stderr
+    assert not (agent_dir / "com.second-brain.process.plist").exists()
+
+
+def test_rendered_plists_have_no_unreplaced_placeholders(
+    tmp_path: Path, fake_path: Path
+) -> None:
+    (fake_path / "qmd").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    (fake_path / "qmd").chmod(stat.S_IRWXU)
+    agent_dir = _render_with_env(tmp_path, "PLAUD_BEARER_TOKEN=token\n")
+
+    plists = sorted(agent_dir.glob("*.plist"))
+    assert len(plists) == 6
+    for plist in plists:
+        leftover = re.findall(r"@[A-Z_]+@", plist.read_text(encoding="utf-8"))
+        assert not leftover, f"{plist.name}: {leftover}"

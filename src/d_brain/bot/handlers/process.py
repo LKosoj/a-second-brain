@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-from datetime import date
 
 from aiogram import Router
 from aiogram.exceptions import TelegramBadRequest
@@ -17,6 +16,7 @@ from d_brain.bot.replies import (
     edit_rich_text,
     edit_text,
 )
+from d_brain.clock import owner_today
 from d_brain.config import get_settings
 from d_brain.services.processor import (
     INTERACTIVE_MODE,
@@ -68,7 +68,7 @@ async def _run_process_command(
                 processor.run_scheduled_cycle
                 if mode == SCHEDULED_MODE
                 else processor.process_daily,
-                date.today(),
+                owner_today(),
                 **({} if mode == SCHEDULED_MODE else {"mode": mode}),
             )
         )

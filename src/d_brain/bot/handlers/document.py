@@ -17,6 +17,7 @@ from d_brain.bot.replies import (
     edit_rich_text,
     edit_text,
 )
+from d_brain.clock import to_owner
 from d_brain.config import get_settings
 from d_brain.services.documents import (
     DocumentArchiveResult,
@@ -51,7 +52,17 @@ def _track_background_task(task: asyncio.Task[None]) -> None:
 @router.message(lambda m: m.document is not None)
 async def handle_document(message: Message, bot: Bot) -> None:
     """Persist one uploaded document first, then continue extraction in background."""
+    await receive_document(message, bot)
 
+
+async def receive_document(
+    message: Message, bot: Bot, *, request: str | None = None
+) -> None:
+    """Stage the document and continue in background.
+
+    ``request`` comes from /do: the document is saved as usual and the request
+    runs on it, without classifying the caption.
+    """
     if not message.document or not message.from_user:
         return
 
@@ -78,17 +89,21 @@ async def handle_document(message: Message, bot: Bot) -> None:
         await answer_text(message, str(exc), parse_mode=None)
         return
 
-    timestamp = message.date.astimezone()
+    timestamp = to_owner(message.date)
     document = message.document
     if document is None:
         return
 
     try:
-        file = await bot.get_file(document.file_id)
+        # Bounded like voice.py/photo.py: a hung Telegram download would
+        # otherwise block this handler forever with no reply.
+        file = await asyncio.wait_for(bot.get_file(document.file_id), timeout=60)
         if not file.file_path:
             raise ValueError("Telegram did not return file_path")
 
-        file_bytes = await bot.download_file(file.file_path)
+        file_bytes = await asyncio.wait_for(
+            bot.download_file(file.file_path), timeout=120
+        )
         if not file_bytes:
             raise ValueError("Failed to download document")
 
@@ -102,11 +117,11 @@ async def handle_document(message: Message, bot: Bot) -> None:
             timestamp=timestamp,
             name_hint=str(message.message_id),
         )
-    except Exception as exc:
+    except Exception:
         logger.exception("Document staging failed")
         await answer_text(
             message,
-            f"❌ Не удалось сохранить документ: {exc}",
+            "❌ Не удалось сохранить документ. Попробуй ещё раз.",
             parse_mode=None,
         )
         return
@@ -149,6 +164,7 @@ async def handle_document(message: Message, bot: Bot) -> None:
             source=source,
             forwarded=forwarded,
             entry_type=entry_type,
+            request=request,
         )
     )
     _track_background_task(task)
@@ -165,6 +181,7 @@ async def _process_document_upload(
     source: SourceInfo,
     forwarded: bool = False,
     entry_type: str = "[document]",
+    request: str | None = None,
 ) -> None:
     """Finish extraction and persistence for a durably staged document.
 
@@ -176,7 +193,11 @@ async def _process_document_upload(
     """
 
     try:
-        caption_intent = await _classify_document_caption(message)
+        caption_intent = (
+            TEXT_INTENT_ACTION
+            if request is not None
+            else await _classify_document_caption(message)
+        )
         if caption_intent == TEXT_INTENT_ACTION:
             try:
                 await edit_text(
@@ -251,9 +272,9 @@ async def _process_document_upload(
 
         logger.info("Document saved: %s", file_name)
 
-    except Exception as exc:
+    except Exception:
         logger.exception("Document processing failed")
-        error_text = f"❌ Не удалось обработать документ: {exc}"
+        error_text = "❌ Не удалось обработать документ. Подробности в логе."
         # Nested for the same reason as the success path above (code review):
         # this whole coroutine runs as a background task nobody awaits, so a
         # fallback that raised here died in the task and took the error
@@ -268,7 +289,9 @@ async def _process_document_upload(
             logger.exception("Failed to deliver document failure report")
         return
 
-    await _execute_document_caption(message, result, intent=caption_intent)
+    await _execute_document_caption(
+        message, result, intent=caption_intent, request=request
+    )
 
 
 async def _classify_document_caption(message: Message) -> str:
@@ -290,15 +313,19 @@ async def _classify_document_caption(message: Message) -> str:
 
 
 async def _execute_document_caption(
-    message: Message, result: DocumentArchiveResult, *, intent: str | None = None
+    message: Message,
+    result: DocumentArchiveResult,
+    *,
+    intent: str | None = None,
+    request: str | None = None,
 ) -> None:
-    """Run the caption request using the route chosen before preparation."""
+    """Run the caption (or the /do ``request``) on the prepared document."""
     if intent is None:
         intent = await _classify_document_caption(message)
     if intent == TEXT_INTENT_ACTION and message.from_user:
         settings = get_settings()
         prompt = (
-            f"{message.caption}\n\n"
+            f"{message.caption if request is None else request}\n\n"
             f"Original document: {settings.vault_path / result.original_path}\n"
             f"Extracted text: {settings.vault_path / result.text_path}\n"
         )

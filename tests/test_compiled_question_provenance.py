@@ -7,7 +7,7 @@ model is called and no vault write path is exercised.
 
 from __future__ import annotations
 
-from pathlib import Path
+from _helpers import make_page_writer
 
 from d_brain.services.compiled_briefings import CompiledBriefingCandidate
 from d_brain.services.compiled_question_provenance import (
@@ -80,10 +80,7 @@ def _page_text(
     return "\n".join(frontmatter) + "\n".join(body) + "\n"
 
 
-def _write_page(vault: Path, rel_path: str, **kwargs: object) -> None:
-    path = vault / rel_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_page_text(**kwargs), encoding="utf-8")  # type: ignore[arg-type]
+_write_page = make_page_writer(_page_text)
 
 
 def test_no_compiled_pages_returns_empty_result(tmp_path, write_vault_manifest):

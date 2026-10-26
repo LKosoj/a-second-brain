@@ -170,7 +170,7 @@ Types: `[voice]`, `[text]`, `[forward from: Name]`, `[photo]`
 
 ## Processing Workflow
 
-Use `/process` for a quick interactive preview. The full write-heavy daily processing runs automatically at 21:00.
+Use `/process` for a quick interactive preview. The full write-heavy daily processing runs automatically at 21:00 by default (`DAILY_PROCESS_TIME` in `.env`; re-run `scripts/install-systemd-user.sh` / `install-launchd-user.sh` after changing it).
 
 All workflows are declared in `src/d_brain/control_plane/registry.py` — the canonical catalog of capture, question, maintenance, and integration workflows. The registry defines entrypoints, context requirements, allowed writes, and fallback behavior for each workflow.
 
@@ -322,6 +322,11 @@ Reports use Telegram MarkdownV2 at delivery time:
 | `/files` | Browse vault files |
 | `/menu` | Open the persistent dashboard menu |
 | `/why` | Explain why a compiled page states a claim, with sources |
+| `/find` | Search vault notes by keywords, no model |
+| `/undo` | Remove the last entry of today |
+| `/reminders` | List pending reminders |
+| `/help` | Show the command list |
+| `/status` | Alias of `/stats` |
 
 ## Customization
 

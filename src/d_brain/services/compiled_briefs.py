@@ -36,12 +36,13 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
+from d_brain.services import compiled_page
 from d_brain.services.compiled_briefings import (
     SOURCES_TRUST_VALUES,
-    WIKILINK_RE,
     CompiledBriefingCandidate,
     CompiledBriefingService,
 )
+from d_brain.services.compiled_page import WIKILINK_RE
 
 # ТЗ 7.6: "решение, тема, проект" -- domain mapping is fixed by the ТЗ 4.1
 # compiled/ domain list, not configurable.
@@ -51,7 +52,7 @@ _BRIEF_LABEL = {"decision": "по решению", "topic": "по теме", "pr
 
 # ТЗ 4.4 "Правила": these two trust levels must never be shown quietly --
 # the owner must see the callout, not a small-print footnote.
-_LOW_TRUST_LEVELS = frozenset({"forwarded", "inferred"})
+LOW_TRUST_LEVELS = frozenset({"forwarded", "inferred"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,7 +67,7 @@ class BriefResult:
     markdown: str
 
 
-def _find_exact_matches(
+def find_exact_matches(
     candidates: list[CompiledBriefingCandidate],
     *,
     domain: str | None,
@@ -98,7 +99,7 @@ def _find_exact_matches(
     for candidate in in_domain:
         if candidate.rel_path == path_query:
             return [candidate]
-    slug_query = CompiledBriefingService._slugify(query_norm)
+    slug_query = compiled_page.slugify(query_norm)
     if not slug_query:
         return []
     return [candidate for candidate in in_domain if candidate.slug == slug_query]
@@ -110,10 +111,10 @@ def _find_exact_target(
     domain: str | None,
     query: str,
 ) -> CompiledBriefingCandidate | None:
-    """The first exact match from ``_find_exact_matches`` -- for callers that
+    """The first exact match from ``find_exact_matches`` -- for callers that
     pass a concrete ``domain`` and therefore cannot hit a cross-domain slug
     collision."""
-    matches = _find_exact_matches(candidates, domain=domain, query=query)
+    matches = find_exact_matches(candidates, domain=domain, query=query)
     return matches[0] if matches else None
 
 
@@ -136,14 +137,14 @@ def _find_target(
     # another domain push a genuinely relevant page in ``domain`` under the
     # bar -- and this function then reported "не нашёл" for a page that
     # exists.
-    ranked = service._rank_candidates(query, limit=1, domain=domain)
+    ranked = service.rank_candidates(query, limit=1, domain=domain)
     return ranked[0] if ranked else None
 
 
-def _trust_line(text: str) -> str:
+def trust_line(text: str) -> str:
     """ТЗ 7.6 / 4.4: the page's trust level, shown right under the title --
     an explicit callout for ``forwarded``/``inferred``, not small print."""
-    trust = CompiledBriefingService._frontmatter_fields(text).get(
+    trust = compiled_page.frontmatter_fields(text).get(
         "sources_trust", ""
     ).strip()
     if trust not in SOURCES_TRUST_VALUES:
@@ -151,7 +152,7 @@ def _trust_line(text: str) -> str:
             "Уровень доверия источников страницы: не определён "
             "(страница ещё не обогащалась)."
         )
-    if trust in _LOW_TRUST_LEVELS:
+    if trust in LOW_TRUST_LEVELS:
         return (
             f"**Внимание: уровень доверия источников страницы — «{trust}».** "
             "Часть утверждений не проверена напрямую владельцем."
@@ -159,7 +160,7 @@ def _trust_line(text: str) -> str:
     return f"Уровень доверия источников страницы: {trust}."
 
 
-def _sources_block(text: str) -> list[str]:
+def sources_block(text: str) -> list[str]:
     """Provenance for every claim (ТЗ 7.6): the per-addition "Sources That
     Shaped This Page" table already carries a date, a source and what was
     added for each entry -- prefer it. Fall back to the page's plain
@@ -167,13 +168,13 @@ def _sources_block(text: str) -> list[str]:
     before it existed, or a page with a torn-up section), so sources are
     surfaced rather than silently dropped.
     """
-    rows = CompiledBriefingService._sources_shaped_rows(text)
+    rows = compiled_page.sources_shaped_rows(text)
     if rows:
         return [
             f"- {date_value} · [[{source_value}]] — {what_value}"
             for date_value, source_value, what_value in rows
         ]
-    section = CompiledBriefingService._section_text(text, "Sources")
+    section = compiled_page.section_text(text, "Sources")
     links = [path.strip() for path in WIKILINK_RE.findall(section) if path.strip()]
     if links:
         return [f"- [[{path}]]" for path in links]
@@ -200,7 +201,7 @@ def _supersedes_block(target: CompiledBriefingCandidate) -> list[str]:
     cannot be turned into a [[wikilink]] -- shown as plain text with an
     explicit note instead of a link that would silently be wrong.
     """
-    raw = CompiledBriefingService._frontmatter_fields(target.text).get(
+    raw = compiled_page.frontmatter_fields(target.text).get(
         "supersedes", ""
     )
     try:
@@ -223,14 +224,14 @@ def _supersedes_block(target: CompiledBriefingCandidate) -> list[str]:
 def _decision_brief(target: CompiledBriefingCandidate) -> str:
     """ТЗ 7.6: суть, когда принято, обоснование, отклонённые варианты, что
     отменяет, источники."""
-    fields = CompiledBriefingService._frontmatter_fields(target.text)
-    rationale = CompiledBriefingService._section_text(target.text, "Rationale")
-    alternatives = CompiledBriefingService._section_bullets(
+    fields = compiled_page.frontmatter_fields(target.text)
+    rationale = compiled_page.section_text(target.text, "Rationale")
+    alternatives = compiled_page.section_bullets(
         target.text, "Alternatives Considered"
     )
     lines = [
         f"**Бриф по решению — {target.title}**",
-        _trust_line(target.text),
+        trust_line(target.text),
         "",
         "**В чём суть**",
         target.description or "не зафиксировано",
@@ -248,7 +249,7 @@ def _decision_brief(target: CompiledBriefingCandidate) -> str:
         *_supersedes_block(target),
         "",
         "**Источники**",
-        *_sources_block(target.text),
+        *sources_block(target.text),
     ]
     return "\n".join(lines)
 
@@ -260,7 +261,7 @@ def _conflict_lines(target: CompiledBriefingCandidate) -> list[str]:
     sides with sources, and dropping a live conflict from a brief would hide
     exactly the kind of thing a brief exists to surface -- kept for both
     brief types, same rendering as before this defect's fix."""
-    conflicts = CompiledBriefingService._open_conflicts_rows(target.text)
+    conflicts = compiled_page.open_conflicts_rows(target.text)
     return [
         f"- {since}: «{existing_claim}» (источник [[{existing_source}]]) "
         f"vs «{new_claim}» (источник [[{new_source}]])"
@@ -283,14 +284,14 @@ def _topic_brief(target: CompiledBriefingCandidate) -> str:
     the page never tracks the concept at all -- "пустой раздел хуже
     отсутствующего", see the task report.
     """
-    current_state = CompiledBriefingService._section_text(target.text, "Current State")
-    key_decisions = CompiledBriefingService._section_bullets(
+    current_state = compiled_page.section_text(target.text, "Current State")
+    key_decisions = compiled_page.section_bullets(
         target.text, "Key Decisions"
     )
-    open_loops = CompiledBriefingService._section_bullets(target.text, "Open Loops")
+    open_loops = compiled_page.section_bullets(target.text, "Open Loops")
     lines = [
         f"**Бриф {_BRIEF_LABEL['topic']} — {target.title}**",
-        _trust_line(target.text),
+        trust_line(target.text),
         "",
         "**Текущее состояние**",
         current_state or "не зафиксировано",
@@ -305,7 +306,7 @@ def _topic_brief(target: CompiledBriefingCandidate) -> str:
         *_conflict_lines(target),
         "",
         "**Источники**",
-        *_sources_block(target.text),
+        *sources_block(target.text),
     ]
     return "\n".join(lines)
 
@@ -329,13 +330,13 @@ def _project_brief(target: CompiledBriefingCandidate) -> str:
 
     See the task report for both checks in full.
     """
-    current_state = CompiledBriefingService._section_text(target.text, "Current State")
-    recent_changes = CompiledBriefingService._section_bullets(
+    current_state = compiled_page.section_text(target.text, "Current State")
+    recent_changes = compiled_page.section_bullets(
         target.text, "Recent Changes"
     )
     lines = [
         f"**Бриф {_BRIEF_LABEL['project']} — {target.title}**",
-        _trust_line(target.text),
+        trust_line(target.text),
         "",
         "**Состояние**",
         current_state or "не зафиксировано",
@@ -347,7 +348,7 @@ def _project_brief(target: CompiledBriefingCandidate) -> str:
         *_conflict_lines(target),
         "",
         "**Источники**",
-        *_sources_block(target.text),
+        *sources_block(target.text),
     ]
     return "\n".join(lines)
 
@@ -365,7 +366,7 @@ def build_brief(vault_path: Path, *, brief_type: str, query: str) -> BriefResult
         raise ValueError(f"unknown brief type: {brief_type!r}")
     domain = _BRIEF_DOMAIN[brief_type]
     service = CompiledBriefingService(Path(vault_path))
-    candidates = service._iter_candidates()
+    candidates = service.iter_candidates()
     target = _find_target(service, candidates, domain=domain, query=query)
     if target is None:
         return None

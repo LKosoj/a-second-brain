@@ -2,7 +2,11 @@
 approach ``tests/test_do_cancel.py`` uses for /do, extended with
 ``get_data``/``update_data`` for the ambiguous-choice callback flow."""
 
+import time
 from types import SimpleNamespace
+
+import pytest
+from aiogram.dispatcher.event.bases import SkipHandler
 
 from d_brain.bot.handlers import why as why_handler
 from d_brain.bot.states import DoCommandState, WhyCommandState
@@ -39,6 +43,7 @@ class FakeMessage:
     def __init__(self, text: str | None = None) -> None:
         self.text = text
         self.voice = None
+        self.forward_origin = None
         self.from_user = SimpleNamespace(id=42)
         self.answers: list[tuple[str, dict]] = []
 
@@ -105,21 +110,119 @@ async def test_handle_why_input_dash_cancels_without_processing(monkeypatch) -> 
     assert message.answers[0][0] == "❌ */why отменён*"
 
 
-async def test_handle_why_input_rejects_non_text_and_keeps_waiting(monkeypatch) -> None:
+async def _no_process(monkeypatch) -> list[str]:  # noqa: ANN001
     calls: list[str] = []
 
     async def fake_process(message, query, state) -> None:  # noqa: ANN001
         calls.append(query)
 
     monkeypatch.setattr(why_handler, "process_why_request", fake_process)
+    return calls
+
+
+async def test_handle_why_input_non_text_releases_state_and_skips(monkeypatch) -> None:
+    calls = await _no_process(monkeypatch)
     message = FakeMessage(text=None)
     state = FakeState(WhyCommandState.waiting_for_input.state)
 
+    with pytest.raises(SkipHandler):
+        await why_handler.handle_why_input(message, state)
+
+    assert state.cleared is True
+    assert calls == []
+    assert message.answers == []
+
+
+async def test_handle_why_input_forwarded_text_releases_state(monkeypatch) -> None:
+    calls = await _no_process(monkeypatch)
+    message = FakeMessage(text="пересланный текст")
+    message.forward_origin = object()
+    state = FakeState(WhyCommandState.waiting_for_input.state)
+
+    with pytest.raises(SkipHandler):
+        await why_handler.handle_why_input(message, state)
+
+    assert state.cleared is True
+    assert calls == []
+
+
+async def test_handle_why_input_expired_text_goes_to_capture(monkeypatch) -> None:
+    calls = await _no_process(monkeypatch)
+    message = FakeMessage(text="обычная заметка")
+    state = FakeState(WhyCommandState.waiting_for_input.state)
+    state.data["why_entered_at"] = time.time() - 601
+
+    with pytest.raises(SkipHandler):
+        await why_handler.handle_why_input(message, state)
+
+    assert state.cleared is True
+    assert calls == []
+
+
+async def test_handle_why_input_fresh_stamp_is_processed(monkeypatch) -> None:
+    calls = await _no_process(monkeypatch)
+    message = FakeMessage(text="решение про цены")
+    state = FakeState(WhyCommandState.waiting_for_input.state)
+    state.data["why_entered_at"] = time.time() - 5
+
     await why_handler.handle_why_input(message, state)
 
-    assert state.cleared is False
+    assert calls == ["решение про цены"]
+
+
+async def test_handle_why_input_expired_dash_just_cancels(monkeypatch) -> None:
+    calls = await _no_process(monkeypatch)
+    message = FakeMessage(text="-")
+    state = FakeState(WhyCommandState.waiting_for_input.state)
+    state.data["why_entered_at"] = time.time() - 601
+
+    await why_handler.handle_why_input(message, state)
+
+    assert state.cleared is True
     assert calls == []
-    assert "только текст" in message.answers[0][0]
+    assert "отменён" in message.answers[0][0]
+
+
+async def test_start_why_flow_stamps_entry_time(monkeypatch) -> None:
+    state = FakeState()
+    message = FakeMessage()
+    before = time.time()
+
+    await why_handler.start_why_flow(message, state)
+
+    assert before <= state.data["why_entered_at"] <= time.time()
+
+
+async def test_ambiguous_why_request_refreshes_entry_time(monkeypatch) -> None:
+    _stub_settings(monkeypatch)
+    choice = WhyChoice(rel_path="compiled/a.md", title="A", domain="d")
+    monkeypatch.setattr(
+        why_handler, "build_why",
+        lambda vault, query: WhyOutcome(
+            status="ambiguous", result=None, choices=(choice,)
+        ),
+    )
+    state = FakeState()
+    state.data["why_entered_at"] = 1.0
+
+    await why_handler.process_why_request(FakeMessage(), "q", state)
+
+    assert state.data["why_entered_at"] > 1.0
+
+
+async def test_handle_why_choice_expired_is_stale_and_clears_state() -> None:
+    state = FakeState(WhyCommandState.waiting_for_input.state)
+    state.data.update(
+        why_choices=[{"rel_path": "compiled/a.md", "title": "A"}],
+        why_choices_token="tok",
+        why_entered_at=time.time() - 601,
+    )
+    query = FakeCallbackQuery("why:choice:tok:0", FakeMessage())
+
+    await why_handler.handle_why_choice(query, state)
+
+    assert query.answer_calls == [("Устарело, отправь /why ещё раз.", True)]
+    assert state.cleared is True
 
 
 async def test_process_why_request_not_found_sends_friendly_message(
@@ -498,3 +601,14 @@ async def test_handle_why_choice_from_another_flow_does_not_clear_it(
     assert state.cleared is False
     assert state.current_state == DoCommandState.waiting_for_input.state
     assert query.answer_calls[0][1] is True
+
+
+async def test_cmd_why_without_args_after_timeout_starts_a_new_flow() -> None:
+    message = FakeMessage()
+    state = FakeState(WhyCommandState.waiting_for_input.state)
+    state.data["why_entered_at"] = time.time() - 601
+
+    await why_handler.cmd_why(message, SimpleNamespace(args=None), state)
+
+    assert state.cleared is False
+    assert "Почему страница так говорит" in message.answers[0][0]

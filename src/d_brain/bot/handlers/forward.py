@@ -7,6 +7,7 @@ from aiogram import Router
 from aiogram.types import Message
 
 from d_brain.bot.replies import answer_text
+from d_brain.clock import to_owner
 from d_brain.config import get_settings
 from d_brain.services.link_summary import (
     LinkSummaryService,
@@ -56,7 +57,7 @@ async def handle_forward(message: Message) -> None:
         source = build_telegram_source_info(
             message, language=settings.content_language
         )
-        timestamp = message.date.astimezone()
+        timestamp = to_owner(message.date)
 
         # Determine and sanitize source name (shared with photo/voice/document
         # so this class of injection is fixed in one place, see
@@ -163,9 +164,13 @@ async def handle_forward(message: Message) -> None:
         )
         logger.info("Forwarded message saved from: %s", source_name)
 
-    except Exception as exc:
+    except Exception:
         logger.exception("Error processing forwarded message")
         try:
-            await answer_text(message, f"Ошибка: {exc}", parse_mode=None)
+            await answer_text(
+                message,
+                "Не удалось сохранить пересланное сообщение, подробности в логе.",
+                parse_mode=None,
+            )
         except Exception:
             logger.exception("Failed to deliver forward failure report")

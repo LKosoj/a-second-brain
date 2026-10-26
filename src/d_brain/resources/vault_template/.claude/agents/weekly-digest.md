@@ -13,15 +13,15 @@ Generate a weekly review that matches the current project contract.
 
 ## Source Of Truth
 
-- Weekly digest runtime behavior currently lives in `src/d_brain/services/processor.py::generate_weekly()`.
+- Weekly digest runtime behavior currently lives in `src/d_brain/services/processor.py::generate_weekly_digest()`.
 - `MEMORY.md` and `.session/handoff.md` may add context for the week's real story.
 - Todoist access must use `mcp-cli`.
-- Reports must be Telegram-safe HTML.
+- Reports must be markdown (the runtime converts it for Telegram).
 - Saving the summary is fine; rotating goal files is not implicit behavior unless the user asks for it.
 
 ## When To Run
 
-- On explicit `/weekly`
+- When the weekly digest workflow runs (scheduled cycle)
 - During end-of-week review
 - When the user asks for weekly progress synthesis
 
@@ -60,27 +60,27 @@ Summarize:
 Prefer synthesis over raw enumeration.
 Call out when the week was mostly operational, even if many small tasks were completed.
 
-### Step 3: Return HTML Report
+### Step 3: Return Markdown Report
 
 Suggested structure:
 
-```html
-📅 <b>Недельный дайджест</b>
+```markdown
+📅 **Недельный дайджест**
 
-<b>🎯 ONE Big Thing:</b>
+**🎯 ONE Big Thing:**
 {status}
 
-<b>🏆 Что сработало:</b>
+**🏆 Что сработало:**
 • {win}
 
-<b>⚠️ Что тянуло вниз:</b>
+**⚠️ Что тянуло вниз:**
 • {challenge}
 
-<b>📊 Итоги:</b>
+**📊 Итоги:**
 • Выполнено задач: {n}
 • Сохранено заметок: {n}
 
-<b>⚡ Фокус на следующую неделю:</b>
+**⚡ Фокус на следующую неделю:**
 1. {priority}
 2. {priority}
 3. {priority}

@@ -64,7 +64,7 @@ this skill and must not be treated as a complete inventory.
   - `_build_question_answer_prompt()`
   - `_build_reflect_prompt()`
   - `execute_prompt()`
-  - `generate_weekly()`
+  - `generate_weekly_digest()`
 - `src/d_brain/services/plaud.py`
   - `_build_classification_prompt()`
 - `src/d_brain/services/todoist_projects.py`

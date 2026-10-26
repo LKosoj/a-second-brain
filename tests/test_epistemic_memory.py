@@ -766,3 +766,40 @@ def test_parse_epistemic_document_reports_frontmatter_errors_as_its_own_type():
     ``FrontmatterError`` leaking through the delegation would escape them."""
     with pytest.raises(EpistemicValidationError, match="closing"):
         epistemic_memory._parse_epistemic_document(b"---\ntype: note\nbody\n")
+
+
+def test_journal_is_private_and_failed_write_leaves_no_tmp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import os
+    import stat
+
+    vault_path = tmp_path / "vault"
+    old_path, new_path = _write_pair(vault_path)
+    plan = epistemic_memory._prepare_supersession_plan(  # noqa: SLF001
+        "thoughts/old.md",
+        "thoughts/new.md",
+        old_path.read_bytes(),
+        new_path.read_bytes(),
+    )
+    locks = vault_path / ".locks"
+    previous = os.umask(0o000)
+    try:
+        with epistemic_memory.vault_write_lock(vault_path) as lock:
+            epistemic_memory._write_journal(lock, plan.notes)  # noqa: SLF001
+    finally:
+        os.umask(previous)
+    journal = locks / "epistemic-supersession.json"
+    assert stat.S_IMODE(journal.stat().st_mode) == 0o600
+    journal.unlink()
+
+    def broken_fsync(fd: int) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "fsync", broken_fsync)
+    with epistemic_memory.vault_write_lock(vault_path) as lock:
+        with pytest.raises(OSError, match="disk full"):
+            epistemic_memory._write_journal(lock, plan.notes)  # noqa: SLF001
+    monkeypatch.undo()
+    assert not journal.exists()
+    assert not [p for p in locks.iterdir() if p.name.endswith(".tmp")]

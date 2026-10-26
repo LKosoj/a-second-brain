@@ -30,6 +30,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "transcript_unavailable": "Транскрипт недоступен.",
         "unknown_title": "Без заголовка",
         "url": "URL",
+        "verify_compiled_digest": "дайджест обогащения compiled за сегодня",
+        "verify_missing": "🔴 VERIFY: нет {artifact}",
+        "verify_reflect_block": "блок reflect",
+        "verify_stale_graph": (
+            "🔴 VERIFY: .graph/vault-graph.json не обновлён в этом цикле"
+        ),
         "warnings": "Предупреждения",
         "youtube_summary": "Саммари YouTube",
         "youtube_transcript": "Транскрипт YouTube",
@@ -61,6 +67,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "transcript_unavailable": "Transcript unavailable.",
         "unknown_title": "Unknown title",
         "url": "URL",
+        "verify_compiled_digest": "today's compiled enrichment digest",
+        "verify_missing": "🔴 VERIFY: missing {artifact}",
+        "verify_reflect_block": "reflect block",
+        "verify_stale_graph": (
+            "🔴 VERIFY: .graph/vault-graph.json was not refreshed in this cycle"
+        ),
         "warnings": "Warnings",
         "youtube_summary": "YouTube summary",
         "youtube_transcript": "YouTube transcript",

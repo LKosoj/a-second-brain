@@ -134,7 +134,7 @@ def test_qmd_touch_uses_current_python_without_uv_cache(
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setenv("UV_BIN", "/opt/uv/bin/uv")
-    monkeypatch.setattr("d_brain.services.qmd.subprocess.run", fake_run)
+    monkeypatch.setattr("d_brain.services.qmd.run_in_process_group", fake_run)
 
     service.touch_notes(["daily/example.md"])
 
@@ -445,7 +445,7 @@ def test_qmd_service_uses_index_from_manifest(tmp_path: Path, monkeypatch) -> No
         commands.append(command)
         return subprocess.CompletedProcess(command, 0, "", "")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr("d_brain.services.qmd.run_in_process_group", fake_run)
 
     env = service.build_env()
     service.run("status")
@@ -485,7 +485,7 @@ def test_qmd_recall_prefers_hotter_memory_and_deep_recall_keeps_archive(
         "search",
         [
             {
-                "file": "qmd://thoughts/old.md",
+                "file": "qmd://thoughts/old.md?index=dbrain",
                 "title": "Old",
                 "score": 0.8,
                 "snippet": "архив",
@@ -1080,7 +1080,7 @@ def test_qmd_recall_uses_remote_query_helper_for_remote_emb_model(
             )
         raise AssertionError(f"unexpected fallback command: {command}")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr("d_brain.services.qmd.run_in_process_group", fake_run)
 
     backend, candidates = service._recall_candidates("remote query", 5)
 
@@ -1090,9 +1090,10 @@ def test_qmd_recall_uses_remote_query_helper_for_remote_emb_model(
         (
             "node",
             str(service._remote_query_script_path),
-            "remote query",
             "--limit",
             "20",
+            "--",
+            "remote query",
         )
     ]
 
@@ -1266,7 +1267,9 @@ def test_qmd_embed_timeout_normalizes_partial_output(
             stderr=partial_stderr,
         )
 
-    monkeypatch.setattr(subprocess, "run", raise_timeout)
+    monkeypatch.setattr(
+        "d_brain.services.qmd.run_in_process_group", raise_timeout
+    )
 
     result = service._run_embed_process(force=False)
 
@@ -1302,7 +1305,9 @@ def test_qmd_refresh_reports_embed_timeout_without_secondary_exception(
         )
 
     monkeypatch.setattr(service, "run", fake_update)
-    monkeypatch.setattr(subprocess, "run", raise_timeout)
+    monkeypatch.setattr(
+        "d_brain.services.qmd.run_in_process_group", raise_timeout
+    )
 
     result = service.refresh(with_embeddings=True)
 
@@ -1417,3 +1422,68 @@ def test_run_qmd_routes_cleanup_through_locked_service(
     assert exit_code == 0
     assert calls == ["cleanup"]
     assert "cleaned" in captured.out
+
+
+def test_qmd_build_env_maps_openai_base_url_to_base_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("BASE_URL", raising=False)
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://gateway.example.com/v1")
+    env = _qmd_service(tmp_path / "vault").build_env()
+    assert env["BASE_URL"] == "https://gateway.example.com/v1"
+
+    monkeypatch.setenv("BASE_URL", "https://other.example.com/v1")
+    env = _qmd_service(tmp_path / "vault").build_env()
+    # The new name wins over a stale legacy BASE_URL.
+    assert env["BASE_URL"] == "https://gateway.example.com/v1"
+
+
+def test_qmd_subprocesses_use_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault_path = tmp_path / "vault"
+    (vault_path / "daily").mkdir(parents=True)
+    service = _qmd_service(vault_path)
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(list(command))
+        return subprocess.CompletedProcess(command, 0, "[]", "")
+
+    def forbidden(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("plain subprocess.run used")
+
+    monkeypatch.setattr("d_brain.services.qmd.run_in_process_group", fake_run)
+    monkeypatch.setattr(subprocess, "run", forbidden)
+
+    service.run("update")
+    service._run_embed_process(force=False)
+    service._recall_candidates("hello", 3)
+
+    assert len(calls) >= 3
+    assert calls[0][-1] == "update"
+
+
+@pytest.mark.parametrize("remote", [False, True])
+def test_recall_separates_query_with_double_dash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, remote: bool
+) -> None:
+    service = _qmd_service(tmp_path / "vault")
+    if remote:
+        monkeypatch.setenv("EMB_MODEL", "llmgateway/embedding-demo")
+    else:
+        monkeypatch.delenv("EMB_MODEL", raising=False)
+    commands: list[list[str]] = []
+
+    def fake_run(command, **kwargs):  # type: ignore[no-untyped-def]
+        commands.append(list(command))
+        return subprocess.CompletedProcess(command, 1, "", "")
+
+    monkeypatch.setattr("d_brain.services.qmd.run_in_process_group", fake_run)
+
+    service._recall_candidates("-n 99", 3)
+
+    assert len(commands) == 2
+    for command in commands:
+        assert command[-2:] == ["--", "-n 99"]
+        assert command.count("--") == 1

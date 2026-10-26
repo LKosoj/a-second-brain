@@ -35,8 +35,8 @@ only `.env` from `.env.example`, then apply mode `0600`.
 ## Required variable is missing
 
 Edit `.env`; do not export secrets in shell history. Required variables are
-`TELEGRAM_BOT_TOKEN`, `DEEPGRAM_API_KEY`, and a positive
-`OWNER_TELEGRAM_ID`.
+`TELEGRAM_BOT_TOKEN` and a positive `OWNER_TELEGRAM_ID`. `DEEPGRAM_API_KEY` is
+optional: without it voice messages are saved as audio and `doctor` only warns.
 
 ## `.env permissions are 644`
 
@@ -103,7 +103,8 @@ systemctl --user list-timers 'a-second-brain-*'
 journalctl --user -u a-second-brain-process.service --since yesterday
 ```
 
-Check the host timezone, whether lingering is enabled, and whether the
+Check the host timezone and `TIMEZONE` in `.env` (the timers use the zone the
+installer wrote: re-run it after changing `TIMEZONE`), whether lingering is enabled, and whether the
 pre-processing backup failed.
 
 ## Search results are stale

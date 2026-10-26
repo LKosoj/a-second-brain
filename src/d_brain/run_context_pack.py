@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import date
 from pathlib import Path
 
+from dotenv import dotenv_values
+
+from d_brain.clock import owner_today, set_owner_timezone
 from d_brain.manifest import ManifestValidationError, load_manifest
 from d_brain.services.context_pack import ContextPackBuilder
 
@@ -23,10 +27,23 @@ def main() -> int:
     """Print a plain pack or the SessionStart hook response."""
     args = _arguments()
     try:
-        target_day = (
-            date.fromisoformat(args.target_day) if args.target_day else date.today()
-        )
         project_root = Path.cwd()
+        # The SessionStart hook runs without the service EnvironmentFile and
+        # never loads Settings, so it reads TIMEZONE from .env itself to land
+        # on the same day as the bot.
+        timezone_name = os.environ.get("TIMEZONE") or dotenv_values(
+            project_root / ".env"
+        ).get("TIMEZONE")
+        if timezone_name:
+            try:
+                set_owner_timezone(timezone_name)
+            except ValueError:
+                # Same as clock.owner_tz: a bad name means the system zone,
+                # the hook must still hand over the context.
+                pass
+        target_day = (
+            date.fromisoformat(args.target_day) if args.target_day else owner_today()
+        )
         manifest = load_manifest(project_root)
         vault_path = (project_root / manifest.memory_root).resolve()
         pack = ContextPackBuilder(vault_path, manifest).build(target_day)

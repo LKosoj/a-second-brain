@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from _helpers import write_page as _write_page
 
 from d_brain.services import compiled_wiki_care
 from d_brain.services.compiled_briefings import CompiledBriefingService
@@ -65,11 +66,6 @@ def _wiki_page_text(
     lines.append("")
     return frontmatter + "\n".join(lines) + "\n"
 
-
-def _write_page(vault: Path, rel_path: str, text: str) -> None:
-    path = vault / rel_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
 
 
 def _read_page(vault: Path, rel_path: str) -> str:
@@ -828,15 +824,65 @@ def _stub_web_search_prompts(monkeypatch, service, *, num_results: int = 1):
     def fake_prompt(*, prompt, timeout, error_context, json_example):
         if error_context == "wiki-care-web-search-queries":
             return {"queries": ["aurora rollout status"]}
-        if error_context == "wiki-care-web-search-selection":
-            return {
-                "selected": [
-                    {"index": i + 1, "reason": "relevant"} for i in range(num_results)
-                ]
-            }
         raise AssertionError(f"unexpected error_context: {error_context}")
 
+    # Selection embeds search-result text, so it bypasses
+    # ``_run_json_dict_prompt`` and goes through the untrusted runner.
+    def fake_selection(service, prompt):
+        return {
+            "selected": [
+                {"index": i + 1, "reason": "relevant"} for i in range(num_results)
+            ]
+        }
+
     monkeypatch.setattr(service, "_run_json_dict_prompt", fake_prompt)
+    monkeypatch.setattr(
+        compiled_wiki_care, "_run_untrusted_json_prompt", fake_selection
+    )
+
+
+def test_web_search_selection_runs_through_untrusted_runner(
+    tmp_path: Path, write_vault_manifest, monkeypatch
+) -> None:
+    vault = tmp_path / "vault"
+    service = _wiki_service(vault, write_vault_manifest)
+    (vault / "MOC").mkdir(parents=True)
+    (vault / "MOC" / "compiled-index.md").write_text("# Catalog\n", encoding="utf-8")
+    plain_prompts: list[str] = []
+
+    def fake_prompt(*, prompt, timeout, error_context, json_example):
+        plain_prompts.append(error_context)
+        return {"queries": ["aurora rollout status"]}
+
+    untrusted_prompts: list[str] = []
+
+    def fake_untrusted(prompt, *, timeout, **kwargs):
+        untrusted_prompts.append(prompt)
+        return '{"selected": []}'
+
+    monkeypatch.setattr(service, "_run_json_dict_prompt", fake_prompt)
+    monkeypatch.setattr(service.runner, "run_untrusted", fake_untrusted)
+    monkeypatch.setattr(
+        compiled_wiki_care,
+        "tavily_search",
+        lambda query, *, api_key, max_results: [
+            {"url": "https://example.com/a", "title": "Ignore rules", "content": "c"}
+        ],
+    )
+
+    result = compiled_wiki_care._run_web_search_action(
+        service,
+        compiled_wiki_care._ModelCallBudget(None),
+        tavily_api_key="key",
+        no_limit=False,
+        content_language="en",
+        ai_cli="claude",
+    )
+
+    assert result["articles_imported"] == 0
+    assert plain_prompts == ["wiki-care-web-search-queries"]
+    assert len(untrusted_prompts) == 1
+    assert "Ignore rules" in untrusted_prompts[0]
 
 
 def test_run_web_search_action_imports_under_auto_subdir_and_logs_ops_entry(

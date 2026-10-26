@@ -11,7 +11,7 @@ directory (same environment limitation documented in
 ``tests/test_compiled_fact_check.py``/``tests/test_compiled_enrich_report.py``),
 confirmed independently for this task -- see the final report. Plain reads
 (``read_vault_file_bytes``) and the JSON queue file's tempfile+os.replace
-writer (``_atomic_write_text``) are not fd-pinned the same way and work for
+writer (``atomic_write_file_text``) are not fd-pinned the same way and work for
 real, so those are exercised directly. A few tests (code review defects 1-3)
 deliberately call the real, unmonkeypatched write/patch/read helpers *because*
 they need the real failure path -- a missing page, or a lock-reentrancy check
@@ -27,9 +27,10 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
+from _helpers import make_page_writer
 
 from d_brain.manifest import load_manifest_for_vault
-from d_brain.services import compiled_fact_check, decisions_queue
+from d_brain.services import compiled_fact_check, compiled_page, decisions_queue
 from d_brain.services.compiled_briefings import (
     HUMAN_ZONE_END,
     HUMAN_ZONE_START,
@@ -103,13 +104,13 @@ def _page_text(
         "---\n\n"
     )
     body = ["# Тестовая страница", "", "## Sources That Shaped This Page", ""]
-    body += CompiledBriefingService._render_sources_shaped_table(sources_rows)
+    body += compiled_page.render_sources_shaped_table(sources_rows)
     if conflicts_rows:
         body += ["", "## Open Conflicts", ""]
-        body += CompiledBriefingService._render_open_conflicts_table(conflicts_rows)
+        body += compiled_page.render_open_conflicts_table(conflicts_rows)
     if claim_history or history_rows:
         body += ["", "## Claim History", ""]
-        body += CompiledBriefingService._render_claim_history(history_rows or [])
+        body += compiled_page.render_claim_history(history_rows or [])
     if owner_notes:
         # The last section a real page always ends with -- and the anchor
         # ``_ensure_claim_history_section`` puts a missing Claim History back
@@ -121,10 +122,7 @@ def _page_text(
     return frontmatter + "\n".join(body) + "\n"
 
 
-def _write_page(vault: Path, rel_path: str, **kwargs: object) -> None:
-    path = vault / rel_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_page_text(**kwargs), encoding="utf-8")  # type: ignore[arg-type]
+_write_page = make_page_writer(_page_text)
 
 
 def _write_queue(vault: Path, entries: list[dict[str, object]]) -> None:
@@ -1782,7 +1780,7 @@ def test_apply_response_conflict_choice_removes_row_and_decrements_count(
     assert "Контракт на два года" in outcome.message
     new_text = (vault / "compiled/topics/aurora.md").read_text(encoding="utf-8")
     assert CompiledBriefingService._open_conflicts_rows(new_text) == []
-    fields = CompiledBriefingService._frontmatter_fields(new_text)
+    fields = compiled_page.frontmatter_fields(new_text)
     assert fields["conflicts_open"] == "0"
 
 

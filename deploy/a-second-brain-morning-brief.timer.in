@@ -2,7 +2,7 @@
 Description=Run A Second Brain morning brief daily
 
 [Timer]
-OnCalendar=*-*-* 08:00:00
+OnCalendar=*-*-* @MORNING_BRIEF_TIME@:00@TIMEZONE_SUFFIX@
 Persistent=true
 
 [Install]

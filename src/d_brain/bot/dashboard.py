@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import logging
 from dataclasses import dataclass, field
-from datetime import date
 from html import escape
 from pathlib import Path
 from typing import Any, Literal, TypedDict
@@ -19,6 +18,7 @@ from aiogram.types import (
 )
 
 from d_brain.bot.replies import send_text
+from d_brain.clock import owner_today
 from d_brain.services.compiled_briefs import BRIEF_TYPES
 from d_brain.services.compiled_enrich_report import WeeklyReview, collect_weekly_review
 from d_brain.services.decisions_queue import (
@@ -144,7 +144,10 @@ def build_help_text() -> str:
         "/start — показать эту справку\n"
         "/menu — открыть или пересоздать рабочее меню\n"
         "/do — выполнить произвольный запрос\n"
+        "/undo — отменить последнюю запись\n"
         "/why — почему компилированная страница так говорит\n"
+        "/find — поиск по заметкам vault без ИИ\n"
+        "/reminders — список ожидающих напоминаний\n"
         "/help — эта справка\n"
         "/stats — статистика по записям\n"
         "/files — файловый браузер vault\n"
@@ -182,7 +185,7 @@ def build_home_text(vault_path: Path | str, user_id: int) -> str:
 def build_stats_text(vault_path: Path | str, user_id: int) -> str:
     """Build a detailed stats view for command and dashboard screens."""
     stats = _collect_usage_stats(vault_path, user_id)
-    today = date.today().isoformat()
+    today = owner_today().isoformat()
 
     lines = [
         "**Статистика**",
@@ -424,6 +427,18 @@ def build_file_directory_text(
     return "\n".join(lines)
 
 
+def file_entries_fingerprint(entries: list[BrowserEntry]) -> str:
+    """8-hex-char fingerprint of one rendered file list (paths in order).
+
+    Same idea as ``queue_item_fingerprint``, but for a whole page: a
+    ``menu:filesentry:`` button is honoured only while the session still
+    holds the list it was drawn from. Paths only, so a file edited in place
+    is not "stale" -- the current version is what gets sent.
+    """
+    joined = "\n".join(entry.relative_path for entry in entries)
+    return hashlib.sha256(joined.encode()).hexdigest()[:8]
+
+
 def build_file_directory_keyboard(
     *,
     current_dir: str,
@@ -433,13 +448,16 @@ def build_file_directory_keyboard(
 ) -> InlineKeyboardMarkup:
     """Build the paginated directory keyboard."""
     rows: list[list[tuple[str, str]]] = []
+    # The index alone points at whatever list is on screen *now*: an older
+    # message (second /menu, refreshed page) would send a different file.
+    token = file_entries_fingerprint(page_entries)
     for index, entry in enumerate(page_entries):
         prefix = "📁" if entry.is_directory else "📄"
         rows.append(
             [
                 (
                     f"{prefix} {entry.name}",
-                    f"menu:filesentry:{index}",
+                    f"menu:filesentry:{index}:{token}",
                 )
             ]
         )
@@ -1042,7 +1060,7 @@ async def render_weekly_review(
     criterion). Collected fresh from ``collect_weekly_review`` on every
     render, same convention as ``render_queue``."""
     review = await asyncio.to_thread(
-        collect_weekly_review, Path(vault_path), date.today()
+        collect_weekly_review, Path(vault_path), owner_today()
     )
 
     session = get_dashboard_session(chat_id)

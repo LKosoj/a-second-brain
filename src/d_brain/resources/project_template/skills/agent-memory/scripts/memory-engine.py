@@ -111,19 +111,37 @@ def _command_positionals(args: list[str]) -> list[str]:
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    """Write text atomically via tempfile + os.replace to avoid partial files."""
+    """Write text atomically, keeping the file's mode and group.
+
+    Follows the same rules as ``d_brain.services.atomic_io.atomic_write_file_text``
+    (mode and group of an existing file, 0660 for a new one, fsync of file and
+    directory) but, unlike it, does not refuse symlinks. Kept standalone because
+    this script runs outside the package.
+    """
+    import stat as stat_module
     import tempfile
-    tmp_dir = path.parent
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        existing = os.stat(path)
+        mode, gid = stat_module.S_IMODE(existing.st_mode), existing.st_gid
+    except FileNotFoundError:
+        mode, gid = 0o660, path.parent.stat().st_gid
     fd, tmp_path = tempfile.mkstemp(
         prefix=path.name + ".",
         suffix=".tmp",
-        dir=str(tmp_dir),
+        dir=str(path.parent),
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
             handle.flush()
+            try:
+                os.fchown(handle.fileno(), -1, gid)
+            except OSError:
+                pass  # not in that group: keep ours, do not fail the write
+            # After chown, which clears setuid/setgid.
+            os.fchmod(handle.fileno(), mode)
             os.fsync(handle.fileno())
         os.replace(tmp_path, path)
     except Exception:
@@ -132,6 +150,15 @@ def _atomic_write_text(path: Path, text: str) -> None:
         except OSError:
             pass
         raise
+    # The file is already published; a directory fsync failure must not fail the write.
+    try:
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
 def _vault_root_for_path(path: Path, fallback: Path | None = None) -> Path:

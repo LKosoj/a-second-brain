@@ -8,9 +8,9 @@ model is called.
 
 from __future__ import annotations
 
-from pathlib import Path
+from _helpers import make_page_writer
 
-from d_brain.services.compiled_briefings import CompiledBriefingService
+from d_brain.services import compiled_page
 from d_brain.services.compiled_why import (
     AMBIGUITY_RATIO,
     WhyOutcome,
@@ -63,7 +63,7 @@ def _page_text(
         "",
     ]
     body = [f"# {title}", "", "## Sources That Shaped This Page", ""]
-    body += CompiledBriefingService._render_sources_shaped_table(sources_rows or [])
+    body += compiled_page.render_sources_shaped_table(sources_rows or [])
     if claim_history_rows:
         body += ["", "## Claim History", ""]
         body += [
@@ -76,14 +76,11 @@ def _page_text(
         ]
     if conflicts_rows:
         body += ["", "## Open Conflicts", ""]
-        body += CompiledBriefingService._render_open_conflicts_table(conflicts_rows)
+        body += compiled_page.render_open_conflicts_table(conflicts_rows)
     return "\n".join(frontmatter) + "\n".join(body) + "\n"
 
 
-def _write_page(vault: Path, rel_path: str, **kwargs: object) -> None:
-    path = vault / rel_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_page_text(**kwargs), encoding="utf-8")  # type: ignore[arg-type]
+_write_page = make_page_writer(_page_text)
 
 
 def _why_section(markdown: str, heading: str) -> list[str]:

@@ -1,22 +1,20 @@
+import functools
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
+from _helpers import patch_get_settings
 
 from d_brain import run_compiled_maintenance
 from d_brain.services.compiled_briefings import CompiledSourceStateError
 
-
-def _patch_settings(monkeypatch, vault: Path) -> None:
-    monkeypatch.setattr(
-        run_compiled_maintenance,
-        "get_settings",
-        lambda: SimpleNamespace(
-            vault_path=vault, content_language="ru", ai_cli="claude"
-        ),
-    )
+_patch_settings = functools.partial(
+    patch_get_settings,
+    module=run_compiled_maintenance,
+    content_language="ru",
+    ai_cli="claude",
+)
 
 
 class FakeService:

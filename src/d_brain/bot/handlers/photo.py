@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import cast
@@ -12,6 +12,7 @@ from aiogram import Bot, Router
 from aiogram.types import Message, PhotoSize
 
 from d_brain.bot.replies import answer_text
+from d_brain.clock import to_owner
 from d_brain.config import Settings, get_settings
 from d_brain.services.image_analysis import ImageAnalysisService
 from d_brain.services.link_summary import (
@@ -45,6 +46,9 @@ _album_tasks: dict[str, asyncio.Task[None]] = {}
 # Photos still being downloaded/analyzed for a media group, keyed by
 # media_group_id -- see _flush_album for why this exists.
 _album_pending: dict[str, int] = {}
+# Albums sent to /do: run once with every saved photo after the grouped
+# daily entry is written.
+_album_requests: dict[str, Callable[[list["PhotoEntry"]], Awaitable[None]]] = {}
 
 
 @dataclass(slots=True)
@@ -62,6 +66,8 @@ class PhotoEntry:
     link_summaries: tuple[LinkSummary, ...] = ()
     entry_type: str = "[photo]"
     forwarded: bool = False
+    # The caption as sent, before link enrichment: /do runs it as the request.
+    raw_caption: str | None = None
 
 
 def _build_photo_daily_content(
@@ -171,7 +177,7 @@ async def _save_photo(
     if not file_bytes:
         raise ValueError("Не удалось скачать фото.")
 
-    timestamp = message.date.astimezone()
+    timestamp = to_owner(message.date)
     photo_bytes = file_bytes.read()
 
     extension = "jpg"
@@ -248,6 +254,7 @@ async def _save_photo(
         link_summaries=link_summaries,
         entry_type=entry_type,
         forwarded=forwarded,
+        raw_caption=message.caption,
     )
 
 
@@ -318,8 +325,10 @@ async def _flush_album(
         return
 
     if not items:
+        _album_requests.pop(media_group_id, None)
         return
 
+    on_saved = None
     async with _album_lock:
         try:
             content = _build_album_daily_content(items)
@@ -350,6 +359,7 @@ async def _flush_album(
             )
             if link_summary_message:
                 reply += "\n\n" + link_summary_message
+            on_saved = _album_requests.pop(media_group_id, None)
             # Guarded like the single-photo path (code review): the grouped
             # daily entry is already written, so a failure to *show* the
             # confirmation is not a failure to save the album -- reported as
@@ -367,6 +377,10 @@ async def _flush_album(
                 media_group_id,
                 len(items),
             )
+            # The owner is told below; this album's /do request is dropped.
+            # Only here: after a successful flush the request is already taken,
+            # and a pop would hit a newer registration for a late photo.
+            _album_requests.pop(media_group_id, None)
             try:
                 await answer_text(
                     reply_message,
@@ -384,6 +398,58 @@ async def _flush_album(
                 )
         finally:
             _album_tasks.pop(media_group_id, None)
+
+    # Outside the lock: a /do request runs for minutes, and other albums must
+    # keep flushing meanwhile.
+    if on_saved is not None:
+        try:
+            await on_saved(items)
+        except Exception:
+            logger.exception("/do request for album %s failed", media_group_id)
+
+
+async def _append_photo_daily(storage: VaultStorage, entry: PhotoEntry) -> None:
+    content = _build_photo_daily_content(
+        entry.relative_path,
+        entry.caption,
+        entry.analysis,
+        entry.source,
+        entry.content_language,
+    )
+    await asyncio.to_thread(
+        storage.append_to_daily,
+        content,
+        entry.timestamp,
+        entry.entry_type,
+    )
+
+
+async def save_single_photo(message: Message, bot: Bot) -> PhotoEntry:
+    """Save one photo like a plain capture (attachment, session, daily).
+
+    Used by /do, which then runs the caption as a request on the saved file.
+    An album is not grouped here: only this photo is saved.
+    """
+    settings = get_settings()
+    storage = VaultStorage(settings.vault_path, settings.content_language)
+    entry = await _save_photo(message, bot)
+    _log_photo_session(message, entry)
+    await _append_photo_daily(storage, entry)
+    return entry
+
+
+async def save_album_for_request(
+    message: Message,
+    bot: Bot,
+    on_saved: Callable[[list[PhotoEntry]], Awaitable[None]],
+) -> None:
+    """Save one album photo for /do; ``on_saved`` gets the whole album.
+
+    The rest of the album may arrive here or through handle_photo: both join
+    the same media group, and the first registered request wins.
+    """
+    _album_requests.setdefault(cast(str, message.media_group_id), on_saved)
+    await handle_photo(message, bot)
 
 
 @router.message(lambda m: m.photo is not None)
@@ -445,19 +511,7 @@ async def handle_photo(message: Message, bot: Bot) -> None:
             )
             return
 
-        content = _build_photo_daily_content(
-            entry.relative_path,
-            entry.caption,
-            entry.analysis,
-            entry.source,
-            entry.content_language,
-        )
-        await asyncio.to_thread(
-            storage.append_to_daily,
-            content,
-            entry.timestamp,
-            entry.entry_type,
-        )
+        await _append_photo_daily(storage, entry)
 
         reply = "📷 ✓ Сохранено"
         link_summary_message = format_link_summary_message(
@@ -479,11 +533,11 @@ async def handle_photo(message: Message, bot: Bot) -> None:
             logger.exception("Failed to deliver photo confirmation")
         logger.info("Photo saved: %s", entry.relative_path)
 
-    except Exception as e:
+    except Exception:
         logger.exception("Error processing photo")
         await answer_text(
             message,
-            f"Ошибка: {e}",
+            "Не удалось сохранить фото, подробности в логе.",
             parse_mode=None,
         )
     finally:

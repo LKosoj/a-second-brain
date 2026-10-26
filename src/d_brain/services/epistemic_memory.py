@@ -11,7 +11,6 @@ import base64
 import hashlib
 import json
 import os
-import secrets
 import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -23,6 +22,7 @@ from d_brain.manifest import (
     VaultManifest,
     load_manifest_for_vault,
 )
+from d_brain.services.atomic_io import atomic_write_file_at
 from d_brain.services.frontmatter import (
     FrontmatterError,
     UnsafeVaultPathError,
@@ -304,24 +304,6 @@ def _read_note(lock: VaultWriteLock, relative_path: str) -> bytes:
         os.close(parent_fd)
 
 
-def _create_temp(parent_fd: int, prefix: str) -> tuple[int, str]:
-    for _attempt in range(32):
-        name = f".{prefix}.{secrets.token_hex(12)}.tmp"
-        try:
-            return (
-                os.open(
-                    name,
-                    os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
-                    0o600,
-                    dir_fd=parent_fd,
-                ),
-                name,
-            )
-        except FileExistsError:
-            continue
-    raise EpistemicMemoryError("could not allocate an atomic vault temporary file")
-
-
 def _replace_note(
     lock: VaultWriteLock,
     relative_path: str,
@@ -401,26 +383,12 @@ def _write_journal(
             for note in notes
         ],
     }
-    descriptor, temporary_name = _create_temp(lock.locks_fd, _JOURNAL_NAME)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(json.dumps(data, ensure_ascii=False, sort_keys=True).encode())
-            handle.write(b"\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(
-            temporary_name,
-            _JOURNAL_NAME,
-            src_dir_fd=lock.locks_fd,
-            dst_dir_fd=lock.locks_fd,
-        )
-        os.fsync(lock.locks_fd)
-    except Exception:
-        try:
-            os.unlink(temporary_name, dir_fd=lock.locks_fd)
-        except FileNotFoundError:
-            pass
-        raise
+    atomic_write_file_at(
+        lock.locks_fd,
+        _JOURNAL_NAME,
+        json.dumps(data, ensure_ascii=False, sort_keys=True).encode() + b"\n",
+        new_file_mode=0o600,
+    )
 
 
 def _load_journal(lock: VaultWriteLock) -> tuple[_JournalNote, _JournalNote] | None:

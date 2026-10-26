@@ -39,7 +39,7 @@ jobs:
         run: uv run --frozen mypy src
 
       - name: Tests
-        run: uv run --frozen pytest -q
+        run: uv run --frozen pytest -q --cov=d_brain --cov-report=term-missing:skip-covered --cov-fail-under=86
 
       - name: Shellcheck
         run: shellcheck install.sh scripts/*.sh scripts/lib/*.sh

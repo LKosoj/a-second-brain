@@ -7,6 +7,6 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=@PROJECT_DIR@
 EnvironmentFile=@PROJECT_DIR@/.env
-Environment=UV_BIN=@UV_BIN@
+Environment=UV_BIN=@UV_BIN@@TZ_ENVIRONMENT@
 ExecStart=@UV_BIN@ run --frozen --no-dev python -m d_brain.run_morning_brief
 NoNewPrivileges=true

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -56,11 +57,11 @@ def test_process_service_has_timeout_start_sec() -> None:
     assert "TimeoutStartSec=4h" in content
 
 
-def test_bot_service_has_kill_mode_process_documented() -> None:
+def test_bot_service_has_kill_mode_mixed_documented() -> None:
     content = (REPO_ROOT / "deploy" / "a-second-brain.service.in").read_text(
         encoding="utf-8"
     )
-    assert "KillMode=process" in content
+    assert "KillMode=mixed" in content
     assert "tmux" in content.lower()
 
 
@@ -82,6 +83,23 @@ def test_process_plist_runs_backup_before_daily_process() -> None:
     )
 
 
+def test_backup_verify_units_run_weekly_verify() -> None:
+    deploy = REPO_ROOT / "deploy"
+    service = (deploy / "a-second-brain-backup-verify.service.in").read_text(
+        encoding="utf-8"
+    )
+    timer = (deploy / "a-second-brain-backup-verify.timer.in").read_text(
+        encoding="utf-8"
+    )
+    plist = (deploy / "com.second-brain.backup-verify.plist.in").read_text(
+        encoding="utf-8"
+    )
+    assert "d_brain.run_vault_backup --verify" in service
+    assert "OnCalendar=Sun" in timer
+    assert "<string>--verify</string>" in plist
+    assert "<key>UV_BIN</key>" in plist
+
+
 def test_all_launchd_plists_export_uv_bin() -> None:
     for name in (
         "com.second-brain.bot.plist.in",
@@ -89,6 +107,7 @@ def test_all_launchd_plists_export_uv_bin() -> None:
         "com.second-brain.morning-brief.plist.in",
         "com.second-brain.plaud-sync.plist.in",
         "com.second-brain.qmd-maintenance.plist.in",
+        "com.second-brain.backup-verify.plist.in",
     ):
         content = (REPO_ROOT / "deploy" / name).read_text(encoding="utf-8")
         assert "<key>UV_BIN</key>" in content
@@ -103,10 +122,13 @@ _SYSTEMD_DEPLOY_TEMPLATES = (
     "a-second-brain.service.in",
     "a-second-brain-process.service.in",
     "a-second-brain-process.timer.in",
+    "a-second-brain-morning-brief.timer.in",
     "a-second-brain-plaud-sync.service.in",
     "a-second-brain-plaud-sync.timer.in",
     "a-second-brain-qmd-maintenance.service.in",
     "a-second-brain-qmd-maintenance.timer.in",
+    "a-second-brain-backup-verify.service.in",
+    "a-second-brain-backup-verify.timer.in",
 )
 
 
@@ -163,6 +185,176 @@ def test_systemd_install_ignores_plist_templates(tmp_path: Path) -> None:
     assert not (unit_dir / "com.second-brain.bot.plist").exists()
 
 
+def _install_systemd(
+    tmp_path: Path, extra_env_lines: list[str]
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    project_dir = tmp_path / "project"
+    _prepare_systemd_project(project_dir, plaud_line=None)
+    env_file = project_dir / ".env"
+    env_file.write_text(
+        env_file.read_text(encoding="utf-8") + "\n".join(extra_env_lines) + "\n",
+        encoding="utf-8",
+    )
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    _write_stub(bin_dir, "uv")
+    _write_stub(bin_dir, "systemctl")
+    config_home = tmp_path / "config"
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
+    env["XDG_CONFIG_HOME"] = str(config_home)
+    result = subprocess.run(
+        ["bash", str(project_dir / "scripts" / "install-systemd-user.sh")],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    return result, config_home / "systemd" / "user"
+
+
+def test_systemd_install_renders_times_from_env(tmp_path: Path) -> None:
+    result, unit_dir = _install_systemd(
+        tmp_path, ["DAILY_PROCESS_TIME=06:45", 'MORNING_BRIEF_TIME="07:15"']
+    )
+
+    assert result.returncode == 0, result.stderr
+    process = (unit_dir / "a-second-brain-process.timer").read_text(encoding="utf-8")
+    brief = (unit_dir / "a-second-brain-morning-brief.timer").read_text(
+        encoding="utf-8"
+    )
+    assert "OnCalendar=*-*-* 06:45:00" in process
+    assert "OnCalendar=*-*-* 07:15:00" in brief
+
+
+def test_systemd_units_have_no_unreplaced_placeholders(tmp_path: Path) -> None:
+    result, unit_dir = _install_systemd(tmp_path, ["PLAUD_BEARER_TOKEN=token"])
+
+    assert result.returncode == 0, result.stderr
+    units = [*unit_dir.glob("*.service"), *unit_dir.glob("*.timer")]
+    assert units
+    for unit in units:
+        leftover = re.findall(r"@[A-Z_]+@", unit.read_text(encoding="utf-8"))
+        assert not leftover, f"{unit.name}: {leftover}"
+
+
+def test_systemd_install_keeps_default_times(tmp_path: Path) -> None:
+    result, unit_dir = _install_systemd(tmp_path, [])
+
+    assert result.returncode == 0, result.stderr
+    process = (unit_dir / "a-second-brain-process.timer").read_text(encoding="utf-8")
+    brief = (unit_dir / "a-second-brain-morning-brief.timer").read_text(
+        encoding="utf-8"
+    )
+    assert "OnCalendar=*-*-* 21:00:00" in process
+    assert "OnCalendar=*-*-* 08:00:00" in brief
+
+
+def test_systemd_install_adds_owner_timezone_to_both_timers(
+    tmp_path: Path,
+) -> None:
+    result, unit_dir = _install_systemd(tmp_path, ["TIMEZONE=Europe/Moscow"])
+
+    assert result.returncode == 0, result.stderr
+    process = (unit_dir / "a-second-brain-process.timer").read_text(encoding="utf-8")
+    brief = (unit_dir / "a-second-brain-morning-brief.timer").read_text(
+        encoding="utf-8"
+    )
+    assert "OnCalendar=*-*-* 21:00:00 Europe/Moscow\n" in process
+    assert "OnCalendar=*-*-* 08:00:00 Europe/Moscow\n" in brief
+    assert "@TIMEZONE_SUFFIX@" not in process + brief
+
+
+def test_systemd_install_without_timezone_keeps_timers_unchanged(
+    tmp_path: Path,
+) -> None:
+    result, unit_dir = _install_systemd(tmp_path, ["TIMEZONE="])
+
+    assert result.returncode == 0, result.stderr
+    process = (unit_dir / "a-second-brain-process.timer").read_text(encoding="utf-8")
+    assert "OnCalendar=*-*-* 21:00:00\n" in process
+    assert "@TIMEZONE_SUFFIX@" not in process
+
+
+def test_systemd_services_get_tz_from_timezone(tmp_path: Path) -> None:
+    result, unit_dir = _install_systemd(tmp_path, ["TIMEZONE=Europe/Moscow"])
+
+    assert result.returncode == 0, result.stderr
+    services = sorted(unit_dir.glob("*.service"))
+    assert len(services) == 5
+    for service in services:
+        body = service.read_text(encoding="utf-8")
+        pattern = r"^Environment=.*\bTZ=Europe/Moscow$"
+        assert re.search(pattern, body, re.M), service.name
+        # systemd lets EnvironmentFile= override Environment=, so a TZ the
+        # owner put into .env wins over the derived one instead of clashing.
+        assert body.index("EnvironmentFile=") < body.index("TZ=Europe/Moscow")
+        assert "UV_BIN=" in body
+
+
+@pytest.mark.parametrize("lines", [[], ["TIMEZONE="]])
+def test_systemd_services_have_no_tz_without_timezone(
+    tmp_path: Path, lines: list[str]
+) -> None:
+    result, unit_dir = _install_systemd(tmp_path, lines)
+
+    assert result.returncode == 0, result.stderr
+    for service in unit_dir.glob("*.service"):
+        assert "TZ=" not in service.read_text(encoding="utf-8"), service.name
+
+
+def test_systemd_install_maintenance_timers_stay_on_system_zone(
+    tmp_path: Path,
+) -> None:
+    result, unit_dir = _install_systemd(tmp_path, ["TIMEZONE=Europe/Moscow"])
+
+    assert result.returncode == 0, result.stderr
+    for name in sorted(unit_dir.glob("*.timer")):
+        if name.name in {
+            "a-second-brain-process.timer",
+            "a-second-brain-morning-brief.timer",
+        }:
+            continue
+        assert "Europe/Moscow" not in name.read_text(encoding="utf-8"), name.name
+
+
+@pytest.mark.parametrize("bad", ["Mars/Base", "Europe/Moscow;rm", "../etc/passwd"])
+def test_systemd_install_rejects_invalid_timezone(tmp_path: Path, bad: str) -> None:
+    result, unit_dir = _install_systemd(tmp_path, [f"TIMEZONE={bad}"])
+
+    assert result.returncode == 1
+    assert "TIMEZONE" in result.stderr
+    assert not unit_dir.exists() or not list(unit_dir.glob("*.timer"))
+
+
+def test_systemd_install_rejects_invalid_time(tmp_path: Path) -> None:
+    result, unit_dir = _install_systemd(tmp_path, ["DAILY_PROCESS_TIME=25:00"])
+
+    assert result.returncode != 0
+    assert "DAILY_PROCESS_TIME" in result.stderr
+    assert not unit_dir.exists() or not list(unit_dir.glob("*.timer"))
+
+
+def test_timer_templates_use_schedule_placeholders() -> None:
+    deploy = REPO_ROOT / "deploy"
+    process_timer = (deploy / "a-second-brain-process.timer.in").read_text("utf-8")
+    brief_timer = (deploy / "a-second-brain-morning-brief.timer.in").read_text(
+        "utf-8"
+    )
+    process_plist = (deploy / "com.second-brain.process.plist.in").read_text("utf-8")
+    brief_plist = (deploy / "com.second-brain.morning-brief.plist.in").read_text(
+        "utf-8"
+    )
+    assert "@DAILY_PROCESS_TIME@:00@TIMEZONE_SUFFIX@" in process_timer
+    assert "@MORNING_BRIEF_TIME@:00@TIMEZONE_SUFFIX@" in brief_timer
+    assert "@DAILY_PROCESS_TIME@" in process_timer
+    assert "@MORNING_BRIEF_TIME@" in brief_timer
+    for placeholder in ("@DAILY_PROCESS_HOUR@", "@DAILY_PROCESS_MINUTE@"):
+        assert placeholder in process_plist
+    for placeholder in ("@MORNING_BRIEF_HOUR@", "@MORNING_BRIEF_MINUTE@"):
+        assert placeholder in brief_plist
+
+
 def test_systemd_install_enable_skips_quoted_empty_plaud_token(
     tmp_path: Path,
 ) -> None:
@@ -193,6 +385,7 @@ def test_systemd_install_enable_skips_quoted_empty_plaud_token(
     assert result.returncode == 0, result.stderr
     log = log_path.read_text(encoding="utf-8")
     assert "a-second-brain.service" in log
+    assert "a-second-brain-backup-verify.timer" in log
     assert "a-second-brain-plaud-sync.timer" not in log
 
 
@@ -299,6 +492,7 @@ def test_launchd_uninstall_removes_all_possible_plists(tmp_path: Path) -> None:
         "com.second-brain.process",
         "com.second-brain.plaud-sync",
         "com.second-brain.qmd-maintenance",
+        "com.second-brain.backup-verify",
     )
     for label in all_labels:
         (agent_dir / f"{label}.plist").write_text("<plist/>", encoding="utf-8")
@@ -482,7 +676,7 @@ def test_macos_guides_create_the_vault_and_drop_unused_dir() -> None:
         )
         assert "a-second-brain init" in content
         assert "second-brain-data" not in content
-        assert "up to five" in content or "до пяти" in content
+        assert "up to six" in content or "до шести" in content
 
 
 def test_development_shellcheck_gate_covers_scripts_lib() -> None:

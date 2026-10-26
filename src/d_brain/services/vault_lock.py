@@ -9,6 +9,7 @@ from __future__ import annotations
 import fcntl
 import os
 import stat
+import time
 import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -18,6 +19,29 @@ from pathlib import Path
 
 class VaultLockError(RuntimeError):
     """Raised when a vault or its cooperative lock cannot be opened safely."""
+
+
+class VaultLockTimeout(VaultLockError):
+    """The vault write lock was not obtained before the requested deadline."""
+
+
+_LOCK_POLL_SECONDS = 0.05
+
+
+def _flock_exclusive(fd: int, deadline: float | None) -> None:
+    """Take an exclusive flock; with a deadline, poll instead of blocking."""
+    if deadline is None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise VaultLockTimeout("vault write lock is busy") from None
+            time.sleep(min(_LOCK_POLL_SECONDS, remaining))
 
 
 def _open_directory_at(parent_fd: int, name: str) -> int:
@@ -182,14 +206,19 @@ def duplicate_live_vault_write_lock(lock: VaultWriteLock) -> tuple[int, int]:
 
 @contextmanager
 def vault_write_lock(
-    vault_path: Path, *, _root_fd: int | None = None
+    vault_path: Path, *, _root_fd: int | None = None, timeout: float | None = None
 ) -> Iterator[VaultWriteLock]:
     """Serialize cooperating writes under ``vault/.locks/vault-write.lock``.
 
     The hidden root descriptor retains the directory flock even if a caller
     closes or reuses the exposed ``root_fd``.  This is cooperative locking, not
     isolation from arbitrary same-UID/root processes; those must be quiesced.
+
+    ``timeout`` (seconds, ``None`` = wait forever) bounds the wait for both
+    flocks, so a worker thread never stays parked on a blocking ``flock``;
+    on expiry ``VaultLockTimeout`` is raised and nothing stays held.
     """
+    deadline = None if timeout is None else time.monotonic() + timeout
     try:
         supplied = Path(vault_path)
         root = supplied if supplied.is_absolute() else Path.cwd() / supplied
@@ -214,7 +243,7 @@ def vault_write_lock(
     public_locks_identity: tuple[int, int] | None = None
     root_locked = False
     try:
-        fcntl.flock(lease_root_fd, fcntl.LOCK_EX)
+        _flock_exclusive(lease_root_fd, deadline)
         root_locked = True
         try:
             os.mkdir(".locks", 0o700, dir_fd=lease_root_fd)
@@ -229,7 +258,7 @@ def vault_write_lock(
         )
         if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
             raise VaultLockError("vault-write.lock is not a regular file")
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        _flock_exclusive(lock_fd, deadline)
         public_root_fd = os.dup(lease_root_fd)
         public_locks_fd = os.dup(lease_locks_fd)
         public_root_identity = _descriptor_identity(public_root_fd)

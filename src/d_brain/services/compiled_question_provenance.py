@@ -41,6 +41,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from d_brain.services import compiled_page
 from d_brain.services.compiled_briefings import (
     QUESTION_CONTEXT_LIMIT,
     SOURCES_TRUST_VALUES,
@@ -50,9 +51,9 @@ from d_brain.services.compiled_briefings import (
 
 # Reused, not duplicated: this is the same weak-trust set `compiled_briefs`
 # uses for its own enrichment-report warnings (ТЗ 4.3/4.4). Provenance and
-# enrichment must agree on what "weak" means, so importing the private
-# constant is intentional -- keeping a second copy would let the two drift.
-from d_brain.services.compiled_briefs import _LOW_TRUST_LEVELS
+# enrichment must agree on what "weak" means, so importing the constant is
+# intentional -- keeping a second copy would let the two drift.
+from d_brain.services.compiled_briefs import LOW_TRUST_LEVELS
 
 _UNKNOWN_TRUST_LABEL = "не определено"
 
@@ -85,14 +86,14 @@ class QuestionProvenance:
 def _page_trust(candidate: CompiledBriefingCandidate) -> str:
     """ТЗ 4.4: trust is a frontmatter fact, read by code only -- never
     guessed and never taken from the model's own claims."""
-    fields = CompiledBriefingService._frontmatter_fields(candidate.text)
+    fields = compiled_page.frontmatter_fields(candidate.text)
     trust = fields.get("sources_trust", "").strip()
     return trust if trust in SOURCES_TRUST_VALUES else ""
 
 
 def _page_conflicts(candidate: CompiledBriefingCandidate) -> int:
-    fields = CompiledBriefingService._frontmatter_fields(candidate.text)
-    return CompiledBriefingService._int_value(fields.get("conflicts_open"), default=0)
+    fields = compiled_page.frontmatter_fields(candidate.text)
+    return compiled_page.int_value(fields.get("conflicts_open"), default=0)
 
 
 def _fold_trust(levels: list[str]) -> str:
@@ -106,7 +107,7 @@ def _fold_trust(levels: list[str]) -> str:
         return ""
     folded = known[0]
     for level in known[1:]:
-        folded = CompiledBriefingService._min_trust(folded, level)
+        folded = compiled_page.min_trust(folded, level)
     return folded
 
 
@@ -115,7 +116,7 @@ def _weak_trust_warning(*, folded_trust: str, any_open_conflicts: bool) -> str:
     by the folded trust being ``forwarded``/``inferred``, by any shown page
     carrying an open conflict, or both at once."""
     reasons = []
-    if folded_trust in _LOW_TRUST_LEVELS:
+    if folded_trust in LOW_TRUST_LEVELS:
         reasons.append(f"уровень доверия источников — «{folded_trust}»")
     if any_open_conflicts:
         reasons.append("на одной из страниц есть неразрешённый конфликт фактов")
@@ -164,7 +165,7 @@ def build_question_provenance(
     """
     if candidates is None:
         service = CompiledBriefingService(Path(vault_path))
-        candidates = service._rank_candidates(question, limit=limit)
+        candidates = service.rank_candidates(question, limit=limit)
     if not candidates:
         return QuestionProvenance(warning="", block="", touched_paths=())
 

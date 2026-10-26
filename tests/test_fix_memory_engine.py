@@ -356,3 +356,42 @@ def test_connect_orphans_maps_plaud_and_summaries_to_an_existing_hub(
         assert (vault_path / note_name).exists(), (
             f"{hub_path} hub {hub_link} does not exist on disk"
         )
+
+
+def test_memory_engine_atomic_write_keeps_mode_and_creates_group_file(tmp_path):
+    import os
+    import stat
+
+    memory_engine = _load_memory_engine()
+    existing = tmp_path / "cfg.json"
+    existing.write_text("{}", encoding="utf-8")
+    existing.chmod(0o640)
+    previous = os.umask(0o077)
+    try:
+        memory_engine._atomic_write_text(existing, "new\n")
+        memory_engine._atomic_write_text(tmp_path / "sub" / "fresh.json", "x\n")
+    finally:
+        os.umask(previous)
+
+    assert existing.read_text(encoding="utf-8") == "new\n"
+    assert stat.S_IMODE(existing.stat().st_mode) == 0o640
+    assert stat.S_IMODE((tmp_path / "sub" / "fresh.json").stat().st_mode) == 0o660
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_memory_engine_atomic_write_survives_directory_open_failure(
+    tmp_path, monkeypatch
+):
+    memory_engine = _load_memory_engine()
+    target = tmp_path / "cfg.json"
+    real_open = memory_engine.os.open
+
+    def open_dir_denied(path, flags, *args, **kwargs):
+        if Path(path) == tmp_path:
+            raise PermissionError(13, "no")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(memory_engine.os, "open", open_dir_denied)
+    memory_engine._atomic_write_text(target, "new\n")
+
+    assert target.read_text(encoding="utf-8") == "new\n"

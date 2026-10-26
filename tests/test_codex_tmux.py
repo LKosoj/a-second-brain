@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from d_brain.services import codex_tmux
+from d_brain.services import claude_tmux, codex_tmux
+from d_brain.services.claude_tmux import ClaudeTmuxError
 from d_brain.services.codex_tmux import run_codex_tmux
 
 
@@ -186,3 +187,101 @@ def test_wait_for_composer_does_not_submit_while_codex_is_loading(
         codex_tmux._wait_for_composer("socket", {"HOME": "/tmp"}, float("inf"))
 
     assert not any(args[3] == "load-buffer" for args, _ in fake.calls)
+
+
+def test_run_codex_tmux_pastes_sanitized_prompt_and_matches_rollout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeTmux(tmp_path)
+    monkeypatch.setattr(codex_tmux.subprocess, "run", fake)
+    monkeypatch.setattr(codex_tmux.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(codex_tmux, "_POLL_INTERVAL", 0.0)
+    monkeypatch.setattr(codex_tmux, "_PASTE_SETTLE", 0.0)
+
+    output = run_codex_tmux(
+        "one\r\ntwo\x1b[A\x03", Path("/work"), {"HOME": str(tmp_path)}, 30
+    )
+
+    assert output == "Готово"
+    loaded = [text for args, text in fake.calls if args[3] == "load-buffer"]
+    assert loaded == ["one\ntwo[A"]
+    paste = next(args for args, _ in fake.calls if args[3] == "paste-buffer")
+    assert "-p" not in paste
+
+
+def _patch_codex(monkeypatch: pytest.MonkeyPatch, fake: object) -> None:
+    monkeypatch.setattr(codex_tmux.subprocess, "run", fake)
+    monkeypatch.setattr(codex_tmux.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(codex_tmux, "_POLL_INTERVAL", 0.0)
+    monkeypatch.setattr(codex_tmux, "_PASTE_SETTLE", 0.0)
+    monkeypatch.setattr(claude_tmux, "_stopping", False)
+    monkeypatch.setattr(claude_tmux, "_ACTIVE", {})
+
+
+def test_run_codex_tmux_uses_owned_socket_and_unregisters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+    import re
+
+    fake = _FakeTmux(tmp_path)
+    seen: list[set[str]] = []
+
+    def spy(argv, **kwargs):  # type: ignore[no-untyped-def]
+        if argv[3] == "new-session":
+            seen.append(set(claude_tmux._ACTIVE))
+        return fake(argv, **kwargs)
+
+    _patch_codex(monkeypatch, spy)
+
+    run_codex_tmux("prompt", Path("/work"), {"HOME": str(tmp_path)}, 30)
+
+    socket = fake.calls[0][0][2]
+    assert re.fullmatch(rf"dbrain-{os.getpid()}-[0-9a-f]{{12}}", socket)
+    assert seen == [{socket}]
+    assert claude_tmux._ACTIVE == {}
+
+
+def test_run_codex_tmux_refuses_to_start_while_stopping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeTmux(tmp_path)
+    _patch_codex(monkeypatch, fake)
+    claude_tmux.shutdown_tmux_sessions()
+
+    with pytest.raises(ClaudeTmuxError):
+        run_codex_tmux("prompt", Path("/work"), {"HOME": str(tmp_path)}, 30)
+
+    assert not any(args[3] == "new-session" for args, _ in fake.calls)
+
+
+def test_shutdown_during_new_session_stops_codex_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeTmux(tmp_path)
+
+    def run(argv, **kwargs):  # type: ignore[no-untyped-def]
+        if argv[3] == "new-session":
+            claude_tmux.shutdown_tmux_sessions()
+        return fake(argv, **kwargs)
+
+    _patch_codex(monkeypatch, run)
+
+    with pytest.raises(ClaudeTmuxError, match="stopping"):
+        run_codex_tmux("prompt", Path("/work"), {"HOME": str(tmp_path)}, 30)
+
+    assert not any(args[3] == "load-buffer" for args, _ in fake.calls)
+    assert any(args[3] == "kill-server" for args, _ in fake.calls)
+    assert claude_tmux._ACTIVE == {}
+
+
+def test_codex_fail_if_pane_died_stops_once_stopping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeTmux(tmp_path)
+    _patch_codex(monkeypatch, fake)
+    claude_tmux.shutdown_tmux_sessions()
+
+    with pytest.raises(ClaudeTmuxError, match="stopping"):
+        codex_tmux._fail_if_pane_died("dbrain-1-aaaaaaaaaaaa", {})

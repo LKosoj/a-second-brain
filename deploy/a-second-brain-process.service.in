@@ -5,7 +5,7 @@ Description=A Second Brain scheduled processing
 Type=oneshot
 WorkingDirectory=@PROJECT_DIR@
 EnvironmentFile=@PROJECT_DIR@/.env
-Environment=UV_BIN=@UV_BIN@
+Environment=UV_BIN=@UV_BIN@@TZ_ENVIRONMENT@
 # oneshot units have no start timeout by default; bound it so a wedged AI
 # CLI cannot hang forever and block every later scheduled run.
 TimeoutStartSec=4h

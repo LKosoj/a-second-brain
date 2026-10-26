@@ -194,6 +194,13 @@ def main() -> int:
     except Exception as notify_exc:
         logger.warning("Failed to send PLAUD auth recovery alert: %s", notify_exc)
 
+    notice = result.get("tasks_unconfirmed_notice")
+    if notice:
+        try:
+            send_telegram_text_sync(f"PLAUD sync:\n{notice}", rich=True)
+        except Exception as notify_exc:
+            logger.warning("Failed to send PLAUD unconfirmed tasks: %s", notify_exc)
+
     sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
     return 0 if not result.get("errors") else 1
 

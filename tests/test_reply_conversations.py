@@ -7,6 +7,7 @@ import pytest
 from aiogram import Bot
 from aiogram.types import Chat, Document, Message, User, Voice
 
+from d_brain.bot import voice_input
 from d_brain.bot.conversations import is_reply_to_bot, reply_context, save_answer
 from d_brain.bot.handlers import do as do_handler
 from d_brain.bot.handlers import text as text_handler
@@ -237,13 +238,13 @@ async def test_voice_reply_continues_without_capture(
         calls.append(prompt)
 
     monkeypatch.setattr(Chat, "do", typing)
-    monkeypatch.setattr(voice_handler, "DeepgramTranscriber", Transcriber)
+    monkeypatch.setattr(voice_input, "DeepgramTranscriber", Transcriber)
     monkeypatch.setattr(voice_handler, "process_request", process)
     monkeypatch.setattr(
         voice_handler,
         "get_settings",
         lambda: SimpleNamespace(
-            vault_path=tmp_path, content_language="ru", deepgram_api_key=""
+            vault_path=tmp_path, content_language="ru", deepgram_api_key="key"
         ),
     )
     await voice_handler.handle_voice(

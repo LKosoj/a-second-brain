@@ -69,7 +69,7 @@ opened in Obsidian or managed with ordinary filesystem tools.
 
 | Input | Immediate result | Later use |
 |---|---|---|
-| Voice message | Deepgram transcript saved to the daily note | Classified during processing and available to search |
+| Voice message | Deepgram transcript saved to the daily note (without a key the audio is kept, marked not recognized, and retried at night) | Classified during processing and available to search |
 | Text thought | Original text saved to the daily note | May become a task, knowledge card, or context update |
 | Text question | Answer built from goals, memory, briefings, and retrieved notes | A longer reusable answer may be filed back into the searchable vault |
 | Forwarded message or link | Source information and extracted content are preserved when available | Included in recall and daily review |
@@ -86,8 +86,13 @@ not discard the original input. There are then three ways the system uses it:
    long-term memory, compiled briefings, note retrieval, or exact lookup.
 2. `/process` runs a quick preview of today's entries without executing the
    write-heavy steps.
-3. The scheduled cycle at 21:00, or `/process_full`, runs three isolated phases:
-   capture and classification, execution, then reflection and maintenance.
+3. The scheduled cycle at 21:00 by default (`DAILY_PROCESS_TIME`), or
+   `/process_full`, runs three isolated phases: capture and classification,
+   execution, then reflection and maintenance.
+
+A morning brief at 08:00 by default (`MORNING_BRIEF_TIME`) shows yesterday's
+open checkboxes, the week's ONE Big Thing, open conflicts and, with
+`CALENDAR_ICS_URL`, today's meetings.
 
 Periodic cycles add weekly, monthly, and yearly reviews. Optional timers refresh
 the local search index and synchronize PLAUD independently of the bot process.
@@ -142,6 +147,11 @@ and which paths are runtime infrastructure.
 |---|---|
 | `/do` | Run a free-form request against the vault and optional Todoist access |
 | `/why` | Explain why a compiled page states a claim, with its sources |
+| `/find` | Search notes by keywords (no model call, up to 5 results, file buttons) |
+| `/undo` | Remove the last entry of today after confirmation |
+| `/reminders` | Show pending reminders |
+| `/help` | Show the command list (`/start` shows the same text) |
+| `/status` | Same as `/stats` (alias) |
 | `/process` | Preview today's classification without write-heavy execution |
 | `/process_full` | Run the full daily cycle now |
 | `/menu` | Open the dashboard: today's tasks, digest, decisions queue, brief builder, weekly summary |
@@ -150,6 +160,9 @@ and which paths are runtime infrastructure.
 
 See the [CLI reference](docs/en/cli.md) for installation and maintenance
 commands and the bot help screen for the complete Telegram command list.
+Editing a text message or photo caption in Telegram updates the saved entry;
+if the nightly run has already processed it, or the photo had no caption, the
+correction is added to the daily note as a separate entry.
 
 ### Continuing a discussion
 
@@ -176,7 +189,7 @@ that is absent from the file itself.
 - [uv](https://docs.astral.sh/uv/)
 - `jq`
 - a Telegram bot token from BotFather
-- a Deepgram API key for voice transcription
+- optionally, a Deepgram API key for voice transcription
 - one installed and authenticated AI CLI: Claude Code, Codex CLI, Qwen Code,
   Gemini CLI, Kimi Code, Grok CLI, or opencode
 
@@ -195,9 +208,9 @@ cd a-second-brain
 ./install.sh
 ```
 
-Edit `.env` and set `TELEGRAM_BOT_TOKEN`, `DEEPGRAM_API_KEY`, and
-`OWNER_TELEGRAM_ID`. Set `AI_CLI` only when using a backend other than the
-default `claude`. Only the Telegram account identified by
+Edit `.env` and set `TELEGRAM_BOT_TOKEN` and `OWNER_TELEGRAM_ID`;
+`DEEPGRAM_API_KEY` is optional. Set `AI_CLI` only when using a backend other
+than the default `claude`. Only the Telegram account identified by
 `OWNER_TELEGRAM_ID` is accepted. Then run:
 
 ```bash

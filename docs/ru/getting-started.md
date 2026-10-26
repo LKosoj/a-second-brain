@@ -11,7 +11,8 @@ vault не попали в публичный репозиторий с кодо
   новее;
 - `uv` и `jq`;
 - токен Telegram-бота от BotFather;
-- API-ключ Deepgram для распознавания голосовых сообщений;
+- API-ключ Deepgram для распознавания голосовых сообщений (необязательно: без
+  него голос сохраняется и распознаётся позже);
 - один поддерживаемый AI CLI: Claude Code, Codex CLI, Qwen Code, Gemini CLI,
   Kimi Code, Grok CLI или opencode;
 - непривилегированная учётная запись.
@@ -46,7 +47,7 @@ cd a-second-brain
 приватный экземпляр:
 
 ```bash
-python -m pip install a_second_brain-0.1.0-py3-none-any.whl
+python -m pip install a_second_brain-0.2.0-py3-none-any.whl
 a-second-brain init /srv/a-second-brain-instance
 cd /srv/a-second-brain-instance
 ```
@@ -57,10 +58,11 @@ cd /srv/a-second-brain-instance
 
 ## Минимальная конфигурация
 
-Откройте `.env` и заполните три обязательных значения:
+Откройте `.env` и заполните обязательные значения:
 
 ```dotenv
 TELEGRAM_BOT_TOKEN=
+# Необязательно: без него голос сохраняется аудио и распознаётся позже
 DEEPGRAM_API_KEY=
 OWNER_TELEGRAM_ID=
 ```

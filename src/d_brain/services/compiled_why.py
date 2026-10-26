@@ -27,7 +27,7 @@ no such data exists to fabricate it from.
 
 Target resolution (ТЗ 7.3 "не гадай, спроси")
 -----------------------------------------------
-Reuses ``compiled_briefs._find_exact_matches`` with ``domain=None`` (search
+Reuses ``compiled_briefs.find_exact_matches`` with ``domain=None`` (search
 all six ``COMPILED_BRIEFING_DOMAINS``, unlike a brief's fixed domain) for an
 exact slug/path match. A slug is only unique within one domain, so that
 search can return several pages at once (``decisions/roadmap``,
@@ -41,7 +41,7 @@ list), so "are the top two close enough to ask instead of guess" cannot
 reuse its real score. Instead this module computes its own, independent
 proxy score per candidate: every *text* term the ranker scores, at the
 ranker's own weights -- a title or slug contained whole in the query, plus
-the token overlap (via ``CompiledBriefingService._tokens``, already
+the token overlap (via ``compiled_page.tokens``, already
 precedented for cross-module reuse) with that candidate's title,
 description, and clipped body. So a pair matched only through their bodies
 is still measurable against each other, a passing body mention never ties
@@ -66,15 +66,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from d_brain.services import compiled_page
 from d_brain.services.compiled_briefings import (
     MAX_BODY_SNIPPET_CHARS,
     CompiledBriefingCandidate,
     CompiledBriefingService,
 )
 from d_brain.services.compiled_briefs import (
-    _find_exact_matches,
-    _sources_block,
-    _trust_line,
+    find_exact_matches,
+    sources_block,
+    trust_line,
 )
 
 # See module docstring: this module's own ambiguity proxy, independent of
@@ -162,13 +163,13 @@ def _proxy_score(
         (1.2, candidate.description),
         (
             0.25,
-            CompiledBriefingService._clip(
-                CompiledBriefingService._body_without_frontmatter(candidate.text),
+            compiled_page.clip(
+                compiled_page.body_without_frontmatter(candidate.text),
                 MAX_BODY_SNIPPET_CHARS,
             ),
         ),
     ):
-        overlap = query_tokens & CompiledBriefingService._tokens(text)
+        overlap = query_tokens & compiled_page.tokens(text)
         text_score += weight * len(overlap)
     return text_score
 
@@ -192,7 +193,7 @@ def resolve_why_target(
     each ``status`` means and how large ``ambiguous`` can get.
     ``ambiguous`` is only non-empty when ``status == "ambiguous"``.
     """
-    exact = _find_exact_matches(candidates, domain=None, query=query)
+    exact = find_exact_matches(candidates, domain=None, query=query)
     if len(exact) == 1:
         return "resolved", exact[0], ()
     if exact:
@@ -205,14 +206,14 @@ def resolve_why_target(
         # -- there is no ranking here that could justify dropping one.
         return "ambiguous", None, tuple(exact)
 
-    ranked = service._rank_candidates(query, limit=2)
+    ranked = service.rank_candidates(query, limit=2)
     if not ranked:
         return "not_found", None, ()
     if len(ranked) == 1:
         return "resolved", ranked[0], ()
 
     query_lower = (query or "").strip().lower()
-    query_tokens = CompiledBriefingService._tokens(query)
+    query_tokens = compiled_page.tokens(query)
     top_score = _proxy_score(query_lower, query_tokens, ranked[0])
     runner_up_score = _proxy_score(query_lower, query_tokens, ranked[1])
     if top_score > 0 and runner_up_score >= top_score * AMBIGUITY_RATIO:
@@ -222,7 +223,7 @@ def resolve_why_target(
 
 def _claim_history_block(text: str) -> list[str]:
     """ТЗ: claim-history table (replacements)."""
-    rows = CompiledBriefingService._claim_history_rows(text)
+    rows = compiled_page.claim_history_rows(text)
     if not rows:
         return ["- замен не зафиксировано"]
     return [
@@ -234,7 +235,7 @@ def _claim_history_block(text: str) -> list[str]:
 
 def _open_conflicts_block(text: str) -> list[str]:
     """ТЗ: open conflicts (both sides)."""
-    rows = CompiledBriefingService._open_conflicts_rows(text)
+    rows = compiled_page.open_conflicts_rows(text)
     if not rows:
         return ["- открытых конфликтов нет"]
     return [
@@ -246,19 +247,19 @@ def _open_conflicts_block(text: str) -> list[str]:
 
 def _render_why(candidate: CompiledBriefingCandidate) -> str:
     text = candidate.text
-    fields = CompiledBriefingService._frontmatter_fields(text)
+    fields = compiled_page.frontmatter_fields(text)
     last_verified = fields.get("last_verified", "").strip()
     human_reviewed = fields.get("human_reviewed", "").strip()
-    enrichment_count = CompiledBriefingService._int_value(
+    enrichment_count = compiled_page.int_value(
         fields.get("enrichment_count"), default=0
     )
 
     lines = [
         f"**Почему страница говорит так — {candidate.title}**",
-        _trust_line(text),
+        trust_line(text),
         "",
         "**Источники (по датам)**",
-        *_sources_block(text),
+        *sources_block(text),
         "",
         "**История утверждений (замены)**",
         *_claim_history_block(text),
@@ -284,7 +285,7 @@ def build_why_for_path(vault_path: Path, rel_path: str) -> WhyResult | None:
     disambiguation callback (the owner already picked one of the two
     offered choices, so no re-resolution is needed)."""
     service = CompiledBriefingService(Path(vault_path))
-    for candidate in service._iter_candidates():
+    for candidate in service.iter_candidates():
         if candidate.rel_path == rel_path:
             return WhyResult(
                 rel_path=candidate.rel_path,
@@ -301,7 +302,7 @@ def build_why(vault_path: Path, query: str) -> WhyOutcome:
     already on disk, calls no model, writes nothing.
     """
     service = CompiledBriefingService(Path(vault_path))
-    candidates = service._iter_candidates()
+    candidates = service.iter_candidates()
     status, target, ambiguous_pair = resolve_why_target(service, candidates, query)
 
     if status == "not_found":

@@ -82,15 +82,12 @@ def _read_source_excerpt(vault_path: Path, rel_path: str) -> str:
 def _run_dry_run(
     service: CompiledBriefingService, vault_path: Path, rel_paths: list[str]
 ) -> dict[str, Any]:
-    # ``_normalize_rel_path``/``_load_queue`` are private -- there is no
-    # public read-only equivalent on ``CompiledBriefingService`` today, and
-    # this CLI is not allowed to add one (out of scope for this task). Both
-    # are pure/read-only (string normalization and a queue-file read), so
-    # reusing them here previews the same thing ``enqueue_refresh`` would
-    # actually do, instead of re-implementing that logic and risking drift.
+    # ``normalize_rel_path``/``load_queue`` are pure/read-only (string
+    # normalization and a queue-file read), so reusing them previews the same
+    # thing ``enqueue_refresh`` would actually do, without re-implementing it.
     would_enqueue = []
     for rel_path in rel_paths:
-        normalized = service._normalize_rel_path(rel_path)  # noqa: SLF001
+        normalized = service.normalize_rel_path(rel_path)
         would_enqueue.append(
             {
                 "source": rel_path,
@@ -99,7 +96,7 @@ def _run_dry_run(
                 and not normalized.startswith("compiled/"),
             }
         )
-    queue = service._load_queue()  # noqa: SLF001
+    queue = service.load_queue()
     current_queue = [
         {
             "source_path": entry.get("source_path"),
@@ -132,7 +129,7 @@ def _run_rollback(service: CompiledBriefingService, pass_id: str) -> dict[str, A
         # reverts them) -- without this, restored pages stay searchable
         # under whatever the rollback put back while the index still
         # reflects the rolled-back content.
-        service._refresh_qmd_index()  # noqa: SLF001
+        service.refresh_qmd_index()
     # ``manifest_found`` tells apart "nothing to roll back because this
     # pass_id has no snapshot at all" (made-up id, typo, already cleaned up
     # by retention) from "nothing to roll back because this pass genuinely

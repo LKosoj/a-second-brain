@@ -334,3 +334,37 @@ def test_personal_storage_and_directions_are_injected(tmp_path, write_vault_mani
         assert f"{domain} index." in pack.text
     assert "directions.md" in pack.loaded_paths
     assert "Направления и места хранения." in pack.text
+
+
+def test_context_pack_hook_reads_timezone_from_dotenv(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from d_brain import clock, run_context_pack
+
+    # The hook gets neither the service EnvironmentFile nor Settings, so the
+    # owner's zone must come from the project .env.
+    (tmp_path / ".env").write_text("TIMEZONE=Pacific/Auckland\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TIMEZONE", raising=False)
+    monkeypatch.setattr(sys, "argv", ["run_context_pack"])
+
+    assert run_context_pack.main() == 1  # no manifest in tmp_path
+    zone = clock.owner_tz()
+    assert zone is not None and str(zone) == "Pacific/Auckland"
+
+
+def test_context_pack_hook_survives_invalid_timezone_in_dotenv(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    from d_brain import clock, run_context_pack
+
+    clock._reset_for_tests()
+    (tmp_path / ".env").write_text("TIMEZONE=Not/AZone\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TIMEZONE", raising=False)
+    monkeypatch.setattr(sys, "argv", ["run_context_pack"])
+
+    assert run_context_pack.main() == 1  # no manifest in tmp_path
+    # The failure must come from the missing manifest, not the bad zone.
+    assert "vault-manifest.json is missing" in capsys.readouterr().err
+    clock._reset_for_tests()

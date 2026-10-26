@@ -354,7 +354,7 @@ def test_document_archive_service_uses_detailed_llm_summary_when_available(
     vault_path = tmp_path / "vault"
     service = DocumentArchiveService(vault_path, ai_cli="qwen")
     captured: dict[str, str] = {}
-    service.runner.run = lambda prompt, timeout: (  # type: ignore[method-assign]
+    service.runner.run = lambda prompt, timeout, **kwargs: (  # type: ignore[method-assign]
         captured.__setitem__("prompt", prompt)
         or (
             '{"summary":"Коротко: документ о квартальном отчёте.'
@@ -386,7 +386,7 @@ def test_document_archive_service_bounds_large_summary_prompt(
     service = DocumentArchiveService(vault_path, ai_cli="qwen")
     captured: dict[str, str] = {}
     large_body = "A" * DOCUMENT_SUMMARY_INPUT_CHARS + "TAIL_SHOULD_NOT_APPEAR"
-    service.runner.run = lambda prompt, timeout: (  # type: ignore[method-assign]
+    service.runner.run = lambda prompt, timeout, **kwargs: (  # type: ignore[method-assign]
         captured.__setitem__("prompt", prompt) or '{"summary":"bounded"}'
     )
 
@@ -497,7 +497,7 @@ def test_link_summary_service_degrades_gracefully_on_summary_error() -> None:
 def test_link_summary_llm_prompt_filters_boilerplate() -> None:
     service = LinkSummaryService("/tmp/vault", "qwen", "en")
     captured: dict[str, str] = {}
-    service.runner.run = lambda prompt, timeout: (  # type: ignore[method-assign]
+    service.runner.run = lambda prompt, timeout, **kwargs: (  # type: ignore[method-assign]
         captured.__setitem__("prompt", prompt) or '{"summary":"ok"}'
     )
 
@@ -515,7 +515,7 @@ def test_link_summary_llm_prompt_filters_boilerplate() -> None:
 def test_link_summary_youtube_prompt_requests_detail() -> None:
     service = LinkSummaryService("/tmp/vault", "qwen", "ru")
     captured: dict[str, str] = {}
-    service.runner.run = lambda prompt, timeout: (  # type: ignore[method-assign]
+    service.runner.run = lambda prompt, timeout, **kwargs: (  # type: ignore[method-assign]
         captured.__setitem__("prompt", prompt) or '{"summary":"ok"}'
     )
 

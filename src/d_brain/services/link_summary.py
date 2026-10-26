@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ipaddress
 import logging
 import re
 import socket
@@ -26,6 +25,7 @@ from d_brain.services.web_content import (
     WebContentResult,
     extract_web_content,
     html_to_text,
+    is_public_ip,
 )
 from d_brain.services.youtube_transcript import (
     YouTubeArchiveService,
@@ -33,7 +33,6 @@ from d_brain.services.youtube_transcript import (
     YouTubeTranscriptService,
 )
 
-CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 LINK_SUMMARY_TIMEOUT = 45
 YOUTUBE_SUMMARY_TIMEOUT = 120
 GENERIC_URL_RE = re.compile(r"https?://[^\s<>()\[\]\"']+", re.IGNORECASE)
@@ -404,21 +403,8 @@ class LinkSummaryService:
         if hostname.lower() == "localhost":
             return False
 
-        def _is_public_ip(value: str) -> bool:
-            ip = ipaddress.ip_address(value)
-            if isinstance(ip, ipaddress.IPv4Address) and ip in CGNAT_NETWORK:
-                return False
-            return not (
-                ip.is_private
-                or ip.is_loopback
-                or ip.is_link_local
-                or ip.is_multicast
-                or ip.is_reserved
-                or ip.is_unspecified
-            )
-
         try:
-            return _is_public_ip(hostname)
+            return is_public_ip(hostname)
         except ValueError:
             try:
                 infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
@@ -428,7 +414,7 @@ class LinkSummaryService:
             for info in infos:
                 address = cast(str, info[4][0])
                 try:
-                    if not _is_public_ip(address):
+                    if not is_public_ip(address):
                         return False
                     resolved_any = True
                 except ValueError:
@@ -471,7 +457,7 @@ class LinkSummaryService:
             "[CONTENT]\n"
             f"{content}\n"
         )
-        output = self.runner.run(prompt, timeout=LINK_SUMMARY_TIMEOUT)
+        output = self.runner.run_untrusted(prompt, timeout=LINK_SUMMARY_TIMEOUT)
         payload = extract_first_json_dict(
             output,
             error_context="link summary output",
@@ -517,7 +503,7 @@ class LinkSummaryService:
             f"{content}\n"
             "[END TRANSCRIPT]\n"
         )
-        output = self.runner.run(prompt, timeout=YOUTUBE_SUMMARY_TIMEOUT)
+        output = self.runner.run_untrusted(prompt, timeout=YOUTUBE_SUMMARY_TIMEOUT)
         payload = extract_first_json_dict(
             output,
             error_context="YouTube summary output",

@@ -9,11 +9,17 @@ import json
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
+from d_brain.clock import owner_now, owner_today
+
 logger = logging.getLogger(__name__)
+
+_SAVED_ENTRY_TYPES = frozenset(
+    {"text", "photo", "edit", "voice", "forward", "document"}
+)
 
 
 class SessionStore:
@@ -34,7 +40,7 @@ class SessionStore:
 
     @staticmethod
     def _local_today() -> date:
-        return datetime.now().astimezone().date()
+        return owner_today()
 
     def _get_session_file(self, user_id: int, day: date | None = None) -> Path:
         if day is None:
@@ -60,7 +66,7 @@ class SessionStore:
             entry_type: Type of entry (voice, text, photo, forward, command, etc.)
             **data: Additional data to store (text, duration, msg_id, etc.)
         """
-        now = datetime.now().astimezone()
+        now = owner_now()
         entry = {
             "ts": now.isoformat(),
             "type": entry_type,
@@ -113,6 +119,43 @@ class SessionStore:
                     return list(reversed(recent_reversed))
 
         return list(reversed(recent_reversed))
+
+    def _saved_files(self, user_id: int, day: date) -> list[Path]:
+        """Existing session files from ``day`` to two days later, newest first."""
+        user_dir = self.sessions_dir / str(user_id)
+        paths = [
+            user_dir / f"{(day + timedelta(days=offset)).isoformat()}.jsonl"
+            for offset in (2, 1, 0)
+        ]
+        return [path for path in paths if path.exists()]
+
+    def find_by_msg_id(
+        self, user_id: int, msg_id: int, day: date
+    ) -> dict[str, Any] | None:
+        """Find the latest saved-message record for one Telegram message id.
+
+        A record lands in the file of the day it was *written*, which can be
+        later than the message date, and Telegram allows an edit for 48 hours,
+        so three days are read. Questions
+        and commands are not saved entries and never match. Reads only: a
+        stranger's id must not create a session directory.
+        """
+        for path in self._saved_files(user_id, day):
+            for entry in reversed(self._read_entries(path)):
+                if (
+                    entry.get("msg_id") == msg_id
+                    and entry.get("type") in _SAVED_ENTRY_TYPES
+                ):
+                    return dict(entry)
+        return None
+
+    def was_undone(self, user_id: int, source_ref: str, day: date) -> bool:
+        """True if /undo removed the entry with this ref (same window as above)."""
+        return any(
+            entry.get("type") == "undo" and entry.get("source_ref") == source_ref
+            for path in self._saved_files(user_id, day)
+            for entry in self._read_entries(path)
+        )
 
     def get_today(self, user_id: int) -> list[dict[str, Any]]:
         """Get today's session entries.
@@ -167,7 +210,7 @@ class SessionStore:
         directory.mkdir(exist_ok=True)
         path = directory / f"{chat_id}.jsonl"
         entry = {
-            "ts": datetime.now().astimezone().isoformat(),
+            "ts": owner_now().isoformat(),
             "message_id": message_id,
             "parent_id": parent_id,
             "question": question,

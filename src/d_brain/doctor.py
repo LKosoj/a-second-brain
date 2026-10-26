@@ -9,15 +9,21 @@ import shutil
 import stat
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal, TextIO
+from urllib.parse import urlsplit
 
+import httpx
 from dotenv import dotenv_values
 
+from d_brain.clock import resolve_timezone, system_timezone_name
+from d_brain.config import parse_clock_time
 from d_brain.control_plane.registry import validate_control_plane_registry
 from d_brain.manifest import ManifestValidationError, VaultManifest, load_manifest
+from d_brain.services.web_content import is_public_ip
 
 CheckLevel = Literal["OK", "INFO", "WARN", "ERR"]
 SUPPORTED_AI_CLIS = frozenset(
@@ -49,13 +55,48 @@ KNOWN_ENV_KEYS = frozenset(
         "TODOIST_API_KEY",
         "PLAUD_BEARER_TOKEN",
         "PLAUD_REGION",
+        "CALENDAR_ICS_URL",
         "VAULT_BACKUP_GPG_RECIPIENT",
         "VAULT_BACKUP_DIR",
         "VAULT_PATH",
+        "OPENAI_BASE_URL",
+        "OPENAI_MODEL",
+        "MORNING_BRIEF_TIME",
+        "DAILY_PROCESS_TIME",
     }
 )
+# (outcome, detail): detail is the bot username or an exception class name,
+# never anything that can carry the token.
+TelegramProbe = tuple[Literal["ok", "rejected", "unreachable"], str]
+LEGACY_OPENAI_NAMES = (("BASE_URL", "OPENAI_BASE_URL"), ("MODEL", "OPENAI_MODEL"))
+SCHEDULE_TIME_KEYS = ("MORNING_BRIEF_TIME", "DAILY_PROCESS_TIME")
 SUPPORTED_PLAUD_REGIONS = frozenset({"api", "api-euc1"})
 _ENV_ASSIGNMENT_RE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+
+
+def _probe_telegram(token: str) -> TelegramProbe:
+    """Ask Telegram ``getMe`` whether the bot token is accepted.
+
+    httpx puts the request URL (with the token) into its exception messages,
+    so only the exception class name may leave this function.
+    """
+    try:
+        response = httpx.get(f"https://api.telegram.org/bot{token}/getMe", timeout=5.0)
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
+        return "unreachable", type(exc).__name__
+    if response.status_code in (401, 404):
+        return "rejected", ""
+    if response.status_code != 200:
+        return "unreachable", f"HTTP {response.status_code}"
+    try:
+        payload = response.json()
+    except ValueError:
+        return "unreachable", "InvalidJSON"
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        return "unreachable", "UnexpectedResponse"
+    result = payload.get("result")
+    username = result.get("username") if isinstance(result, dict) else None
+    return "ok", f"@{username}" if isinstance(username, str) and username else "bot"
 
 
 def _first_symlink_component(path: Path) -> Path | None:
@@ -87,6 +128,10 @@ def _has_unquoted_risky_value(raw_value: str) -> bool:
             return False
     value = value.split(" #", 1)[0].rstrip()
     return " " in value or "$" in value
+
+
+def _system_utc_offset() -> timedelta | None:
+    return datetime.now().astimezone().utcoffset()
 
 
 @dataclass(frozen=True)
@@ -139,10 +184,16 @@ class ProjectDoctor:
         *,
         smoke: bool = False,
         environ: Mapping[str, str] | None = None,
+        telegram_probe: Callable[[str], TelegramProbe] | None = None,
     ) -> None:
         self.project_dir = Path(project_dir).expanduser().resolve()
         self.smoke = smoke
         self.process_environ = dict(os.environ if environ is None else environ)
+        # Network only when run from the CLI (no explicit environ), so tests
+        # and embedded calls with a fixed environment stay offline.
+        if telegram_probe is None and environ is None:
+            telegram_probe = _probe_telegram
+        self.telegram_probe = telegram_probe
         self.report = DoctorReport(self.project_dir)
         self.values: dict[str, str] = {}
         self.manifest: VaultManifest | None = None
@@ -153,6 +204,10 @@ class ProjectDoctor:
     def run(self) -> DoctorReport:
         self._load_environment()
         self._check_environment()
+        self._check_telegram_token()
+        self._check_schedule_times()
+        self._check_timezone()
+        self._check_openai_names()
         self._check_project_files()
         self._check_control_plane_registry()
         self._check_commands()
@@ -225,11 +280,19 @@ class ProjectDoctor:
             )
 
     def _check_environment(self) -> None:
-        for name in ("TELEGRAM_BOT_TOKEN", "DEEPGRAM_API_KEY"):
-            if self._value(name):
-                self.report.add("OK", f"{name} is set")
-            else:
-                self.report.add("ERR", f"{name} is missing")
+        if self._value("TELEGRAM_BOT_TOKEN"):
+            self.report.add("OK", "TELEGRAM_BOT_TOKEN is set")
+        else:
+            self.report.add("ERR", "TELEGRAM_BOT_TOKEN is missing")
+
+        if self._value("DEEPGRAM_API_KEY"):
+            self.report.add("OK", "DEEPGRAM_API_KEY is set")
+        else:
+            self.report.add(
+                "WARN",
+                "DEEPGRAM_API_KEY is not set; voice messages are saved as audio "
+                "marked 'не распознано' and transcribed after the key is added",
+            )
 
         owner_id = self._value("OWNER_TELEGRAM_ID")
         if owner_id.isdigit() and int(owner_id) > 0:
@@ -254,6 +317,89 @@ class ProjectDoctor:
                 "INFO",
                 "OWNER_FULL_NAME is not set; ownership prompts use fallback wording",
             )
+
+    def _check_telegram_token(self) -> None:
+        token = self._value("TELEGRAM_BOT_TOKEN")
+        if not token or self.telegram_probe is None:
+            return
+        outcome, detail = self.telegram_probe(token)
+        if outcome == "ok":
+            self.report.add("OK", f"Telegram accepted TELEGRAM_BOT_TOKEN ({detail})")
+        elif outcome == "rejected":
+            self.report.add("ERR", "Telegram rejected TELEGRAM_BOT_TOKEN")
+        else:
+            self.report.add(
+                "WARN",
+                f"Could not reach Telegram to verify TELEGRAM_BOT_TOKEN "
+                f"({detail}); check skipped",
+            )
+
+    def _check_schedule_times(self) -> None:
+        for name in SCHEDULE_TIME_KEYS:
+            value = self._value(name)
+            if value and parse_clock_time(value) is None:
+                self.report.add(
+                    "WARN",
+                    f"{name} must be HH:MM (00:00-23:59); the installer will "
+                    "refuse it and the default time applies at runtime",
+                )
+            elif name == "DAILY_PROCESS_TIME" and value:
+                parsed = parse_clock_time(value)
+                if parsed is not None and parsed[0] < 6:
+                    self.report.add(
+                        "WARN",
+                        f"{name} {value.strip()} is in the small hours; a run "
+                        "before that time is treated as catch-up for the "
+                        "previous day, and a run just after midnight sees an "
+                        "empty new day. Pick an evening time",
+                    )
+
+    def _check_timezone(self) -> None:
+        value = self._value("TIMEZONE")
+        system_name = system_timezone_name()
+        if not value:
+            self.report.add(
+                "OK",
+                f"TIMEZONE is not set; the system zone {system_name} "
+                "defines the day",
+            )
+            return
+        try:
+            zone = resolve_timezone(value)
+        except ValueError:
+            self.report.add(
+                "ERR", "TIMEZONE must be an IANA name such as Europe/Moscow"
+            )
+            return
+        owner_offset = datetime.now(zone).utcoffset()
+        if owner_offset == _system_utc_offset():
+            self.report.add(
+                "OK", f"TIMEZONE {value} matches the system zone {system_name}"
+            )
+            return
+        self.report.add(
+            "WARN",
+            f"TIMEZONE {value} differs from the system zone {system_name}: "
+            "entries and reminders follow TIMEZONE, systemd timers carry it "
+            "from the installer, but launchd runs by the system clock, so the "
+            "installer converts the hours. Re-run the installer after a "
+            "daylight-saving change or any TIMEZONE change",
+        )
+
+    def _check_openai_names(self) -> None:
+        for legacy, current in LEGACY_OPENAI_NAMES:
+            old, new = self._value(legacy), self._value(current)
+            if old and not new:
+                self.report.add(
+                    "WARN",
+                    f"{legacy} is the legacy name; rename it to {current} "
+                    "(the old name still works)",
+                )
+            elif old and new and old != new:
+                self.report.add(
+                    "WARN",
+                    f"both {legacy} and {current} are set; {current} wins",
+                )
 
     def _check_project_files(self) -> None:
         raw_vault_path = self._value("VAULT_PATH") or "./vault"
@@ -387,6 +533,41 @@ class ProjectDoctor:
                 "WARN",
                 f"PLAUD_REGION '{plaud_region}' is not one of: {supported}",
             )
+
+        self._check_calendar()
+
+    def _check_calendar(self) -> None:
+        # The link is a secret: no message below repeats it. DNS is not asked
+        # (doctor works offline), so only literal addresses and localhost are
+        # recognised as non-public.
+        url = self._value("CALENDAR_ICS_URL")
+        if not url:
+            self.report.add("INFO", "Calendar is not configured")
+            return
+        try:
+            parts = urlsplit(url)
+            host = (parts.hostname or "").lower()
+            schemes = {"http", "https", "webcal", "webcals"}
+            valid = parts.scheme.lower() in schemes and bool(host)
+        except ValueError:
+            valid = False
+        if not valid:
+            self.report.add(
+                "ERR", "CALENDAR_ICS_URL must be an http(s) or webcal link"
+            )
+            return
+        try:
+            public = is_public_ip(host)
+        except ValueError:
+            public = host != "localhost" and not host.endswith(".localhost")
+        if not public:
+            self.report.add(
+                "WARN",
+                "CALENDAR_ICS_URL points to a non-public address; "
+                "the calendar will be skipped",
+            )
+            return
+        self.report.add("OK", "Calendar is configured")
 
     def _check_backup(self) -> None:
         recipient = self._value("VAULT_BACKUP_GPG_RECIPIENT")
@@ -529,9 +710,15 @@ def run_doctor(
     smoke: bool = False,
     environ: Mapping[str, str] | None = None,
     stream: TextIO | None = None,
+    telegram_probe: Callable[[str], TelegramProbe] | None = None,
 ) -> int:
     """Inspect one project and return a process-compatible status code."""
 
-    report = ProjectDoctor(project_dir, smoke=smoke, environ=environ).run()
+    report = ProjectDoctor(
+        project_dir,
+        smoke=smoke,
+        environ=environ,
+        telegram_probe=telegram_probe,
+    ).run()
     report.render(sys.stdout if stream is None else stream)
     return 1 if report.error_count else 0

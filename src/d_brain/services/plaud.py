@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import subprocess
-import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
@@ -16,10 +14,11 @@ from typing import Any, cast
 
 import httpx
 
+from d_brain.clock import to_owner
 from d_brain.control_plane.contracts import WorkflowSpec
 from d_brain.control_plane.registry import get_workflow
 from d_brain.manifest import VaultManifest, load_manifest_for_vault
-from d_brain.services.cli_runner import CliRunner, build_subprocess_env
+from d_brain.services.cli_runner import CliRunner
 from d_brain.services.compiled_briefings import CompiledBriefingService
 from d_brain.services.entry_status import (
     ENTRY_STATUS_ALREADY_PROCESSED,
@@ -49,6 +48,11 @@ from d_brain.services.storage import VaultStorage
 from d_brain.services.todoist_projects import (
     TodoistProjectCatalog,
     TodoistProjectRouter,
+)
+from d_brain.services.todoist_tasks import (
+    TodoistCreateStatus,
+    create_todoist_tasks,
+    tasks_fingerprint,
 )
 
 logger = logging.getLogger(__name__)
@@ -482,6 +486,8 @@ class PlaudSyncService:
             catalog=self.project_catalog,
         )
         self._owns_client = client is None
+        # Titles of tasks Todoist accepted without an id during the current sync.
+        self._unconfirmed_titles: list[str] = []
         self._workflow = self._load_control_plane_workflow()
 
     @classmethod
@@ -563,7 +569,7 @@ class PlaudSyncService:
         return env
 
     def _run_prompt(self, prompt: str) -> str:
-        return self.runner.run(
+        return self.runner.run_untrusted(
             prompt,
             timeout=PLAUD_TASK_TIMEOUT,
             extra_env=self._cli_extra_env(),
@@ -575,10 +581,10 @@ class PlaudSyncService:
         for key in ("record_time", "create_time", "created_at", "updated_at"):
             parsed = _parse_timestamp(payload.get(key))
             if parsed is not None:
-                return parsed.astimezone()
+                return to_owner(parsed)
         if fallback is not None:
-            return fallback.astimezone()
-        return _utc_now().astimezone()
+            return to_owner(fallback)
+        return to_owner(_utc_now())
 
     def _file_paths(self, file_id: str, recorded_at: datetime) -> tuple[Path, Path]:
         year_dir = f"{recorded_at:%Y}"
@@ -874,7 +880,7 @@ class PlaudSyncService:
             "file_id": detail.get("file_id") or detail.get("id"),
             "title": detail.get("title"),
             "recorded_at": recorded_at.isoformat(),
-            "age_days": (_utc_now().astimezone().date() - recorded_at.date()).days,
+            "age_days": (to_owner(_utc_now()).date() - recorded_at.date()).days,
             "retro_todo_allowed": retro_todo_allowed,
             "summary_length": len(summary_text),
             "transcript_length": len(transcript),
@@ -927,9 +933,7 @@ class PlaudSyncService:
         return normalized
 
     def _todoist_fingerprint(self, tasks: list[dict[str, Any]]) -> str:
-        return sha256(
-            json.dumps(tasks, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        ).hexdigest()
+        return tasks_fingerprint(tasks)
 
     def _create_todoist_tasks(
         self,
@@ -938,83 +942,38 @@ class PlaudSyncService:
         source_context: str = "",
     ) -> list[str] | None:
         """Create tasks, returning ``None`` when the external outcome is unknown."""
-        if not tasks or not self.todoist_api_key:
+        if not tasks:
             return []
-        catalog_result = self.project_catalog.get_catalog(force_refresh=True)
-        catalog = catalog_result["catalog"] if catalog_result["available"] else None
-        payload: dict[str, list[dict[str, Any]]] = {"tasks": []}
-        for task in tasks:
-            route = self.project_router.route_task(
-                task,
-                source_context=source_context,
-                catalog=catalog,
-            )
-            payload_task = {
-                "content": task["content"],
-                "priority": f"p{task['priority']}",
-                **({"dueString": task["due_hint"]} if task["due_hint"] else {}),
-            }
-            if route.get("project_id"):
-                payload_task["projectId"] = route["project_id"]
-            payload["tasks"].append(payload_task)
-        env = self._cli_extra_env()
-        command = [
-            "mcp-cli",
-            "call",
-            "todoist",
-            "add-tasks",
-            json.dumps(payload, ensure_ascii=False),
-        ]
-        errors: list[str] = []
-        for attempt in range(3):
-            if attempt > 0:
-                time.sleep(2 * attempt)
-            try:
-                result = subprocess.run(
-                    command,
-                    cwd=self.vault_path,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    env=build_subprocess_env(env),
-                    timeout=3600,
-                )
-            except subprocess.TimeoutExpired:
+        result = create_todoist_tasks(
+            tasks,
+            vault_path=self.vault_path,
+            api_key=self.todoist_api_key,
+            extra_env=self._cli_extra_env(),
+            project_catalog=self.project_catalog,
+            project_router=self.project_router,
+            source_context=source_context,
+        )
+        if result.status is TodoistCreateStatus.CREATED:
+            if result.unconfirmed:
+                # PLAUD state tracks one id list per recording, so tasks Todoist
+                # returned no id for can only be surfaced here for a manual check
+                # and in the sync result.
                 logger.warning(
-                    "Todoist creation timed out; external outcome is unknown"
+                    "PLAUD: %d Todoist task(s) unconfirmed, check manually: %s",
+                    len(result.unconfirmed),
+                    "; ".join(
+                        str(item.get("content") or "") for item in result.unconfirmed
+                    ),
                 )
-                return None
-            if result.returncode == 0:
-                try:
-                    parsed = extract_first_json_dict(
-                        result.stdout,
-                        error_context="PLAUD Todoist MCP output",
-                    )
-                except ValueError:
-                    logger.warning(
-                        "Todoist creation returned malformed success output; "
-                        "external outcome is unknown"
-                    )
-                    return None
-                task_items = parsed.get("tasks")
-                if not isinstance(task_items, list):
-                    structured = parsed.get("structuredContent")
-                    if isinstance(structured, dict):
-                        task_items = structured.get("tasks") or structured.get(
-                            "created"
-                        )
-                created_ids: list[str] = []
-                for item in task_items or []:
-                    if isinstance(item, dict) and item.get("id"):
-                        created_ids.append(str(item["id"]))
-                if created_ids:
-                    return created_ids
-                logger.warning(
-                    "Todoist creation returned no task IDs; external outcome is unknown"
+                # Titles come from the PLAUD cloud: collapse them like the nightly
+                # digest does so they cannot start a line of their own.
+                self._unconfirmed_titles.extend(
+                    collapse_to_single_line(str(item.get("content") or ""))
+                    for item in result.unconfirmed
                 )
-                return None
-            errors.append(result.stderr.strip() or result.stdout.strip())
-        logger.warning("Todoist creation failed after retries: %s", " | ".join(errors))
+            return [item["id"] for item in result.created]
+        if result.status is TodoistCreateStatus.UNCONFIRMED:
+            return None
         return []
 
     def _refresh_qmd_index(self) -> dict[str, Any]:
@@ -1079,7 +1038,7 @@ class PlaudSyncService:
         state: dict[str, Any],
         allow_retro_todo: bool,
     ) -> dict[str, Any]:
-        imported_at = _utc_now().astimezone()
+        imported_at = to_owner(_utc_now())
         file_id = _safe_text(detail.get("file_id") or detail.get("id"))
         if not file_id:
             return {"status": "skipped", "reason": "missing-file-id"}
@@ -1130,7 +1089,7 @@ class PlaudSyncService:
             )
             pending_age_days = max(
                 (imported_at.date() - recorded_at.date()).days,
-                (imported_at.date() - first_seen_at.astimezone().date()).days,
+                (imported_at.date() - to_owner(first_seen_at).date()).days,
             )
             if transcript and pending_age_days > PLAUD_PENDING_SUMMARY_MAX_AGE_DAYS:
                 pending_summary_note = PLAUD_SUMMARY_UNAVAILABLE_NOTE
@@ -1147,7 +1106,7 @@ class PlaudSyncService:
                 self._save_state(state)
                 return {"status": "pending_summary", "file_id": file_id}
 
-        record_age_days = (_utc_now().astimezone().date() - recorded_at.date()).days
+        record_age_days = (to_owner(_utc_now()).date() - recorded_at.date()).days
         within_window = record_age_days <= PLAUD_TASK_WINDOW_DAYS
         retro_todo_allowed = allow_retro_todo and within_window
         owner_eval_pending = within_window and not allow_retro_todo
@@ -1407,7 +1366,7 @@ class PlaudSyncService:
         every slot and newer pending/placeholder records would never be
         checked at all.
         """
-        now = _utc_now().astimezone()
+        now = to_owner(_utc_now())
         pending: list[tuple[datetime, str]] = []
         for file_id, record in state.get("recordings", {}).items():
             if not isinstance(record, dict):
@@ -1423,7 +1382,7 @@ class PlaudSyncService:
                 or _parse_timestamp(record.get("recorded_at"))
                 or now
             )
-            age_days = (now.date() - first_seen.astimezone().date()).days
+            age_days = (now.date() - to_owner(first_seen).date()).days
             if age_days > PLAUD_PENDING_SUMMARY_GIVE_UP_DAYS:
                 continue
             pending.append((first_seen, file_id))
@@ -1475,6 +1434,7 @@ class PlaudSyncService:
     ) -> dict[str, Any]:
         self._manifest_for_writes()
         with plaud_state_lock(self._state_path, blocking=False):
+            self._unconfirmed_titles = []
             state = self._load_state()
             counters = {
                 "seen": 0,
@@ -1531,6 +1491,16 @@ class PlaudSyncService:
                 "dirty_weeks": state.get("dirty_weeks", []),
                 "errors": errors,
             }
+            if self._unconfirmed_titles:
+                titles = self._unconfirmed_titles
+                result["tasks_unconfirmed"] = [{"content": t} for t in titles]
+                result["tasks_unconfirmed_notice"] = "\n".join(
+                    [
+                        "⚠️ Не подтверждено, проверьте в Todoist: "
+                        f"**{len(titles)}**",
+                        *(f"- {t}" for t in titles if t),
+                    ]
+                )
             if counters["imported"] > 0 and refresh_qmd:
                 result["qmd"] = self._refresh_qmd_index()
             return result

@@ -88,3 +88,48 @@ async def test_auth_blocks_callback_query_without_user() -> None:
     result = await middleware(handler, update, {})
     handler.assert_not_awaited()
     assert result is None
+
+
+def _update_in_chat(user_id: int, chat_type: str, *, via_callback: bool = False):
+    chat = SimpleNamespace(id=-5, type=chat_type)
+    user = SimpleNamespace(id=user_id)
+    if via_callback:
+        return SimpleNamespace(
+            message=None,
+            callback_query=SimpleNamespace(
+                from_user=user, message=SimpleNamespace(chat=chat)
+            ),
+        )
+    return SimpleNamespace(
+        message=SimpleNamespace(from_user=user, chat=chat), callback_query=None
+    )
+
+
+@pytest.mark.asyncio
+async def test_auth_ignores_owner_message_in_group(caplog) -> None:
+    middleware = create_auth_middleware(_make_settings(owner_id=42))
+    handler = AsyncMock()
+    with caplog.at_level("INFO"):
+        result = await middleware(handler, _update_in_chat(42, "group"), {})
+    handler.assert_not_awaited()
+    assert result is None
+    assert "non-private" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_auth_ignores_owner_callback_from_supergroup_message() -> None:
+    middleware = create_auth_middleware(_make_settings(owner_id=42))
+    handler = AsyncMock()
+    update = _update_in_chat(42, "supergroup", via_callback=True)
+    result = await middleware(handler, update, {})
+    handler.assert_not_awaited()
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_auth_allows_owner_in_private_chat() -> None:
+    middleware = create_auth_middleware(_make_settings(owner_id=42))
+    handler = AsyncMock(return_value="ok")
+    result = await middleware(handler, _update_in_chat(42, "private"), {})
+    handler.assert_awaited_once()
+    assert result == "ok"

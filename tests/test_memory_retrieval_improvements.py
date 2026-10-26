@@ -101,7 +101,7 @@ def test_qmd_scope_reaches_backend_for_local_and_remote_models(
         calls.append(command)
         return subprocess.CompletedProcess(command, 0, "[]", "")
 
-    monkeypatch.setattr("d_brain.services.qmd.subprocess.run", run)
+    monkeypatch.setattr("d_brain.services.qmd.run_in_process_group", run)
     qmd.recall("доклад начальнику", scope=("thoughts/learnings",))
     assert len(calls) == 1
     assert calls[0][0] == "node"
@@ -204,7 +204,7 @@ def test_semantic_lesson_recall_handles_paraphrase_without_accepting_other_notes
         'lesson: "Сначала вывод"\nsource: "telegram:1:2"\n'
         'exceptions: ["Не применять к техническому приложению"]\n---\n'
     )
-    db_path = QmdService(tmp_path)._db_path
+    db_path = QmdService(tmp_path).db_path
     db_path.parent.mkdir(parents=True)
     db_path.touch()
 

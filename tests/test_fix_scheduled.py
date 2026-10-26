@@ -3,6 +3,8 @@ self-disabling periodic steps (job health), and daily idempotency + VERIFY.
 """
 
 import json
+import os
+import time
 from datetime import date
 from pathlib import Path
 
@@ -659,6 +661,200 @@ def test_new_entry_added_after_marked_entries_is_processed_alone_on_rerun(
     assert created_tasks == ["Follow up A", "Follow up B"]
 
 
+def _stub_daily_pipeline(processor: CliProcessor, fake_run) -> None:  # type: ignore[no-untyped-def]
+    processor._run_vault_prompt = fake_run  # type: ignore[method-assign]
+    processor._refresh_qmd_index = lambda: None  # type: ignore[method-assign]
+    processor._run_memory_decay = lambda: None  # type: ignore[method-assign]
+    processor._capture_creative_recall = lambda *a, **k: None  # type: ignore[method-assign]
+    processor._run_vault_health_maintenance = lambda: None  # type: ignore[method-assign]
+    processor._capture_memory_audit = lambda: None  # type: ignore[method-assign]
+    processor._rebuild_graph = lambda: True  # type: ignore[method-assign]
+
+
+def _capture_json_for(day: date, entries: list[dict[str, object]]) -> str:
+    return json.dumps(
+        {
+            "date": day.isoformat(),
+            "entries": entries,
+            "stats": {"total_entries": len(entries)},
+        },
+        ensure_ascii=False,
+    )
+
+
+def _status_of(daily_text: str, hhmm: str) -> bool:
+    """True when the entry block with this HH:MM carries the processed marker."""
+    block = daily_text.split(f"## {hhmm} ", 1)[1].split("\n## ", 1)[0]
+    return ENTRY_STATUS_ALREADY_PROCESSED in block
+
+
+def test_entry_arriving_during_execute_is_not_marked(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 6)
+    _setup_daily_processing_vault(vault_path, day)
+    daily_file = vault_path / "daily" / f"{day.isoformat()}.md"
+    daily_file.write_text(
+        f"# {day.isoformat()}\n\n## 09:00 [text]\nCall the vendor.\n",
+        encoding="utf-8",
+    )
+    processor = CliProcessor(vault_path)
+    capture_calls = 0
+
+    def fake_run(prompt: str) -> str:
+        nonlocal capture_calls
+        if "capture.md" in prompt:
+            capture_calls += 1
+            text = daily_file.read_text(encoding="utf-8")
+            entries = [
+                {"time": t, "type": "text", "classification": "reflection"}
+                for t in ("09:00", "11:00")
+                if f"## {t} [text]" in text
+                and not _status_of(text, t)
+            ]
+            return _capture_json_for(day, entries)
+        if "execute.md" in prompt:
+            # A new entry lands while EXECUTE is running.
+            with daily_file.open("a", encoding="utf-8") as handle:
+                handle.write("\n## 11:00 [text]\nlate\n")
+            return json.dumps(
+                {"tasks_created": [], "thoughts_saved": [], "crm_updated": []}
+            )
+        return "ok"
+
+    _stub_daily_pipeline(processor, fake_run)
+
+    processor.process_daily(day, mode=SCHEDULED_MODE)
+    text = daily_file.read_text(encoding="utf-8")
+    assert _status_of(text, "09:00")
+    assert not _status_of(text, "11:00")
+
+    second = processor.process_daily(day, mode=SCHEDULED_MODE)
+    assert capture_calls == 2
+    assert second["processed_entries"] == 1
+
+
+def test_deferred_task_entry_is_still_marked(tmp_path: Path) -> None:
+    # Deferred tasks (tasks_pending) are delivered by the retry file, so the
+    # entry must be marked: re-classifying it would create the task twice.
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 7)
+    _setup_daily_processing_vault(vault_path, day)
+    daily_file = vault_path / "daily" / f"{day.isoformat()}.md"
+    daily_file.write_text(
+        f"# {day.isoformat()}\n\n## 09:00 [text]\nBook a flight.\n"
+        "\n## 10:00 [text]\nA thought.\n",
+        encoding="utf-8",
+    )
+    processor = CliProcessor(vault_path)
+
+    def fake_run(prompt: str) -> str:
+        if "capture.md" in prompt:
+            return _capture_json_for(
+                day,
+                [
+                    {
+                        "time": "09:00",
+                        "type": "text",
+                        "classification": "task",
+                        "task_content": "Book a flight",
+                        "task_priority": 3,
+                    },
+                    {"time": "10:00", "type": "text", "classification": "reflection"},
+                ],
+            )
+        if "execute.md" in prompt:
+            return json.dumps(
+                {"tasks_created": [], "thoughts_saved": [], "crm_updated": []}
+            )
+        return "ok"
+
+    _stub_daily_pipeline(processor, fake_run)
+    processor._create_todoist_tasks = lambda tasks, **kw: []  # type: ignore[method-assign]
+
+    processor.process_daily(day, mode=SCHEDULED_MODE)
+
+    execute_json = json.loads(
+        (vault_path / ".session" / "execute.json").read_text(encoding="utf-8")
+    )
+    assert execute_json["tasks_pending"]
+    text = daily_file.read_text(encoding="utf-8")
+    assert _status_of(text, "09:00")
+    assert _status_of(text, "10:00")
+
+
+def test_marking_uses_heading_and_text_not_position(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 8)
+    _setup_daily_processing_vault(vault_path, day)
+    daily_file = vault_path / "daily" / f"{day.isoformat()}.md"
+    daily_file.write_text(
+        f"# {day.isoformat()}\n\n## 09:00 [text]\nfirst\n\n## 10:00 [text]\nsecond\n",
+        encoding="utf-8",
+    )
+    processor = CliProcessor(vault_path)
+
+    def fake_run(prompt: str) -> str:
+        if "capture.md" in prompt:
+            return _capture_json_for(
+                day,
+                [{"time": "10:00", "type": "text", "classification": "reflection"}],
+            )
+        if "execute.md" in prompt:
+            return json.dumps(
+                {"tasks_created": [], "thoughts_saved": [], "crm_updated": []}
+            )
+        return "ok"
+
+    _stub_daily_pipeline(processor, fake_run)
+
+    processor.process_daily(day, mode=SCHEDULED_MODE)
+
+    text = daily_file.read_text(encoding="utf-8")
+    assert not _status_of(text, "09:00")
+    assert _status_of(text, "10:00")
+
+
+def _two_entry_daily(vault_path: Path, day: date) -> Path:
+    _setup_daily_processing_vault(vault_path, day)
+    daily_file = vault_path / "daily" / f"{day.isoformat()}.md"
+    daily_file.write_text(
+        f"# {day.isoformat()}\n\n## 09:00 [text]\nfirst\n\n## 10:00 [text]\nsecond\n",
+        encoding="utf-8",
+    )
+    return daily_file
+
+
+def test_mark_daily_entries_processed_is_idempotent(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 9)
+    daily_file = _two_entry_daily(vault_path, day)
+    processor = CliProcessor(vault_path)
+    capture = {
+        "entries": [{"classification": "reflection"}, {"classification": "idea"}]
+    }
+
+    claimed = processor._claim_capture_entries(day, capture)
+    assert len(claimed) == 2
+    processor._mark_daily_entries_processed(day, claimed)
+    first = daily_file.read_bytes()
+    assert ENTRY_STATUS_ALREADY_PROCESSED.encode() in first
+
+    processor._mark_daily_entries_processed(day, claimed)
+    assert daily_file.read_bytes() == first
+
+
+def test_mark_with_empty_claim_does_not_touch_daily(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 10)
+    daily_file = _two_entry_daily(vault_path, day)
+    before = daily_file.read_bytes()
+    processor = CliProcessor(vault_path)
+
+    processor._mark_daily_entries_processed(day, [])
+
+    assert daily_file.read_bytes() == before
+
+
 # ---------------------------------------------------------------------------
 # Task 19b: VERIFY phase warns about missing scheduled-cycle artifacts
 # ---------------------------------------------------------------------------
@@ -771,6 +967,142 @@ def test_verify_scheduled_cycle_artifacts_warns_about_missing_compiled_digest(
     )
 
     assert any("дайджест" in line.lower() for line in warnings)
+
+
+def _verify_vault_with_nothing_present(tmp_path: Path, day: date) -> Path:
+    vault_path = tmp_path / "vault"
+    _write_vault_manifest(vault_path)
+    (vault_path / "daily").mkdir(parents=True)
+    # Daily exists but has no reflect marker; no handoff, no graph.
+    (vault_path / "daily" / f"{day.isoformat()}.md").write_text(
+        f"# {day.isoformat()}\n\n## 10:00 [text]\nx\n", encoding="utf-8"
+    )
+    return vault_path
+
+
+_DIGEST_CYCLE = [
+    {
+        "name": "maintenance.compiled-digest",
+        "label": "digest",
+        "result": {"report": "", "processed_entries": 1},
+    }
+]
+
+
+def test_verify_lines_are_english_when_content_language_is_en(
+    tmp_path: Path,
+) -> None:
+    day = date(2026, 4, 4)
+    vault_path = _verify_vault_with_nothing_present(tmp_path, day)
+    processor = CliProcessor(vault_path, content_language="en")
+
+    warnings = processor._verify_scheduled_cycle_artifacts(
+        day, {"report": "ok", "processed_entries": 1}, _DIGEST_CYCLE
+    )
+
+    text = "\n".join(warnings)
+    assert warnings
+    assert all(line.startswith("🔴 VERIFY: missing") for line in warnings)
+    assert "reflect block" in text
+    assert "compiled enrichment digest" in text
+    assert "нет" not in text
+    assert "блок" not in text
+
+
+def test_verify_lines_stay_russian_by_default(tmp_path: Path) -> None:
+    day = date(2026, 4, 4)
+    vault_path = _verify_vault_with_nothing_present(tmp_path, day)
+    processor = CliProcessor(vault_path)
+
+    warnings = processor._verify_scheduled_cycle_artifacts(
+        day, {"report": "ok", "processed_entries": 1}, _DIGEST_CYCLE
+    )
+
+    assert "🔴 VERIFY: нет .session/handoff.md" in warnings
+    assert f"🔴 VERIFY: нет daily/{day.isoformat()}.md (блок reflect)" in warnings
+    assert "🔴 VERIFY: нет дайджест обогащения compiled за сегодня" in warnings
+
+
+def _write_graph(vault_path: Path, *, age_seconds: float) -> None:
+    graph = vault_path / ".graph" / "vault-graph.json"
+    graph.parent.mkdir(parents=True, exist_ok=True)
+    graph.write_text("{}", encoding="utf-8")
+    stamp = time.time() - age_seconds
+    os.utime(graph, (stamp, stamp))
+
+
+def _verify_graph_only(
+    tmp_path: Path, *, graph_age: float, cycle_started_at: float | None
+) -> list[str]:
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 4)
+    _write_vault_manifest(vault_path)
+    (vault_path / "daily").mkdir(parents=True)
+    (vault_path / "daily" / f"{day.isoformat()}.md").write_text(
+        _daily_text_with_reflect_marker(day), encoding="utf-8"
+    )
+    (vault_path / ".session").mkdir(parents=True)
+    (vault_path / ".session" / "handoff.md").write_text("h", encoding="utf-8")
+    _write_graph(vault_path, age_seconds=graph_age)
+    return CliProcessor(vault_path)._verify_scheduled_cycle_artifacts(
+        day,
+        {"report": "ok", "processed_entries": 1},
+        [],
+        cycle_started_at=cycle_started_at,
+    )
+
+
+def test_verify_warns_when_graph_not_refreshed_in_this_cycle(tmp_path: Path) -> None:
+    warnings = _verify_graph_only(
+        tmp_path, graph_age=86400, cycle_started_at=time.time()
+    )
+
+    assert len(warnings) == 1
+    assert ".graph/vault-graph.json" in warnings[0]
+    assert "не обновлён" in warnings[0]
+
+
+def test_verify_accepts_graph_refreshed_after_cycle_start(tmp_path: Path) -> None:
+    warnings = _verify_graph_only(
+        tmp_path, graph_age=0, cycle_started_at=time.time() - 60
+    )
+
+    assert warnings == []
+
+
+def test_verify_graph_check_skipped_without_cycle_start(tmp_path: Path) -> None:
+    warnings = _verify_graph_only(tmp_path, graph_age=86400, cycle_started_at=None)
+
+    assert warnings == []
+
+
+def test_run_scheduled_cycle_flags_stale_graph(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    day = date(2026, 4, 6)  # Monday: no periodic reviews
+    _setup_daily_processing_vault(vault_path, day)
+    _write_graph(vault_path, age_seconds=86400)
+    processor = CliProcessor(vault_path)
+    processor.process_daily = lambda d, mode=SCHEDULED_MODE: {  # type: ignore[method-assign]
+        "report": "📊 **Daily**",
+        "processed_entries": 0,
+    }
+    processor._run_control_plane_maintenance_workflow = lambda name: {  # type: ignore[method-assign]
+        "report": "",
+        "processed_entries": 0,
+    }
+    processor.audit_cycle_result = lambda **kwargs: {  # type: ignore[method-assign]
+        "cycle_name": kwargs["cycle_name"],
+        "label": kwargs["cycle_name"],
+        "summary": "",
+        "issues": [],
+        "task_candidates": [],
+        "tasks_created": [],
+    }
+    processor._refresh_qmd_index = lambda: None  # type: ignore[method-assign]
+
+    result = processor.run_scheduled_cycle(day)
+
+    assert "не обновлён в этом цикле" in result["report"]
 
 
 def test_run_scheduled_cycle_appends_verify_warnings_to_the_report(

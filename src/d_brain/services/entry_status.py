@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -92,18 +93,25 @@ def extract_entry_statuses(text: str) -> list[str]:
     return normalize_entry_statuses(ENTRY_STATUS_RE.findall(_normalize_newlines(text)))
 
 
+def entry_spans(content: str) -> list[tuple[re.Match[str], int]]:
+    """Entry headings of ``content`` with the end offset of each entry.
+
+    An entry runs from its heading to the next heading (or the end of the
+    text). Offsets index ``content`` as given, no newline normalization.
+    """
+
+    matches = list(DAILY_ENTRY_RE.finditer(content))
+    ends = [m.start() for m in matches[1:]] + [len(content)]
+    return list(zip(matches, ends[: len(matches)], strict=True))
+
+
 def parse_daily_entry_statuses(content: str) -> list[DailyEntryStatus]:
     """Parse raw daily markdown and return statuses for each entry in order."""
 
     content = _normalize_newlines(content)
-    matches = list(DAILY_ENTRY_RE.finditer(content))
     parsed: list[DailyEntryStatus] = []
-    for index, match in enumerate(matches):
-        block_start = match.start()
-        block_end = matches[index + 1].start() if index + 1 < len(matches) else len(
-            content
-        )
-        block = content[block_start:block_end]
+    for match, block_end in entry_spans(content):
+        block = content[match.start() : block_end]
         parsed.append(
             DailyEntryStatus(
                 time=match.group("time"),
@@ -112,3 +120,26 @@ def parse_daily_entry_statuses(content: str) -> list[DailyEntryStatus]:
             )
         )
     return parsed
+
+
+def entry_block_digest(block: str) -> str:
+    """Fingerprint one entry's body, ignoring runtime status markers.
+
+    The heading is not part of the block passed in, and marker lines are
+    dropped, so adding ``already_processed`` never changes the digest and
+    marking stays idempotent. Whitespace is collapsed so line endings and
+    indentation do not matter.
+    """
+
+    text = ENTRY_STATUS_RE.sub("", _normalize_newlines(block))
+    return hashlib.sha256(" ".join(text.split()).encode("utf-8")).hexdigest()[:16]
+
+
+def daily_entry_digests(content: str) -> list[str]:
+    """Return one body digest per entry, in ``parse_daily_entry_statuses`` order."""
+
+    content = _normalize_newlines(content)
+    return [
+        entry_block_digest(content[match.end() : block_end])
+        for match, block_end in entry_spans(content)
+    ]

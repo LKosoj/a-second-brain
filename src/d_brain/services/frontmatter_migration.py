@@ -16,7 +16,6 @@ import os
 import stat as stat_module
 import subprocess
 import tarfile
-import tempfile
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from copy import deepcopy
@@ -30,6 +29,11 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from d_brain.manifest import VaultManifest
+from d_brain.services.atomic_io import (
+    atomic_write_file_bytes,
+    copy_owner_group,
+    replace_durable,
+)
 from d_brain.services.frontmatter import (
     FrontmatterError,
     UnsafeVaultPathError,
@@ -203,9 +207,14 @@ def atomic_replace_vault_markdown(
             view = memoryview(content)
             while view:
                 view = view[os.write(temporary_fd, view) :]
-            os.fsync(temporary_fd)
+            # Owner only sticks for root; elsewhere the group (and mode)
+            # carry over and the chown failure is not an error.
+            copy_owner_group(
+                temporary_fd, gid=source_stat.st_gid, uid=source_stat.st_uid
+            )
+            # After chown, which clears setuid/setgid.
             os.fchmod(temporary_fd, source_stat.st_mode & 0o7777)
-            os.fchown(temporary_fd, source_stat.st_uid, source_stat.st_gid)
+            os.fsync(temporary_fd)
         finally:
             os.close(temporary_fd)
         target_stat = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
@@ -782,28 +791,6 @@ def _ensure_external(vault_path: Path, *paths: Path) -> tuple[Path, ...]:
     return resolved
 
 
-def _atomic_external_write(path: Path, content: bytes) -> None:
-    target = Path(path)
-    temporary_fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{target.name}.", dir=target.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(temporary_fd, "wb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, target)
-        directory_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    except Exception:
-        temporary.unlink(missing_ok=True)
-        raise
-
-
 def _source_set_hash(entries: Iterable[Mapping[str, Any]]) -> str:
     canonical = [
         {
@@ -1119,12 +1106,13 @@ def write_inventory_report(
             "available": False,
             "reason": "coverage_incomplete",
         }
-    _atomic_external_write(
+    atomic_write_file_bytes(
         report,
         json.dumps(
             report_payload, ensure_ascii=False, indent=2, sort_keys=True
         ).encode()
         + b"\n",
+        new_file_mode=0o600,
     )
     summary = "\n".join(
         (
@@ -1148,7 +1136,9 @@ def write_inventory_report(
             "",
         )
     )
-    _atomic_external_write(destination / "inventory.md", summary.encode())
+    atomic_write_file_bytes(
+        destination / "inventory.md", summary.encode(), new_file_mode=0o600
+    )
     return report
 
 
@@ -1280,10 +1270,11 @@ def save_migration_state(state_path: Path, state: Mapping[str, Any]) -> None:
     root = _state_vault_path(state)
     path = _ensure_external(root, state_path)[0]
     path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_external_write(
+    atomic_write_file_bytes(
         path,
         json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True).encode()
         + b"\n",
+        new_file_mode=0o600,
     )
 
 
@@ -1642,15 +1633,6 @@ def _validate_backup_archive(
         raise MigrationStateError(f"backup archive is unreadable: {exc}") from exc
 
 
-def _replace_durable_archive(temporary: Path, archive: Path) -> None:
-    os.replace(temporary, archive)
-    directory_fd = os.open(archive.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-
-
 def _write_quiesce_proof(
     state: Mapping[str, Any],
     proof_path: Path,
@@ -1670,10 +1652,11 @@ def _write_quiesce_proof(
         "writers": dict(states),
         "writer_pids": tuple(processes),
     }
-    _atomic_external_write(
+    atomic_write_file_bytes(
         proof_path,
         json.dumps(proof_data, ensure_ascii=False, indent=2, sort_keys=True).encode()
         + b"\n",
+        new_file_mode=0o600,
     )
 
 
@@ -1762,7 +1745,7 @@ def create_backup_gate(
             handle.flush()
             os.fsync(handle.fileno())
         _validate_backup_archive(temporary, records)
-        _replace_durable_archive(temporary, archive)
+        replace_durable(temporary, archive)
     except Exception:
         temporary.unlink(missing_ok=True)
         proof.unlink(missing_ok=True)
@@ -1778,10 +1761,11 @@ def create_backup_gate(
         "archive_sha256": archive_hash,
         "entries": records,
     }
-    _atomic_external_write(
+    atomic_write_file_bytes(
         manifest_path,
         json.dumps(backup, ensure_ascii=False, indent=2, sort_keys=True).encode()
         + b"\n",
+        new_file_mode=0o600,
     )
     _write_quiesce_proof(
         state,

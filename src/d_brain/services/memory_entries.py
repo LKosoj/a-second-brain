@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import fcntl
 import json
-import os
 import re
-import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, cast
+
+from d_brain.clock import owner_today
+from d_brain.services.atomic_io import atomic_write_file_text
 
 DAILY_HEADING_RE = re.compile(r"^##\s+(\d{2}:\d{2})\s+(\[[^\]]+\])\s*$")
 ENTRY_STORE_NAME = ".memory-entries.json"
@@ -154,22 +155,9 @@ class DailyEntryMemoryStore:
         return {"version": 1, "entries": entries}
 
     def _write(self, payload: dict[str, Any]) -> None:
-        self._store_path.parent.mkdir(parents=True, exist_ok=True)
-        mode = (
-            self._store_path.stat().st_mode & 0o777
-            if self._store_path.exists()
-            else 0o660
+        atomic_write_file_text(
+            self._store_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
         )
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=self._store_path.parent,
-            delete=False,
-        ) as temp_file:
-            os.fchmod(temp_file.fileno(), mode)
-            temp_file.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-            temp_path = Path(temp_file.name)
-        os.replace(temp_path, self._store_path)
 
     @staticmethod
     def _parse_entries(rel_path: str, content: str) -> list[dict[str, Any]]:
@@ -208,7 +196,7 @@ class DailyEntryMemoryStore:
 
     def sync_daily_file(self, file_path: Path, *, today: date | None = None) -> None:
         """Upsert entry-level memory for one daily file."""
-        today = today or date.today()
+        today = today or owner_today()
         resolved = file_path.resolve()
         rel_path = resolved.relative_to(self.vault_path).as_posix()
         parsed = self._parse_entries(rel_path, resolved.read_text(encoding="utf-8"))
@@ -284,7 +272,7 @@ class DailyEntryMemoryStore:
 
     def touch_daily_file(self, rel_path: str, *, today: date | None = None) -> int:
         """Promote all entry memories for one daily file."""
-        today = today or date.today()
+        today = today or owner_today()
         with self._exclusive_lock():
             payload = self._load()
             entries = payload["entries"]

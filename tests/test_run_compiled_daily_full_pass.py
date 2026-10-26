@@ -1,22 +1,20 @@
+import functools
 import hashlib
 import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+from _helpers import patch_get_settings
+
 from d_brain import run_compiled_daily_full_pass
 
-
-def _patch_settings(monkeypatch, vault: Path) -> None:
-    monkeypatch.setattr(
-        run_compiled_daily_full_pass,
-        "get_settings",
-        lambda: SimpleNamespace(
-            vault_path=vault,
-            content_language="ru",
-            ai_cli="claude",
-        ),
-    )
+_patch_settings = functools.partial(
+    patch_get_settings,
+    module=run_compiled_daily_full_pass,
+    content_language="ru",
+    ai_cli="claude",
+)
 
 
 def test_main_stops_the_whole_pass_on_a_terminal_backend_error(
@@ -55,7 +53,7 @@ def test_main_stops_the_whole_pass_on_a_terminal_backend_error(
                 "source_rel_path": source_path,
             }
 
-        def _refresh_qmd_index(self) -> None:
+        def refresh_qmd_index(self) -> None:
             raise AssertionError("qmd must not be refreshed after a terminal stop")
 
     monkeypatch.setattr(
@@ -119,7 +117,7 @@ def test_main_resume_continues_from_the_progress_file(
                 "source_rel_path": source_path,
             }
 
-        def _refresh_qmd_index(self) -> None:
+        def refresh_qmd_index(self) -> None:
             pass
 
     monkeypatch.setattr(
@@ -196,7 +194,7 @@ def test_main_resume_continues_from_the_interrupted_chunk(
                 "processed_chunks": 128,
             }
 
-        def _refresh_qmd_index(self) -> None:
+        def refresh_qmd_index(self) -> None:
             pass
 
     monkeypatch.setattr(
@@ -263,7 +261,7 @@ def test_main_updated_notes_counter_ignores_duplicate_skip_days(
                 "source_rel_path": source_path,
             }
 
-        def _refresh_qmd_index(self) -> None:
+        def refresh_qmd_index(self) -> None:
             pass
 
     monkeypatch.setattr(

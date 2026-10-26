@@ -22,9 +22,9 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from datetime import date
 from pathlib import Path
 
+from d_brain.clock import owner_today
 from d_brain.config import get_settings
 from d_brain.manifest import load_manifest_for_vault
 from d_brain.services.compiled_briefs import BRIEF_TYPES, build_brief
@@ -71,7 +71,7 @@ def main() -> int:
         sys.stdout.write(result.markdown + "\n")
         return 0
 
-    today = date.today()
+    today = owner_today()
     manifest = load_manifest_for_vault(vault_path)
     # Path selection must happen under the vault write lock: computing the
     # counter-suffixed path before taking the lock let two near-simultaneous

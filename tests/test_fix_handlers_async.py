@@ -22,7 +22,7 @@ Same FakeMessage/monkeypatch approach the sibling handler test modules use
 
 import asyncio
 import subprocess
-import time
+import threading
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
@@ -104,7 +104,7 @@ class FakeCallbackQuery:
 
 
 @contextmanager
-def _fake_vault_write_lock(vault_path):  # noqa: ANN001
+def _fake_vault_write_lock(vault_path, timeout=None):  # noqa: ANN001
     yield SimpleNamespace()
 
 
@@ -113,22 +113,40 @@ def _qmd_service(vault_path: Path, *, qmd_index: str = "dbrain") -> QmdService:
     return QmdService(vault_path)
 
 
-async def _tick(order: list[str]) -> None:
+class _Order(list):
+    """Call log shared by ``_tick`` and the blocking stand-ins.
+
+    The blocking side waits for the event ``_tick`` sets instead of sleeping:
+    run in a worker thread it is released as soon as the loop got to the tick;
+    run on the loop thread the tick can never fire, the wait times out and the
+    test fails on the assert rather than hanging or passing by luck.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tick_done = threading.Event()
+
+    def block_until_tick(self) -> None:
+        assert self.tick_done.wait(timeout=5), "event loop never ran the tick"
+        self.append("blocking")
+
+
+async def _tick(order: _Order) -> None:
     """A cheap coroutine that must still run promptly while a slow call
     below is in flight -- if that call still ran on the event loop thread
     instead of ``asyncio.to_thread``, this would be starved until it
-    finished and ``order`` would read ``["blocking", "tick"]`` instead."""
-    await asyncio.sleep(0.05)
+    finished and ``order`` would never see the tick before the blocking call."""
+    await asyncio.sleep(0)
     order.append("tick")
+    order.tick_done.set()
 
 
-def _slow_sync(order: list[str], result: object = None, delay: float = 0.15):
+def _slow_sync(order: _Order, result: object = None):
     """Build a sync callable standing in for one of the vault-reading
     builders this fix moves off the event loop."""
 
     def _call(*args: object, **kwargs: object) -> object:
-        time.sleep(delay)
-        order.append("blocking")
+        order.block_until_tick()
         return result
 
     return _call
@@ -151,7 +169,7 @@ def test_qmd_touch_notes_timeout_logs_warning_and_does_not_raise(
     def fake_run(command, **kwargs):  # type: ignore[no-untyped-def]
         raise subprocess.TimeoutExpired(cmd=command, timeout=kwargs.get("timeout"))
 
-    monkeypatch.setattr("d_brain.services.qmd.subprocess.run", fake_run)
+    monkeypatch.setattr("d_brain.services.qmd.run_in_process_group", fake_run)
 
     service.touch_notes(["daily/example.md"])  # must not raise
 
@@ -203,7 +221,7 @@ def test_qmd_refresh_timeout_on_update_returns_error_without_raising(
 async def test_deliver_daily_digest_offloads_build_to_a_thread(
     monkeypatch, tmp_path: Path
 ) -> None:
-    order: list[str] = []
+    order = _Order()
     status = SimpleNamespace(edits=[])
 
     async def fake_answer_text(message, text: str, **kwargs) -> object:  # noqa: ANN001, ANN003
@@ -229,7 +247,7 @@ async def test_deliver_daily_digest_offloads_build_to_a_thread(
 
 
 async def test_process_why_request_offloads_build_why_to_a_thread(monkeypatch) -> None:
-    order: list[str] = []
+    order = _Order()
     monkeypatch.setattr(
         why_handler, "get_settings", lambda: SimpleNamespace(vault_path="vault")
     )
@@ -250,7 +268,7 @@ async def test_process_why_request_offloads_build_why_to_a_thread(monkeypatch) -
 async def test_handle_why_choice_offloads_build_why_for_path_to_a_thread(
     monkeypatch,
 ) -> None:
-    order: list[str] = []
+    order = _Order()
     monkeypatch.setattr(
         why_handler, "get_settings", lambda: SimpleNamespace(vault_path="vault")
     )
@@ -281,15 +299,14 @@ async def test_handle_why_choice_offloads_build_why_for_path_to_a_thread(
 
 
 async def test_deliver_why_result_offloads_touch_notes_to_a_thread(monkeypatch) -> None:
-    order: list[str] = []
+    order = _Order()
 
     class SlowQmd:
         def __init__(self, vault_path) -> None:  # noqa: ANN001
             pass
 
         def touch_notes(self, targets: list[str]) -> None:
-            time.sleep(0.15)
-            order.append("blocking")
+            order.block_until_tick()
 
     async def fake_answer_rich_text(message, text: str, **kwargs) -> None:  # noqa: ANN001, ANN003
         pass
@@ -326,7 +343,7 @@ def _sample_brief_result() -> BriefResult:
 async def test_process_brief_request_offloads_build_brief_to_a_thread(
     monkeypatch,
 ) -> None:
-    order: list[str] = []
+    order = _Order()
     result = _sample_brief_result()
 
     monkeypatch.setattr(
@@ -374,7 +391,7 @@ async def test_process_brief_request_offloads_build_brief_to_a_thread(
 async def test_handle_menu_callback_queueact_offloads_apply_response_to_a_thread(
     monkeypatch,
 ) -> None:
-    order: list[str] = []
+    order = _Order()
     monkeypatch.setattr(
         menu_handler, "get_settings", lambda: SimpleNamespace(vault_path="vault")
     )
@@ -418,7 +435,7 @@ async def test_handle_menu_callback_queueact_offloads_apply_response_to_a_thread
 async def test_handle_menu_callback_weeklyreview_offloads_mark_reviewed_to_a_thread(
     monkeypatch,
 ) -> None:
-    order: list[str] = []
+    order = _Order()
     monkeypatch.setattr(
         menu_handler, "get_settings", lambda: SimpleNamespace(vault_path="vault")
     )
@@ -467,7 +484,7 @@ async def test_handle_menu_callback_weeklyreview_offloads_mark_reviewed_to_a_thr
 async def test_render_queue_offloads_list_queue_items_to_a_thread(
     monkeypatch, tmp_path: Path
 ) -> None:
-    order: list[str] = []
+    order = _Order()
     monkeypatch.setattr(dashboard, "list_queue_items", _slow_sync(order, result=[]))
 
     async def fake_render_dashboard(
@@ -488,7 +505,7 @@ async def test_render_queue_offloads_list_queue_items_to_a_thread(
 async def test_render_weekly_review_offloads_collect_weekly_review_to_a_thread(
     monkeypatch, tmp_path: Path
 ) -> None:
-    order: list[str] = []
+    order = _Order()
     review = WeeklyReview(
         start=date(2026, 7, 30),
         end=date(2026, 8, 5),
@@ -519,7 +536,7 @@ async def test_render_weekly_review_offloads_collect_weekly_review_to_a_thread(
 async def test_render_file_directory_offloads_list_entries_to_a_thread(
     monkeypatch, tmp_path: Path
 ) -> None:
-    order: list[str] = []
+    order = _Order()
     root = BrowserRoot(id="daily", label="Daily", relative_path="daily")
 
     class SlowBrowser:
@@ -527,8 +544,7 @@ async def test_render_file_directory_offloads_list_entries_to_a_thread(
             pass
 
         def list_entries(self, *, root_id: str, current_dir: str):
-            time.sleep(0.15)
-            order.append("blocking")
+            order.block_until_tick()
             return (root, current_dir, [])
 
     monkeypatch.setattr(dashboard, "FileBrowserService", SlowBrowser)

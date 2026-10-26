@@ -15,7 +15,7 @@ from d_brain import run_daily_process, run_plaud_sync, run_telegram_delivery
 from d_brain.bot.formatters import truncate_plain_text_for_edit
 from d_brain.bot.handlers.photo import _build_photo_daily_content
 from d_brain.manifest import ManifestValidationError, load_manifest_for_vault
-from d_brain.services import telegram_delivery
+from d_brain.services import telegram_delivery, todoist_projects
 from d_brain.services.frontmatter import write_validated_vault_markdown
 from d_brain.services.image_analysis import ImageAnalysisService
 from d_brain.services.memory_audit import MemoryAuditService
@@ -531,7 +531,7 @@ def test_todoist_project_catalog_refresh_parses_projects(
             stderr="",
         )
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(todoist_projects, "run_in_process_group", fake_run)
 
     refreshed = catalog.refresh()
 
@@ -626,7 +626,7 @@ def test_image_analysis_service_parses_fenced_json(tmp_path: Path) -> None:
 
     service = ImageAnalysisService(tmp_path / "vault", "qwen")
 
-    def fake_run(prompt, timeout, extra_env=None):  # noqa: ANN001, ANN202, ARG001
+    def fake_run(prompt, timeout, extra_env=None, **kwargs):  # noqa: ANN001, ANN003, ANN202, ARG001
         assert timeout == 600
         return '```json\n{"description":"Слайд с надписью","ocr_text":"HELLO 123"}\n```'
 
@@ -1192,6 +1192,56 @@ def test_run_daily_process_sends_scheduled_error_digest(
     assert "capture failed" in stderr
     assert "Ежедневная обработка завершилась с ошибкой." in sent[0][0]
     assert sent[0][1] is False
+
+
+@pytest.mark.parametrize(
+    "notice", [None, "⚠️ Не подтверждено, проверьте в Todoist: **1**\n- Позвонить"]
+)
+def test_run_plaud_sync_sends_unconfirmed_tasks_notice(
+    tmp_path: Path, monkeypatch, notice: str | None
+) -> None:
+    result: dict[str, object] = {"imported": 1, "errors": []}
+    if notice:
+        result["tasks_unconfirmed_notice"] = notice
+
+    class FakePlaudService:
+        def __init__(self, vault_path: Path, **kwargs) -> None:  # noqa: ANN003
+            del vault_path, kwargs
+
+        def sync(self, **kwargs):  # noqa: ANN003, ANN202
+            del kwargs
+            return result
+
+        def close(self) -> None:
+            return None
+
+    sent: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        run_plaud_sync,
+        "get_settings",
+        lambda: SimpleNamespace(
+            plaud_bearer_token="token",
+            vault_path=tmp_path,
+            plaud_region="api-euc1",
+            ai_cli="codex",
+            todoist_api_key="",
+            owner_full_name="Иван Иванов",
+            content_language="ru",
+        ),
+    )
+    monkeypatch.setattr(run_plaud_sync, "PlaudSyncService", FakePlaudService)
+    monkeypatch.setattr(
+        run_plaud_sync, "_notify_auth_recovered", lambda **kwargs: False
+    )
+    monkeypatch.setattr(
+        run_plaud_sync,
+        "send_telegram_text_sync",
+        lambda text, rich=False: sent.append((text, rich)),
+    )
+    monkeypatch.setattr(sys, "argv", ["run_plaud_sync.py"])
+
+    assert run_plaud_sync.main() == 0
+    assert sent == ([(f"PLAUD sync:\n{notice}", True)] if notice else [])
 
 
 def test_run_plaud_sync_refreshes_qmd_with_embeddings_after_import(

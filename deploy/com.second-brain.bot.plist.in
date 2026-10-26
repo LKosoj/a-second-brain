@@ -18,7 +18,7 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>UV_BIN</key>
-        <string>@UV_BIN@</string>
+        <string>@UV_BIN@</string>@TZ_PLIST_ENTRY@
     </dict>
     <key>WorkingDirectory</key>
     <string>@PROJECT_DIR@</string>

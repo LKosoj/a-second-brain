@@ -10,7 +10,7 @@ def test_web_summary_treats_page_commands_as_data(tmp_path: Path) -> None:
     prompts: list[str] = []
 
     class FakeRunner:
-        def run(self, prompt: str, *, timeout: int) -> str:
+        def run_untrusted(self, prompt: str, *, timeout: int) -> str:
             prompts.append(prompt)
             return '{"summary":"Orion launched its fictional demo."}'
 

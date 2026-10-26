@@ -1,4 +1,6 @@
 import json
+import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -301,3 +303,264 @@ def test_scan_transcript_takes_the_last_assistant_text(tmp_path: Path) -> None:
 
     assert state.turn_finished is True
     assert state.assistant_text == '{"ok": true}'
+
+
+def test_sanitize_tmux_prompt_normalizes_newlines_and_strips_controls() -> None:
+    raw = "a\r\nb\rc\x1b[Ad\x03e\tf\x7f\x85g Привет 😀"
+
+    assert claude_tmux.sanitize_tmux_prompt(raw) == "a\nb\nc[Ade\tfg Привет 😀"
+
+
+def test_run_claude_tmux_pastes_sanitized_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fast_polling: None,
+) -> None:
+    home = tmp_path / "home"
+    fake = _FakeTmux(home)
+    _install(monkeypatch, fake)
+
+    run_claude_tmux("x\r\ny\x1bz\x03", tmp_path / "work", {"HOME": str(home)}, 30)
+
+    assert fake.pasted_prompt == "x\nyz"
+    paste = _args_of(fake, "paste-buffer")[0]
+    assert "-p" not in paste
+    assert "-r" in paste
+
+
+@pytest.fixture(autouse=True)
+def _reset_session_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(claude_tmux, "_stopping", False)
+    monkeypatch.setattr(claude_tmux, "_ACTIVE", {})
+
+
+def test_session_socket_name_carries_owner_pid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fast_polling: None,
+) -> None:
+    assert re.fullmatch(
+        rf"dbrain-{os.getpid()}-[0-9a-f]{{12}}", claude_tmux.new_socket_name()
+    )
+    home = tmp_path / "home"
+    fake = _FakeTmux(home)
+    _install(monkeypatch, fake)
+
+    run_claude_tmux("prompt", tmp_path / "work", {"HOME": str(home)}, 30)
+
+    assert re.fullmatch(rf"dbrain-{os.getpid()}-[0-9a-f]{{12}}", fake.commands[0][2])
+
+
+@pytest.mark.parametrize("dead_status", [None, "127"])
+def test_run_claude_tmux_registers_and_unregisters_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fast_polling: None,
+    dead_status: str | None,
+) -> None:
+    home = tmp_path / "home"
+    fake = _FakeTmux(home, dead_status=dead_status)
+    seen: list[set[str]] = []
+
+    def spy(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        if cmd[3] == "new-session":
+            seen.append(set(claude_tmux._ACTIVE))
+        return fake(cmd, **kwargs)
+
+    monkeypatch.setattr(claude_tmux.subprocess, "run", spy)
+    monkeypatch.setattr(claude_tmux.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    if dead_status:
+        with pytest.raises(ClaudeTmuxError):
+            run_claude_tmux("prompt", tmp_path / "work", {"HOME": str(home)}, 30)
+    else:
+        run_claude_tmux("prompt", tmp_path / "work", {"HOME": str(home)}, 30)
+
+    assert seen == [{fake.commands[0][2]}]
+    assert claude_tmux._ACTIVE == {}
+    assert _args_of(fake, "kill-server")
+
+
+def test_shutdown_tmux_sessions_kills_active_servers_and_blocks_new_ones(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fast_polling: None,
+) -> None:
+    calls: list[list[str]] = []
+
+    def run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(list(cmd))
+        if cmd[2] == "dbrain-1-aaaaaaaaaaaa":
+            raise subprocess.TimeoutExpired(cmd, 15)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(claude_tmux.subprocess, "run", run)
+    claude_tmux.register_session("dbrain-1-aaaaaaaaaaaa", {})
+    claude_tmux.register_session("dbrain-2-bbbbbbbbbbbb", {})
+
+    claude_tmux.shutdown_tmux_sessions()
+
+    assert {c[2] for c in calls if c[3] == "kill-server"} == {
+        "dbrain-1-aaaaaaaaaaaa",
+        "dbrain-2-bbbbbbbbbbbb",
+    }
+    with pytest.raises(ClaudeTmuxError):
+        claude_tmux.register_session("dbrain-3-cccccccccccc", {})
+
+    home = tmp_path / "home"
+    fake = _FakeTmux(home)
+    _install(monkeypatch, fake)
+    with pytest.raises(ClaudeTmuxError):
+        run_claude_tmux("prompt", tmp_path / "work", {"HOME": str(home)}, 30)
+    assert not _args_of(fake, "new-session")
+
+
+def _make_sockets(tmp_path: Path) -> tuple[dict[str, str], dict[str, Path]]:
+    sock_dir = tmp_path / f"tmux-{os.getuid()}"
+    sock_dir.mkdir()
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    names = {
+        "dead": f"dbrain-{dead.pid}-aaaaaaaaaaaa",
+        "alive": f"dbrain-{os.getpid()}-bbbbbbbbbbbb",
+        "other": "other-123",
+        "old": "dbrain-cccccccccccc",
+        "fresh": "dbrain-dddddddddddd",
+    }
+    paths = {key: sock_dir / name for key, name in names.items()}
+    for path in paths.values():
+        path.touch()
+    old = time.time() - 7 * 3600
+    os.utime(paths["old"], (old, old))
+    return {"TMUX_TMPDIR": str(tmp_path)}, paths
+
+
+def test_cleanup_orphan_sessions_kills_only_dead_owners(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env, paths = _make_sockets(tmp_path)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        claude_tmux.subprocess,
+        "run",
+        lambda cmd, **kw: calls.append(list(cmd))
+        or subprocess.CompletedProcess(cmd, 0, "", ""),
+    )
+    monkeypatch.setattr(claude_tmux.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    assert claude_tmux.cleanup_orphan_sessions(env) == 2
+
+    assert sorted(c[2] for c in calls if c[3] == "kill-server") == sorted(
+        [paths["dead"].name, paths["old"].name]
+    )
+    assert not paths["dead"].exists()
+    assert not paths["old"].exists()
+    for key in ("alive", "other", "fresh"):
+        assert paths[key].exists()
+
+
+def test_cleanup_orphan_sessions_survives_tmux_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env, paths = _make_sockets(tmp_path)
+
+    def run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        raise subprocess.TimeoutExpired(cmd, 15)
+
+    monkeypatch.setattr(claude_tmux.subprocess, "run", run)
+    monkeypatch.setattr(claude_tmux.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    assert claude_tmux.cleanup_orphan_sessions(env) == 2
+    assert not paths["dead"].exists()
+    assert not paths["old"].exists()
+
+
+def test_cleanup_orphan_sessions_without_socket_dir_or_tmux(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        claude_tmux.subprocess, "run", lambda cmd, **kw: calls.append(list(cmd))
+    )
+    monkeypatch.setattr(claude_tmux.shutil, "which", lambda name: "/usr/bin/tmux")
+    assert claude_tmux.cleanup_orphan_sessions({"TMUX_TMPDIR": str(tmp_path)}) == 0
+
+    env, _ = _make_sockets(tmp_path)
+    monkeypatch.setattr(claude_tmux.shutil, "which", lambda name: None)
+    assert claude_tmux.cleanup_orphan_sessions(env) == 0
+    assert calls == []
+
+
+def test_shutdown_during_new_session_kills_new_server_and_fails_fast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fast_polling: None,
+) -> None:
+    monkeypatch.setattr(claude_tmux, "_stopping", False)
+    monkeypatch.setattr(claude_tmux, "_ACTIVE", {})
+    home = tmp_path / "home"
+    fake = _FakeTmux(home)
+
+    def run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        if cmd[3] == "new-session":
+            # Shutdown ran after register_session but before the server existed.
+            claude_tmux.shutdown_tmux_sessions()
+        return fake(cmd, **kwargs)
+
+    monkeypatch.setattr(claude_tmux.subprocess, "run", run)
+    monkeypatch.setattr(claude_tmux.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    with pytest.raises(ClaudeTmuxError, match="stopping"):
+        run_claude_tmux("prompt", tmp_path / "work", {"HOME": str(home)}, 30)
+
+    assert not _args_of(fake, "load-buffer")
+    assert _args_of(fake, "kill-server")[-1] == ["kill-server"]
+    assert claude_tmux._ACTIVE == {}
+
+
+def test_fail_if_pane_died_stops_polling_once_stopping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(claude_tmux, "_stopping", True)
+    monkeypatch.setattr(
+        claude_tmux.subprocess,
+        "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "0 \n", ""),
+    )
+
+    with pytest.raises(ClaudeTmuxError, match="stopping"):
+        claude_tmux._fail_if_pane_died("dbrain-1-aaaaaaaaaaaa", {})
+
+
+def test_cleanup_default_env_has_no_tmux_tmpdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Sessions run with build_subprocess_env (no TMUX_TMPDIR), so the sweep must
+    # look where tmux put their sockets, not where the bot's own env points.
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmp_path / "elsewhere"))
+    seen: list[dict[str, str]] = []
+
+    def socket_dir(env):  # type: ignore[no-untyped-def]
+        seen.append(dict(env))
+        return tmp_path / "missing"
+
+    monkeypatch.setattr(claude_tmux, "_socket_dir", socket_dir)
+    monkeypatch.setattr(claude_tmux.shutil, "which", lambda name: "/usr/bin/tmux")
+
+    assert claude_tmux.cleanup_orphan_sessions() == 0
+    assert seen and "TMUX_TMPDIR" not in seen[0]
+
+
+def test_cleanup_ignores_huge_pid_in_socket_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sock_dir = tmp_path / f"tmux-{os.getuid()}"
+    sock_dir.mkdir()
+    (sock_dir / ("dbrain-" + "9" * 30 + "-aaaaaaaaaaaa")).touch()
+    monkeypatch.setattr(claude_tmux.shutil, "which", lambda name: "/usr/bin/tmux")
+
+    assert claude_tmux.cleanup_orphan_sessions({"TMUX_TMPDIR": str(tmp_path)}) == 0
+
+
+def test_pid_alive_treats_overflow_as_dead() -> None:
+    assert claude_tmux._pid_alive(10**30) is False

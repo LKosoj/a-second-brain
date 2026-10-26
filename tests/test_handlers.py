@@ -7,6 +7,7 @@ import pytest
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.methods import EditMessageText
 
+from d_brain.bot import voice_input
 from d_brain.bot.handlers import document as document_handler
 from d_brain.bot.handlers import forward as forward_handler
 from d_brain.bot.handlers import photo as photo_handler
@@ -781,6 +782,8 @@ def test_handle_voice_offloads_daily_write_to_thread(
 
     class FakeMessage:
         voice = SimpleNamespace(file_id="voice-file", duration=7)
+        audio = None
+        video_note = None
         from_user = FakeUser()
         chat = FakeChat()
         date = FakeDate()
@@ -816,7 +819,7 @@ def test_handle_voice_offloads_daily_write_to_thread(
     monkeypatch.setattr(voice_handler.asyncio, "to_thread", fake_to_thread)
     monkeypatch.setattr(voice_handler.asyncio, "create_task", fake_create_task)
     monkeypatch.setattr(voice_handler, "VaultStorage", FakeStorage)
-    monkeypatch.setattr(voice_handler, "DeepgramTranscriber", FakeTranscriber)
+    monkeypatch.setattr(voice_input, "DeepgramTranscriber", FakeTranscriber)
     monkeypatch.setattr(voice_handler, "SessionStore", FakeSessionStore)
     monkeypatch.setattr(voice_handler, "answer_text", fake_answer_text)
 
@@ -881,6 +884,8 @@ def test_handle_voice_failed_confirmation_is_not_reported_as_a_lost_recording(
 
     class FakeMessage:
         voice = SimpleNamespace(file_id="voice-file", duration=7)
+        audio = None
+        video_note = None
         from_user = SimpleNamespace(id=42)
         chat = FakeChat()
         date = datetime(2026, 4, 4, 12, 0, 0)
@@ -915,7 +920,7 @@ def test_handle_voice_failed_confirmation_is_not_reported_as_a_lost_recording(
     monkeypatch.setattr(voice_handler.asyncio, "to_thread", fake_to_thread)
     monkeypatch.setattr(voice_handler.asyncio, "create_task", fake_create_task)
     monkeypatch.setattr(voice_handler, "VaultStorage", FakeStorage)
-    monkeypatch.setattr(voice_handler, "DeepgramTranscriber", FakeTranscriber)
+    monkeypatch.setattr(voice_input, "DeepgramTranscriber", FakeTranscriber)
     monkeypatch.setattr(voice_handler, "SessionStore", FakeSessionStore)
     monkeypatch.setattr(voice_handler, "answer_text", fake_answer_text)
 
@@ -998,6 +1003,8 @@ def _run_handle_voice_trust_case(
 
     class FakeMessage:
         voice = SimpleNamespace(file_id="voice-file", duration=7)
+        audio = None
+        video_note = None
         from_user = FakeUser()
         chat = FakeChat()
         date = FakeDate()
@@ -1033,7 +1040,7 @@ def _run_handle_voice_trust_case(
     monkeypatch.setattr(voice_handler.asyncio, "to_thread", fake_to_thread)
     monkeypatch.setattr(voice_handler.asyncio, "create_task", fake_create_task)
     monkeypatch.setattr(voice_handler, "VaultStorage", FakeStorage)
-    monkeypatch.setattr(voice_handler, "DeepgramTranscriber", FakeTranscriber)
+    monkeypatch.setattr(voice_input, "DeepgramTranscriber", FakeTranscriber)
     monkeypatch.setattr(voice_handler, "SessionStore", FakeSessionStore)
     monkeypatch.setattr(voice_handler, "answer_text", fake_answer_text)
 
@@ -2776,7 +2783,9 @@ def test_handle_forward_reports_a_failed_daily_write_instead_of_silence(
 
     asyncio.run(forward_handler.handle_forward(FakeMessage()))
 
-    assert answers == ["Ошибка: disk full"]
+    assert answers == [
+        "Не удалось сохранить пересланное сообщение, подробности в логе."
+    ]
 
 
 def test_handle_forward_failed_confirmation_is_not_reported_as_a_lost_forward(
@@ -2970,7 +2979,7 @@ def test_handle_text_reports_a_failed_daily_write_instead_of_a_stuck_status(
 
     asyncio.run(text_handler.handle_text(FakeMessage()))
 
-    assert answers == ["Ошибка: disk full"]
+    assert answers == ["Не удалось сохранить сообщение, подробности в логе."]
     assert deleted["value"] is True
 
 
@@ -3190,5 +3199,82 @@ def test_handle_text_reports_a_failed_session_store_setup(
     asyncio.run(text_handler.handle_text(FakeMessage()))
 
     assert len(answers) == 1
-    assert answers[0].startswith("Ошибка:")
+    assert answers[0].startswith("Не удалось")
     assert deleted["value"] is True
+
+
+def test_forward_entry_lands_in_owner_day_not_utc_day(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """22:30 UTC is already 01:30 of the next day in Moscow: the forward must
+    go to that day's daily file under that time, not the UTC day's."""
+    from datetime import UTC
+
+    from conftest import _write_vault_manifest
+
+    from d_brain import clock
+
+    clock.set_owner_timezone("Europe/Moscow")
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _write_vault_manifest(vault)
+
+    class FakeLinkSummaryService:
+        def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            pass
+
+        def enrich_text(self, text: str, **kwargs):  # noqa: ANN202, ANN003
+            return SimpleNamespace(
+                content=text, transcripts=[], summaries=[], youtube_summaries=[]
+            )
+
+    class FakeSessionStore:
+        def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            pass
+
+        def append(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            return None
+
+    class FakeMessage:
+        text = "Пересланный текст"
+        from_user = SimpleNamespace(id=42)
+        forward_origin = SimpleNamespace(
+            sender_user=SimpleNamespace(full_name="Sender"),
+        )
+        date = datetime(2026, 3, 10, 22, 30, tzinfo=UTC)
+        message_id = 303
+        link = None
+
+    async def fake_answer_text(_message, text: str, **kwargs):  # noqa: ANN001, ARG001, ANN202
+        return SimpleNamespace()
+
+    class FakeTask:
+        def add_done_callback(self, callback) -> None:  # noqa: ANN001
+            return None
+
+    def fake_create_task(coro):  # type: ignore[no-untyped-def]
+        coro.close()
+        return FakeTask()
+
+    monkeypatch.setattr(
+        forward_handler,
+        "get_settings",
+        lambda: SimpleNamespace(
+            vault_path=vault, content_language="ru", ai_cli="codex"
+        ),
+    )
+    monkeypatch.setattr(forward_handler.asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(
+        forward_handler,
+        "build_telegram_source_info",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(forward_handler, "LinkSummaryService", FakeLinkSummaryService)
+    monkeypatch.setattr(forward_handler, "SessionStore", FakeSessionStore)
+    monkeypatch.setattr(forward_handler, "answer_text", fake_answer_text)
+
+    asyncio.run(forward_handler.handle_forward(FakeMessage()))
+
+    assert not (vault / "daily" / "2026-03-10.md").exists()
+    written = (vault / "daily" / "2026-03-11.md").read_text(encoding="utf-8")
+    assert "## 01:30 [forward from: Sender]" in written

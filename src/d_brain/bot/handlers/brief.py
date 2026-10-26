@@ -11,17 +11,19 @@ query, then building, filing, and delivering the brief the same way
 import asyncio
 import logging
 from contextlib import suppress
-from datetime import date
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from aiogram import Bot, Router
+from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from d_brain.bot.dashboard import render_input, render_section
 from d_brain.bot.replies import answer_rich_text, answer_text
-from d_brain.bot.states import BriefCommandState
+from d_brain.bot.states import BriefCommandState, wait_expired, wait_started_at
+from d_brain.bot.vault_busy import VaultBusyError, run_with_vault_lock
+from d_brain.clock import owner_today
 from d_brain.config import get_settings
 from d_brain.manifest import load_manifest_for_vault
 from d_brain.services.compiled_briefs import (
@@ -47,7 +49,7 @@ async def start_brief_flow(
     """Prompt for the brief's target query after a type button was tapped."""
     if brief_type not in BRIEF_TYPES:
         raise ValueError(f"unknown brief type: {brief_type!r}")
-    await state.update_data(brief_type=brief_type)
+    await state.update_data(brief_type=brief_type, brief_entered_at=wait_started_at())
     await state.set_state(BriefCommandState.waiting_for_query)
     label = _BRIEF_TYPE_LABELS[brief_type]
     if menu_message_id is not None:
@@ -73,29 +75,55 @@ async def start_brief_flow(
 @router.message(BriefCommandState.waiting_for_query)
 async def handle_brief_query(message: Message, state: FSMContext) -> None:
     """Handle the query text after a brief type was chosen -- text only."""
-    if not message.text:
-        await answer_text(
-            message,
-            "❌ Нужен текстовый запрос. Отправь текст или `-` для отмены.",
-        )
-        return  # stay in waiting_for_query -- owner can just retry with text
-
-    query = message.text.strip()
     data = await state.get_data()
+    menu_message_id = data.get("menu_message_id")
+    query = (message.text or "").strip()
+    expired = wait_expired(data.get("brief_entered_at"))
+
+    # Non-text messages, forwards and text after the wait expired leave the
+    # flow and continue to the regular capture handlers (see why.py).
+    if (
+        message.text is None
+        or message.forward_origin is not None
+        or (expired and query != "-")
+    ):
+        await state.clear()
+        # A failed menu repaint must not stop the message from reaching the
+        # regular capture handlers.
+        try:
+            await _restore_menu(message, menu_message_id)
+        except Exception:
+            logger.exception("Failed to restore the dashboard menu")
+        raise SkipHandler
+
+    # A command that a later router handles ("/reminders", unknown "/foo")
+    # must not be taken for the query (same rule as /find).
+    if query.startswith("/"):
+        await state.clear()
+        try:
+            await _restore_menu(message, menu_message_id)
+        except Exception:
+            logger.exception("Failed to restore the dashboard menu")
+        raise SkipHandler
+
     brief_type = data.get("brief_type")
     await state.clear()
-    menu_message_id = data.get("menu_message_id")
-    if isinstance(menu_message_id, int):
-        await render_section(
-            cast(Bot, message.bot), chat_id=message.chat.id, section="summaries",
-            preferred_message_id=menu_message_id,
-        )
+    await _restore_menu(message, menu_message_id)
 
     if query == "-" or not isinstance(brief_type, str) or brief_type not in BRIEF_TYPES:
         await answer_text(message, "Сбор справки отменён. Открыть меню: /menu")
         return
 
     await process_brief_request(message, brief_type, query)
+
+
+async def _restore_menu(message: Message, menu_message_id: object) -> None:
+    """Put the dashboard back over the "send the query" prompt."""
+    if isinstance(menu_message_id, int):
+        await render_section(
+            cast(Bot, message.bot), chat_id=message.chat.id, section="summaries",
+            preferred_message_id=menu_message_id,
+        )
 
 
 async def process_brief_request(message: Message, brief_type: str, query: str) -> None:
@@ -124,21 +152,30 @@ async def process_brief_request(message: Message, brief_type: str, query: str) -
         )
         return
 
-    today = date.today()
+    today = owner_today()
     try:
         manifest = load_manifest_for_vault(vault_path)
+
         # Path selection under the vault write lock -- see
         # run_compiled_brief.py's main() for why (two near-simultaneous
         # callers must not both see the same counter suffix as free).
-        with vault_write_lock(vault_path) as lock:
-            path = brief_path(vault_path, result, today)
+        def write_brief(lock: Any) -> Path:
+            brief_file = brief_path(vault_path, result, today)
             write_validated_vault_markdown(
                 vault_path,
-                path,
+                brief_file,
                 render_brief_note(result, today),
                 manifest=manifest,
                 existing_lock=lock,
             )
+            return brief_file
+
+        path = await run_with_vault_lock(
+            vault_path, write_brief, lock_factory=vault_write_lock
+        )
+    except VaultBusyError:
+        await answer_text(message, "⏳ Идёт обработка, попробуйте позже.")
+        return
     except Exception:
         logger.exception("Failed to write brief")
         await answer_text(message, "❌ Не удалось сохранить справку.")

@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+import contextlib
+import os
+import signal
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
 
-from acp import PROTOCOL_VERSION, Client, RequestError, spawn_agent_process, text_block
+from acp import PROTOCOL_VERSION, Client, RequestError, text_block
+from acp.client.connection import ClientSideConnection
 from acp.schema import (
     AgentMessageChunk,
     AllowedOutcome,
@@ -18,6 +23,9 @@ from acp.schema import (
     RequestPermissionResponse,
     TextContentBlock,
 )
+from acp.transports import default_environment
+
+_PROCESS_EXIT_GRACE_SECONDS = 2.0
 
 
 class _KimiAcpClient:
@@ -79,6 +87,55 @@ class _KimiAcpClient:
         del elicitation_id, kwargs
 
 
+def _signal_group(pgid: int, sig: signal.Signals) -> None:
+    with contextlib.suppress(OSError):
+        os.killpg(pgid, sig)
+
+
+@asynccontextmanager
+async def _spawn_kimi(
+    client: Client,
+    args: list[str],
+    env: Mapping[str, str],
+    workdir: Path,
+) -> AsyncIterator[ClientSideConnection]:
+    """Start Kimi in its own process group and always stop the whole group.
+
+    `acp.spawn_agent_process` cannot set `start_new_session`, and on a timeout
+    it stops only the direct `kimi` process, leaving its MCP/tool children.
+    """
+    process = await asyncio.create_subprocess_exec(
+        "kimi",
+        *args,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        env={**default_environment(), **env},
+        cwd=str(workdir),
+        start_new_session=True,
+    )
+    assert process.stdin is not None and process.stdout is not None
+    connection = ClientSideConnection(client, process.stdin, process.stdout)
+    try:
+        yield connection
+    finally:
+        try:
+            # Bounded: a hung close() must not keep the group alive.
+            await asyncio.wait_for(
+                connection.close(), _PROCESS_EXIT_GRACE_SECONDS
+            )
+            process.stdin.close()
+            await asyncio.wait_for(process.wait(), _PROCESS_EXIT_GRACE_SECONDS)
+        except (asyncio.CancelledError, Exception):
+            pass
+        finally:
+            # The group leader's pid stays the group id while any member lives.
+            _signal_group(process.pid, signal.SIGTERM)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(process.wait(), _PROCESS_EXIT_GRACE_SECONDS)
+            _signal_group(process.pid, signal.SIGKILL)
+
+
 async def _run_kimi_acp(
     prompt: str,
     workdir: Path,
@@ -86,15 +143,12 @@ async def _run_kimi_acp(
     model: str | None = None,
 ) -> str:
     client = _KimiAcpClient()
-    async with spawn_agent_process(
+    async with _spawn_kimi(
         cast(Client, client),
-        "kimi",
-        *(["--model", model] if model else []),
-        "acp",
-        env=env,
-        cwd=workdir,
-        transport_kwargs={"stderr": asyncio.subprocess.DEVNULL},
-    ) as (connection, _process):
+        [*(["--model", model] if model else []), "acp"],
+        env,
+        workdir,
+    ) as connection:
         await connection.initialize(
             protocol_version=PROTOCOL_VERSION,
             client_capabilities=ClientCapabilities(),

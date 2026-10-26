@@ -12,6 +12,7 @@ from d_brain.bot.conversations import is_reply_to_bot, save_answer
 from d_brain.bot.formatters import format_process_report, inline_artifact_image_paths
 from d_brain.bot.handlers.do import process_request
 from d_brain.bot.replies import answer_files, answer_rich_text, answer_text, edit_text
+from d_brain.clock import to_owner
 from d_brain.config import get_settings
 from d_brain.services.link_summary import (
     LinkSummaryService,
@@ -42,21 +43,6 @@ def _text_branch_label(intent: str, workflow: str = "") -> str:
 def _text_status(branch: str, step: str) -> str:
     """One compact status payload for text routing."""
     return f"⏳ **Ветка:** {branch}\n**Сейчас:** {step}"
-
-
-async def _safe_edit_status(
-    status_message: Message | None,
-    *,
-    branch: str,
-    step: str,
-) -> None:
-    """Best-effort status update without breaking the main flow."""
-    if status_message is None:
-        return
-    try:
-        await edit_text(status_message, _text_status(branch, step))
-    except Exception:
-        logger.debug("Failed to edit text status", exc_info=True)
 
 
 async def _safe_delete_status(status_message: Message | None) -> None:
@@ -269,7 +255,7 @@ async def handle_text(message: Message) -> None:
             zai_api_key=getattr(settings, "zai_api_key", ""),
             proxy_url=getattr(settings, "proxy_url", ""),
         )
-        timestamp = message.date.astimezone()
+        timestamp = to_owner(message.date)
         source = build_telegram_source_info(
             message, language=settings.content_language
         )
@@ -343,10 +329,64 @@ async def handle_text(message: Message) -> None:
             logger.exception("Failed to deliver text capture confirmation")
         logger.info("Text message saved: %d chars", len(result.content))
 
-    except Exception as exc:
+    except Exception:
         logger.exception("Error processing text message")
         await _safe_delete_status(status_message)
         try:
-            await answer_text(message, f"Ошибка: {exc}", parse_mode=None)
+            await answer_text(
+                message,
+                "Не удалось сохранить сообщение, подробности в логе.",
+                parse_mode=None,
+            )
         except Exception:
             logger.exception("Failed to deliver text failure report")
+
+
+# Known commands are claimed by their own routers earlier in bot/main.py, so
+# whatever starts with "/" and reaches this router is not a registered command.
+# No intent classifier here: it could read "/srv тормозит" as an instruction
+# and start a processing run, so the text is simply kept.
+@router.message(lambda m: m.text is not None and m.text.startswith("/"))
+async def handle_unknown_command(message: Message) -> None:
+    """Save an unrecognized "/..." message to daily as plain text."""
+    if not message.text or not message.from_user:
+        return
+
+    settings = get_settings()
+    try:
+        content, _ = scrub_secrets(message.text)
+        source = build_telegram_source_info(
+            message, language=settings.content_language
+        )
+        storage = VaultStorage(settings.vault_path, settings.content_language)
+        await asyncio.to_thread(
+            storage.append_to_daily,
+            content,
+            to_owner(message.date),
+            "[text]",
+            source=source,
+        )
+        SessionStore(settings.vault_path).append(
+            message.from_user.id,
+            "text",
+            text=content,
+            msg_id=message.message_id,
+            source_ref=source.ref,
+            source_url=source.url,
+            unknown_command=True,
+        )
+        await answer_text(
+            message,
+            "✓ Сохранено (команда не распознана, записано как текст)",
+            parse_mode=None,
+        )
+    except Exception:
+        logger.exception("Error processing unknown command")
+        try:
+            await answer_text(
+                message,
+                "Не удалось сохранить сообщение, подробности в логе.",
+                parse_mode=None,
+            )
+        except Exception:
+            logger.exception("Failed to deliver unknown command failure report")

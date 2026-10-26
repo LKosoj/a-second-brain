@@ -66,8 +66,10 @@ Deepgram transcribes Telegram voice messages. Configure:
 DEEPGRAM_API_KEY=
 ```
 
-The key is required by the current runtime. Audio is sent to the configured
-Deepgram service for transcription.
+The key is optional. Without it, or when Deepgram fails, the voice message is
+kept under `attachments/` with a daily entry marked `voice_unrecognized`
+("Не распознано"); the nightly run retries for yesterday and today. Audio is
+sent to the configured Deepgram service for transcription.
 
 ## Todoist
 
@@ -85,6 +87,31 @@ responsibility.
 Leave `TODOIST_API_KEY` empty to disable Todoist. `doctor` then reports an
 informational result rather than an error.
 
+## Calendar
+
+Set `CALENDAR_ICS_URL` to a private ICS link of your calendar (Google Calendar:
+settings of the calendar, "Secret address in iCal format"; Outlook and
+Nextcloud: a published calendar). The bot only reads it; nothing is written to
+the calendar or the vault.
+
+- The morning brief shows today's meetings (the day follows `TIMEZONE`);
+  all-day events come last.
+- The nightly processing receives the meetings of the processed day that have
+  already started, as context for tasks and CRM. The calendar text is passed to
+  the model as data, not as instructions.
+- Recurring meetings are supported (`RRULE`, `EXDATE`, moved occurrences);
+  `RDATE` is not. Time zones with Windows names (Outlook) are read as your
+  `TIMEZONE`, so such meetings can be off by a few hours.
+- The link is a secret: anyone with it can read the calendar. Do not publish or
+  commit it; the bot never logs or prints it.
+- Only public addresses are allowed (protection against requests into your own
+  network). A calendar on a home server or `localhost` is skipped, and `doctor`
+  warns about it.
+- If the link stops working, the brief shows "календарь недоступен" instead of
+  the meetings, and the nightly processing runs without the calendar.
+
+Leave `CALENDAR_ICS_URL` empty to disable the calendar.
+
 ## QMD
 
 [QMD](https://github.com/tobi/qmd) supplies local vault indexing and retrieval.
@@ -101,14 +128,15 @@ variables below. When `EMB_MODEL` is empty, the project uses
 `Qwen3-Embedding-0.6B`; when `RERANK_MODEL` is empty, QMD uses
 `Qwen3-Reranker-0.6B`. The models are downloaded from Hugging Face during the
 first embedding or query run and use the CPU by default. To use a remote
-embedding provider, set `OPENAI_API_KEY` and `EMB_MODEL`; set `BASE_URL` for a
-non-default compatible endpoint. `MODEL` belongs to the recall planner rather
+embedding provider, set `OPENAI_API_KEY` and `EMB_MODEL`; set `OPENAI_BASE_URL` for a
+non-default compatible endpoint (the older `BASE_URL` and `MODEL` still work).
+`OPENAI_MODEL` belongs to the recall planner rather
 than QMD indexing.
 
 ```dotenv
 OPENAI_API_KEY=
-BASE_URL=
-MODEL=
+OPENAI_BASE_URL=
+OPENAI_MODEL=
 EMB_MODEL=
 RERANK_MODEL=
 ```
@@ -148,6 +176,10 @@ PLAUD_BEARER_TOKEN=
 
 Supported regions are `api` and `api-euc1`. The optional hourly timer is
 enabled only when the token is present.
+
+If Todoist accepted tasks from a recording but returned no ids for them, the
+sync sends their count and titles to Telegram ("⚠️ Не подтверждено, проверьте
+в Todoist"), the same way as the nightly report.
 
 Removing the token does not disable an already enabled timer:
 

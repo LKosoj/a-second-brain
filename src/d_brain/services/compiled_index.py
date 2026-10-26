@@ -24,10 +24,11 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
-from datetime import date
 from pathlib import Path
 
+from d_brain.clock import owner_today
 from d_brain.manifest import VaultManifest, load_manifest_for_vault
+from d_brain.services import compiled_page
 from d_brain.services.compiled_briefings import (
     COMPILED_BRIEFING_DOMAINS,
     CompiledBriefingService,
@@ -76,12 +77,12 @@ def build_question_catalog(vault_path: Path, question: str) -> str:
     pages = _collect_pages(vault_path)
     if not pages:
         return ""
-    tokens = CompiledBriefingService._tokens(question.casefold())
+    tokens = compiled_page.tokens(question.casefold())
     scored = [
         (
             len(
                 tokens
-                & CompiledBriefingService._tokens(
+                & compiled_page.tokens(
                     f"{page.title} {page.description} {page.domain}".casefold()
                 )
             ),
@@ -110,16 +111,16 @@ def project_scope_paths(vault_path: Path, question: str) -> tuple[str, ...]:
     matches: list[Path] = []
     service = CompiledBriefingService(vault_path)
     for path in sorted((vault_path / "compiled/projects").glob("*.md")):
-        text = service._read_page_text(path)
-        fields = service._frontmatter_fields(text)
+        text = compiled_page.read_page_text(path)
+        fields = compiled_page.frontmatter_fields(text)
         if fields.get("canonical_path"):
             continue
-        title = service._title_from_text(text)
+        title = compiled_page.title_from_text(text)
         names = [
             title,
             re.sub(r"^(?:проект|project)\s+", "", title, flags=re.I),
             path.stem.replace("-", " "),
-            *service._normalize_list(fields.get("aliases")),
+            *compiled_page.normalize_list(fields.get("aliases")),
         ]
         if any(
             len(name) >= 3
@@ -131,10 +132,10 @@ def project_scope_paths(vault_path: Path, question: str) -> tuple[str, ...]:
     if len(matches) != 1:
         return ()
     path = matches[0]
-    text = service._read_page_text(path)
+    text = compiled_page.read_page_text(path)
     paths = [path.relative_to(vault_path).as_posix()]
-    for source in service._source_links_from_note(text):
-        resolved = service._resolve_lint_source_path(source)
+    for source in compiled_page.source_links_from_note(text):
+        resolved = service.resolve_lint_source_path(source)
         if (
             resolved is not None
             and resolved.is_file()
@@ -174,11 +175,11 @@ def _collect_pages(vault_path: Path) -> list[_CatalogPage]:
         rel_path = path.relative_to(vault_path).as_posix()
         if rel_path.startswith("compiled/archive/"):
             continue
-        text = CompiledBriefingService._read_page_text(path)
-        fields = CompiledBriefingService._frontmatter_fields(text)
+        text = compiled_page.read_page_text(path)
+        fields = compiled_page.frontmatter_fields(text)
         if fields.get("canonical_path"):
             continue
-        title = CompiledBriefingService._title_from_text(text) or path.stem.replace(
+        title = compiled_page.title_from_text(text) or path.stem.replace(
             "-", " "
         )
         pages.append(
@@ -254,7 +255,7 @@ def write_entity_indexes(
             fields = parse_frontmatter_bytes(
                 (vault_path / "compiled" / domain / f"{page.slug}.md").read_bytes()
             ).fields
-            names = CompiledBriefingService._normalize_list(fields.get("directions"))
+            names = compiled_page.normalize_list(fields.get("directions"))
             for name in names or ["Без направления"]:
                 groups.setdefault(name, []).append(page)
         for name, entries in sorted(groups.items()):
@@ -366,7 +367,7 @@ def refresh_compiled_index(
         old_bytes = None
 
     old_fields = parse_frontmatter_bytes(old_bytes).fields if old_bytes else {}
-    last_accessed = old_fields.get("last_accessed") or date.today().isoformat()
+    last_accessed = old_fields.get("last_accessed") or owner_today().isoformat()
     relevance = old_fields.get("relevance")
     if relevance is None:
         relevance = _DEFAULT_RELEVANCE

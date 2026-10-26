@@ -8,14 +8,14 @@ import threading
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from conftest import _write_vault_manifest
 
-from d_brain.services import compiled_briefings, decisions_queue
+from d_brain.services import compiled_briefings, compiled_page, decisions_queue
 from d_brain.services.compiled_briefings import (
     ARCHIVE_TIER_IDLE_DAYS,
     COMPILED_BRIEFING_DOMAINS,
@@ -74,8 +74,8 @@ def test_atomic_writers_create_group_accessible_files(tmp_path: Path) -> None:
     text_path = tmp_path / "state.json"
     bytes_path = tmp_path / "snapshot.bin"
 
-    compiled_briefings._atomic_write_text(text_path, "{}\n")
-    compiled_briefings._atomic_write_bytes(bytes_path, b"snapshot")
+    compiled_briefings.atomic_write_file_text(text_path, "{}\n")
+    compiled_briefings.atomic_write_file_bytes(bytes_path, b"snapshot")
 
     assert text_path.stat().st_mode & 0o777 == 0o660
     assert bytes_path.stat().st_mode & 0o777 == 0o660
@@ -89,8 +89,8 @@ def test_atomic_writers_preserve_existing_modes(tmp_path: Path) -> None:
     text_path.chmod(0o640)
     bytes_path.chmod(0o640)
 
-    compiled_briefings._atomic_write_text(text_path, "new\n")
-    compiled_briefings._atomic_write_bytes(bytes_path, b"new")
+    compiled_briefings.atomic_write_file_text(text_path, "new\n")
+    compiled_briefings.atomic_write_file_bytes(bytes_path, b"new")
 
     assert text_path.stat().st_mode & 0o777 == 0o640
     assert bytes_path.stat().st_mode & 0o777 == 0o640
@@ -246,13 +246,13 @@ def _full_compiled_page_text(
             *svc._render_sources(sources or []),
             "",
             "## Sources That Shaped This Page",
-            *svc._render_sources_shaped_table(shaped_rows or []),
+            *compiled_page.render_sources_shaped_table(shaped_rows or []),
             "",
             "## Open Conflicts",
-            *svc._render_open_conflicts_table(conflict_rows or []),
+            *compiled_page.render_open_conflicts_table(conflict_rows or []),
             "",
             "## Claim History",
-            *svc._render_claim_history([]),
+            *compiled_page.render_claim_history([]),
             "",
         ]
     )
@@ -1080,7 +1080,7 @@ def test_compiled_briefings_on_source_finished_marks_import_note_used_on_update(
 
     service.drain_queue(force=True, refresh_qmd=False)
 
-    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    fields = compiled_page.frontmatter_fields(note_path.read_text(encoding="utf-8"))
     assert fields["compile_state"] == "used"
     assert fields["compile_checked"] == date.today().isoformat()
 
@@ -1111,7 +1111,7 @@ def test_compiled_briefings_on_source_finished_marks_import_note_nothing_unrefer
 
     service.drain_queue(force=True, refresh_qmd=False)
 
-    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    fields = compiled_page.frontmatter_fields(note_path.read_text(encoding="utf-8"))
     assert fields["compile_state"] == "nothing"
 
 
@@ -1144,7 +1144,7 @@ def test_compiled_briefings_on_source_finished_skips_mark_when_not_targets_empty
 
     service.drain_queue(force=True, refresh_qmd=False)
 
-    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    fields = compiled_page.frontmatter_fields(note_path.read_text(encoding="utf-8"))
     assert "compile_state" not in fields
 
 
@@ -1177,7 +1177,7 @@ def test_compiled_briefings_on_source_finished_marks_import_note_used_when_refer
 
     service.drain_queue(force=True, refresh_qmd=False)
 
-    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    fields = compiled_page.frontmatter_fields(note_path.read_text(encoding="utf-8"))
     assert fields["compile_state"] == "used"
 
 
@@ -1203,7 +1203,7 @@ def test_compiled_briefings_on_source_finished_marks_import_note_failed_on_rejec
 
     service.drain_queue(force=True, refresh_qmd=False)
 
-    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    fields = compiled_page.frontmatter_fields(note_path.read_text(encoding="utf-8"))
     assert fields["compile_state"] == "failed"
 
 
@@ -1230,7 +1230,7 @@ def test_compiled_briefings_on_source_finished_marks_import_note_failed_on_dropp
     for _ in range(3):
         service.drain_queue(force=True, refresh_qmd=False)
 
-    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    fields = compiled_page.frontmatter_fields(note_path.read_text(encoding="utf-8"))
     assert fields["compile_state"] == "failed"
 
 
@@ -1268,7 +1268,7 @@ def test_compiled_briefings_on_source_finished_does_not_mark_non_import_source(
 
     service.drain_queue(force=True, refresh_qmd=False)
 
-    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    fields = compiled_page.frontmatter_fields(note_path.read_text(encoding="utf-8"))
     assert "compile_state" not in fields
 
 
@@ -1318,7 +1318,7 @@ def test_compiled_briefings_sweep_unmarked_imports_marks_referenced_note_used(
     result = service.sweep_unmarked_imports(limit=None)
 
     assert result == {"marked_used": 1, "requeued": 0, "skipped": 0}
-    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    fields = compiled_page.frontmatter_fields(note_path.read_text(encoding="utf-8"))
     assert fields["compile_state"] == "used"
 
 
@@ -1491,7 +1491,7 @@ def test_compiled_briefings_run_nightly_maintenance_marks_import_note_via_drain(
     result = service.run_nightly_maintenance()
 
     assert result["imports_used"] == 1
-    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    fields = compiled_page.frontmatter_fields(note_path.read_text(encoding="utf-8"))
     assert fields["compile_state"] == "used"
 
 
@@ -2216,7 +2216,7 @@ def test_compiled_briefings_rollback_discards_buffered_import_marks(
     )
 
     assert any("changed zero pages" in error for error in result["errors"])
-    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    fields = compiled_page.frontmatter_fields(note_path.read_text(encoding="utf-8"))
     assert "compile_state" not in fields
     assert result["imports_used"] == 0
     assert result["imports_nothing"] == 0
@@ -2261,7 +2261,7 @@ def test_compiled_briefings_a_pass_that_survives_applies_buffered_import_marks(
     )
 
     assert result["errors"] == []
-    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    fields = compiled_page.frontmatter_fields(note_path.read_text(encoding="utf-8"))
     assert fields["compile_state"] == "nothing"
     assert result["imports_used"] == 0
     assert result["imports_nothing"] == 1
@@ -2310,7 +2310,7 @@ def test_compiled_briefings_a_crashed_pass_discards_buffered_import_marks(
     assert journal["imports_used"] == 0
     assert journal["imports_nothing"] == 0
     assert journal["imports_failed"] == 0
-    fields = service._frontmatter_fields(note_path.read_text(encoding="utf-8"))
+    fields = compiled_page.frontmatter_fields(note_path.read_text(encoding="utf-8"))
     assert "compile_state" not in fields
 
 
@@ -4180,7 +4180,7 @@ def test_compiled_decision_preserves_accepted_record_without_supersession(
         },
         source_rel_path="daily/2026-04-04.md",
         existing_text=existing,
-        existing_meta=service._frontmatter_fields(existing),
+        existing_meta=compiled_page.frontmatter_fields(existing),
         signal=None,
     )
 
@@ -4232,7 +4232,7 @@ def test_compiled_decision_preserves_accepted_rationale_despite_human_zone_echo(
         },
         source_rel_path="daily/2026-04-04.md",
         existing_text=existing,
-        existing_meta=service._frontmatter_fields(existing),
+        existing_meta=compiled_page.frontmatter_fields(existing),
         signal=None,
     )
 
@@ -4253,10 +4253,9 @@ def test_frontmatter_fields_decodes_point_edit_json_quoted_values(
     of the memory tier (e.g. the archive-tier gate in ``_upsert_briefing``)
     never sees a stray wrapping quote.
     """
-    service = _compiled_service(tmp_path / "vault")
     text = '---\ntier: "warm"\nstatus: active\n---\n\n# Demo\n'
 
-    fields = service._frontmatter_fields(text)
+    fields = compiled_page.frontmatter_fields(text)
 
     assert fields["tier"] == "warm"
     assert fields["status"] == "active"
@@ -4271,16 +4270,15 @@ def test_frontmatter_fields_survives_leading_utf8_bom(tmp_path: Path) -> None:
     entirely and ``_frontmatter_fields`` return ``{}`` for the whole page,
     ``tier`` included.
     """
-    service = _compiled_service(tmp_path / "vault")
     text = "---\ntier: archive\nstatus: active\n---\n\n# Demo\n"
     bom_text = "\ufeff" + text
 
-    fields = service._frontmatter_fields(bom_text)
+    fields = compiled_page.frontmatter_fields(bom_text)
 
     assert fields["tier"] == "archive"
     assert fields["status"] == "active"
-    assert fields == service._frontmatter_fields(text)
-    assert service._body_without_frontmatter(bom_text) == "# Demo\n"
+    assert fields == compiled_page.frontmatter_fields(text)
+    assert compiled_page.body_without_frontmatter(bom_text) == "# Demo\n"
 
 
 def test_compiled_briefings_upsert_briefing_frozen_tier_survives_utf8_bom(
@@ -4438,16 +4436,15 @@ def test_frontmatter_fields_survives_crlf_line_endings(tmp_path: Path) -> None:
     copy the way ``_frontmatter_fields`` above may for its own
     string-valued dict.
     """
-    service = _compiled_service(tmp_path / "vault")
     text = "---\ntier: archive\nstatus: active\n---\n\n# Demo\n"
     crlf_text = text.replace("\n", "\r\n")
 
-    fields = service._frontmatter_fields(crlf_text)
+    fields = compiled_page.frontmatter_fields(crlf_text)
 
     assert fields["tier"] == "archive"
     assert fields["status"] == "active"
-    assert fields == service._frontmatter_fields(text)
-    assert service._body_without_frontmatter(crlf_text) == "# Demo\r\n"
+    assert fields == compiled_page.frontmatter_fields(text)
+    assert compiled_page.body_without_frontmatter(crlf_text) == "# Demo\r\n"
 
 
 def test_compiled_briefings_upsert_briefing_frozen_tier_survives_crlf_line_endings(
@@ -4481,7 +4478,7 @@ def test_compiled_briefings_upsert_briefing_frozen_tier_survives_crlf_line_endin
 
     assert len(calls) == 1
     assert result.written is True
-    new_tier = service._frontmatter_fields(
+    new_tier = compiled_page.frontmatter_fields(
         page_path.read_text(encoding="utf-8")
     )["tier"]
     assert new_tier != "active"
@@ -4534,10 +4531,10 @@ def test_compiled_decision_owner_with_embedded_quotes_survives_repeated_compiles
         existing_meta={},
         signal=None,
     )
-    assert service._frontmatter_fields(text)["decision_owner"] == owner
+    assert compiled_page.frontmatter_fields(text)["decision_owner"] == owner
 
     for day in ("05", "06"):
-        meta = service._frontmatter_fields(text)
+        meta = compiled_page.frontmatter_fields(text)
         assert meta["decision_owner"] == owner
         text = service._render_briefing(
             target=target,
@@ -4552,7 +4549,7 @@ def test_compiled_decision_owner_with_embedded_quotes_survives_repeated_compiles
             signal=None,
         )
 
-    final_meta = service._frontmatter_fields(text)
+    final_meta = compiled_page.frontmatter_fields(text)
     assert final_meta["decision_owner"] == owner
     assert '\\\\' not in text
     assert 'decision_owner: "Иван \\"Ваня\\" Петров"' in text
@@ -4808,7 +4805,7 @@ def test_compiled_briefings_render_carries_human_zone_byte_for_byte(
         payload=_minimal_compile_payload(current_state="New state."),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
     )
 
@@ -4857,7 +4854,7 @@ def test_compiled_briefings_render_carries_related_pages_forward_before_sources(
         payload=_minimal_compile_payload(current_state="New state."),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
     )
 
@@ -4905,7 +4902,7 @@ def test_compiled_briefings_render_carries_forward_typed_frontmatter_fields(
         payload=_minimal_compile_payload(),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
     )
 
@@ -4941,7 +4938,7 @@ def test_compiled_briefings_render_drops_unreparseable_frontmatter_fields_with_w
             payload=_minimal_compile_payload(),
             source_rel_path="daily/2026-08-05.md",
             existing_text=existing_text,
-            existing_meta=service._frontmatter_fields(existing_text),
+            existing_meta=compiled_page.frontmatter_fields(existing_text),
             signal=None,
         )
 
@@ -4967,7 +4964,7 @@ def test_compiled_briefings_render_rejects_unpaired_human_zone_markers(
             payload=_minimal_compile_payload(),
             source_rel_path="daily/2026-08-05.md",
             existing_text=existing_text,
-            existing_meta=service._frontmatter_fields(existing_text),
+            existing_meta=compiled_page.frontmatter_fields(existing_text),
             signal=None,
         )
 
@@ -4989,7 +4986,7 @@ def test_compiled_briefings_render_rejects_duplicated_human_zone_markers(
             payload=_minimal_compile_payload(),
             source_rel_path="daily/2026-08-05.md",
             existing_text=existing_text,
-            existing_meta=service._frontmatter_fields(existing_text),
+            existing_meta=compiled_page.frontmatter_fields(existing_text),
             signal=None,
         )
 
@@ -5042,7 +5039,7 @@ def test_compiled_briefings_model_output_cannot_forge_a_second_human_zone(
         payload=payload,
         source_rel_path="daily/2026-08-05.md",
         existing_text=with_notes,
-        existing_meta=service._frontmatter_fields(with_notes),
+        existing_meta=compiled_page.frontmatter_fields(with_notes),
         signal=None,
     )
 
@@ -5067,7 +5064,7 @@ def test_compiled_briefings_defusing_a_marker_is_idempotent() -> None:
     assert once == twice
     assert HUMAN_ZONE_START not in once
     assert HUMAN_ZONE_END not in once
-    assert CompiledBriefingService._normalize_list([quoted]) == [once]
+    assert compiled_page.normalize_list([quoted]) == [once]
 
 
 def test_compiled_briefings_model_output_cannot_forge_a_section_heading(
@@ -5110,7 +5107,7 @@ def test_compiled_briefings_model_output_cannot_forge_a_section_heading(
         ),
         source_rel_path="daily/2026-08-06.md",
         existing_text=first,
-        existing_meta=service._frontmatter_fields(first),
+        existing_meta=compiled_page.frontmatter_fields(first),
         signal=None,
     )
 
@@ -5202,7 +5199,7 @@ def test_compiled_briefings_next_check_cannot_forge_a_section_heading(
     )
 
     assert len(re.findall(rf"^## {heading}$", first, re.MULTILINE)) == 1
-    assert service._source_links_from_note(first) == ["daily/2026-08-05.md"]
+    assert compiled_page.source_links_from_note(first) == ["daily/2026-08-05.md"]
 
 
 def test_compiled_briefings_render_refuses_to_write_an_ambiguous_human_zone(
@@ -5220,9 +5217,48 @@ def test_compiled_briefings_render_refuses_to_write_an_ambiguous_human_zone(
     monkeypatch.setattr(
         compiled_briefings, "_defuse_human_zone_markers", lambda text: text
     )
+    monkeypatch.setattr(compiled_page, "defuse_human_zone_markers", lambda text: text)
     payload = _minimal_compile_payload(
         current_state=f"{HUMAN_ZONE_START}\nforged\n{HUMAN_ZONE_END}"
     )
+
+    with pytest.raises(HumanZoneMarkerError):
+        service._render_briefing(
+            target=_demo_target(),
+            payload=payload,
+            source_rel_path="daily/2026-08-05.md",
+            existing_text="",
+            existing_meta={},
+            signal=None,
+        )
+
+
+def test_compiled_briefings_render_defuses_a_forged_marker_in_a_list_field(
+    tmp_path: Path,
+) -> None:
+    """``normalize_list`` defuses markers, so the render succeeds and keeps one zone."""
+    service = _compiled_service(tmp_path / "vault")
+
+    text = service._render_briefing(
+        target=_demo_target(),
+        payload=_minimal_compile_payload(key_decisions=[HUMAN_ZONE_START]),
+        source_rel_path="daily/2026-08-05.md",
+        existing_text="",
+        existing_meta={},
+        signal=None,
+    )
+
+    assert text.count(HUMAN_ZONE_START) == 1
+
+
+def test_compiled_briefings_render_refuses_a_forged_marker_in_a_list_field(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same backstop, reached through ``normalize_list`` (list fields)."""
+    service = _compiled_service(tmp_path / "vault")
+    monkeypatch.setattr(compiled_page, "defuse_human_zone_markers", lambda text: text)
+    payload = _minimal_compile_payload(key_decisions=[HUMAN_ZONE_START])
 
     with pytest.raises(HumanZoneMarkerError):
         service._render_briefing(
@@ -5270,7 +5306,7 @@ def test_compiled_briefings_render_rejects_symmetric_typo_in_both_human_zone_mar
             payload=_minimal_compile_payload(),
             source_rel_path="daily/2026-08-05.md",
             existing_text=existing_text,
-            existing_meta=service._frontmatter_fields(existing_text),
+            existing_meta=compiled_page.frontmatter_fields(existing_text),
             signal=None,
         )
 
@@ -5297,7 +5333,7 @@ def test_compiled_briefings_render_rejects_zero_width_char_in_both_human_zone_ma
             payload=_minimal_compile_payload(),
             source_rel_path="daily/2026-08-05.md",
             existing_text=existing_text,
-            existing_meta=service._frontmatter_fields(existing_text),
+            existing_meta=compiled_page.frontmatter_fields(existing_text),
             signal=None,
         )
 
@@ -5321,7 +5357,7 @@ def test_compiled_briefings_render_keeps_empty_scaffold_for_page_genuinely_witho
         payload=_minimal_compile_payload(),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
     )
 
@@ -5436,7 +5472,7 @@ def test_compiled_briefings_render_rejects_underscore_typo_in_both_human_zone_ma
             payload=_minimal_compile_payload(),
             source_rel_path="daily/2026-08-05.md",
             existing_text=existing_text,
-            existing_meta=service._frontmatter_fields(existing_text),
+            existing_meta=compiled_page.frontmatter_fields(existing_text),
             signal=None,
         )
 
@@ -5459,7 +5495,7 @@ def test_compiled_briefings_render_rejects_homoglyph_typo_in_both_human_zone_mar
             payload=_minimal_compile_payload(),
             source_rel_path="daily/2026-08-05.md",
             existing_text=existing_text,
-            existing_meta=service._frontmatter_fields(existing_text),
+            existing_meta=compiled_page.frontmatter_fields(existing_text),
             signal=None,
         )
 
@@ -5489,7 +5525,7 @@ def test_compiled_briefings_render_does_not_block_on_prose_mentioning_marker_wit
         payload=_minimal_compile_payload(),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
     )
 
@@ -5676,7 +5712,7 @@ def test_compiled_briefings_render_rejects_owner_notes_heading_anchor_with_missi
             payload=_minimal_compile_payload(),
             source_rel_path="daily/2026-08-05.md",
             existing_text=existing_text,
-            existing_meta=service._frontmatter_fields(existing_text),
+            existing_meta=compiled_page.frontmatter_fields(existing_text),
             signal=None,
         )
 
@@ -5700,7 +5736,7 @@ def test_compiled_briefings_render_rejects_owner_notes_section_fully_truncated_w
             payload=_minimal_compile_payload(),
             source_rel_path="daily/2026-08-05.md",
             existing_text=existing_text,
-            existing_meta=service._frontmatter_fields(existing_text),
+            existing_meta=compiled_page.frontmatter_fields(existing_text),
             signal=None,
         )
 
@@ -5727,7 +5763,7 @@ def test_compiled_briefings_render_keeps_scaffold_for_never_populated_page_even_
         payload=_minimal_compile_payload(),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
     )
 
@@ -5756,7 +5792,7 @@ def test_compiled_briefings_render_sets_human_zone_populated_flag_on_first_real_
         payload=_minimal_compile_payload(),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
     )
 
@@ -5809,7 +5845,7 @@ def test_compiled_briefings_render_keeps_human_zone_populated_flag_sticky_after_
         payload=_minimal_compile_payload(),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
     )
 
@@ -5897,7 +5933,7 @@ def test_body_without_frontmatter_preserves_crlf_inside_human_zone() -> None:
         f"{HUMAN_ZONE_START}\r\nline one\r\nline two\r\n{HUMAN_ZONE_END}\r\n"
     )
 
-    body = CompiledBriefingService._body_without_frontmatter(text)
+    body = compiled_page.body_without_frontmatter(text)
 
     assert "\r\n" in body
     assert body.count("\r\n") >= 5
@@ -6014,7 +6050,7 @@ def test_compiled_briefings_render_carries_crlf_human_zone_byte_for_byte(
         payload=_minimal_compile_payload(current_state="New state."),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
     )
 
@@ -6123,7 +6159,7 @@ def test_compiled_briefings_render_drops_payload_content_duplicating_human_zone(
         ),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
     )
 
@@ -6483,7 +6519,7 @@ def test_compiled_briefings_render_keeps_short_bullet_that_echoes_human_zone(
         payload=_minimal_compile_payload(recent_changes=["SLA"]),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
     )
 
@@ -6513,7 +6549,7 @@ def test_compiled_briefings_duplicate_filter_still_drops_long_verbatim_duplicate
     None
 ):
     human_note = "Обсудили retry strategy с partner Acme и зафиксировали SLA."
-    human_zone_tokens = CompiledBriefingService._tokens(human_note)
+    human_zone_tokens = compiled_page.tokens(human_note)
 
     assert CompiledBriefingService._text_duplicates_human_zone(
         human_note, human_zone_tokens
@@ -6566,7 +6602,7 @@ def test_compiled_briefings_sources_table_accumulates_rows_across_passes(
         payload=_minimal_compile_payload(recent_changes=["Второе обновление."]),
         source_rel_path="daily/2026-08-02.md",
         existing_text=first_pass,
-        existing_meta=service._frontmatter_fields(first_pass),
+        existing_meta=compiled_page.frontmatter_fields(first_pass),
         signal=None,
     )
 
@@ -6599,7 +6635,7 @@ def test_compiled_briefings_sources_table_deduplicates_same_day_source(
         ),
         source_rel_path="daily/2026-08-05.md",
         existing_text=first_pass,
-        existing_meta=service._frontmatter_fields(first_pass),
+        existing_meta=compiled_page.frontmatter_fields(first_pass),
         signal=None,
     )
 
@@ -6710,7 +6746,7 @@ def test_compiled_briefings_render_new_page_sets_default_provenance_fields(
         signal=None,
     )
 
-    fields = service._frontmatter_fields(rendered)
+    fields = compiled_page.frontmatter_fields(rendered)
     assert fields["sources_trust"] == DEFAULT_SOURCES_TRUST == "inferred"
     assert fields["enrichment_count"] == "1"
     assert fields["conflicts_open"] == "0"
@@ -6737,11 +6773,11 @@ def test_compiled_briefings_render_increments_enrichment_keeps_human_reviewed(
         payload=_minimal_compile_payload(),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
     )
 
-    fields = service._frontmatter_fields(rendered)
+    fields = compiled_page.frontmatter_fields(rendered)
     assert fields["enrichment_count"] == "4"
     assert fields["human_reviewed"] == "2026-07-01"
     assert fields["sources_trust"] == "own"
@@ -6775,11 +6811,11 @@ def test_compiled_briefings_render_keeps_owner_written_duplicate_of(
         payload=_minimal_compile_payload(),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
     )
 
-    fields = service._frontmatter_fields(rendered)
+    fields = compiled_page.frontmatter_fields(rendered)
     assert fields["duplicate_of"] == "compiled/projects/other-page.md"
     assert fields["human_reviewed"] == "2026-07-01"
     # Whitelist fields are still freshly recomputed, not carried over as-is.
@@ -6812,11 +6848,11 @@ def test_compiled_briefings_render_clears_invalid_last_verified(
             payload=_minimal_compile_payload(),
             source_rel_path="daily/2026-08-05.md",
             existing_text=existing_text,
-            existing_meta=service._frontmatter_fields(existing_text),
+            existing_meta=compiled_page.frontmatter_fields(existing_text),
             signal=None,
         )
 
-    fields = service._frontmatter_fields(rendered)
+    fields = compiled_page.frontmatter_fields(rendered)
     assert fields["last_verified"] == ""
     assert "unverified: check again" not in rendered
     assert "last_verified" in caplog.text
@@ -6836,11 +6872,11 @@ def test_compiled_briefings_render_recovers_negative_enrichment_count(
         payload=_minimal_compile_payload(),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
     )
 
-    fields = service._frontmatter_fields(rendered)
+    fields = compiled_page.frontmatter_fields(rendered)
     assert fields["enrichment_count"] == "1"
     assert fields["conflicts_open"] == "0"
 
@@ -6848,12 +6884,12 @@ def test_compiled_briefings_render_recovers_negative_enrichment_count(
 def test_compiled_briefings_int_value_clamps_negative_and_warns_on_garbage(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    assert CompiledBriefingService._int_value("-5", default=0) == 0
-    assert CompiledBriefingService._int_value("3", default=0) == 3
-    assert CompiledBriefingService._int_value("", default=2) == 2
+    assert compiled_page.int_value("-5", default=0) == 0
+    assert compiled_page.int_value("3", default=0) == 3
+    assert compiled_page.int_value("", default=2) == 2
 
     with caplog.at_level("WARNING"):
-        result = CompiledBriefingService._int_value("not-a-number", default=0)
+        result = compiled_page.int_value("not-a-number", default=0)
     assert result == 0
     assert "not-a-number" in caplog.text
 
@@ -7400,7 +7436,7 @@ def test_compiled_briefings_refresh_candidate_skips_applied_chunk_without_raisin
     page_path.write_text(page_text, encoding="utf-8")
 
     # `_refresh_candidate` reads the excerpt via `_source_excerpt`, which
-    # clips/strips the raw file text (see `CompiledBriefingService._clip`)
+    # clips/strips the raw file text (see `compiled_page.clip`)
     # before hashing it -- match that here or the pre-seeded hash below
     # would never match what `_duplicate_source_chunk` computes at runtime.
     chunk_hash = service._source_chunk_hash(excerpt_text.strip())
@@ -8043,7 +8079,7 @@ def test_compiled_briefings_adjudicated_supersession_overrides_the_compile_label
         payload=_minimal_compile_payload(),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
         source_excerpt="event_date: 2026-08-05\nЦена — 150 USD.",
         claims=claims,
@@ -8103,7 +8139,7 @@ def test_compiled_briefings_existing_stands_verdict_drops_the_new_claim(
         payload=_minimal_compile_payload(),
         source_rel_path="daily/2026-07-01.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
         source_excerpt="## 09:00 [text]\nВстреча в среду.",
         claims=claims,
@@ -8156,7 +8192,7 @@ def test_compiled_briefings_factual_conflict_keeps_both_and_opens_conflict(
         payload=_minimal_compile_payload(),
         source_rel_path="imports/report.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
         source_excerpt="Отчёт: бюджет — 120 000 руб.",
         claims=claims,
@@ -8167,7 +8203,7 @@ def test_compiled_briefings_factual_conflict_keeps_both_and_opens_conflict(
     assert what_values == {"Бюджет — 100 000 руб.", "Бюджет — 120 000 руб."}
     assert service._claim_history_rows(rendered) == []
     assert len(service._open_conflicts_rows(rendered)) == 1
-    fields = service._frontmatter_fields(rendered)
+    fields = compiled_page.frontmatter_fields(rendered)
     assert fields["conflicts_open"] == "1"
 
 
@@ -8205,7 +8241,7 @@ def test_compiled_briefings_both_valid_verdict_keeps_both_without_opening(
         payload=_minimal_compile_payload(),
         source_rel_path="imports/report.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
         source_excerpt="Отчёт: в ЕС цена — 90 EUR.",
         claims=claims,
@@ -8215,7 +8251,7 @@ def test_compiled_briefings_both_valid_verdict_keeps_both_without_opening(
     what_values = {row[2] for row in service._sources_shaped_rows(rendered)}
     assert what_values == {"В США цена — 100 USD.", "В ЕС цена — 90 EUR."}
     assert service._open_conflicts_rows(rendered) == []
-    fields = service._frontmatter_fields(rendered)
+    fields = compiled_page.frontmatter_fields(rendered)
     assert fields["conflicts_open"] == "0"
 
 
@@ -8482,14 +8518,14 @@ def test_compiled_briefings_sources_trust_is_fail_closed_minimum_across_passes(
             {"text": "Заметка про идею.", "source": "thoughts/idea.md", "kind": "fact"}
         ],
     )
-    assert service._frontmatter_fields(first_pass)["sources_trust"] == "own"
+    assert compiled_page.frontmatter_fields(first_pass)["sources_trust"] == "own"
 
     second_pass = service._render_briefing(
         target=_demo_target(),
         payload=_minimal_compile_payload(),
         source_rel_path="daily/2026-08-05.md",
         existing_text=first_pass,
-        existing_meta=service._frontmatter_fields(first_pass),
+        existing_meta=compiled_page.frontmatter_fields(first_pass),
         signal=None,
         source_excerpt="## 09:00 [forward from: Alice]\nПересланное сообщение.",
         claims=[
@@ -8500,14 +8536,14 @@ def test_compiled_briefings_sources_trust_is_fail_closed_minimum_across_passes(
             }
         ],
     )
-    assert service._frontmatter_fields(second_pass)["sources_trust"] == "forwarded"
+    assert compiled_page.frontmatter_fields(second_pass)["sources_trust"] == "forwarded"
 
     third_pass = service._render_briefing(
         target=_demo_target(),
         payload=_minimal_compile_payload(),
         source_rel_path="thoughts/idea-2.md",
         existing_text=second_pass,
-        existing_meta=service._frontmatter_fields(second_pass),
+        existing_meta=compiled_page.frontmatter_fields(second_pass),
         signal=None,
         source_excerpt="Ещё одна собственная мысль.",
         claims=[
@@ -8520,7 +8556,7 @@ def test_compiled_briefings_sources_trust_is_fail_closed_minimum_across_passes(
     )
     # Still "forwarded" -- the own-trust third pass must not undo the
     # earlier degrade.
-    assert service._frontmatter_fields(third_pass)["sources_trust"] == "forwarded"
+    assert compiled_page.frontmatter_fields(third_pass)["sources_trust"] == "forwarded"
 
 
 def test_compiled_briefings_trust_does_not_affect_conflict_winner(
@@ -8560,7 +8596,7 @@ def test_compiled_briefings_trust_does_not_affect_conflict_winner(
         payload=_minimal_compile_payload(),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
         # [photo] -> "own" trust (ТЗ 4.4), reported to the adjudicator
         # rather than gating the outcome.
@@ -8628,7 +8664,7 @@ def test_compiled_briefings_weak_trust_no_longer_blocks_temporal_supersession(
         payload=_minimal_compile_payload(),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
         # A forwarded entry: someone else's words, relayed by the owner.
         source_excerpt="## 09:00 [forward from: Bob]\nДедлайн — 15 сентября.",
@@ -8643,7 +8679,7 @@ def test_compiled_briefings_weak_trust_no_longer_blocks_temporal_supersession(
         "Дедлайн — 1 сентября."
     ]
     assert service._open_conflicts_rows(rendered) == []
-    fields = service._frontmatter_fields(rendered)
+    fields = compiled_page.frontmatter_fields(rendered)
     assert fields["conflicts_open"] == "0"
 
 
@@ -9332,12 +9368,26 @@ def _two_claim_page(service: Any) -> str:
     )
 
 
+class _FrozenDatetime(datetime):
+    """``datetime`` whose ``now()`` never moves.
+
+    ``_render_briefing`` stamps ``last_compiled_at`` to the second, so two
+    renders that straddle a second boundary differ for reasons unrelated to
+    what the test checks.
+    """
+
+    @classmethod
+    def now(cls, tz=None):
+        return datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
+
+
 def test_compiled_briefings_claim_order_does_not_change_rendered_page(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Defect 2 (Verify/claims code review): the same source must always
     compile to the same page bytes. The model's array order for claims and
     conflicts is arbitrary, so it must not reach the rendered page."""
+    monkeypatch.setattr(compiled_briefings, "datetime", _FrozenDatetime)
     service = _compiled_service(tmp_path / "vault")
     existing_text = _two_claim_page(service)
     raw_claims = [
@@ -9372,7 +9422,7 @@ def test_compiled_briefings_claim_order_does_not_change_rendered_page(
             payload=_minimal_compile_payload(),
             source_rel_path="imports/report.md",
             existing_text=existing_text,
-            existing_meta=service._frontmatter_fields(existing_text),
+            existing_meta=compiled_page.frontmatter_fields(existing_text),
             signal=None,
             source_excerpt="Отчёт.",
             claims=claims,
@@ -9417,7 +9467,7 @@ def test_compiled_briefings_same_conflict_twice_adds_one_row_and_one_count(
             payload=_minimal_compile_payload(),
             source_rel_path="imports/report.md",
             existing_text=page_text,
-            existing_meta=service._frontmatter_fields(page_text),
+            existing_meta=compiled_page.frontmatter_fields(page_text),
             signal=None,
             source_excerpt="Отчёт.",
             claims=claims,
@@ -9426,11 +9476,11 @@ def test_compiled_briefings_same_conflict_twice_adds_one_row_and_one_count(
 
     first = render(existing_text)
     assert len(service._open_conflicts_rows(first)) == 1
-    assert service._frontmatter_fields(first)["conflicts_open"] == "1"
+    assert compiled_page.frontmatter_fields(first)["conflicts_open"] == "1"
 
     second = render(first)
     assert len(service._open_conflicts_rows(second)) == 1
-    assert service._frontmatter_fields(second)["conflicts_open"] == "1"
+    assert compiled_page.frontmatter_fields(second)["conflicts_open"] == "1"
 
 
 def test_compiled_briefings_open_conflict_closes_when_one_side_superseded(
@@ -9462,7 +9512,7 @@ def test_compiled_briefings_open_conflict_closes_when_one_side_superseded(
         payload=_minimal_compile_payload(),
         source_rel_path="imports/report.md",
         existing_text=_two_claim_page(service),
-        existing_meta=service._frontmatter_fields(_two_claim_page(service)),
+        existing_meta=compiled_page.frontmatter_fields(_two_claim_page(service)),
         signal=None,
         source_excerpt="Отчёт.",
         claims=[
@@ -9482,7 +9532,7 @@ def test_compiled_briefings_open_conflict_closes_when_one_side_superseded(
         ],
     )
     assert len(service._open_conflicts_rows(opened)) == 1
-    assert service._frontmatter_fields(opened)["conflicts_open"] == "1"
+    assert compiled_page.frontmatter_fields(opened)["conflicts_open"] == "1"
 
     # A newer daily entry supersedes the *existing* side of that conflict.
     closed = service._render_briefing(
@@ -9490,7 +9540,7 @@ def test_compiled_briefings_open_conflict_closes_when_one_side_superseded(
         payload=_minimal_compile_payload(),
         source_rel_path=later_source,
         existing_text=opened,
-        existing_meta=service._frontmatter_fields(opened),
+        existing_meta=compiled_page.frontmatter_fields(opened),
         signal=None,
         source_excerpt="## 09:00 [text]\nБюджет — 150 000 руб.",
         claims=[
@@ -9511,7 +9561,7 @@ def test_compiled_briefings_open_conflict_closes_when_one_side_superseded(
     )
 
     assert service._open_conflicts_rows(closed) == []
-    assert service._frontmatter_fields(closed)["conflicts_open"] == "0"
+    assert compiled_page.frontmatter_fields(closed)["conflicts_open"] == "0"
 
 
 def test_compiled_briefings_repeated_conflict_in_one_payload_adds_one_history_row(
@@ -9546,7 +9596,7 @@ def test_compiled_briefings_repeated_conflict_in_one_payload_adds_one_history_ro
         payload=_minimal_compile_payload(),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
         source_excerpt="## 09:00 [text]\nДедлайн — 15 сентября.",
         claims=claims,
@@ -10190,7 +10240,7 @@ def test_compiled_briefings_cold_tier_skips_write_on_ambiguous_human_zone(
         )
 
     assert page_path.read_bytes() == original_bytes
-    assert service._frontmatter_fields(original_text).get("source_count") == "1"
+    assert compiled_page.frontmatter_fields(original_text).get("source_count") == "1"
     assert service._applied_source_chunk_hashes(
         rel_path, "daily/2026-08-05.md"
     ) == []
@@ -10443,7 +10493,7 @@ def test_compiled_briefings_cold_tier_records_new_chunk_with_no_visible_diff(
 
     assert result.written is True
     after_text = page_path.read_text(encoding="utf-8")
-    assert service._frontmatter_fields(after_text).get("updated") == today
+    assert compiled_page.frontmatter_fields(after_text).get("updated") == today
     assert (
         service._applied_source_chunk_hashes(rel_path, "daily/2026-08-05.md") != []
     )
@@ -11002,7 +11052,7 @@ def test_compiled_briefings_run_queue_worker_crash_journal_write_failure_does_no
 
     Reproduces both failures at once: ``refresh_after_write`` raises
     ``OSError`` (same as the sibling crash-journal test above), and
-    ``_atomic_write_text`` also raises ``OSError`` specifically for the
+    ``atomic_write_file_text`` also raises ``OSError`` specifically for the
     crash-journal path (leaving the queue's own ``_save_queue``/worker-state
     writes, which use the same helper under a different filename,
     unaffected). The fix -- mirroring
@@ -11026,7 +11076,7 @@ def test_compiled_briefings_run_queue_worker_crash_journal_write_failure_does_no
 
     monkeypatch.setattr(service, "refresh_after_write", fake_refresh)
 
-    real_atomic_write_text = compiled_briefings._atomic_write_text
+    real_atomic_write_text = compiled_briefings.atomic_write_file_text
 
     def failing_for_crash_journal(path: Path, payload: str) -> None:
         if path.name == "compile-queue-worker.json":
@@ -11034,7 +11084,7 @@ def test_compiled_briefings_run_queue_worker_crash_journal_write_failure_does_no
         real_atomic_write_text(path, payload)
 
     monkeypatch.setattr(
-        compiled_briefings, "_atomic_write_text", failing_for_crash_journal
+        compiled_briefings, "atomic_write_file_text", failing_for_crash_journal
     )
 
     with pytest.raises(OSError, match="ORIGINAL") as excinfo:
@@ -11244,6 +11294,8 @@ def test_compiled_briefings_rollback_restores_modified_page(
         "manifest_found": True,
     }
     assert page_path.read_text(encoding="utf-8") == original_text
+    log_text = (vault_path / ".session" / "log.md").read_text(encoding="utf-8")
+    assert "откат прохода pass-2: восстановлено 1, пропущено 0" in log_text
 
 
 def test_compiled_briefings_rollback_skips_externally_changed_file(
@@ -11282,6 +11334,42 @@ def test_compiled_briefings_rollback_skips_externally_changed_file(
         "manifest_found": True,
     }
     assert page_path.read_text(encoding="utf-8") == changed_text
+
+
+def test_compiled_briefings_rollback_writes_ops_log_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rollback leaves one ops-journal line: which pass, how many pages
+    were restored, how many skipped and why -- vault-relative paths only,
+    never page content."""
+    vault_path = tmp_path / "vault"
+    service = _compiled_service(vault_path)
+    _bypass_atomic_vault_write(monkeypatch)
+
+    service._active_pass = CompileEnrichPass(pass_id="pass-log", snapshot_enabled=True)
+    monkeypatch.setattr(
+        service.runner, "run", lambda *a, **k: json.dumps(_minimal_compile_payload())
+    )
+    touched = service._upsert_briefing(
+        target=_demo_target(domain="people", slug="touched", title="Touched"),
+        source_rel_path="daily/2026-08-05.md",
+        source_excerpt="A fact.",
+        signal=None,
+    )
+    secret = "private body that must not reach the journal"
+    (vault_path / touched.path).write_text(secret, encoding="utf-8")
+
+    service.rollback_compile_enrich_pass("pass-log")
+
+    log_text = (vault_path / ".session" / "log.md").read_text(encoding="utf-8")
+    line = next(
+        entry for entry in log_text.splitlines() if "откат прохода pass-log" in entry
+    )
+    assert "[compile]" in line
+    assert "восстановлено 0, пропущено 1" in line
+    assert f"{touched.path}: изменена после прохода" in line
+    assert secret not in log_text
 
 
 def test_compiled_briefings_batch_consolidation_note_rolls_back_with_its_pass(
@@ -12490,7 +12578,7 @@ def test_compiled_briefings_unclear_verdict_increments_trust_blocked_counter(
         payload=_minimal_compile_payload(),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
         source_excerpt="## 09:00 [forward from: Bob]\nДедлайн — 15 сентября.",
         claims=claims,
@@ -12525,7 +12613,7 @@ def test_compiled_briefings_unclear_verdict_queues_undecided_conflict_entry(
         payload=_minimal_compile_payload(),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
         source_excerpt="## 09:00 [forward from: Bob]\nДедлайн — 15 сентября.",
         claims=[
@@ -12589,7 +12677,7 @@ def test_compiled_briefings_unclear_verdict_queues_entry_outside_a_pass(
         payload=_minimal_compile_payload(),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
         source_excerpt="## 09:00 [forward from: Bob]\nДедлайн — 15 сентября.",
         claims=[
@@ -12660,7 +12748,7 @@ def test_compiled_briefings_undecided_conflict_entry_does_not_duplicate_across_p
             payload=_minimal_compile_payload(),
             source_rel_path="daily/2026-08-05.md",
             existing_text=existing_text,
-            existing_meta=service._frontmatter_fields(existing_text),
+            existing_meta=compiled_page.frontmatter_fields(existing_text),
             signal=None,
             source_excerpt="## 09:00 [forward from: Bob]\nДедлайн — 15 сентября.",
             claims=claims,
@@ -12726,7 +12814,7 @@ def test_compiled_briefings_cold_tier_enriches_new_source(
         )
     ]
     assert "daily/2026-08-05.md" in service._section_text(rendered, "Sources")
-    assert service._frontmatter_fields(rendered)["source_count"] == "1"
+    assert compiled_page.frontmatter_fields(rendered)["source_count"] == "1"
     assert service._section_text(rendered, "Current State") == (
         "Updated cold-page state."
     )
@@ -13011,7 +13099,7 @@ def test_compiled_briefings_archive_tier_promotes_and_enriches(
     assert len(calls) == 1
     assert result.written is True
     rendered = page_path.read_text(encoding="utf-8")
-    assert service._frontmatter_fields(rendered)["tier"] == "warm"
+    assert compiled_page.frontmatter_fields(rendered)["tier"] == "warm"
     assert service._sources_shaped_rows(rendered)
     assert service._section_text(rendered, "Current State") == (
         "Updated archived-page state."
@@ -13057,7 +13145,7 @@ def test_compiled_briefings_recent_changes_accumulate_across_passes(
         payload=_minimal_compile_payload(recent_changes=["Second change."]),
         source_rel_path="daily/2026-08-02.md",
         existing_text=first,
-        existing_meta=service._frontmatter_fields(first),
+        existing_meta=compiled_page.frontmatter_fields(first),
         signal=None,
     )
 
@@ -13085,7 +13173,7 @@ def test_compiled_briefings_open_loops_accumulate_across_passes(
         payload=_minimal_compile_payload(open_loops=["Waiting on budget sign-off."]),
         source_rel_path="daily/2026-08-02.md",
         existing_text=first,
-        existing_meta=service._frontmatter_fields(first),
+        existing_meta=compiled_page.frontmatter_fields(first),
         signal=None,
     )
 
@@ -13813,7 +13901,7 @@ def test_compiled_briefings_contextual_conflict_note_appended_to_new_row(
         payload=_minimal_compile_payload(),
         source_rel_path="imports/report.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
         source_excerpt="Отчёт: в ЕС цена — 90 EUR.",
         claims=claims,
@@ -13826,7 +13914,7 @@ def test_compiled_briefings_contextual_conflict_note_appended_to_new_row(
         "В ЕС цена — 90 EUR. (разные регионы продаж)",
     }
     assert service._open_conflicts_rows(rendered) == []
-    fields = service._frontmatter_fields(rendered)
+    fields = compiled_page.frontmatter_fields(rendered)
     assert fields["conflicts_open"] == "0"
 
 
@@ -13886,7 +13974,7 @@ def test_compiled_briefings_factual_conflict_survives_same_claim_contextual_note
         payload=_minimal_compile_payload(),
         source_rel_path="imports/report.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
         source_excerpt="Отчёт: в ЕС цена — 90 EUR.",
         claims=claims,
@@ -13906,7 +13994,7 @@ def test_compiled_briefings_factual_conflict_survives_same_claim_contextual_note
     assert len(open_conflicts) == 1
     assert open_conflicts[0][1] == "В США цена — 100 USD."
     assert open_conflicts[0][3] == "В ЕС цена — 90 EUR."
-    fields = service._frontmatter_fields(rendered)
+    fields = compiled_page.frontmatter_fields(rendered)
     assert fields["conflicts_open"] == "1"
 
 
@@ -14139,7 +14227,7 @@ def test_compiled_briefings_forwarded_plaud_source_supersedes_when_agent_says_so
         payload=_minimal_compile_payload(),
         source_rel_path="imports/plaud/2026-08-05-standup.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
         source_excerpt="Расшифровка: дедлайн перенесли на 15 сентября.",
         claims=[
@@ -14206,7 +14294,7 @@ def test_compiled_briefings_existing_stands_beats_a_newer_source(
         payload=_minimal_compile_payload(),
         source_rel_path="daily/2026-08-05.md",
         existing_text=existing_text,
-        existing_meta=service._frontmatter_fields(existing_text),
+        existing_meta=compiled_page.frontmatter_fields(existing_text),
         signal=None,
         source_excerpt=(
             "event_date: 2026-08-05\nКто-то сказал, что дедлайн 15 сентября."
@@ -14402,7 +14490,7 @@ def test_compiled_briefings_nightly_retry_resolves_a_standing_conflict(
         )
     ]
     assert service._open_conflicts_rows(text) == []
-    assert service._frontmatter_fields(text)["conflicts_open"] == "0"
+    assert compiled_page.frontmatter_fields(text)["conflicts_open"] == "0"
     assert json.loads(
         (vault_path / ".session" / "decisions-queue.json").read_text(encoding="utf-8")
     ) == []
@@ -14610,7 +14698,7 @@ def test_compiled_briefings_nightly_retry_stops_at_its_own_budget(
     text = page_path.read_text(encoding="utf-8")
     remaining = service._open_conflicts_rows(text)
     assert [row[1] for row in remaining] == ["Старое 3."]
-    assert service._frontmatter_fields(text)["conflicts_open"] == "1"
+    assert compiled_page.frontmatter_fields(text)["conflicts_open"] == "1"
 
 
 def test_compiled_briefings_nightly_retry_keeps_the_queue_entry_until_page_is_clear(
@@ -14758,7 +14846,7 @@ def test_compiled_briefings_failed_fact_check_is_decided_not_queued(
     assert "перепроверена сегодня" in prompts[0]
     assert "compiled/archive" in prompts[0]
     assert json.loads(queue_path.read_text(encoding="utf-8")) == []
-    fields = service._frontmatter_fields(page_path.read_text(encoding="utf-8"))
+    fields = compiled_page.frontmatter_fields(page_path.read_text(encoding="utf-8"))
     assert fields["last_verified"] == date.today().isoformat()
 
 
@@ -15099,7 +15187,7 @@ def test_compiled_briefings_real_drift_is_recorded_on_the_page(
     # The model was shown what actually landed on the page that month.
     assert "Про склад." in prompts[0]
     assert "Про найм." in prompts[0]
-    fields = service._frontmatter_fields(page_path.read_text(encoding="utf-8"))
+    fields = compiled_page.frontmatter_fields(page_path.read_text(encoding="utf-8"))
     assert fields["quality_status"] == "needs_review"
     assert "смешаны склад и найм" in fields["quality_reason"]
     assert json.loads(queue_path.read_text(encoding="utf-8")) == []
@@ -15134,7 +15222,7 @@ def test_compiled_briefings_busy_page_is_not_drift(
 
     assert service._adjudicate_drift_entries(limit=5) == []
 
-    fields = service._frontmatter_fields(page_path.read_text(encoding="utf-8"))
+    fields = compiled_page.frontmatter_fields(page_path.read_text(encoding="utf-8"))
     assert "quality_status" not in fields
     assert json.loads(queue_path.read_text(encoding="utf-8")) == []
 

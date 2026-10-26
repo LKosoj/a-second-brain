@@ -667,3 +667,53 @@ def test_recover_reports_each_undone_entry_for_a_file_rewritten_in_one_run(
         "removed (created by run): note.md",
     ]
     assert out[-1] == "recover run-M: 2 restored, 1 removed, 0 skipped"
+
+
+def test_prune_ops_journal_keeps_journal_mode(tmp_path):
+    vault = tmp_path / "vault"
+    session_dir = vault / ".session"
+    session_dir.mkdir(parents=True)
+    now = datetime(2026, 9, 3, tzinfo=UTC)
+    lines = [
+        json.dumps({"ts": (now - timedelta(days=days)).isoformat(), "path": name})
+        for days, name in ((40, "old.md"), (1, "recent.md"))
+    ]
+    journal = session_dir / "ops.jsonl"
+    journal.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    journal.chmod(0o664)
+
+    previous = os.umask(0o077)
+    try:
+        prune_ops_journal(vault, max_age_days=30, now=now)
+    finally:
+        os.umask(previous)
+
+    assert [e["path"] for e in _journal_entries(vault)] == ["recent.md"]
+    assert journal.stat().st_mode & 0o777 == 0o664
+    assert not [p for p in session_dir.iterdir() if ".tmp" in p.name]
+
+
+def test_ops_snapshot_is_not_left_half_written(tmp_path, monkeypatch):
+    from d_brain.services import atomic_io
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    note = vault / "note.md"
+    note.write_text("old\n", encoding="utf-8")
+
+    def broken_fsync(fd):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(atomic_io.os, "fsync", broken_fsync)
+    from d_brain.services.frontmatter import _record_ops_journal_entry
+
+    _record_ops_journal_entry(
+        vault,
+        "note.md",
+        sha_before="a" * 64,
+        old_bytes=b"old\n",
+        content=b"new\n",
+    )
+    snapshots = vault / ".session" / "ops-snapshots"
+    assert not list(snapshots.glob("*.bak"))
+    assert not [p for p in snapshots.iterdir() if p.name.endswith(".tmp")]

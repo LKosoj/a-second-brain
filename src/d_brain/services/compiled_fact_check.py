@@ -61,15 +61,17 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from d_brain.clock import owner_today
 from d_brain.manifest import load_manifest_for_vault
+from d_brain.services import compiled_page
+from d_brain.services.atomic_io import atomic_write_file_text
 from d_brain.services.compiled_briefings import (
     CONFIDENCE_VALUES,
     DATE_ONLY_RE,
-    WIKILINK_RE,
     CompiledBriefingCandidate,
     CompiledBriefingService,
-    _atomic_write_text,
 )
+from d_brain.services.compiled_page import WIKILINK_RE
 from d_brain.services.decisions_queue import append_decision_queue_entries
 from d_brain.services.frontmatter import patch_validated_vault_frontmatter
 from d_brain.services.ops_log import append_ops_log
@@ -228,16 +230,16 @@ def evaluate_page(
     ``_iter_candidates``) plus the filesystem for wikilink targets. No
     frontmatter is written here -- see ``run_monthly_fact_check``.
     """
-    fields = CompiledBriefingService._frontmatter_fields(candidate.text)
-    conflicts_open = CompiledBriefingService._int_value(
+    fields = compiled_page.frontmatter_fields(candidate.text)
+    conflicts_open = compiled_page.int_value(
         fields.get("conflicts_open"), default=0
     )
     has_open_conflicts = conflicts_open > 0 or bool(
-        CompiledBriefingService._open_conflicts_rows(candidate.text)
+        compiled_page.open_conflicts_rows(candidate.text)
     )
 
     verdicts: list[ClaimVerdict] = []
-    for _row_date, source, claim_text in CompiledBriefingService._sources_shaped_rows(
+    for _row_date, source, claim_text in compiled_page.sources_shaped_rows(
         candidate.text
     ):
         claim_text = claim_text.strip()
@@ -326,12 +328,12 @@ def select_pages_for_fact_check(
     """
     eligible = [
         candidate
-        for candidate in service._iter_candidates()
+        for candidate in service.iter_candidates()
         if not candidate.tier or candidate.tier in FACT_CHECK_ELIGIBLE_TIERS
     ]
     eligible.sort(
         key=lambda candidate: _page_sort_key(
-            CompiledBriefingService._frontmatter_fields(candidate.text),
+            compiled_page.frontmatter_fields(candidate.text),
             candidate.rel_path,
         )
     )
@@ -378,7 +380,7 @@ def _write_fact_check_journal(
         "errors": errors,
         "queue_evictions": queue_evictions,
     }
-    _atomic_write_text(
+    atomic_write_file_text(
         vault_path / _JOURNAL_RELATIVE_PATH,
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
     )
@@ -407,7 +409,7 @@ def run_monthly_fact_check(
     that machinery exists only for passes that rewrite page bodies via a
     model (ТЗ 5.5); this pass never touches a page body.
     """
-    resolved_today = today or date.today()
+    resolved_today = today or owner_today()
     resolved_vault_path = Path(vault_path).resolve()
     service = CompiledBriefingService(resolved_vault_path)
     selected = select_pages_for_fact_check(service, limit=page_limit)

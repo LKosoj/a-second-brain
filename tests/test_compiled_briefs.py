@@ -15,6 +15,7 @@ CLI test (mirrors ``tests/test_qmd_service.py``'s ``run_qmd`` tests).
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 from contextlib import contextmanager
@@ -23,6 +24,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from _helpers import make_page_writer, patch_get_settings
 
 from d_brain import run_compiled_brief
 from d_brain.manifest import load_manifest_for_vault
@@ -158,10 +160,7 @@ def _compiled_page_text(
     return "\n".join(frontmatter) + "\n".join(body) + "\n"
 
 
-def _write_page(vault: Path, rel_path: str, **kwargs: object) -> None:
-    path = vault / rel_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_compiled_page_text(**kwargs), encoding="utf-8")  # type: ignore[arg-type]
+_write_page = make_page_writer(_compiled_page_text)
 
 
 # --- target resolution (ТЗ 7.6 step 1) -----------------------------------
@@ -788,7 +787,7 @@ def test_topic_brief_missing_sections_show_placeholders(tmp_path, write_vault_ma
 def test_sources_fallback_to_plain_sources_section_when_table_empty(
     tmp_path, write_vault_manifest
 ):
-    """ТЗ 7.6 provenance (``compiled_briefs._sources_block``): a page
+    """ТЗ 7.6 provenance (``compiled_briefs.sources_block``): a page
     compiled before the "Sources That Shaped This Page" table existed only
     carries the older "## Sources" link list -- this is the main path for
     every page compiled that far back, and must still surface its sources
@@ -825,10 +824,7 @@ def test_sources_fallback_to_plain_sources_section_when_table_empty(
 # --- run_compiled_brief CLI -----------------------------------------------
 
 
-def _patch_settings(monkeypatch, vault: Path) -> None:
-    monkeypatch.setattr(
-        run_compiled_brief, "get_settings", lambda: SimpleNamespace(vault_path=vault)
-    )
+_patch_settings = functools.partial(patch_get_settings, module=run_compiled_brief)
 
 
 def test_render_note_passes_write_time_frontmatter_validation(

@@ -10,9 +10,11 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections import Counter
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager, redirect_stdout
 from datetime import date, datetime, timedelta
+from functools import partial
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, cast
@@ -20,6 +22,7 @@ from typing import Any, cast
 import httpx
 from openai import OpenAI
 
+from d_brain.clock import owner_now, owner_today
 from d_brain.control_plane.registry import (
     get_workflow,
     iter_workflows,
@@ -39,6 +42,8 @@ from d_brain.manifest import (
     VaultManifest,
     load_manifest_for_vault,
 )
+from d_brain.services import calendar_ics
+from d_brain.services.atomic_io import atomic_write_file_text
 from d_brain.services.cli_runner import (
     CliExecutionError,
     CliRunner,
@@ -68,8 +73,11 @@ from d_brain.services.daily_workflow import (  # isort: skip
     run_json_phase,
 )
 from d_brain.services.entry_status import (
-    DAILY_ENTRY_RE,
     ENTRY_STATUS_ALREADY_PROCESSED,
+    DailyEntryStatus,
+    daily_entry_digests,
+    entry_block_digest,
+    entry_spans,
     extract_entry_statuses,
     format_entry_status_comments,
     normalize_entry_type,
@@ -82,10 +90,15 @@ from d_brain.services.frontmatter import (
     parse_frontmatter_bytes,
     patch_frontmatter_bytes,
     prune_ops_journal,
+    split_frontmatter_text,
     write_validated_vault_markdown,
 )
 from d_brain.services.json_normalizer import extract_first_json_dict
-from d_brain.services.localization import normalize_language, prompt_language_name
+from d_brain.services.localization import (
+    normalize_language,
+    prompt_language_name,
+    translate,
+)
 from d_brain.services.memory_audit import MemoryAuditService
 from d_brain.services.qmd import QmdService
 from d_brain.services.recall_planner import (
@@ -95,11 +108,17 @@ from d_brain.services.recall_planner import (
 from d_brain.services.session import SessionStore
 from d_brain.services.source_links import collapse_to_single_line
 from d_brain.services.storage import VaultStorage
+from d_brain.services.subprocess_group import run_in_process_group
 from d_brain.services.telegram_delivery import send_telegram_text_sync
 from d_brain.services.telegram_markup import normalize_markdown_input
 from d_brain.services.todoist_projects import (
     TodoistProjectCatalog,
     TodoistProjectRouter,
+)
+from d_brain.services.todoist_tasks import (
+    TodoistCreateStatus,
+    create_todoist_tasks,
+    task_identity,
 )
 from d_brain.services.vault_lock import VaultWriteLock, vault_write_lock
 from d_brain.services.vault_map import export_vault_map
@@ -107,7 +126,6 @@ from d_brain.services.vault_map import export_vault_map
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 2400  # 40 minutes
-TODOIST_TASK_TIMEOUT = 30
 REFLECT_DAILY_START_MARKER = "<!-- d-brain:reflect:start -->"
 REFLECT_DAILY_END_MARKER = "<!-- d-brain:reflect:end -->"
 TEXT_INTENT_CAPTURE = "capture"
@@ -144,7 +162,22 @@ HANDOFF_SECTION_RE = re.compile(
     r"^##\s+(Last Session|Key Decisions|In Progress|Next Steps|Observations)\s*$",
     re.MULTILINE,
 )
-HANDOFF_FRONTMATTER_RE = re.compile(r"\A\ufeff?---\n.*?\n---\n*", re.DOTALL)
+
+
+def handoff_section_spans(text: str) -> list[tuple[str, int, int]]:
+    """Canonical handoff sections of ``text`` as (title, body_start, body_end).
+
+    A body runs from the end of its heading to the next canonical heading (or
+    the end of the text). Offsets index ``text`` as given, no newline
+    normalization; text before the first heading belongs to no section.
+    """
+
+    matches = list(HANDOFF_SECTION_RE.finditer(text))
+    ends = [m.start() for m in matches[1:]] + [len(text)]
+    spans = zip(matches, ends[: len(matches)], strict=True)
+    return [(m.group(1), m.end(), end) for m, end in spans]
+
+
 THOUGHT_FRONTMATTER_KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*):(?:\s*(.*))?$")
 PROCESS_AUDIT_STATE_TTL_DAYS = 7
 TODOIST_RETRY_RELATIVE_PATH = Path(".session") / "todoist-retry.json"
@@ -186,20 +219,17 @@ def load_job_health(vault_path: Path) -> dict[str, Any]:
 def save_job_health(vault_path: Path, payload: dict[str, Any]) -> None:
     """Persist the per-step failure-streak state for the scheduled cycle.
 
-    Writes to a temporary file and ``os.replace``s it into place so a reader
+    The file is replaced atomically (``atomic_write_file_text``) so a reader
     never observes a partially-written file. This is not itself sufficient to
     prevent a read-modify-write race between two callers (the scheduled
     cycle and the bot's ``reenable_job_step``) -- callers must additionally
     hold ``vault_write_lock`` around their whole load-modify-save sequence.
     """
     path = job_health_path(vault_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(f"{path.suffix}.tmp-{os.getpid()}")
-    tmp_path.write_text(
+    atomic_write_file_text(
+        path,
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
     )
-    os.replace(tmp_path, path)
 
 
 def cycle_step_label(cycle_name: str, *, content_language: str = "ru") -> str:
@@ -260,6 +290,10 @@ class CliProcessor:
     ) -> None:
         self.vault_path = Path(vault_path)
         self.todoist_api_key = todoist_api_key
+        # Tasks of the last _create_todoist_tasks call whose delivery is unknown.
+        self._todoist_unconfirmed: list[dict[str, Any]] = []
+        # Unconfirmed tasks of the start-of-cycle retry, shown with the day's result.
+        self._carried_unconfirmed_tasks: list[dict[str, Any]] = []
         self.ai_cli = ai_cli
         self.owner_full_name = owner_full_name.strip()
         self.content_language = normalize_language(content_language)
@@ -1141,7 +1175,7 @@ class CliProcessor:
         refresh_qmd: bool = True,
     ) -> dict[str, Any]:
         """Switch goals/3-weekly.md to the scheduled target ISO week."""
-        today = day or date.today()
+        today = day or owner_today()
         weekly_path = self.vault_path / "goals" / "3-weekly.md"
         if not weekly_path.exists():
             return {
@@ -1247,7 +1281,7 @@ class CliProcessor:
             self._write_vault_markdown(weekly_path, content, lock=lock)
         self._touch_memory_paths("goals/3-weekly.md")
         self._log_periodic_summary(
-            timestamp=datetime.now().astimezone(),
+            timestamp=owner_now(),
             label=self._cycle_label("weekly_goals_rollover"),
             summary_path=weekly_path,
             refresh_qmd=False,
@@ -1594,7 +1628,7 @@ WORKFLOW:
     def _ensure_weekly_moc_metadata(content: str) -> str:
         """Fill the index profile fields without changing the MOC body."""
         document = parse_frontmatter_bytes(content.encode("utf-8"))
-        today = date.today().isoformat()
+        today = owner_today().isoformat()
         updates: dict[str, object] = (
             {"type": "index"} if document.fields.get("type") != "index" else {}
         )
@@ -1666,11 +1700,13 @@ WORKFLOW:
 
     @staticmethod
     def _split_frontmatter(text: str) -> tuple[str, str]:
-        """Split YAML frontmatter from the markdown body when present."""
-        match = HANDOFF_FRONTMATTER_RE.match(text)
-        if not match:
-            return "", text
-        return match.group(0), text[match.end() :]
+        """Split YAML frontmatter from the markdown body when present.
+
+        Stays a text cutter rather than a YAML parse: the callers glue the
+        verbatim header back onto a rewritten body and must not fail on a
+        damaged one.
+        """
+        return split_frontmatter_text(text)
 
     @classmethod
     def _split_thought_frontmatter(cls, text: str) -> tuple[str, str]:
@@ -1712,12 +1748,8 @@ WORKFLOW:
     def _parse_handoff_sections(body: str) -> dict[str, list[str]]:
         """Collect all canonical handoff sections in encounter order."""
         sections: dict[str, list[str]] = {title: [] for title in HANDOFF_SECTION_ORDER}
-        matches = list(HANDOFF_SECTION_RE.finditer(body))
-        for index, match in enumerate(matches):
-            end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
-            title = match.group(1)
-            content = body[match.end() : end].strip()
-            sections[title].append(content)
+        for title, start, end in handoff_section_spans(body):
+            sections[title].append(body[start:end].strip())
         return sections
 
     @staticmethod
@@ -1779,7 +1811,7 @@ WORKFLOW:
     @staticmethod
     def _default_handoff_frontmatter() -> str:
         """Frontmatter for a freshly initialized rolling handoff file."""
-        today = date.today().isoformat()
+        today = owner_today().isoformat()
         return (
             "---\n"
             "type: note\n"
@@ -1842,15 +1874,6 @@ WORKFLOW:
             )
             self._write_vault_markdown(handoff_path, compacted, lock=lock)
 
-    def _current_handoff_observations(self) -> list[str]:
-        """Return unresolved handoff observations as canonical bullets."""
-        self._ensure_handoff_file()
-        handoff_path = self._handoff_path()
-        _, sections = self._normalized_handoff_sections(
-            handoff_path.read_text(encoding="utf-8")
-        )
-        return self._coerce_bullet_lines(sections["Observations"])
-
     @staticmethod
     def _handoff_revision(path: Path, content: bytes) -> HandoffRevision:
         """Identify one exact atomic handoff version, including same-byte rewrites."""
@@ -1876,25 +1899,6 @@ WORKFLOW:
         observations = self._coerce_bullet_lines(sections["Observations"])
         return observations, revision
 
-    def _write_handoff_observations(self, bullets: list[str]) -> None:
-        """Replace the rolling handoff observations section."""
-        self._ensure_handoff_file()
-        handoff_path = self._handoff_path()
-        with vault_write_lock(self.vault_path) as lock:
-            frontmatter, sections = self._normalized_handoff_sections(
-                handoff_path.read_text(encoding="utf-8")
-            )
-            normalized = self._coerce_bullet_lines("\n".join(bullets))
-            deduped = list(dict.fromkeys(normalized))
-            sections["Observations"] = (
-                "\n".join(deduped) if deduped else HANDOFF_EMPTY_SECTION["Observations"]
-            )
-            self._write_vault_markdown(
-                handoff_path,
-                self._render_handoff_sections(frontmatter, sections),
-                lock=lock,
-            )
-
     @staticmethod
     def _splice_handoff_last_session(text: str, sentence: str) -> str:
         """Add one sentence to the "Last Session" block, leaving every other
@@ -1915,12 +1919,10 @@ WORKFLOW:
         ``_merge_handoff_observation_snapshot``, which deliberately leaves a
         concurrently edited handoff alone.
         """
-        matches = list(HANDOFF_SECTION_RE.finditer(text))
-        for index, match in enumerate(matches):
-            if match.group(1) != "Last Session":
+        for title, start, end in handoff_section_spans(text):
+            if title != "Last Session":
                 continue
-            end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
-            current = text[match.end() : end].strip()
+            current = text[start:end].strip()
             if sentence in current:
                 return text
             if not current or current == HANDOFF_EMPTY_SECTION["Last Session"]:
@@ -1929,7 +1931,7 @@ WORKFLOW:
                 merged = current + " " + sentence
             tail = text[end:]
             separator = "\n\n" if tail else "\n"
-            return text[: match.end()] + "\n" + merged + separator + tail
+            return text[:start] + "\n" + merged + separator + tail
         return text
 
     def _append_handoff_last_session(self, sentence: str) -> None:
@@ -2083,7 +2085,7 @@ WORKFLOW:
             document = parse_frontmatter_bytes(content.encode("utf-8"))
             handoff_defaults: dict[str, object] = {
                 "type": "note",
-                "last_accessed": date.today().isoformat(),
+                "last_accessed": owner_today().isoformat(),
                 "relevance": 1.0,
                 "tier": "active",
             }
@@ -2122,9 +2124,8 @@ WORKFLOW:
     def _write_session_json(self, file_name: str, payload: dict[str, Any]) -> Path:
         """Persist a phase artifact to the session directory."""
         path = self._session_dir() / file_name
-        path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
+        atomic_write_file_text(
+            path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
         )
         return path
 
@@ -2133,7 +2134,7 @@ WORKFLOW:
         path = self._session_dir() / file_name
         rendered = content.rstrip() + "\n"
         if file_name == "memory-audit.md":
-            today = date.today().isoformat()
+            today = owner_today().isoformat()
             rendered = (
                 "---\n"
                 "type: technical\n"
@@ -2144,52 +2145,24 @@ WORKFLOW:
             )
             self._write_vault_markdown(path, rendered)
         else:
-            path.write_text(rendered, encoding="utf-8")
+            atomic_write_file_text(path, rendered)
         return path
 
     _UV_SCRIPT_TIMEOUT_SECONDS = 3600
 
-    def _run_uv_script(self, *args: str) -> None:
-        """Run a uv-managed helper script from the vault root."""
-        command_args = self._project_skill_script_args(args)
-        uv_bin = os.environ.get("UV_BIN", "uv").strip() or "uv"
-        try:
-            result = subprocess.run(
-                [uv_bin, "run", *command_args],
-                cwd=self.vault_path,
-                capture_output=True,
-                text=True,
-                check=False,
-                env=build_subprocess_env(),
-                timeout=self._UV_SCRIPT_TIMEOUT_SECONDS,
-            )
-        except FileNotFoundError as exc:
-            raise CliExecutionError(f"uv executable not found: {uv_bin}") from exc
-        except subprocess.TimeoutExpired:
-            logger.warning(
-                "Command timed out after %ss: %s",
-                self._UV_SCRIPT_TIMEOUT_SECONDS,
-                " ".join([uv_bin, "run", *args]),
-            )
-            return
-        if result.returncode != 0:
-            logger.warning(
-                "Command failed: %s (%s)",
-                " ".join(result.args),
-                (result.stderr or result.stdout).strip(),
-            )
+    def _run_uv_script(self, *args: str) -> bool:
+        """Run a uv-managed helper script from the vault root.
 
-    def _run_uv_script_capture(self, *args: str) -> str:
-        """Run a uv-managed helper script and return stdout on success."""
+        Returns True only when the script exited with code 0; a timeout or a
+        non-zero exit is logged and reported as False so callers that depend
+        on the script's output can refuse to use stale files.
+        """
         command_args = self._project_skill_script_args(args)
         uv_bin = os.environ.get("UV_BIN", "uv").strip() or "uv"
         try:
-            result = subprocess.run(
+            result = run_in_process_group(
                 [uv_bin, "run", *command_args],
                 cwd=self.vault_path,
-                capture_output=True,
-                text=True,
-                check=False,
                 env=build_subprocess_env(),
                 timeout=self._UV_SCRIPT_TIMEOUT_SECONDS,
             )
@@ -2201,15 +2174,15 @@ WORKFLOW:
                 self._UV_SCRIPT_TIMEOUT_SECONDS,
                 " ".join([uv_bin, "run", *args]),
             )
-            return ""
+            return False
         if result.returncode != 0:
             logger.warning(
                 "Command failed: %s (%s)",
                 " ".join(result.args),
                 (result.stderr or result.stdout).strip(),
             )
-            return ""
-        return result.stdout
+            return False
+        return True
 
     def _project_skill_script_args(self, args: tuple[str, ...]) -> tuple[str, ...]:
         """Resolve a project skill script while preserving vault-root arguments."""
@@ -2239,7 +2212,7 @@ WORKFLOW:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         if hasattr(module, "TODAY"):
-            cast(Any, module).TODAY = date.today()
+            cast(Any, module).TODAY = owner_today()
         return module
 
     def _todoist_project_catalog_snapshot(
@@ -2258,10 +2231,16 @@ WORKFLOW:
             )
         return cast(dict[str, Any], result["catalog"])
 
-    def _rebuild_graph(self) -> None:
-        """Refresh vault graph artifacts."""
-        self._run_uv_script("skills/graph-builder/scripts/analyze.py")
+    def _rebuild_graph(self) -> bool:
+        """Refresh vault graph artifacts; False when analyze.py did not succeed.
+
+        On failure the old graph stays on disk untouched and is not exported
+        as if it were fresh.
+        """
+        if not self._run_uv_script("skills/graph-builder/scripts/analyze.py"):
+            return False
         export_vault_map(self.vault_path, self._load_graph_stats())
+        return True
 
     def _load_graph_stats(self) -> dict[str, Any]:
         """Load the latest graph stats from disk."""
@@ -2289,106 +2268,52 @@ WORKFLOW:
         *,
         source_context: str = "",
     ) -> list[dict[str, str]]:
-        """Create routed Todoist tasks and return created ids with titles."""
-        tasks = self._dedupe_todoist_tasks(
-            [*self._load_pending_todoist_tasks(), *tasks]
+        """Create routed Todoist tasks and return created ids with titles.
+
+        Tasks that could not be sent stay in the retry file. Tasks whose
+        delivery is unknown (timeout, unreadable answer) are NOT retried --
+        that could duplicate them -- and are exposed via `_todoist_unconfirmed`.
+        """
+        pending = self._load_pending_todoist_tasks()
+        tasks = self._dedupe_todoist_tasks([*pending, *tasks])
+        self._todoist_unconfirmed = []
+        if not tasks:
+            return []
+
+        result = create_todoist_tasks(
+            tasks,
+            vault_path=self.vault_path,
+            api_key=self.todoist_api_key,
+            extra_env=self._cli_extra_env(),
+            project_catalog=self._project_catalog,
+            project_router=self._project_router,
+            source_context=source_context,
         )
-        if not tasks or not self.todoist_api_key:
-            return []
-
-        catalog_result = self._project_catalog.get_catalog(force_refresh=True)
-        catalog = catalog_result["catalog"] if catalog_result["available"] else None
-        payload: dict[str, list[dict[str, Any]]] = {"tasks": []}
-        normalized_tasks: list[dict[str, Any]] = []
-
-        for task in tasks:
-            content = " ".join(str(task.get("content") or "").split())
-            if not content:
-                continue
-            priority = int(task.get("priority") or 1)
-            due_hint = " ".join(str(task.get("due_hint") or "").split())
-            route = self._project_router.route_task(
-                task,
-                source_context=source_context,
-                catalog=catalog,
+        if result.status is TodoistCreateStatus.CREATED:
+            self._save_pending_todoist_tasks([])
+            # Todoist returned ids for only some tasks: do not retry the rest
+            # (they may exist already), but keep them visible.
+            self._todoist_unconfirmed = list(result.unconfirmed)
+            return result.created
+        if result.status is TodoistCreateStatus.UNCONFIRMED:
+            self._save_pending_todoist_tasks([])
+            self._todoist_unconfirmed = tasks
+            logger.warning(
+                "Todoist delivery unconfirmed for %d tasks, fingerprint %s: %s",
+                len(tasks),
+                result.fingerprint,
+                result.error,
             )
-            payload_task: dict[str, Any] = {
-                "content": content,
-                "priority": f"p{max(1, min(priority, 4))}",
-            }
-            if due_hint:
-                payload_task["dueString"] = due_hint
-            if route.get("project_id"):
-                payload_task["projectId"] = route["project_id"]
-            payload["tasks"].append(payload_task)
-            normalized_tasks.append({"content": content})
-
-        if not payload["tasks"]:
             return []
-
-        command = [
-            "mcp-cli",
-            "call",
-            "todoist",
-            "add-tasks",
-            json.dumps(payload, ensure_ascii=False),
-        ]
-        errors: list[str] = []
-        for attempt in range(3):
-            if attempt > 0:
-                time.sleep(2 * attempt)
-            try:
-                result = subprocess.run(
-                    command,
-                    cwd=self.vault_path,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    env=build_subprocess_env(self._cli_extra_env()),
-                    timeout=TODOIST_TASK_TIMEOUT,
-                )
-            except subprocess.TimeoutExpired:
-                errors.append(f"timeout after {TODOIST_TASK_TIMEOUT}s")
-                continue
-            if result.returncode == 0:
-                try:
-                    parsed = extract_first_json_dict(
-                        result.stdout,
-                        error_context="Processor Todoist MCP output",
-                    )
-                except ValueError:
-                    # The request may already have succeeded. Repeating an
-                    # ambiguous successful response could create duplicates.
-                    self._save_pending_todoist_tasks([])
-                    return []
-                task_items = parsed.get("tasks")
-                if not isinstance(task_items, list):
-                    structured = parsed.get("structuredContent")
-                    if isinstance(structured, dict):
-                        task_items = structured.get("tasks") or structured.get(
-                            "created"
-                        )
-                created: list[dict[str, str]] = []
-                for index, item in enumerate(task_items or []):
-                    if not isinstance(item, dict) or not item.get("id"):
-                        continue
-                    fallback = (
-                        normalized_tasks[index]["content"]
-                        if index < len(normalized_tasks)
-                        else ""
-                    )
-                    created.append(
-                        {
-                            "id": str(item["id"]),
-                            "content": str(item.get("content") or fallback).strip()
-                            or fallback,
-                        }
-                    )
-                self._save_pending_todoist_tasks([])
-                return created
-            errors.append(result.stderr.strip() or result.stdout.strip())
-        self._save_pending_todoist_tasks(tasks)
-        logger.warning("Todoist creation failed after retries: %s", " | ".join(errors))
+        if result.status is not TodoistCreateStatus.EMPTY:
+            if tasks != pending:
+                self._save_pending_todoist_tasks(tasks)
+            logger.warning(
+                "%d Todoist tasks waiting for retry, fingerprint %s: %s",
+                len(tasks),
+                result.fingerprint,
+                result.error,
+            )
         return []
 
     def _todoist_retry_path(self) -> Path:
@@ -2407,7 +2332,9 @@ WORKFLOW:
             if not content:
                 continue
             normalized = {**task, "content": content}
-            key = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+            # By identity, not by the whole dict: CAPTURE words priority and
+            # hints differently on each run, and near-duplicates piled up.
+            key = task_identity(normalized)
             if key in seen:
                 continue
             seen.add(key)
@@ -2429,9 +2356,8 @@ WORKFLOW:
 
     def _save_pending_todoist_tasks(self, tasks: list[dict[str, Any]]) -> None:
         path = self._todoist_retry_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_suffix(f"{path.suffix}.tmp-{os.getpid()}")
-        tmp_path.write_text(
+        atomic_write_file_text(
+            path,
             json.dumps(
                 {"tasks": self._dedupe_todoist_tasks(tasks)},
                 ensure_ascii=False,
@@ -2439,9 +2365,7 @@ WORKFLOW:
                 sort_keys=True,
             )
             + "\n",
-            encoding="utf-8",
         )
-        os.replace(tmp_path, path)
 
     def _retry_pending_todoist_tasks(self) -> list[dict[str, str]]:
         """Retry durable Todoist tasks before processing new daily entries."""
@@ -2455,6 +2379,12 @@ WORKFLOW:
         execute_data: dict[str, Any],
     ) -> None:
         """Create capture tasks missing from the execute phase result."""
+        if self._carried_unconfirmed_tasks:
+            execute_data["tasks_unconfirmed"] = [
+                *self._json_dict_list(execute_data, "tasks_unconfirmed"),
+                *self._carried_unconfirmed_tasks,
+            ]
+            self._carried_unconfirmed_tasks = []
         created = self._json_dict_list(execute_data, "tasks_created")
         created_contents = {
             " ".join(str(item.get("content") or "").split()).casefold()
@@ -2486,7 +2416,12 @@ WORKFLOW:
         )
         if newly_created:
             execute_data["tasks_created"] = [*created, *newly_created]
-        else:
+        if self._todoist_unconfirmed:
+            execute_data["tasks_unconfirmed"] = [
+                *self._json_dict_list(execute_data, "tasks_unconfirmed"),
+                *self._todoist_unconfirmed,
+            ]
+        elif not newly_created:
             execute_data["tasks_pending"] = missing
 
     def _process_audit_state_path(self) -> Path:
@@ -2508,10 +2443,9 @@ WORKFLOW:
     def _save_process_audit_state(self, payload: dict[str, Any]) -> None:
         """Persist the audit dedupe cache."""
         path = self._process_audit_state_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
+        atomic_write_file_text(
+            path,
             json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
         )
 
     @staticmethod
@@ -2734,6 +2668,37 @@ WORKFLOW:
 
         raw_entries = parse_daily_entry_statuses(daily_file.read_text(encoding="utf-8"))
         changed = False
+        entry_to_raw = self._match_capture_entries_to_raw(entries, raw_entries)
+
+        for entry_pos, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            raw_index = entry_to_raw.get(entry_pos)
+            statuses = (
+                list(raw_entries[raw_index].statuses) if raw_index is not None else []
+            )
+            if statuses:
+                entry["entry_statuses"] = statuses
+            if ENTRY_STATUS_ALREADY_PROCESSED not in statuses:
+                continue
+
+            entry["classification"] = "skip"
+            entry["skip_reason"] = "entry_status:already_processed"
+            for key in tuple(entry):
+                if not str(key).startswith("task_"):
+                    continue
+                entry.pop(key, None)
+            changed = True
+
+        if changed:
+            self._recompute_capture_stats(capture_data)
+
+    @staticmethod
+    def _match_capture_entries_to_raw(
+        entries: list[Any],
+        raw_entries: list[DailyEntryStatus],
+    ) -> dict[int, int]:
+        """Map capture entry positions to raw daily entry indices."""
         used_raw_indices: set[int] = set()
         entry_to_raw: dict[int, int] = {}
 
@@ -2766,32 +2731,44 @@ WORKFLOW:
                 used_raw_indices.add(next_raw_index)
                 entry_to_raw[entry_pos] = next_raw_index
                 next_raw_index += 1
+        return entry_to_raw
 
-        for entry_pos, entry in enumerate(entries):
-            if not isinstance(entry, dict):
+    def _claim_capture_entries(
+        self,
+        day: date,
+        capture_data: dict[str, Any],
+    ) -> list[tuple[str, str, str]]:
+        """Fingerprint the daily blocks CAPTURE actually looked at.
+
+        Taken right after CAPTURE, before EXECUTE runs: an entry that
+        arrives later is absent from this list and so never gets the
+        ``already_processed`` marker it has not earned.
+        """
+        entries = capture_data.get("entries")
+        if not isinstance(entries, list) or not entries:
+            return []
+        daily_file = self._get_daily_file(day)
+        if not daily_file.exists():
+            return []
+        content = daily_file.read_text(encoding="utf-8")
+        raw_entries = parse_daily_entry_statuses(content)
+        digests = daily_entry_digests(content)
+        claimed: list[tuple[str, str, str]] = []
+        for raw_index in sorted(
+            self._match_capture_entries_to_raw(entries, raw_entries).values()
+        ):
+            raw = raw_entries[raw_index]
+            if raw.entry_type == "d-brain":
                 continue
-            raw_index = entry_to_raw.get(entry_pos)
-            statuses = (
-                list(raw_entries[raw_index].statuses) if raw_index is not None else []
-            )
-            if statuses:
-                entry["entry_statuses"] = statuses
-            if ENTRY_STATUS_ALREADY_PROCESSED not in statuses:
-                continue
+            claimed.append((raw.time, raw.entry_type, digests[raw_index]))
+        return claimed
 
-            entry["classification"] = "skip"
-            entry["skip_reason"] = "entry_status:already_processed"
-            for key in tuple(entry):
-                if not str(key).startswith("task_"):
-                    continue
-                entry.pop(key, None)
-            changed = True
-
-        if changed:
-            self._recompute_capture_stats(capture_data)
-
-    def _mark_daily_entries_processed(self, day: date) -> None:
-        """Tag every entry EXECUTE just handled so a same-day rerun skips it.
+    def _mark_daily_entries_processed(
+        self,
+        day: date,
+        claimed: Iterable[tuple[str, str, str]],
+    ) -> None:
+        """Tag the entries CAPTURE claimed so a same-day rerun skips them.
 
         Reuses the marker ``_apply_entry_status_guardrails`` already reads
         (``entry_status.py``'s ``already_processed``, the same one
@@ -2802,40 +2779,45 @@ WORKFLOW:
         could recreate Todoist tasks and thoughts. The reflect phase's own
         ``[d-brain]`` summary block is not a captured entry and is left
         alone, matching ``_apply_entry_status_guardrails``' entry model.
+
+        Only blocks whose (time, type, body digest) was claimed after
+        CAPTURE are tagged; an entry that landed while EXECUTE was running
+        stays unmarked and is classified on the next run. Each claimed key
+        is spent once, so a later duplicate of the same text stays unmarked.
         """
+        pending = Counter(claimed)
+        if not pending:
+            return
         # In the real scheduled pipeline this is a no-op: daily_workflow.run
         # already bootstraps frontmatter via _ensure_daily_file before
-        # capture. But _normalize_saved_thoughts (this method's only caller)
-        # also has its own direct unit tests that skip straight to it with a
-        # frontmatter-less fixture daily file (see
-        # test_normalize_saved_thoughts_repairs_*_frontmatter) -- without
-        # this, the validated write below rejects that file outright.
+        # capture. Direct unit tests may skip straight here with a
+        # frontmatter-less fixture daily file -- without this, the validated
+        # write below rejects that file outright.
         daily_file = self._ensure_daily_file(day)
         try:
             original_bytes = daily_file.read_bytes()
         except FileNotFoundError:
             return
         original = original_bytes.decode("utf-8")
-        matches = list(DAILY_ENTRY_RE.finditer(original))
-        if not matches:
+        spans = entry_spans(original)
+        if not spans:
             return
 
         marker_line = format_entry_status_comments((ENTRY_STATUS_ALREADY_PROCESSED,))
         pieces: list[str] = []
         cursor = 0
         changed = False
-        for index, match in enumerate(matches):
-            block_end = (
-                matches[index + 1].start()
-                if index + 1 < len(matches)
-                else len(original)
-            )
+        for match, block_end in spans:
             pieces.append(original[cursor : match.end()])
             block = original[match.end() : block_end]
             entry_type = normalize_entry_type(match.group("type"))
-            if entry_type != "d-brain" and (
-                ENTRY_STATUS_ALREADY_PROCESSED not in extract_entry_statuses(block)
+            key = (match.group("time"), entry_type, entry_block_digest(block))
+            if (
+                entry_type != "d-brain"
+                and pending[key] > 0
+                and ENTRY_STATUS_ALREADY_PROCESSED not in extract_entry_statuses(block)
             ):
+                pending[key] -= 1
                 pieces.append(f"\n{marker_line}")
                 changed = True
             pieces.append(block)
@@ -2874,9 +2856,29 @@ WORKFLOW:
                     day,
                 )
 
+    def _calendar_context(self, day: date) -> str:
+        """Prompt section with the day's meetings that already started.
+
+        Text for the model only: nothing is written to the vault or the
+        calendar. Empty when no calendar is set or the feed is unavailable (the
+        model must not see an error message it could mistake for content).
+        """
+        # The systemd units load .env into the environment; Settings is not used
+        # here because the processor never builds one.
+        url = os.environ.get("CALENDAR_ICS_URL", "").strip()
+        if not url:
+            return ""
+        result = calendar_ics.fetch_day(url, day)
+        if result.error:
+            return ""
+        return calendar_ics.format_prompt_section(result.events, day, owner_now())
+
     def _build_capture_prompt(self, day: date) -> str:
         """Prompt for the shared capture phase."""
         core_context = self._build_injected_context(consumer="capture", target_day=day)
+        calendar_context = self._calendar_context(day)
+        if calendar_context:
+            calendar_context += "\n"
         phase_content = self._load_phase_content("capture")
         about_reference = self._load_dbrain_reference("about")
         classification_reference = self._load_dbrain_reference("classification")
@@ -2889,6 +2891,7 @@ WORKFLOW:
             "for Phase 1.\n\n"
             f"{self._language_instruction()}\n"
             f"{core_context}\n"
+            f"{calendar_context}"
             "=== PHASE INSTRUCTIONS ===\n"
             f"{phase_content}\n"
             "=== END PHASE ===\n\n"
@@ -2930,6 +2933,9 @@ WORKFLOW:
     def _build_execute_prompt(self, day: date) -> str:
         """Prompt for the scheduled execute phase."""
         core_context = self._build_injected_context(consumer="execute", target_day=day)
+        calendar_context = self._calendar_context(day)
+        if calendar_context:
+            calendar_context += "\n"
         phase_content = self._load_phase_content("execute")
         vault_retrieval_skill = self._load_vault_retrieval_skill()
         goals_reference = self._load_dbrain_reference("goals")
@@ -2946,6 +2952,7 @@ WORKFLOW:
             "for Phase 2.\n\n"
             f"{self._language_instruction()}\n"
             f"{core_context}\n"
+            f"{calendar_context}"
             "=== PHASE INSTRUCTIONS ===\n"
             f"{phase_content}\n"
             "=== END PHASE ===\n\n"
@@ -3022,7 +3029,7 @@ WORKFLOW:
     def _build_question_answer_prompt(self, question: str, user_id: int) -> str:
         """Prompt for direct plain-text answers without capture."""
         core_context = self._build_injected_context(
-            consumer="question", target_day=date.today()
+            consumer="question", target_day=owner_today()
         )
         todoist_ref = self._load_todoist_reference()
         question_reference = self._load_question_answer_reference()
@@ -3172,6 +3179,8 @@ or recent vault notes before answering instead of guessing.
             "configuration from .memory-config.json, not vault/.memory-config.json.\n"
             "In handoff Last Session, report reviewed entries and processed "
             "entries as separate counts from execute.json entry_counts.\n"
+            "If execute.json has tasks_pending or tasks_unconfirmed, mention them "
+            "in the report as not delivered / unconfirmed.\n"
             "Read .graph/health-history.json, .session/creative-recall.txt and "
             ".session/memory-audit.md "
             "when they exist.\n"
@@ -3594,20 +3603,13 @@ or recent vault notes before answering instead of guessing.
         if normalized_count:
             logger.info("Normalized %s thought note(s) after execute", normalized_count)
 
-        # Not thought-note cleanup itself, but this is the one place
-        # ``daily_workflow.DailyWorkflow._execute`` calls right after
-        # ``execute.json`` is written -- i.e. exactly "EXECUTE has
-        # succeeded" -- so idempotency marking piggybacks on it rather than
-        # adding a second call site there.
-        self._mark_daily_entries_processed(day)
-
     def _write_reflect_daily_block(
         self,
         day: date,
         execute_data: dict[str, Any],
     ) -> None:
         """Persist the reflect summary block via the single locked daily writer."""
-        timestamp = datetime.now().astimezone()
+        timestamp = owner_now()
         tasks_created = self._json_dict_list(execute_data, "tasks_created")
         thoughts_saved = self._json_dict_list(execute_data, "thoughts_saved")
         crm_updated = self._json_dict_list(execute_data, "crm_updated")
@@ -3659,6 +3661,30 @@ or recent vault notes before answering instead of guessing.
                 details.append(f"{due_label}: {due_value}")
             suffix = f" ({', '.join(details)})" if details else ""
             lines.append(f'- "{content}"{suffix}')
+
+        # Tasks not delivered stay visible in the day's record, not only in
+        # execute.json: the owner reads this block.
+        pending_count = len(self._load_pending_todoist_tasks())
+        if pending_count:
+            pending_label = (
+                "Не отправлено в Todoist (ждёт повтора)"
+                if is_russian
+                else "Not sent to Todoist (waiting for retry)"
+            )
+            lines.append(f"**{pending_label}:** {pending_count}")
+        tasks_unconfirmed = self._json_dict_list(execute_data, "tasks_unconfirmed")
+        if tasks_unconfirmed:
+            unconfirmed_label = (
+                "Не подтверждено, проверить в Todoist"
+                if is_russian
+                else "Unconfirmed, check Todoist"
+            )
+            lines.append(f"**{unconfirmed_label}:** {len(tasks_unconfirmed)}")
+            for task in tasks_unconfirmed:
+                content = collapse_to_single_line(task.get("content")) or (
+                    "Задача без названия" if is_russian else "Untitled task"
+                )
+                lines.append(f'- "{content}"')
 
         lines.extend(["", f"**{thoughts_label}:** {len(thoughts_saved)}"])
         for thought in thoughts_saved:
@@ -4492,10 +4518,18 @@ or recent vault notes before answering instead of guessing.
             lines.append(more)
         return "\n".join(lines)
 
+    def _require_graph_rebuild(self) -> None:
+        """Rebuild the graph or fail the health step instead of reading an old graph."""
+        if not self._rebuild_graph():
+            raise CliExecutionError(
+                "Vault graph rebuild failed (analyze.py); "
+                "the previous graph was not used"
+            )
+
     def _run_vault_health_cycle(self) -> dict[str, Any]:
         """Rebuild graph stats and apply a safe repair pass when health is low."""
         try:
-            self._rebuild_graph()
+            self._require_graph_rebuild()
             initial = self._load_graph_stats()
             initial_score = float(initial.get("health_score") or 0.0)
             initial_broken = int(initial.get("broken_link_count") or 0)
@@ -4510,7 +4544,7 @@ or recent vault notes before answering instead of guessing.
                     "--apply",
                 )
                 repair_applied = True
-                self._rebuild_graph()
+                self._require_graph_rebuild()
 
             final = self._load_graph_stats()
             final_score = float(final.get("health_score", initial_score))
@@ -4608,8 +4642,8 @@ or recent vault notes before answering instead of guessing.
         # dispatcher (``_run_control_plane_maintenance_workflow``) calls this
         # with no arguments, so fall back to the cycle day pinned by
         # ``_run_scheduled_cycle_locked`` before finally defaulting to
-        # ``date.today()`` for any other caller.
-        today = day or self._scheduled_cycle_day or date.today()
+        # ``owner_today()`` for any other caller.
+        today = day or self._scheduled_cycle_day or owner_today()
         try:
             pass_status = read_pass_status(self.vault_path)
             digest = build_daily_digest(self.vault_path, today, pass_status=pass_status)
@@ -4712,7 +4746,7 @@ or recent vault notes before answering instead of guessing.
         conversation_context: str | None = None,
     ) -> dict[str, Any]:
         """Execute arbitrary prompt with the configured CLI."""
-        today = date.today()
+        today = owner_today()
         core_context = self._build_injected_context(consumer="do", target_day=today)
         todoist_ref = self._load_todoist_reference()
         vault_retrieval_skill = self._load_vault_retrieval_skill()
@@ -4975,6 +5009,7 @@ vault answer artifacts, such as matplotlib charts, is allowed.
         today: date,
         daily_result: dict[str, Any],
         periodic_cycles: list[dict[str, Any]],
+        cycle_started_at: float | None = None,
     ) -> list[str]:
         """Warn about scheduled-cycle artifacts that should exist but don't.
 
@@ -4995,13 +5030,23 @@ vault answer artifacts, such as matplotlib charts, is allowed.
             except OSError:
                 daily_text = ""
             if REFLECT_DAILY_START_MARKER not in daily_text:
-                missing.append(f"daily/{today.isoformat()}.md (блок reflect)")
+                reflect_block = translate(self.content_language, "verify_reflect_block")
+                missing.append(f"daily/{today.isoformat()}.md ({reflect_block})")
 
         if not self._handoff_path().exists():
             missing.append(".session/handoff.md")
 
-        if not (self.vault_path / ".graph" / "vault-graph.json").exists():
+        graph_path = self.vault_path / ".graph" / "vault-graph.json"
+        stale_graph = False
+        if not graph_path.exists():
             missing.append(".graph/vault-graph.json")
+        elif cycle_started_at is not None:
+            # An old graph on disk is not "present": the health step reads it
+            # as fresh unless analyze.py actually rewrote it during this cycle.
+            try:
+                stale_graph = graph_path.stat().st_mtime < cycle_started_at
+            except OSError:
+                stale_graph = False
 
         digest_cycle = next(
             (
@@ -5016,12 +5061,21 @@ vault answer artifacts, such as matplotlib charts, is allowed.
             digest_result = digest_result if isinstance(digest_result, dict) else {}
             if not digest_result.get("skipped") and "error" not in digest_result:
                 if not digest_path(self.vault_path, today).exists():
-                    missing.append("дайджест обогащения compiled за сегодня")
+                    missing.append(
+                        translate(self.content_language, "verify_compiled_digest")
+                    )
 
         lines: list[str] = []
         for artifact in missing:
             logger.warning("VERIFY: missing scheduled-cycle artifact: %s", artifact)
-            lines.append(f"🔴 VERIFY: нет {artifact}")
+            lines.append(
+                translate(self.content_language, "verify_missing").format(
+                    artifact=artifact
+                )
+            )
+        if stale_graph:
+            logger.warning("VERIFY: graph not refreshed in this cycle")
+            lines.append(translate(self.content_language, "verify_stale_graph"))
         return lines
 
     @staticmethod
@@ -5272,6 +5326,7 @@ vault answer artifacts, such as matplotlib charts, is allowed.
             "issues": issues,
             "task_candidates": [task["content"] for task in task_candidates],
             "tasks_created": created_tasks,
+            "tasks_unconfirmed": list(self._todoist_unconfirmed),
             **({"fallback": True} if fallback_payload is not None else {}),
         }
 
@@ -5318,7 +5373,7 @@ vault answer artifacts, such as matplotlib charts, is allowed.
         refresh_qmd: bool = True,
     ) -> dict[str, Any]:
         """Generate the owner-facing weekly digest."""
-        today = day or date.today()
+        today = day or owner_today()
         copy = self._owner_report_defaults()
         yearly_goals_name = self._get_yearly_goals_name()
         rollover_error = self._weekly_rollover_guard(today)
@@ -5353,7 +5408,7 @@ vault answer artifacts, such as matplotlib charts, is allowed.
                 summary_path = self._save_weekly_summary(summary_markdown, today)
                 self._update_weekly_moc(summary_path)
                 self._log_periodic_summary(
-                    timestamp=datetime.now().astimezone(),
+                    timestamp=owner_now(),
                     label=copy["weekly_digest_title"],
                     summary_path=summary_path,
                     refresh_qmd=False,
@@ -5387,10 +5442,6 @@ vault answer artifacts, such as matplotlib charts, is allowed.
             logger.exception("Unexpected error during weekly digest")
             return {"error": str(exc), "processed_entries": 0}
 
-    def generate_weekly(self) -> dict[str, Any]:
-        """Backward-compatible alias for the weekly digest."""
-        return self.generate_weekly_digest()
-
     def generate_weekly_system_reflection(
         self,
         *,
@@ -5398,7 +5449,7 @@ vault answer artifacts, such as matplotlib charts, is allowed.
         refresh_qmd: bool = True,
     ) -> dict[str, Any]:
         """Generate one weekly system reflection from handoff observations."""
-        today = day or date.today()
+        today = day or owner_today()
         copy = self._owner_report_defaults()
         observations, observation_revision = self._handoff_observation_snapshot()
         if not observations:
@@ -5550,7 +5601,7 @@ Return exactly one JSON object:
             )
         )
         self._log_weekly_system_reflection(
-            timestamp=datetime.now().astimezone(),
+            timestamp=owner_now(),
             note_path=note_path,
             title=title,
             processed_observations=processed_observations,
@@ -5608,7 +5659,7 @@ Return exactly one JSON object:
         refresh_qmd: bool = True,
     ) -> dict[str, Any]:
         """Generate the end-of-month owner review."""
-        today = day or date.today()
+        today = day or owner_today()
         copy = self._owner_report_defaults()
         yearly_goals_name = self._get_yearly_goals_name()
         month_label = today.strftime("%Y-%m")
@@ -5666,7 +5717,7 @@ MONTHLY REVIEW RULES:
             try:
                 summary_path = self._save_monthly_summary(summary_markdown, today)
                 self._log_periodic_summary(
-                    timestamp=datetime.now().astimezone(),
+                    timestamp=owner_now(),
                     label=copy["monthly_review_title"],
                     summary_path=summary_path,
                     refresh_qmd=False,
@@ -5707,7 +5758,7 @@ MONTHLY REVIEW RULES:
         refresh_qmd: bool = True,
     ) -> dict[str, Any]:
         """Generate the end-of-year owner review."""
-        today = day or date.today()
+        today = day or owner_today()
         copy = self._owner_report_defaults()
         yearly_goals_name = f"1-yearly-{today.year}.md"
         rollover_due = self._three_year_rollover_due(today)
@@ -5794,7 +5845,7 @@ YEARLY REVIEW RULES:
                         )
                     )
                 self._log_periodic_summary(
-                    timestamp=datetime.now().astimezone(),
+                    timestamp=owner_now(),
                     label=copy["yearly_review_title"],
                     summary_path=summary_path,
                     refresh_qmd=False,
@@ -5830,54 +5881,6 @@ YEARLY REVIEW RULES:
             logger.exception("Unexpected error during yearly review")
             return {"error": str(exc), "processed_entries": 0}
 
-    def run_weekly_cycle(self, *, day: date | None = None) -> dict[str, Any]:
-        """Run the weekly digest and system reflection back-to-back."""
-        if day is None:
-            digest_result = self.generate_weekly_digest(refresh_qmd=False)
-        else:
-            digest_result = self.generate_weekly_digest(day=day, refresh_qmd=False)
-        if "error" in digest_result:
-            return digest_result
-
-        if day is None:
-            system_result = self.generate_weekly_system_reflection(refresh_qmd=False)
-        else:
-            system_result = self.generate_weekly_system_reflection(
-                day=day,
-                refresh_qmd=False,
-            )
-        digest_report = str(digest_result.get("report", "")).strip()
-        system_report = str(system_result.get("report", "")).strip()
-
-        if "error" in system_result:
-            system_report = "\n".join(
-                [
-                    "🛠 **Системная рефлексия**",
-                    "",
-                    f"`{str(system_result['error'])}`",
-                ]
-            )
-
-        combined_report = digest_report
-        if system_report:
-            combined_report = (
-                f"{combined_report.rstrip()}\n\n{system_report.lstrip()}"
-                if combined_report
-                else system_report
-            )
-
-        self._refresh_qmd_index()
-        result: dict[str, Any] = {
-            "report": combined_report,
-            "processed_entries": int(digest_result.get("processed_entries") or 0)
-            + int(system_result.get("processed_entries") or 0),
-            "digest": digest_result,
-            "system_reflection": system_result,
-        }
-        if "error" in system_result:
-            result["system_reflection_error"] = system_result["error"]
-        return result
-
     def run_scheduled_cycle(self, day: date | None = None) -> dict[str, Any]:
         """Run the full scheduled stack: daily plus any due periodic reviews."""
         try:
@@ -5903,26 +5906,91 @@ YEARLY REVIEW RULES:
             logger.warning("%s", exc)
             return {"error": str(exc), "processed_entries": 0}
 
+    def _run_scheduled_step(
+        self,
+        name: str,
+        step: Callable[[], dict[str, Any]],
+        *,
+        day: date,
+        reports: list[str],
+        audits: list[dict[str, Any]],
+        periodic_cycles: list[dict[str, Any]],
+        record: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> None:
+        """Run one scheduled step with the shared health/audit/report bookkeeping.
+
+        A step that raised has no ``report`` of its own, so without the
+        ``❌`` fallback it would contribute an empty string and the nightly
+        message would read as a clean run -- the traceback only reaches a
+        service log nobody opens at 21:00.
+        """
+        if self._is_job_step_disabled(name):
+            reports.append(self._disabled_step_skip_report(name))
+            return
+        try:
+            result = step()
+        except Exception as exc:
+            logger.exception("Scheduled step failed: %s", name)
+            result = {"error": str(exc), "processed_entries": 0}
+
+        newly_disabled = self._record_job_step_health(name, result)
+        label = self._cycle_label(name)
+        periodic_cycles.append(
+            record(name, result)
+            if record
+            else {"name": name, "label": label, "result": result}
+        )
+        audits.append(
+            self._safe_audit_cycle_result(cycle_name=name, day=day, result=result)
+        )
+
+        report = str(result.get("report", "")).strip()
+        if not report and "error" in result:
+            report = "\n".join([f"❌ **{label}**", "", f"`{str(result['error'])}`"])
+        reports.append(report)
+        if newly_disabled:
+            reports.append(self._disabled_step_transition_report(name))
+
     def _run_scheduled_cycle_locked(self, day: date | None = None) -> dict[str, Any]:
         """Run scheduled processing while the full-cycle lock is held."""
-        today = day or date.today()
+        cycle_started = time.time()
+        today = day or owner_today()
         # Pins the cycle day for entrypoints dispatched generically by name
         # (``_run_control_plane_maintenance_workflow``, e.g.
         # ``_run_compiled_digest_cycle``) that cannot take ``today`` as a
         # direct argument without breaking that dispatcher's single-arg
         # call signature. A long-running nightly cycle can cross midnight,
-        # so those entrypoints must not fall back to ``date.today()``.
+        # so those entrypoints must not fall back to ``owner_today()``.
         self._scheduled_cycle_day = today
+        self._carried_unconfirmed_tasks = []
+        # An empty retry file returns before `_create_todoist_tasks` resets it,
+        # so the previous cycle's leftovers would leak into this report.
+        self._todoist_unconfirmed = []
         try:
             self._retry_pending_todoist_tasks()
+            self._carried_unconfirmed_tasks = list(self._todoist_unconfirmed)
         except Exception:
             logger.warning("Todoist pending-task retry failed", exc_info=True)
-        daily_result = self.process_daily(today, mode=SCHEDULED_MODE)
-        reports = [
-            self._strip_vault_health_report_section(
+        try:
+            daily_result = self.process_daily(today, mode=SCHEDULED_MODE)
+        finally:
+            # An empty or failed day never reaches the capture reconciliation
+            # that reports these, so the cycle result carries the rest.
+            retry_unconfirmed = self._carried_unconfirmed_tasks
+            self._carried_unconfirmed_tasks = []
+        # An empty error string must stay an error, not look like success.
+        daily_error = str(daily_result.get("error") or "").strip() or "unknown error"
+        if "error" in daily_result:
+            # No ``report`` on a failed day: keep the error visible in the
+            # combined report in the same shape as the other steps.
+            daily_report = "\n".join(
+                [f"❌ **{self._cycle_label('daily')}**", "", f"`{daily_error}`"]
+            )
+        else:
+            daily_report = self._strip_vault_health_report_section(
                 str(daily_result.get("report", "")).strip()
             )
-        ]
+        reports = [daily_report]
         audits: list[dict[str, Any]] = [
             self._safe_audit_cycle_result(
                 cycle_name="daily",
@@ -5936,112 +6004,41 @@ YEARLY REVIEW RULES:
         )
 
         if "error" not in daily_result:
+            # Looked up on ``self`` at call time: tests replace these methods
+            # on the instance.
+            periodic_steps: dict[str, Callable[[], dict[str, Any]]] = {
+                "weekly_digest": lambda: self.generate_weekly_digest(
+                    day=today, refresh_qmd=False
+                ),
+                "weekly_system_reflection": lambda: (
+                    self.generate_weekly_system_reflection(
+                        day=today, refresh_qmd=False
+                    )
+                ),
+                "monthly": lambda: self.run_monthly_cycle(
+                    day=today, refresh_qmd=False
+                ),
+                "yearly": lambda: self.run_yearly_cycle(day=today, refresh_qmd=False),
+            }
             for cycle_name in self._scheduled_cycle_names_for_day(today):
-                if self._is_job_step_disabled(cycle_name):
-                    reports.append(self._disabled_step_skip_report(cycle_name))
-                    continue
-                try:
-                    if cycle_name == "weekly_digest":
-                        cycle_result = self.generate_weekly_digest(
-                            day=today,
-                            refresh_qmd=False,
-                        )
-                    elif cycle_name == "weekly_system_reflection":
-                        cycle_result = self.generate_weekly_system_reflection(
-                            day=today,
-                            refresh_qmd=False,
-                        )
-                    elif cycle_name == "monthly":
-                        cycle_result = self.run_monthly_cycle(
-                            day=today,
-                            refresh_qmd=False,
-                        )
-                    else:
-                        cycle_result = self.run_yearly_cycle(
-                            day=today,
-                            refresh_qmd=False,
-                        )
-                except Exception as exc:
-                    logger.exception("Scheduled periodic cycle failed: %s", cycle_name)
-                    cycle_result = {"error": str(exc), "processed_entries": 0}
-
-                newly_disabled = self._record_job_step_health(cycle_name, cycle_result)
-
-                label = self._cycle_label(cycle_name)
-                periodic_cycles.append(
-                    {
-                        "name": cycle_name,
-                        "label": label,
-                        "result": cycle_result,
-                    }
+                self._run_scheduled_step(
+                    cycle_name,
+                    periodic_steps.get(cycle_name, periodic_steps["yearly"]),
+                    day=today,
+                    reports=reports,
+                    audits=audits,
+                    periodic_cycles=periodic_cycles,
                 )
-                audits.append(
-                    self._safe_audit_cycle_result(
-                        cycle_name=cycle_name,
-                        day=today,
-                        result=cycle_result,
-                    )
-                )
-
-                cycle_report = str(cycle_result.get("report", "")).strip()
-                if not cycle_report and "error" in cycle_result:
-                    cycle_report = "\n".join(
-                        [
-                            f"❌ **{label}**",
-                            "",
-                            f"`{str(cycle_result['error'])}`",
-                        ]
-                    )
-                reports.append(cycle_report)
-                if newly_disabled:
-                    reports.append(self._disabled_step_transition_report(cycle_name))
 
         if run_weekly_goals_rollover:
-            rollover_name = "weekly_goals_rollover"
-            rollover_label = self._cycle_label(rollover_name)
-            if self._is_job_step_disabled(rollover_name):
-                reports.append(self._disabled_step_skip_report(rollover_name))
-            else:
-                try:
-                    rollover_result = self.rollover_weekly_goals(
-                        day=today,
-                        refresh_qmd=False,
-                    )
-                except Exception as exc:
-                    logger.exception("Scheduled weekly goals rollover failed")
-                    rollover_result = {"error": str(exc), "processed_entries": 0}
-
-                newly_disabled = self._record_job_step_health(
-                    rollover_name, rollover_result
-                )
-
-                periodic_cycles.append(
-                    {
-                        "name": rollover_name,
-                        "label": rollover_label,
-                        "result": rollover_result,
-                    }
-                )
-                audits.append(
-                    self._safe_audit_cycle_result(
-                        cycle_name=rollover_name,
-                        day=today,
-                        result=rollover_result,
-                    )
-                )
-
-                rollover_report = str(rollover_result.get("report", "")).strip()
-                if not rollover_report and "error" in rollover_result:
-                    rollover_report = "\n".join(
-                        [
-                            f"❌ **{rollover_label}**",
-                            "",
-                            f"`{str(rollover_result['error'])}`",
-                        ]
-                    )
-                reports.append(rollover_report)
-                if newly_disabled:
-                    reports.append(self._disabled_step_transition_report(rollover_name))
+            self._run_scheduled_step(
+                "weekly_goals_rollover",
+                lambda: self.rollover_weekly_goals(day=today, refresh_qmd=False),
+                day=today,
+                reports=reports,
+                audits=audits,
+                periodic_cycles=periodic_cycles,
+            )
 
         # Maintenance workflows run regardless of daily processing outcome
         # so that compiled briefings, vault health, etc. stay fresh even when
@@ -6050,51 +6047,15 @@ YEARLY REVIEW RULES:
             kind="maintenance",
             trigger="scheduled-post",
         ):
-            if self._is_job_step_disabled(workflow.name):
-                reports.append(self._disabled_step_skip_report(workflow.name))
-                continue
-            try:
-                cycle_result = self._run_control_plane_maintenance_workflow(
-                    workflow.name
-                )
-            except Exception as exc:
-                logger.exception(
-                    "Scheduled maintenance workflow failed: %s", workflow.name
-                )
-                cycle_result = {"error": str(exc), "processed_entries": 0}
-            newly_disabled = self._record_job_step_health(workflow.name, cycle_result)
-            periodic_cycles.append(
-                self._build_control_plane_cycle_record(
-                    workflow.name,
-                    cycle_result,
-                )
+            self._run_scheduled_step(
+                workflow.name,
+                partial(self._run_control_plane_maintenance_workflow, workflow.name),
+                day=today,
+                reports=reports,
+                audits=audits,
+                periodic_cycles=periodic_cycles,
+                record=self._build_control_plane_cycle_record,
             )
-            audits.append(
-                self._safe_audit_cycle_result(
-                    cycle_name=workflow.name,
-                    day=today,
-                    result=cycle_result,
-                )
-            )
-            cycle_report = str(cycle_result.get("report", "")).strip()
-            if not cycle_report and "error" in cycle_result:
-                # Same fallback as the two loops above (code review): a
-                # workflow that raised has no ``report`` of its own, so
-                # appending it verbatim contributed an empty string and the
-                # owner's nightly message came back looking like a clean
-                # run. The traceback goes to the service log, which nobody
-                # reads at 21:00 -- and these are exactly the workflows
-                # whose silence is indistinguishable from "nothing to say".
-                cycle_report = "\n".join(
-                    [
-                        f"❌ **{self._cycle_label(workflow.name)}**",
-                        "",
-                        f"`{str(cycle_result['error'])}`",
-                    ]
-                )
-            reports.append(cycle_report)
-            if newly_disabled:
-                reports.append(self._disabled_step_transition_report(workflow.name))
 
         # ``.session/ops.jsonl`` and its snapshots are append-only; trim them
         # to the rolling window once per night. Best-effort: the journal is
@@ -6116,7 +6077,10 @@ YEARLY REVIEW RULES:
 
         reports.extend(
             self._verify_scheduled_cycle_artifacts(
-                today, daily_result, periodic_cycles
+                today,
+                daily_result,
+                periodic_cycles,
+                cycle_started_at=cycle_started,
             )
         )
 
@@ -6134,20 +6098,35 @@ YEARLY REVIEW RULES:
             if isinstance(task, dict) and str(task.get("content") or "").strip()
         ]
 
+        # A failed daily part is reported as ``daily_error``, not as a
+        # top-level "error": that key means "the cycle did not run" and makes
+        # callers drop the maintenance results gathered above.
         result: dict[str, Any] = {
-            **daily_result,
+            **{k: v for k, v in daily_result.items() if k != "error"},
             "report": combined_report or str(daily_result.get("report", "")).strip(),
             "daily": daily_result,
             "periodic_cycles": periodic_cycles,
             "audits": audits,
             "audit_task_candidates": task_candidates,
             "audit_tasks_created": tasks_created,
+            "retry_tasks_unconfirmed": retry_unconfirmed,
+            "audit_tasks_unconfirmed": [
+                task
+                for audit in audits
+                for task in audit.get("tasks_unconfirmed", [])
+                if isinstance(task, dict) and str(task.get("content") or "").strip()
+            ],
             "processed_entries": int(daily_result.get("processed_entries") or 0)
             + sum(
                 int(cycle["result"].get("processed_entries") or 0)
                 for cycle in periodic_cycles
             ),
         }
+        if "error" in daily_result:
+            result["daily_error"] = daily_error
+        if disabled_summary:
+            # The digest is built from structured fields, not from ``report``.
+            result["disabled_steps_notice"] = disabled_summary
         return result
 
 

@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import escape
 from typing import cast
 from zoneinfo import ZoneInfo
@@ -36,6 +36,18 @@ from d_brain.services.todoist_tasks import TodoistTask, TodoistTaskError, Todois
 router = Router(name="tasks")
 logger = logging.getLogger(__name__)
 PAGE_SIZE = 8
+REOPEN_WINDOW = timedelta(minutes=2)
+
+
+def _can_reopen(task: TodoistTask, now: datetime) -> bool:
+    # A recurring task's due date has already moved to the next occurrence,
+    # so reopening it would not restore the state the owner saw.
+    return (
+        task.completed
+        and not task.recurring
+        and task.completed_at is not None
+        and now - task.completed_at < REOPEN_WINDOW
+    )
 
 
 def build_tasks_view(
@@ -68,6 +80,11 @@ def build_tasks_view(
             group = label
         complete = f"tasks:complete:{task.id}:{task.fingerprint}"
         details = f"tasks:ask:{task.id}:{task.fingerprint}"
+        reopen = (
+            f"tasks:reopen:{task.id}:{task.fingerprint}"
+            if _can_reopen(task, now)
+            else ""
+        )
         mark = "☑" if task.completed else "☐"
         style = (
             "success" if task.completed else ("danger" if task.overdue(now) else "link")
@@ -76,6 +93,11 @@ def build_tasks_view(
         if task.completed:
             title = f"<s>{title}</s>"
             checkbox = f'<tg-button type="disabled" style="success">{mark}</tg-button>'
+            if reopen:
+                checkbox += (
+                    f' <tg-button type="callback_data" data="{escape(reopen)}" '
+                    'style="link">Вернуть</tg-button>'
+                )
         else:
             checkbox = (
                 f'<tg-button type="callback_data" data="{escape(complete)}" '
@@ -100,16 +122,19 @@ def build_tasks_view(
             f'<tg-button type="callback_data" data="{escape(details)}" '
             f'style="link">↗</tg-button><br><i>{escape(" · ".join(meta))}</i></p>'
         )
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"{mark} {index}",
-                    callback_data="menu:noop" if task.completed else complete,
-                    style=style if style != "link" else None,
-                ),
-                InlineKeyboardButton(text=f"↗ {index}", callback_data=details),
-            ]
-        )
+        row = [
+            InlineKeyboardButton(
+                text=f"{mark} {index}",
+                callback_data="menu:noop" if task.completed else complete,
+                style=style if style != "link" else None,
+            ),
+            InlineKeyboardButton(text=f"↗ {index}", callback_data=details),
+        ]
+        if reopen:
+            row.append(
+                InlineKeyboardButton(text=f"↩ Вернуть {index}", callback_data=reopen)
+            )
+        rows.append(row)
     navigation: list[list[InlineKeyboardButton]] = []
     if pages > 1:
         navigation.append(
@@ -236,6 +261,63 @@ async def show_tasks(bot: Bot, chat_id: int, message_id: int) -> None:
         session.task_busy = False
 
 
+async def _redraw_or_warn(
+    bot: Bot, message: Message, session: DashboardSession, failure: str
+) -> None:
+    try:
+        if (
+            session.current_screen == "tasks"
+            and get_dashboard_session(session.chat_id) is session
+        ):
+            await render_tasks(bot, session)
+    except Exception:
+        logger.exception("Task changed but screen redraw failed")
+        await answer_text(message, failure)
+
+
+async def _reopen_task(
+    query: CallbackQuery,
+    message: Message,
+    session: DashboardSession,
+    item: TodoistTask,
+    bot: Bot,
+    state: FSMContext,
+) -> None:
+    now = datetime.now(ZoneInfo(session.task_timezone))
+    if not item.completed:
+        await query.answer("Задача уже открыта.")
+        return
+    if item.completed_at is None or now - item.completed_at >= REOPEN_WINDOW:
+        await query.answer("Время вышло")
+        # Redraw so the expired button disappears.
+        with suppress(Exception):
+            await render_tasks(bot, session)
+        return
+    # Raise the flag before the first await, or a second tap slips in while
+    # this one is still answering the callback.
+    session.task_busy = True
+    try:
+        await query.answer()
+        await state.clear()
+        settings = get_settings()
+        client = TodoistTasks(settings.vault_path, settings.todoist_api_key)
+        await asyncio.to_thread(client.reopen, item)
+        item.completed = False
+        item.completed_at = None
+    except TodoistTaskError as exc:
+        await answer_text(message, str(exc), parse_mode=None)
+        return
+    except Exception:
+        logger.exception("Failed to reopen Todoist task")
+        await answer_text(message, "Не удалось вернуть задачу. Обновите список.")
+        return
+    finally:
+        session.task_busy = False
+    await _redraw_or_warn(
+        bot, message, session, "Задача возвращена. Для обновления списка откройте меню."
+    )
+
+
 async def explain_task(message: Message, task: TodoistTask, user_id: int) -> None:
     settings = get_settings()
     status = await answer_text(message, "⏳ Ищу детали задачи…")
@@ -348,22 +430,32 @@ async def handle_task_callback(
         ),
         None,
     )
-    if item is None or parts[1] not in {"complete", "ask"}:
+    if item is None or parts[1] not in {"complete", "ask", "reopen"}:
         await query.answer("Задача устарела. Обновите список.")
         return
-    await query.answer()
-    await state.clear()
+    if parts[1] == "reopen":
+        await _reopen_task(query, message, session, item, bot, state)
+        return
     if parts[1] == "ask":
+        await query.answer()
+        await state.clear()
         await explain_task(message, item, query.from_user.id)
         return
     if item.completed:
+        await query.answer()
+        await state.clear()
         return
+    # Raise the flag before the first await, or a second tap slips in while
+    # this one is still answering the callback.
     session.task_busy = True
     try:
+        await query.answer()
+        await state.clear()
         settings = get_settings()
         client = TodoistTasks(settings.vault_path, settings.todoist_api_key)
         await asyncio.to_thread(client.complete, item)
         item.completed = True
+        item.completed_at = datetime.now(ZoneInfo(session.task_timezone))
     except TodoistTaskError as exc:
         await answer_text(message, str(exc), parse_mode=None)
         return
@@ -375,14 +467,13 @@ async def handle_task_callback(
         return
     finally:
         session.task_busy = False
-    try:
-        if (
-            session.current_screen == "tasks"
-            and get_dashboard_session(session.chat_id) is session
-        ):
-            await render_tasks(bot, session)
-    except Exception:
-        logger.exception("Task completed but screen redraw failed")
+    await _redraw_or_warn(
+        bot, message, session, "Задача выполнена. Для обновления списка откройте меню."
+    )
+    if item.recurring:
         await answer_text(
-            message, "Задача выполнена. Для обновления списка откройте меню."
+            message,
+            "Повторяющаяся задача: срок уже перенесён на следующий раз, "
+            "вернуть её отсюда нельзя — измените срок в Todoist.",
+            parse_mode=None,
         )

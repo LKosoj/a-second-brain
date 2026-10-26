@@ -25,7 +25,13 @@ from typing import Any
 
 import yaml
 
+from d_brain.clock import owner_today
 from d_brain.manifest import VaultManifest
+from d_brain.services.atomic_io import (
+    atomic_write_file_bytes,
+    atomic_write_file_text,
+    copy_owner_group,
+)
 from d_brain.services.vault_lock import (
     VaultLockError,
     VaultWriteLock,
@@ -251,6 +257,27 @@ def split_frontmatter_bytes(content: bytes) -> tuple[bytes | None, bytes, bytes]
         header = unmarked[offset:closing_index]
         body = unmarked[closing_index + len(closing) :]
     return header, body, newline
+
+
+# Text-level sibling of split_frontmatter_bytes for callers that glue the
+# header and body back together: LF-only, keeps a leading BOM and the blank
+# lines after the closing delimiter inside the header part.
+_HEADER_BLOCK_RE = re.compile(r"\A\ufeff?---\n.*?\n---\n*", re.DOTALL)
+
+
+def split_frontmatter_text(text: str) -> tuple[str, str]:
+    """Cut ``text`` into (header block, body) without parsing the header.
+
+    The header block is returned verbatim -- BOM, both ``---`` lines and the
+    blank lines after the closing one -- so ``header + body == text``. Never
+    raises: a document without a closing ``---`` is all body, ``("", text)``.
+    Unlike ``split_frontmatter_bytes`` it does not validate the YAML and does
+    not understand CRLF.
+    """
+    match = _HEADER_BLOCK_RE.match(text)
+    if match is None:
+        return "", text
+    return match.group(0), text[match.end() :]
 
 
 def parse_frontmatter_bytes(content: bytes) -> FrontmatterDocument:
@@ -988,14 +1015,9 @@ def _atomic_write_at(
         view = memoryview(content)
         while view:
             view = view[os.write(candidate_fd, view) :]
-        if os.fstat(candidate_fd).st_gid != target_gid:
-            try:
-                os.fchown(candidate_fd, -1, target_gid)
-            except OSError:
-                # A writer that is not a member of that group cannot hand the
-                # file over; the write itself must not fail over a permission
-                # detail, so the candidate keeps its own group.
-                pass
+        # Best effort: a writer outside that group cannot hand the file over,
+        # and the write must not fail over a permission detail.
+        copy_owner_group(candidate_fd, gid=target_gid)
         # After ``fchown``, which clears setuid/setgid on the file.
         os.fchmod(candidate_fd, mode)
         os.fsync(candidate_fd)
@@ -1664,7 +1686,7 @@ def _record_ops_journal_entry(
             snapshot_path = Path(vault_path) / snapshot_relative
             if not snapshot_path.exists():
                 snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-                snapshot_path.write_bytes(old_bytes)
+                atomic_write_file_bytes(snapshot_path, old_bytes)
             else:
                 # Reused snapshot (same sha_before as an earlier write):
                 # refresh its mtime so it does not look artificially stale
@@ -1952,12 +1974,13 @@ def prune_ops_journal(
     ``.session/ops.jsonl`` and ``.session/ops-snapshots/`` are append-only and
     otherwise grow without bound, which also means every encrypted backup of
     the vault sweeps up the full history. This trims both to a rolling
-    ``max_age_days`` window: ``ops.jsonl`` is rewritten (atomically, via a
-    temp file + ``os.replace``) keeping only lines whose ``ts`` is within the
-    window, and snapshot files under ``ops-snapshots`` older than the window
-    (by mtime) are deleted. An entry the parser cannot make sense of (missing
-    or malformed ``ts``, or the line isn't a JSON object) is kept rather than
-    guessed away, and never counts toward ``dropped_entries``.
+    ``max_age_days`` window: ``ops.jsonl`` is rewritten (atomically, keeping its
+    mode and group via ``atomic_write_file_text``) keeping only lines whose
+    ``ts`` is within the window, and snapshot files under ``ops-snapshots``
+    older than the window (by mtime) are deleted. An entry the parser cannot
+    make sense of (missing or malformed ``ts``, or the line isn't a JSON
+    object) is kept rather than guessed away, and never counts toward
+    ``dropped_entries``.
 
     Snapshots are content-addressed by ``sha_before`` and can be shared by
     several journal entries (a later write that happens to reproduce an
@@ -2015,12 +2038,7 @@ def prune_ops_journal(
 
         if raw and dropped_entries:
             payload = "".join(line + "\n" for line in kept_lines)
-            journal_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = journal_path.with_name(
-                journal_path.name + f".tmp-{os.getpid()}"
-            )
-            tmp_path.write_text(payload, encoding="utf-8")
-            os.replace(tmp_path, journal_path)
+            atomic_write_file_text(journal_path, payload)
 
         dropped_snapshots = 0
         snapshots_dir = vault_path / _OPS_SNAPSHOTS_RELATIVE_DIR
@@ -2045,7 +2063,7 @@ def prune_ops_journal(
 def _fresh_memory_fields() -> dict[str, Any]:
     """Return the memory-engine values for a note accessed at creation time."""
     return {
-        "last_accessed": date.today().isoformat(),
+        "last_accessed": owner_today().isoformat(),
         "relevance": 1.0,
         "tier": "active",
     }

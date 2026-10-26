@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from functools import partial
 from typing import cast
 
 from aiogram import Bot, F, Router
@@ -12,12 +13,22 @@ from aiogram.types import Message
 from d_brain.bot.conversations import reply_context, save_answer
 from d_brain.bot.dashboard import render_home, render_input
 from d_brain.bot.formatters import format_process_report, inline_artifact_image_paths
+from d_brain.bot.handlers.photo import (
+    PhotoEntry,
+    save_album_for_request,
+    save_single_photo,
+)
 from d_brain.bot.progress import wait_for_task_with_progress
 from d_brain.bot.replies import answer_files, answer_rich_text, answer_text, edit_text
 from d_brain.bot.states import DoCommandState
+from d_brain.bot.voice_input import (
+    VoiceInputError,
+    download_voice,
+    pick_voice_media,
+    transcribe_audio,
+)
 from d_brain.config import get_settings
 from d_brain.services.processor import CliProcessor
-from d_brain.services.transcription import DeepgramTranscriber
 
 router = Router(name="do")
 logger = logging.getLogger(__name__)
@@ -48,6 +59,11 @@ _KNOWN_COMMANDS = (
 # other router claims it either).
 _BOT_COMMAND_RE = rf"^/(?:{'|'.join(_KNOWN_COMMANDS)})(@[A-Za-z0-9_]+)?(\s|$)"
 
+# Request for a photo or document sent to /do without the owner's own caption.
+_PHOTO_REQUEST = "Разбери это изображение."
+_ALBUM_REQUEST = "Разбери эти изображения."
+_DOCUMENT_REQUEST = "Разбери этот документ."
+
 
 async def start_do_flow(
     message: Message, state: FSMContext, *, menu_message_id: int | None = None
@@ -61,7 +77,8 @@ async def start_do_flow(
             screen="do_input",
             text=(
                 "**Что сделать?**\n\n"
-                "Отправь вопрос или поручение голосом или текстом.\n"
+                "Отправь вопрос или поручение голосом или текстом, "
+                "или фото/файл с подписью.\n"
                 "Для отмены нажми «Назад» или отправь `-`."
             ),
         )
@@ -69,7 +86,8 @@ async def start_do_flow(
     await answer_text(
         message,
         "🎯 **Что сделать?**\n\n"
-        "Отправь голосовое или текстовое сообщение с запросом.\n"
+        "Отправь голосовое или текстовое сообщение с запросом "
+        "или фото/файл с подписью.\n"
         "Повтори `/do` или отправь `-`, чтобы отменить."
     )
 
@@ -100,7 +118,7 @@ async def cmd_do(message: Message, command: CommandObject, state: FSMContext) ->
 
 @router.message(DoCommandState.waiting_for_input, ~F.text.regexp(_BOT_COMMAND_RE))
 async def handle_do_input(message: Message, bot: Bot, state: FSMContext) -> None:
-    """Handle voice/text input after /do command.
+    """Handle voice, text, photo or document input after /do command.
 
     Excludes text shaped like one of the actually registered commands
     (_BOT_COMMAND_RE / _KNOWN_COMMANDS) so a command typed while waiting for
@@ -126,43 +144,36 @@ async def handle_do_input(message: Message, bot: Bot, state: FSMContext) -> None
 
     prompt = None
 
-    # Handle voice input
-    if message.voice:
+    # Handle voice input (voice, audio file, video note)
+    picked = pick_voice_media(message)
+    if picked is not None:
+        _kind, media = picked
         await message.chat.do(action="typing")
         settings = get_settings()
-        transcriber = DeepgramTranscriber(
-            settings.deepgram_api_key,
-            settings.content_language,
-        )
 
         try:
-            file = await asyncio.wait_for(
-                bot.get_file(message.voice.file_id), timeout=60
-            )
-            if not file.file_path:
-                await answer_text(message, "❌ Не удалось скачать голосовое")
-                return
-
-            file_bytes = await asyncio.wait_for(
-                bot.download_file(file.file_path), timeout=120
-            )
-            if not file_bytes:
-                await answer_text(message, "❌ Не удалось скачать голосовое")
-                return
-
-            audio_bytes = file_bytes.read()
-            prompt = await transcriber.transcribe(audio_bytes)
-        except Exception as e:
+            _path, audio_bytes = await download_voice(bot, media)
+            prompt = await transcribe_audio(settings, audio_bytes)
+        except VoiceInputError as exc:
+            await answer_text(message, f"❌ {exc}", parse_mode=None)
+            return
+        except Exception:
             logger.exception("Failed to transcribe voice for /do")
             await answer_text(
                 message,
-                f"❌ Не удалось транскрибировать: {e}",
+                "❌ Не удалось транскрибировать голосовое, подробности в логе.",
                 parse_mode=None,
             )
             return
 
         if not prompt:
-            await answer_text(message, "❌ Не удалось распознать речь")
+            await answer_text(
+                message,
+                "❌ Не удалось распознать речь"
+                if settings.deepgram_api_key
+                else "❌ Распознавание голоса не настроено (нет DEEPGRAM_API_KEY)",
+                parse_mode=None,
+            )
             return
 
         # Echo transcription to user
@@ -179,12 +190,66 @@ async def handle_do_input(message: Message, bot: Bot, state: FSMContext) -> None
             await answer_text(message, "❌ **/do отменён**")
             return
 
+    elif message.photo or message.document:
+        # A forwarded file's caption is someone else's words, not the owner's
+        # request (the same rule as document captions outside /do).
+        caption = "" if message.forward_origin else (message.caption or "").strip()
+        if message.photo and message.media_group_id:
+            await save_album_for_request(
+                message, bot, partial(_run_album_request, message)
+            )
+        elif message.photo:
+            await _process_photo_request(message, bot, caption or _PHOTO_REQUEST)
+        else:
+            # Imported here: document.py imports process_request from this module.
+            from d_brain.bot.handlers.document import receive_document
+
+            await receive_document(
+                message, bot, request=caption or _DOCUMENT_REQUEST
+            )
+        return
+
     else:
-        await answer_text(message, "❌ Отправь текст или голосовое сообщение")
+        await answer_text(
+            message, "❌ Отправь текст, голосовое, фото или документ"
+        )
         return
 
     user_id = message.from_user.id if message.from_user else 0
     await process_request(message, prompt, user_id)
+
+
+async def _process_photo_request(message: Message, bot: Bot, request: str) -> None:
+    """Save the photo as a usual capture, then run the request on that file."""
+    await message.chat.do(action="typing")
+    try:
+        entry = await save_single_photo(message, bot)
+    except Exception:
+        logger.exception("Failed to save photo for /do")
+        await answer_text(
+            message,
+            "❌ Не удалось сохранить фото, подробности в логе.",
+            parse_mode=None,
+        )
+        return
+    settings = get_settings()
+    prompt = f"{request}\n\nImage: {settings.vault_path / entry.relative_path}\n"
+    user_id = message.from_user.id if message.from_user else 0
+    await process_request(message, prompt, user_id)
+
+
+async def _run_album_request(message: Message, entries: list[PhotoEntry]) -> None:
+    """Run the album caption as one request over every saved photo."""
+    # Fail closed like the album's daily entry: one forwarded photo makes the
+    # caption someone else's words, not the owner's request.
+    captions = [(entry.raw_caption or "").strip() for entry in entries]
+    if any(entry.forwarded for entry in entries):
+        captions = []
+    request = next((text for text in captions if text), _ALBUM_REQUEST)
+    vault_path = get_settings().vault_path
+    images = "\n".join(f"- {vault_path / entry.relative_path}" for entry in entries)
+    user_id = message.from_user.id if message.from_user else 0
+    await process_request(message, f"{request}\n\nImages:\n{images}\n", user_id)
 
 
 async def process_request(message: Message, prompt: str, user_id: int = 0) -> None:
