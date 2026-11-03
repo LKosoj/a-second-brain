@@ -9,6 +9,7 @@ English and Russian pages are maintained as mirrored documentation sets.
 | Commands | [CLI reference](en/cli.md) | [Справочник CLI](ru/cli.md) |
 | Knowledge and retrieval | [Memory, notes, and search](en/memory-and-search.md) | [Память, заметки и поиск](ru/memory-and-search.md) |
 | Production use | [Operations](en/operations.md) | [Эксплуатация](ru/operations.md) |
+| External client | [External client](en/external-client.md) | [Внешний клиент](ru/external-client.md) |
 | External services | [Integrations](en/integrations.md) | [Интеграции](ru/integrations.md) |
 | Data recovery | [Backup and restore](en/backup-and-restore.md) | [Резервное копирование и восстановление](ru/backup-and-restore.md) |
 | Problem solving | [Troubleshooting](en/troubleshooting.md) | [Устранение неполадок](ru/troubleshooting.md) |

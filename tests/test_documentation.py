@@ -9,6 +9,7 @@ DOCUMENTATION_PAGES = {
     "cli.md",
     "configuration.md",
     "development.md",
+    "external-client.md",
     "getting-started.md",
     "integrations.md",
     "macos.md",
@@ -74,6 +75,34 @@ def test_readmes_match_checkout_and_wheel_install_contracts() -> None:
         assert "\na-second-brain run\n" in readme
         assert "./scripts/install-systemd-user.sh --enable" in readme
         assert '${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/' in readme
+
+
+def test_external_client_documents_file_api_contract() -> None:
+    for language in ("en", "ru"):
+        page = (PROJECT_ROOT / f"docs/{language}/external-client.md").read_text(
+            encoding="utf-8"
+        )
+        for marker in (
+            "/v1/vault/tree",
+            "/v1/vault/file",
+            "/v1/vault/conflicts/",
+            "/v1/vault/search",
+            "ETag",
+            "If-Match",
+            "page_token",
+            "409",
+            "conflict_id",
+            "replace",
+            "cancel",
+            "binary",
+            "user_content_roots",
+            "20",
+            "limited",
+            "QMD",
+        ):
+            assert marker in page
+        assert "Planned file API" not in page
+        assert "Планируемый файловый API" not in page
 
 
 def test_cli_reference_documents_all_public_commands() -> None:

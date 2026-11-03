@@ -43,6 +43,7 @@ units:
 | Unit | Назначение |
 |---|---|
 | `a-second-brain.service` | Telegram-бот |
+| `a-second-brain-network.service` | Закрытый сетевой вход LacEditor, если задан `NETWORK_API_TOKEN` |
 | `a-second-brain-process.timer` | Ежедневная обработка в 21:00 по умолчанию (`DAILY_PROCESS_TIME`) |
 | `a-second-brain-morning-brief.timer` | Утренний бриф в 08:00 по умолчанию (`MORNING_BRIEF_TIME`) |
 | `a-second-brain-plaud-sync.timer` | Ежечасная синхронизация PLAUD, если она настроена |
@@ -61,6 +62,34 @@ units:
 Перед ежедневной обработкой с записью запускается предварительное
 зашифрованное резервное копирование. Если GPG-получатель не задан, этот этап
 сообщает о пропуске и успешно завершается.
+
+## Сетевой вход LacEditor
+
+Задайте в `.env` токен и, при необходимости, адрес с портом:
+
+```dotenv
+NETWORK_API_TOKEN=длинный-случайный-токен
+NETWORK_API_HOST=127.0.0.1
+NETWORK_API_PORT=8765
+```
+
+После этого перегенерируйте units:
+
+```bash
+./scripts/install-systemd-user.sh
+systemctl --user enable --now a-second-brain-network.service
+```
+
+Сервис принимает `POST /v1/requests` с JSON-полями `request_id`, `text` и
+необязательным `client`. Он сам определяет, является ли запрос вопросом,
+записью или поручением. Статус читается через `GET /v1/jobs/<job_id>`, а
+созданные итоговые файлы — через адреса из результата задачи. Для проверки
+доступности есть `GET /healthz`; остальные запросы требуют заголовок
+`Authorization: Bearer <NETWORK_API_TOKEN>`.
+
+Если токен пустой, установщик не включает сетевой unit. Для доступа с Mac
+привяжите сервис к приватному интерфейсу или используйте SSH-туннель; не
+выставляйте порт в общий интернет.
 
 ## Команды Telegram
 

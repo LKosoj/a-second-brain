@@ -22,6 +22,7 @@ for user knowledge and must remain outside public Git history.
 | `d_brain.cli` | `init`, `doctor`, and `run` entrypoints |
 | `d_brain.doctor` | Installation and runtime diagnostics |
 | `d_brain.bot` | Telegram authorization, handlers, menu, and delivery |
+| `d_brain.network_server` | Private HTTP entry point for LacEditor and result delivery |
 | `d_brain.control_plane` | Workflow registry, routing, context, and allowed writes |
 | `d_brain.services` | Processing, storage, imports, retrieval, backups, and integrations |
 | `d_brain.resources` | Anonymized project and vault templates |
@@ -36,6 +37,11 @@ Telegram handlers authorize the sender using `OWNER_TELEGRAM_ID`, classify the
 input, and delegate to a specialized service. Text and voice can enter the
 daily capture area; files, pages, videos, and recordings enter import areas.
 Searchable writes trigger derived indexing where configured.
+
+The LacEditor network entry point accepts the same free-form text as Telegram
+and passes it through the existing classifier. Questions, captures, and actions
+use the same application workflows; long requests return a `job_id`, and final
+files are exposed only from the artifact list produced by the workflow.
 
 ## Processing flow
 

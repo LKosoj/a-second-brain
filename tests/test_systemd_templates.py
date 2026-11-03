@@ -20,3 +20,13 @@ def test_bot_unit_stops_leftover_processes() -> None:
 
     assert "KillMode=mixed" in content
     assert "KillMode=process" not in content
+
+
+def test_network_unit_uses_private_network_command() -> None:
+    content = (
+        PROJECT_ROOT / "deploy" / "a-second-brain-network.service.in"
+    ).read_text(encoding="utf-8")
+
+    assert "a-second-brain network" in content
+    assert "EnvironmentFile=@PROJECT_DIR@/.env" in content
+    assert "NoNewPrivileges=true" in content

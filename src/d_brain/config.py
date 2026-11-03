@@ -149,6 +149,20 @@ class Settings(BaseSettings):
     owner_telegram_id: int = Field(
         description="Telegram user ID allowed to use the bot",
     )
+    network_api_token: str = Field(
+        default="",
+        description="Bearer token for the private LacEditor network API",
+    )
+    network_api_host: str = Field(
+        default="127.0.0.1",
+        description="Listen address for the private LacEditor network API",
+    )
+    network_api_port: int = Field(
+        default=8765,
+        ge=1,
+        le=65535,
+        description="Listen port for the private LacEditor network API",
+    )
     timezone: str = Field(
         default="",
         description=(

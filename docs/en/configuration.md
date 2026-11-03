@@ -12,6 +12,9 @@ paste its values into issues, logs, or documentation.
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot API token from BotFather |
 | `OWNER_TELEGRAM_ID` | Positive numeric Telegram user ID allowed to use the bot |
+| `NETWORK_API_TOKEN` | Bearer token for the private LacEditor network API; empty disables the service |
+| `NETWORK_API_HOST` | LacEditor network API listen address, default `127.0.0.1` |
+| `NETWORK_API_PORT` | LacEditor network API listen port, default `8765` |
 
 `DEEPGRAM_API_KEY` is optional and enables voice transcription. Without it, or
 when Deepgram fails, the bot still saves the recording to `attachments/` and a

@@ -12,6 +12,9 @@
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Токен Telegram Bot API от BotFather |
 | `OWNER_TELEGRAM_ID` | Положительный числовой Telegram user ID владельца бота |
+| `NETWORK_API_TOKEN` | Токен закрытого сетевого входа LacEditor; пусто — сервис не включается |
+| `NETWORK_API_HOST` | Адрес сетевого входа LacEditor, по умолчанию `127.0.0.1` |
+| `NETWORK_API_PORT` | Порт сетевого входа LacEditor, по умолчанию `8765` |
 
 `DEEPGRAM_API_KEY` необязателен и включает распознавание голоса. Без него, а
 также при сбое Deepgram бот всё равно сохраняет запись в `attachments/` и

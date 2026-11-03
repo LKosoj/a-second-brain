@@ -20,6 +20,7 @@ from d_brain.services.qmd import QmdService
 logger = logging.getLogger(__name__)
 
 FIND_LIMIT = 5
+NETWORK_FIND_LIMIT = 20
 # Fetch more than we show: unsafe paths and duplicates are dropped afterwards.
 FIND_FETCH = 15
 FIND_TIMEOUT_SECONDS = 30
@@ -40,6 +41,15 @@ class FindHit:
     rel_path: str
     title: str
     snippet: str
+
+
+@dataclass(frozen=True, slots=True)
+class FindSearchResult:
+    """Structured search result for non-Telegram clients."""
+
+    hits: tuple[FindHit, ...]
+    total: int
+    limited: bool
 
 
 def normalize_query(raw: str) -> str:
@@ -109,9 +119,7 @@ def _emoji_to_hex(segment: str) -> str:
 def _dash_separate(text: str) -> str:
     """Every run outside letters, digits and ``$`` becomes one ``-``; trim ends."""
     cleaned = "".join(
-        char
-        if unicodedata.category(char)[0] in ("L", "N") or char == "$"
-        else "\0"
+        char if unicodedata.category(char)[0] in ("L", "N") or char == "$" else "\0"
         for char in text
     )
     return re.sub(r"\0+", "-", cleaned).strip("-")
@@ -218,17 +226,22 @@ def _clean_title(raw: object, rel_path: str) -> str:
     return title
 
 
-def find_in_vault(
-    vault_path: Path | str, query: str, *, limit: int = FIND_LIMIT
-) -> list[FindHit]:
-    """Run ``qmd search`` and return up to ``limit`` safe, existing hits."""
+def search_in_vault(
+    vault_path: Path | str,
+    query: str,
+    *,
+    limit: int = FIND_LIMIT,
+) -> FindSearchResult:
+    """Run qmd and return safe hits plus fixed-limit metadata."""
+    if limit < 1:
+        raise ValueError("limit must be positive")
     service = QmdService(Path(vault_path))
     try:
         result = service.run(
             "search",
             "--json",
             "-n",
-            str(FIND_FETCH),
+            str(max(FIND_FETCH, limit * 3)),
             # Without "--" a query like "--rm" would be read as an option.
             "--",
             query,
@@ -242,7 +255,7 @@ def find_in_vault(
 
     stdout = (result.stdout or "").strip()
     if not stdout:
-        return []
+        return FindSearchResult((), 0, False)
     try:
         items = json.loads(stdout)
     except ValueError as exc:
@@ -279,6 +292,12 @@ def find_in_vault(
                 snippet=_clean_snippet(item.get("snippet")),
             )
         )
-        if len(hits) >= limit:
-            break
-    return hits
+    limited = len(hits) >= limit
+    return FindSearchResult(tuple(hits[:limit]), min(len(hits), limit), limited)
+
+
+def find_in_vault(
+    vault_path: Path | str, query: str, *, limit: int = FIND_LIMIT
+) -> list[FindHit]:
+    """Run qmd and preserve the Telegram list-returning contract."""
+    return list(search_in_vault(vault_path, query, limit=limit).hits)

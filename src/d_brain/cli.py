@@ -117,6 +117,14 @@ def _run_bot() -> int:
     return 0
 
 
+def _run_network() -> int:
+    from d_brain.config import get_settings
+    from d_brain.network_server import run_network_server
+
+    run_network_server(get_settings())
+    return 0
+
+
 def _init_command(args: argparse.Namespace) -> int:
     try:
         vault_path = initialize_project(args.target)
@@ -270,6 +278,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser("run", help="start the Telegram bot")
     run_parser.set_defaults(handler=lambda _args: _run_bot())
+
+    network_parser = subparsers.add_parser(
+        "network",
+        help="start the private LacEditor network API",
+    )
+    network_parser.set_defaults(handler=lambda _args: _run_network())
     return parser
 
 

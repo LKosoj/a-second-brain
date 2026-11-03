@@ -57,6 +57,23 @@ has_plaud_token() {
   [[ -n "$value" ]]
 }
 
+has_network_api_token() {
+  local env_file="$1" line value
+  line="$(grep -E '^(export[[:space:]]+)?NETWORK_API_TOKEN=' "$env_file" | tail -n1)" || true
+  [[ -z "$line" ]] && return 1
+  value="${line#*=}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  if [[ ${#value} -ge 2 ]]; then
+    if [[ "$value" == \"* && "$value" == *\" ]]; then
+      value="${value:1:${#value}-2}"
+    elif [[ "$value" == \'* && "$value" == *\' ]]; then
+      value="${value:1:${#value}-2}"
+    fi
+  fi
+  [[ -n "$value" ]]
+}
+
 # Last KEY=value from the .env file (empty when absent), without surrounding
 # whitespace or one pair of quotes. Read from the file, not the shell
 # environment: the units load .env themselves.
@@ -154,6 +171,9 @@ if [[ "$ENABLE" -eq 1 ]]; then
   )
   if has_plaud_token "$PROJECT_DIR/.env"; then
     units+=(a-second-brain-plaud-sync.timer)
+  fi
+  if has_network_api_token "$PROJECT_DIR/.env"; then
+    units+=(a-second-brain-network.service)
   fi
   if command -v qmd >/dev/null 2>&1; then
     units+=(a-second-brain-qmd-maintenance.timer)

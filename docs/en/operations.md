@@ -42,6 +42,7 @@ The enable step runs `doctor` first.
 | Unit | Purpose |
 |---|---|
 | `a-second-brain.service` | Telegram bot |
+| `a-second-brain-network.service` | Private LacEditor network entry point when `NETWORK_API_TOKEN` is set |
 | `a-second-brain-process.timer` | Daily processing at 21:00 by default (`DAILY_PROCESS_TIME`) |
 | `a-second-brain-morning-brief.timer` | Morning brief at 08:00 by default (`MORNING_BRIEF_TIME`) |
 | `a-second-brain-plaud-sync.timer` | Hourly PLAUD sync when configured |
@@ -58,6 +59,33 @@ voice entries marked "Не распознано" for yesterday and today.
 The daily processing service runs an encrypted backup preflight before
 write-heavy processing. With no GPG recipient configured, that preflight
 reports a skip and exits successfully.
+
+## LacEditor network entry point
+
+Set a token and, if needed, an address and port in `.env`:
+
+```dotenv
+NETWORK_API_TOKEN=long-random-token
+NETWORK_API_HOST=127.0.0.1
+NETWORK_API_PORT=8765
+```
+
+Render the units and enable the network service:
+
+```bash
+./scripts/install-systemd-user.sh
+systemctl --user enable --now a-second-brain-network.service
+```
+
+The service accepts `POST /v1/requests` with `request_id`, `text`, and an
+optional `client`. It decides whether the request is a question, capture, or
+action. Read job status with `GET /v1/jobs/<job_id>` and download final files
+from the artifact URLs in the result. `GET /healthz` checks availability;
+other requests require `Authorization: Bearer <NETWORK_API_TOKEN>`.
+
+If the token is empty, the installer does not enable the network unit. Bind the
+service to a private interface or use an SSH tunnel from the Mac; do not expose
+the port to the public internet.
 
 ## Telegram commands
 

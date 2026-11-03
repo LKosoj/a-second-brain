@@ -16,6 +16,9 @@ picking one.
 memory and search, operations, integrations, backups, troubleshooting,
 architecture, and development in English and Russian.
 
+To connect an external client through the private request API, see [Connecting
+an external client](docs/en/external-client.md).
+
 The repository contains application code and an anonymized starter-vault
 template. Your real `vault/`, `.env`, backups, logs, and runtime state are
 ignored by Git and must remain private.
