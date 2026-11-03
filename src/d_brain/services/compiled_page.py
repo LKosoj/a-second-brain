@@ -12,7 +12,7 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from d_brain.services.frontmatter import FrontmatterError, parse_frontmatter_bytes
 
@@ -421,6 +421,20 @@ def _service() -> Any:
     from d_brain.services.compiled_briefings import CompiledBriefingService
 
     return CompiledBriefingService
+
+
+def human_zone_span(text: str) -> tuple[int, int] | None:
+    """Return the shared human-zone span, or the fail-closed sentinel."""
+    return cast(tuple[int, int] | None, _service()._human_zone_span(text))
+
+
+def human_zone_markers_look_corrupted(text: str) -> bool:
+    """Use the compiled-page marker corruption check without duplicating it."""
+    from d_brain.services.compiled_briefings import (
+        human_zone_markers_look_corrupted as check,
+    )
+
+    return bool(check(text))
 
 
 def section_text(text: str, heading: str) -> str:

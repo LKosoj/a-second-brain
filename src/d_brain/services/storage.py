@@ -464,6 +464,7 @@ class VaultStorage:
         *,
         entry_statuses: list[str] | tuple[str, ...] | None = None,
         source: SourceInfo | None = None,
+        job_id: str | None = None,
         refresh_qmd: bool = True,
     ) -> None:
         """Append entry to daily file.
@@ -483,6 +484,11 @@ class VaultStorage:
             source,
             language=self.content_language,
         )
+        job_marker = (
+            f"<!-- network-job-id: {job_id.strip()} -->"
+            if job_id and job_id.strip()
+            else ""
+        )
         # A body line shaped like "## HH:MM [...]" would be read back as a
         # second, independent daily entry -- with its own, possibly
         # stronger, trust rating -- once this file is split back into
@@ -496,7 +502,9 @@ class VaultStorage:
         body = escape_embedded_runtime_markup(
             escape_embedded_daily_headers(text.strip())
         )
-        entry_parts = [part for part in (status_block, source_block, body) if part]
+        entry_parts = [
+            part for part in (status_block, source_block, job_marker, body) if part
+        ]
         entry_body = "\n\n".join(entry_parts)
         # Keep the "## HH:MM [type]" header attached to the body: the
         # compiled-briefings pipeline reads the entry marker off the first
@@ -511,6 +519,8 @@ class VaultStorage:
                     current = file_path.read_bytes().decode("utf-8")
                 else:
                     current = ""
+                if job_marker and job_marker in current:
+                    return
                 content = self._bootstrap_daily_content(day, current)
                 content_bytes = content.encode("utf-8")
                 document = parse_frontmatter_bytes(content_bytes)

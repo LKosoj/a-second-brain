@@ -107,6 +107,33 @@ def test_storage_append_to_daily_syncs_entry_memory(tmp_path: Path) -> None:
     assert signal.relevance == 1.0
 
 
+def test_storage_append_to_daily_skips_repeated_network_job(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    storage = VaultStorage(vault_path)
+    storage._refresh_qmd_index = lambda: None  # type: ignore[method-assign]
+    storage._post_daily_write = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    timestamp = datetime(2026, 4, 4, 16, 20)
+
+    storage.append_to_daily(
+        "Сетевая запись",
+        timestamp,
+        "[network]",
+        job_id="a" * 32,
+    )
+    storage.append_to_daily(
+        "Сетевая запись",
+        timestamp,
+        "[network]",
+        job_id="a" * 32,
+    )
+
+    content = (vault_path / "daily" / "2026-04-04.md").read_text(encoding="utf-8")
+    assert content.count("<!-- network-job-id: " + "a" * 32 + " -->") == 1
+    assert content.count("## 16:20 [network]") == 1
+
+
 def test_storage_daily_writer_requires_manifest(tmp_path: Path) -> None:
     (tmp_path / "vault-manifest.json").unlink()
 

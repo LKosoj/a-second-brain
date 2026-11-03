@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import mimetypes
@@ -19,8 +20,11 @@ from d_brain.services.network_requests import (
 from d_brain.services.vault_file_service import (
     MAX_FILE_BYTES,
     VaultFileConflict,
+    VaultFileConflictResolved,
+    VaultFileEditForbidden,
     VaultFileError,
     VaultFileForbidden,
+    VaultFileListingChanged,
     VaultFileNotFound,
     VaultFileService,
 )
@@ -67,6 +71,7 @@ class NetworkServer:
 
         class Handler(BaseHTTPRequestHandler):
             server_version = "a-second-brain-network/1"
+            timeout = 60
 
             def do_GET(self) -> None:  # noqa: N802
                 path = urlsplit(self.path).path
@@ -84,6 +89,9 @@ class NetworkServer:
                             page_size=int(query.get("page_size", ["100"])[0]),
                             page_token=(query.get("page_token", [None])[0]),
                         )
+                    except VaultFileListingChanged as exc:
+                        self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                        return
                     except (ValueError, VaultFileError) as exc:
                         self._send_file_error(exc)
                         return
@@ -104,6 +112,7 @@ class NetworkServer:
                                 for entry in page.entries
                             ],
                             "next_page_token": page.next_page_token,
+                            "listing_complete": page.listing_complete,
                         },
                     )
                     return
@@ -119,13 +128,19 @@ class NetworkServer:
                     except (ValueError, VaultFileError) as exc:
                         self._send_file_error(exc)
                         return
-                    self.send_response(HTTPStatus.OK)
+                    not_modified = _etag_matches(
+                        self.headers.get("If-None-Match"), file_result.etag
+                    )
+                    self.send_response(
+                        HTTPStatus.NOT_MODIFIED if not_modified else HTTPStatus.OK
+                    )
                     self.send_header("Content-Type", file_result.mime_type)
                     self.send_header("Content-Length", str(file_result.size))
                     self.send_header("ETag", f'"{file_result.etag}"')
                     self.send_header("X-File-Modified-Ns", str(file_result.mtime_ns))
                     self.end_headers()
-                    self.wfile.write(file_result.content)
+                    if not not_modified:
+                        self.wfile.write(file_result.content)
                     return
                 if path == "/v1/vault/search":
                     try:
@@ -175,7 +190,29 @@ class NetworkServer:
                     return
                 parts = [unquote(part) for part in path.split("/") if part]
                 if len(parts) == 3 and parts[:2] == ["v1", "jobs"]:
-                    job = service.get(parts[2])
+                    try:
+                        query = self._query()
+                    except VaultFileError as exc:
+                        self._send_file_error(exc)
+                        return
+                    raw_wait = query.get("wait", [None])[0]
+                    if raw_wait is None:
+                        job = service.get(parts[2])
+                    else:
+                        try:
+                            wait = float(raw_wait)
+                        except ValueError:
+                            self._send_json(
+                                HTTPStatus.BAD_REQUEST, {"error": "invalid wait"}
+                            )
+                            return
+                        if wait < 0 or wait > 30:
+                            self._send_json(
+                                HTTPStatus.BAD_REQUEST,
+                                {"error": "wait must be between 0 and 30"},
+                            )
+                            return
+                        job = service.wait_for(parts[2], wait)
                     if job is None:
                         self._send_json(
                             HTTPStatus.NOT_FOUND,
@@ -219,6 +256,18 @@ class NetworkServer:
                             {"error": "conflict", **exc.record},
                         )
                         return
+                    except VaultFileConflictResolved as exc:
+                        self._send_json(
+                            HTTPStatus.CONFLICT,
+                            {"error": str(exc), "status": exc.status},
+                        )
+                        return
+                    except VaultFileEditForbidden as exc:
+                        self._send_json(
+                            HTTPStatus.UNPROCESSABLE_ENTITY,
+                            {"error": str(exc), "reason": exc.reason},
+                        )
+                        return
                     except (ValueError, VaultFileError) as exc:
                         self._send_file_error(exc)
                         return
@@ -246,7 +295,12 @@ class NetworkServer:
                     client = str(payload.get("client", ""))
                     job = service.submit(request_id, text, client)
                 except (NetworkRequestError, ValueError, json.JSONDecodeError) as exc:
-                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    status = (
+                        HTTPStatus.CONFLICT
+                        if str(exc) == "request_id reused with different text"
+                        else HTTPStatus.BAD_REQUEST
+                    )
+                    self._send_json(status, {"error": str(exc)})
                     return
                 self._send_json(HTTPStatus.ACCEPTED, _public_job(job))
 
@@ -279,6 +333,12 @@ class NetworkServer:
                 except VaultFileConflict as exc:
                     self._send_json(
                         HTTPStatus.CONFLICT, {"error": "conflict", **exc.record}
+                    )
+                    return
+                except VaultFileEditForbidden as exc:
+                    self._send_json(
+                        HTTPStatus.UNPROCESSABLE_ENTITY,
+                        {"error": str(exc), "reason": exc.reason},
                     )
                     return
                 except (ValueError, VaultFileError) as exc:
@@ -315,7 +375,23 @@ class NetworkServer:
                 length = int(raw_length)
                 if length < 0 or length > maximum:
                     raise VaultFileError("request body is too large")
-                return self.rfile.read(length)
+                chunks: list[bytes] = []
+                remaining = length
+                while remaining:
+                    chunk = self.rfile.read(remaining)
+                    if not chunk:
+                        raise VaultFileError("incomplete request body")
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                body = b"".join(chunks)
+                expected_checksum = self.headers.get("X-Content-SHA256")
+                if expected_checksum is not None and (
+                    not re.fullmatch(r"[0-9a-fA-F]{64}", expected_checksum)
+                    or hashlib.sha256(body).hexdigest().lower()
+                    != expected_checksum.lower()
+                ):
+                    raise VaultFileError("body checksum mismatch")
+                return body
 
             def _query(self) -> dict[str, list[str]]:
                 query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
@@ -426,6 +502,12 @@ def _safe_filename(name: str) -> str:
     return (
         name.replace("\\", "_").replace('"', "_").replace("\r", "_").replace("\n", "_")
     )
+
+
+def _etag_matches(header: str | None, etag: str) -> bool:
+    if not header:
+        return False
+    return any(value.strip().strip('"') == etag for value in header.split(","))
 
 
 def _public_result(result: dict[str, object], job_id: object) -> dict[str, object]:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -36,6 +37,22 @@ def test_job_store_is_idempotent(tmp_path: Path) -> None:
     assert first["job_id"] == second["job_id"]
     assert store.get(str(first["job_id"])) == first
     assert store.get("../../MEMORY") is None
+
+
+def test_wait_for_returns_terminal_job(tmp_path: Path) -> None:
+    service = NetworkRequestService(_settings(tmp_path))
+    job = service.jobs.create("request-1")
+    service.jobs.update(
+        str(job["job_id"]),
+        status="completed",
+        result={"report": "done"},
+    )
+
+    waited = service.wait_for(str(job["job_id"]), 30)
+
+    assert waited is not None
+    assert waited["status"] == "completed"
+    service.close()
 
 
 def test_network_routes_question_action_and_capture(
@@ -106,6 +123,21 @@ def test_http_api_auth_job_and_artifact_download(
         body = json.loads(response.read())
         assert response.status == 202
         job_id = body["job_id"]
+
+        connection.request(
+            "POST",
+            "/v1/requests",
+            body=json.dumps({"request_id": "r1", "text": "different"}),
+            headers={
+                "Authorization": "Bearer network-token",
+                "Content-Type": "application/json",
+            },
+        )
+        response = connection.getresponse()
+        assert response.status == 409
+        assert json.loads(response.read())["error"] == (
+            "request_id reused with different text"
+        )
 
         for _ in range(50):
             connection.request(
@@ -178,6 +210,7 @@ def test_http_vault_tree_read_write_and_conflict(
         tree = json.loads(response.read())
         assert response.status == 200
         assert tree["entries"][0]["path"] == "projects/note.md"
+        assert tree["listing_complete"] is True
 
         connection.request(
             "GET", "/v1/vault/file?path=projects/note.md", headers=headers
@@ -188,10 +221,38 @@ def test_http_vault_tree_read_write_and_conflict(
         assert response.read() == b"original"
 
         connection.request(
+            "GET",
+            "/v1/vault/file?path=projects/note.md",
+            headers={**headers, "If-None-Match": etag or ""},
+        )
+        response = connection.getresponse()
+        assert response.status == 304
+        assert response.getheader("ETag") == etag
+        assert response.read() == b""
+
+        connection.request(
             "PUT",
             "/v1/vault/file?path=projects/note.md",
             body=b"updated",
-            headers={**headers, "If-Match": etag or ""},
+            headers={
+                **headers,
+                "If-Match": etag or "",
+                "X-Content-SHA256": "0" * 64,
+            },
+        )
+        response = connection.getresponse()
+        assert response.status == 400
+        assert json.loads(response.read())["error"] == "body checksum mismatch"
+
+        connection.request(
+            "PUT",
+            "/v1/vault/file?path=projects/note.md",
+            body=b"updated",
+            headers={
+                **headers,
+                "If-Match": etag or "",
+                "X-Content-SHA256": hashlib.sha256(b"updated").hexdigest(),
+            },
         )
         response = connection.getresponse()
         assert response.status == 200
@@ -216,6 +277,57 @@ def test_http_vault_tree_read_write_and_conflict(
         response = connection.getresponse()
         assert response.status == 200
         assert target.read_bytes() == b"stale-client"
+    finally:
+        server.httpd.shutdown()
+        server.requests.close()
+        thread.join(timeout=2)
+
+
+def test_http_compiled_file_rejects_outside_owner_notes(
+    tmp_path: Path,
+    write_vault_manifest: Any,
+) -> None:
+    vault = tmp_path / "vault"
+    (vault / "compiled" / "topics").mkdir(parents=True)
+    write_vault_manifest(vault, overrides={"user_content_roots": ["vault/compiled"]})
+    target = vault / "compiled" / "topics" / "note.md"
+    target.write_text(
+        "---\ntype: topic\n---\n# Note\n\n## Owner Notes\n"
+        "<!-- human:start -->\nold\n<!-- human:end -->\n",
+        encoding="utf-8",
+    )
+    settings = _settings(tmp_path)
+    settings.vault_path = vault
+    settings.network_api_port = 0
+    server = NetworkServer(settings)
+    thread = threading.Thread(target=server.httpd.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.httpd.server_port)
+    headers = {"Authorization": "Bearer network-token"}
+
+    try:
+        connection.request(
+            "GET", "/v1/vault/file?path=compiled/topics/note.md", headers=headers
+        )
+        response = connection.getresponse()
+        etag = response.getheader("ETag")
+        original = response.read()
+        proposed = original.replace(b"# Note", b"# Changed")
+
+        connection.request(
+            "PUT",
+            "/v1/vault/file?path=compiled/topics/note.md",
+            body=proposed,
+            headers={**headers, "If-Match": etag or ""},
+        )
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+        assert response.status == 422
+        assert payload == {
+            "error": "only owner notes may be edited",
+            "reason": "outside_owner_notes",
+        }
+        assert target.read_bytes() == original
     finally:
         server.httpd.shutdown()
         server.requests.close()

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
 import threading
+import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -117,6 +119,7 @@ class NetworkRequestService:
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="network")
         self._futures: dict[str, Future[None]] = {}
         self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
         self._resume_pending_jobs()
 
     def submit(self, request_id: str, text: str, client: str = "") -> dict[str, Any]:
@@ -128,17 +131,49 @@ class NetworkRequestService:
             raise NetworkRequestError("text is required")
         if len(text) > 100_000:
             raise NetworkRequestError("text is too long")
+        text_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
 
         with self._lock:
             job = self.jobs.create(request_id)
+            existing_digest = job.get("text_sha256")
+            if not isinstance(existing_digest, str):
+                existing_text = job.get("text")
+                if isinstance(existing_text, str):
+                    existing_digest = hashlib.sha256(
+                        existing_text.encode("utf-8")
+                    ).hexdigest()
+            if existing_digest is not None and existing_digest != text_digest:
+                raise NetworkRequestError(
+                    "request_id reused with different text"
+                )
             if job["status"] not in {"queued", "running"}:
                 return job
-            self.jobs.update(job["job_id"], text=text, client=client.strip())
+            self.jobs.update(
+                job["job_id"],
+                text=text,
+                text_sha256=text_digest,
+                client=client.strip(),
+            )
+            self._condition.notify_all()
             self._schedule(str(job["job_id"]), text)
             return self.jobs.get(job["job_id"]) or job
 
     def get(self, job_id: str) -> dict[str, Any] | None:
         return self.jobs.get(job_id)
+
+    def wait_for(self, job_id: str, timeout: float) -> dict[str, Any] | None:
+        """Wait for a queued/running job to finish or until timeout."""
+        timeout = max(0.0, min(timeout, 30.0))
+        with self._condition:
+            end = time.monotonic() + timeout
+            while True:
+                job = self.jobs.get(job_id)
+                if job is None or job.get("status") not in {"queued", "running"}:
+                    return job
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    return job
+                self._condition.wait(timeout=remaining)
 
     def close(self) -> None:
         self.executor.shutdown(wait=False, cancel_futures=False)
@@ -146,6 +181,15 @@ class NetworkRequestService:
     def _resume_pending_jobs(self) -> None:
         for job in self.jobs.list():
             if job.get("status") not in {"queued", "running"}:
+                continue
+            if job.get("side_effect_started_at") and not job.get("result"):
+                self.jobs.update(
+                    str(job["job_id"]),
+                    status="failed",
+                    error="interrupted",
+                    retryable=False,
+                    completed_at=owner_now().isoformat(),
+                )
                 continue
             text = job.get("text")
             if not isinstance(text, str) or not text.strip():
@@ -165,6 +209,8 @@ class NetworkRequestService:
 
     def _run(self, job_id: str, text: str) -> None:
         self.jobs.update(job_id, status="running", started_at=owner_now().isoformat())
+        with self._condition:
+            self._condition.notify_all()
         try:
             result = self._dispatch(text, job_id)
         except Exception as exc:  # pragma: no cover - final safety boundary
@@ -177,6 +223,8 @@ class NetworkRequestService:
             completed_at=owner_now().isoformat(),
             result=result,
         )
+        with self._condition:
+            self._condition.notify_all()
 
     def _processor(self) -> CliProcessor:
         settings = self.settings
@@ -202,8 +250,10 @@ class NetworkRequestService:
         if intent["intent"] == TEXT_INTENT_QUESTION:
             result = processor.answer_question(text, self.settings.owner_telegram_id)
         elif intent["intent"] == TEXT_INTENT_ACTION:
+            self._mark_side_effect_started(job_id)
             result = processor.execute_prompt(text, self.settings.owner_telegram_id)
         else:
+            self._mark_side_effect_started(job_id)
             result = self._capture(text, source)
         SessionStore(self.settings.vault_path).append(
             self.settings.owner_telegram_id,
@@ -216,7 +266,20 @@ class NetworkRequestService:
         )
         return result
 
-    def _capture(self, text: str, source: SourceInfo) -> dict[str, Any]:
+    def _mark_side_effect_started(self, job_id: str) -> None:
+        if self.jobs.get(job_id) is not None:
+            self.jobs.update(
+                job_id,
+                side_effect_started_at=owner_now().isoformat(),
+            )
+            with self._condition:
+                self._condition.notify_all()
+
+    def _capture(
+        self, text: str, source: SourceInfo, job_id: str | None = None
+    ) -> dict[str, Any]:
+        if job_id is None and source.kind == "network":
+            job_id = source.ref.removeprefix("network:")
         settings = self.settings
         timestamp = owner_now()
         service = LinkSummaryService(
@@ -240,6 +303,7 @@ class NetworkRequestService:
             timestamp,
             "[network]",
             source=source,
+            job_id=job_id,
             refresh_qmd=False,
         )
         reply = "✓ Сохранено"

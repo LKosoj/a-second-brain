@@ -91,6 +91,8 @@ The response contains a `job_id`:
 
 `request_id` must be unique for one request. Resubmitting the same identifier
 returns the existing job and does not execute the action again.
+The repeated request must contain the same text. Reusing a `request_id` with
+different text returns `409` and leaves the original job unchanged.
 
 ## 4. Read the result
 
@@ -102,6 +104,11 @@ curl http://127.0.0.1:8765/v1/jobs/<job_id> \
 ```
 
 Possible states are `queued`, `running`, `completed`, and `failed`.
+
+To avoid frequent polling, pass `wait` from 0 to 30 seconds when reading a job.
+The server waits for a state change or returns the current state when the limit
+expires. A job interrupted after a data-changing action starts becomes `failed`
+with `error: interrupted` and `retryable: false`, and is not resumed.
 
 When the job is `completed`, `result.report` contains the textual response. If
 the server created a final file, `result.artifacts` contains its name and a
@@ -133,6 +140,10 @@ The directory listing exposes only `user_content_roots` from
 absolute paths, backslashes, and paths containing `..` are rejected. `depth`
 accepts 0 through 8, and `page_size` accepts 1 through 1000. Pass the opaque
 `page_token` from the previous response to read the next page.
+The last page contains `listing_complete: true`. If the directory changes
+between pages, the server returns `409` with `listing changed`; restart the
+listing. The client treats a note as deleted only after a separate file read
+returns `404`.
 
 List a directory:
 
@@ -178,9 +189,27 @@ curl -X POST \
   -d '{"decision":"replace"}'
 ```
 
-Send `{"decision":"cancel"}` to cancel. A decision is one-time and bound to
-the path, current fingerprint, and proposed bytes. If the file changes again,
-the server creates a new conflict. Oversized files return `413`.
+Send `{"decision":"cancel"}` to cancel. Repeating the same decision returns
+the same result; a different decision for an already resolved conflict returns
+`409`. The decision is bound to the path, current fingerprint, and proposed
+bytes. If the file changes again, the server creates a new conflict. Oversized
+files return `413`.
+
+Repeating a successful write with the same body returns `200` with the current
+`path`, `size`, `mtime_ns`, and `etag`, even when `If-Match` is from the previous
+read. To check a file without downloading it, send
+`If-None-Match: "<etag>"`; a matching ETag returns `304` with an empty body.
+`X-Content-SHA256` can validate an upload body. An incomplete body returns
+`400` with `incomplete request body`; a wrong checksum returns `400` with
+`body checksum mismatch`, and the file remains unchanged.
+
+For `compiled/*.md` pages at any depth, the server allows edits only between
+`<!-- human:start -->` and `<!-- human:end -->`. Headers, metadata, and
+automated sections are protected. Violations return `422` with one of
+`not_utf8`, `no_owner_notes`, `owner_notes_markers_damaged`, or
+`outside_owner_notes` in `reason`; the file and any conflict remain unchanged.
+Clients should expose compiled pages as editable only inside the owner-notes
+zone.
 
 ## 6. QMD search
 
