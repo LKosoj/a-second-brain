@@ -155,6 +155,19 @@ def test_encrypted_vault_backup_captures_full_vault_and_prunes_retention(
     assert result.skipped == 0
 
 
+def test_vault_backup_excludes_skill_credentials(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    (service.vault_path / ".env").write_text(
+        "ANYTHINGLLM_API_KEY=fictional-key\n", encoding="utf-8"
+    )
+
+    result = service.create_snapshot(now=NOW)
+
+    names = _archive_names(result.snapshot_path)
+    assert "vault/.env" not in names
+    assert "vault/daily/2026-04-04.md" in names
+
+
 def test_vault_backup_is_disabled_without_recipient(tmp_path: Path) -> None:
     service = EncryptedVaultBackupService(
         vault_path=tmp_path / "vault",

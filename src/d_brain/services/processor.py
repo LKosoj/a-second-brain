@@ -654,8 +654,24 @@ class CliProcessor:
             [
                 "ASSISTANT SCOPE RULES:",
                 "- Current working directory is the vault root. Stay inside it.",
-                "- Read/write only files in the current directory tree.",
+                "- Write files and save skill results only inside the vault.",
                 "- Use Bash + mcp-cli for Todoist when task actions are needed.",
+                (
+                    "- Shared skills are available in ~/.claude/skills "
+                    "(also exposed as ~/.codex/skills). You may read their "
+                    "SKILL.md files, references and scripts, and execute those "
+                    "scripts by absolute path without copying them into the vault. "
+                    "Keep the working directory, outputs and state inside the vault. "
+                    "Do not modify shared skills. This is an exception to the "
+                    "outside-path restriction below."
+                ),
+                (
+                    "- Discover installed skills under skills/**/SKILL.md inside "
+                    "the vault. Read their instructions and run their scripts "
+                    "when relevant to the request. Skills may read the vault .env "
+                    "internally; never open or print .env or credential values "
+                    "yourself."
+                ),
                 (
                     "- Never access ../, absolute paths, .env, .git, src/, scripts/, "
                     "deploy/, docs/, install/setup files, or system configuration."

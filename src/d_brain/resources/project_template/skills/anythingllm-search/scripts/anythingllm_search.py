@@ -19,7 +19,7 @@ Modes:
     query             POST /chat (mode=query) -> answer grounded strictly in the
                       workspace documents, with citations. Spends service LLM tokens.
 
-Config (read from the repo-root .env only; environment variables are ignored):
+Config (read from .env in the current working directory; environment variables are ignored):
     ANYTHINGLLM_BASE_URL    e.g. https://anythingllm.example.com  (no /api suffix)
     ANYTHINGLLM_API_KEY     developer API key (Bearer token)
     ANYTHINGLLM_WORKSPACE   workspace slug scoped to Data & AI
@@ -38,19 +38,6 @@ REQUIRED_CONFIG = (
     "ANYTHINGLLM_API_KEY",
     "ANYTHINGLLM_WORKSPACE",
 )
-
-
-def is_repo_root(path: Path) -> bool:
-    git_path = path / ".git"
-    return git_path.is_file() or (git_path / "HEAD").is_file()
-
-
-def repo_env_file(start: Path | None = None) -> Path:
-    here = (start or Path(__file__)).resolve()
-    for parent in here.parents:
-        if is_repo_root(parent):
-            return parent / ".env"
-    sys.exit(f"Error: cannot locate repo root from {here}.")
 
 
 def read_env_file(env_file: Path) -> dict[str, str]:
@@ -75,7 +62,7 @@ def read_env_file(env_file: Path) -> dict[str, str]:
 
 
 def config() -> tuple[str, str, str]:
-    env_file = repo_env_file()
+    env_file = Path.cwd() / ".env"
     values = read_env_file(env_file)
     base = values.get("ANYTHINGLLM_BASE_URL", "").rstrip("/")
     key = values.get("ANYTHINGLLM_API_KEY", "")

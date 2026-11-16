@@ -72,6 +72,14 @@ responsibilities remain isolated.
 Use `scripts/setup_control_plane.sh` to validate the installed control-plane
 assets.
 
+## Shared skills
+
+You may read and execute shared skills from `~/.claude/skills`, also exposed as
+`~/.codex/skills`, without copying them into the vault. Resolve scripts from the
+loaded skill directory. Keep the working directory, outputs and state inside
+the vault. Do not modify shared skills. This is an explicit exception to the
+restriction on paths outside the vault.
+
 ## Core skills
 
 - `dbrain-processor`
@@ -106,7 +114,9 @@ assets.
 
 ## Privacy
 
-- Keep secrets in the project `.env`, never in this vault.
+- Keep application secrets in the project `.env`. The vault `.env` may contain
+  only settings needed by installed vault skills. Scripts read it internally;
+  never open or print it or copy credentials into notes.
 - Do not publish the generated vault or its backups.
 - Use the shared vault lock for cooperating writers.
 - Keep user knowledge inside the vault and external actions inside workflows

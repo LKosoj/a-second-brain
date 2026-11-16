@@ -30,8 +30,11 @@ source: combine its results with other research. If the topic is unrelated to Da
 
 ## Setup (one-time)
 
-The script reads connection settings from the repo-root `.env` only; environment variables are
-ignored by design. Required keys (see `.env.example`):
+The script reads `.env` from the current working directory; environment variables are
+ignored by design. For the bot, install this skill inside `vault/skills/anythingllm-search`
+and run it from the vault root. The vault `.env` must contain only the required settings
+below. The agent must not open or print `.env`; the script reads it internally.
+Standalone project-root use reads the project `.env`. Required keys (see `.env.example`):
 
 | Variable | Meaning |
 | --- | --- |
@@ -42,7 +45,7 @@ ignored by design. Required keys (see `.env.example`):
 Verify the connection before first use:
 
 ```bash
-python skills/anythingllm-search/scripts/anythingllm_search.py --check
+python3 skills/anythingllm-search/scripts/anythingllm_search.py --check
 ```
 
 If it reports missing config, the `.env` file or required keys are absent — ask the user to fill
@@ -54,18 +57,18 @@ Default mode is `search` (raw retrieval — preferred for synthesis, no service 
 
 ```bash
 # Retrieve the most relevant chunks + their sources (default)
-python .../scripts/anythingllm_search.py "feature store vs feature platform"
+python3 .../scripts/anythingllm_search.py "feature store vs feature platform"
 
 # Tune recall
-python .../scripts/anythingllm_search.py "RAG evaluation metrics" --top 8
-python .../scripts/anythingllm_search.py "vector index HNSW vs IVF" --threshold 0.6
+python3 .../scripts/anythingllm_search.py "RAG evaluation metrics" --top 8
+python3 .../scripts/anythingllm_search.py "vector index HNSW vs IVF" --threshold 0.6
 
 # Grounded answer with citations (spends the service's LLM tokens; AnythingLLM answers
 # strictly from the workspace documents in query mode)
-python .../scripts/anythingllm_search.py "what is GraphRAG" --mode query
+python3 .../scripts/anythingllm_search.py "what is GraphRAG" --mode query
 
 # Raw JSON (for programmatic use)
-python .../scripts/anythingllm_search.py "llm distillation" --json
+python3 .../scripts/anythingllm_search.py "llm distillation" --json
 ```
 
 ### Choosing a mode

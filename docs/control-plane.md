@@ -46,6 +46,29 @@ operation with inventory, backup/proof, WAL and validation; epistemic
 supersession is a separate namespaced metadata operation. Neither mechanism
 adds a workflow definition to the registry.
 
+## Vault and shared skills
+
+The Telegram agent can read instructions under `vault/skills/**/SKILL.md` and run
+those skills from the vault root. Skill scripts can read `vault/.env` internally;
+the agent must not open or print that file. Store only the settings those skills
+need there; the application `.env` stays at the project root.
+
+Shared skills in `~/.claude/skills` (also exposed as `~/.codex/skills`) are also
+available to Telegram questions and `/do`: the agent may read their instructions,
+references and scripts and execute scripts by absolute path, without copying
+them into the vault. The working directory, outputs and state must stay inside
+the vault. Shared skill files must not be modified. This is an explicit exception
+to the restriction on paths outside the vault.
+
+For AnythingLLM, copy the public `skills/anythingllm-search` directory into
+`vault/skills/anythingllm-search` and put only `ANYTHINGLLM_BASE_URL`,
+`ANYTHINGLLM_API_KEY`, and `ANYTHINGLLM_WORKSPACE` in `vault/.env` (permissions 0600).
+From the vault root, run
+`python3 skills/anythingllm-search/scripts/anythingllm_search.py --check`.
+The script reads `.env` from the working directory. Note search and QMD index
+Markdown only; the vault `.env` is also excluded from vault backup snapshots.
+Any separately configured vault synchronization must exclude `.env` as well.
+
 ## Workflow Kinds
 
 The registry currently models these workflow kinds:

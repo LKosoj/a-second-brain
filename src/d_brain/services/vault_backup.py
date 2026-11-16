@@ -227,6 +227,8 @@ class EncryptedVaultBackupService:
             for name in [*dirnames, *sorted(filenames)]:
                 path = Path(root) / name
                 relative = path.relative_to(self.vault_path).as_posix()
+                if relative == ".env":
+                    continue
                 add(path, f"vault/{relative}")
 
     def _encrypt_vault_stream(self, descriptor: int) -> _ArchiveStats:
