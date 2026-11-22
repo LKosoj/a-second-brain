@@ -17,7 +17,7 @@ dependencies = [
     # Not imported by the package: processor prompts (services/processor.py) ask
     # the agent to draw charts in the project environment.
     "matplotlib>=3.11,<4",
-    "openai>=1.99.1,<3",
+    "openai>=1.99.1,<4",
     "pydantic>=2.0",
     "pydantic-settings",
     "python-dateutil>=2.9,<3",
