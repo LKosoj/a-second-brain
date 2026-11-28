@@ -22,6 +22,9 @@ def test_prompt_source_map_declares_loaded_runtime_and_secondary_layers() -> Non
     assert "Runtime-Loaded Retrieval Policy" in source_map
     assert "skills/vault-retrieval/SKILL.md" in source_map
     assert "recall_planner.py" in source_map
+    assert "src/d_brain/services/processor_periodic.py" in source_map
+    assert "src/d_brain/services/compiled_wiki_care.py" in source_map
+    assert "src/d_brain/services/conversation_learning.py" in source_map
 
 
 def test_dbrain_processor_skill_is_thin_wrapper_for_runtime_canon() -> None:
@@ -95,6 +98,30 @@ def test_repo_agents_do_not_use_direct_todoist_mcp_tool_names() -> None:
         assert "mcp__todoist__" not in content, path.name
 
 
+def test_repo_agents_use_markdown_reports_and_current_entrypoints() -> None:
+    agents_root = TEMPLATE_ROOT / ".claude/agents"
+    forbidden = (
+        "```html",
+        "Telegram HTML",
+        "Telegram-safe HTML",
+        "Return HTML",
+        "<b>",
+        "<i>",
+    )
+
+    for path in sorted(agents_root.glob("*.md")):
+        content = path.read_text(encoding="utf-8")
+        for token in forbidden:
+            assert token not in content, f"{path.name} contains {token!r}"
+
+    weekly_digest = (agents_root / "weekly-digest.md").read_text(encoding="utf-8")
+    assert (
+        "src/d_brain/services/processor_periodic.py::generate_weekly_digest()"
+        in weekly_digest
+    )
+    assert "processor.py::generate_weekly()" not in weekly_digest
+
+
 def test_rules_are_navigation_docs_not_competing_runtime_specs() -> None:
     daily_rule = (TEMPLATE_ROOT / ".claude/rules/daily-format.md").read_text(
         encoding="utf-8"
@@ -136,11 +163,25 @@ def test_phase_files_are_self_contained_and_use_current_layout() -> None:
     assert "GUARANTEED to work" not in execute
     assert "business/crm.md" in execute
     assert "projects/projects.md" in execute
+    assert "Animaccord" not in execute
+    assert "Example Studio" in execute
+    assert "## mcp-cli retry algorithm" not in execute
     assert "Use the template from SKILL.md" not in reflect
     assert "Do not rewrite whole files" in reflect
     assert "hidden template elsewhere" in reflect
     assert "Vault Health score" not in reflect
     assert "Vault Health section" not in reflect
+
+
+def test_todoist_and_plaud_references_prompt_contracts() -> None:
+    refs_root = SKILLS_TEMPLATE_ROOT / "dbrain-processor/references"
+    todoist = (refs_root / "todoist.md").read_text(encoding="utf-8")
+    plaud = (refs_root / "plaud.md").read_text(encoding="utf-8")
+
+    assert "conservative fallback" not in todoist
+    assert "leave the task undated" in todoist
+    assert "`1` is the most urgent" in plaud
+    assert "`4` is the lowest" in plaud
 
 
 def test_navigation_docs_and_secondary_skills_match_current_flat_layout() -> None:

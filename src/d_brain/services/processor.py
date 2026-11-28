@@ -429,13 +429,130 @@ class CliProcessor:
             return ""
         return ref_path.read_text(encoding="utf-8")
 
-    def _load_todoist_reference(self) -> str:
-        """Load Todoist reference for inclusion in prompt."""
-        return self._load_dbrain_reference("todoist")
+    @staticmethod
+    def _strip_markdown_sections(text: str, excluded_headings: set[str]) -> str:
+        """Remove ## and ### markdown sections matching excluded_headings."""
+        kept: list[str] = []
+        skip_level: int | None = None
+        in_code_block = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                in_code_block = not in_code_block
+                if skip_level is None:
+                    kept.append(line)
+                continue
+            if not in_code_block:
+                match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+                if match:
+                    level = len(match.group(1))
+                    title = match.group(2).strip()
+                    if skip_level is not None and level <= skip_level:
+                        skip_level = None
+                    if (
+                        skip_level is None
+                        and level in {2, 3}
+                        and title in excluded_headings
+                    ):
+                        skip_level = level
+                        continue
+            if skip_level is None:
+                kept.append(line)
+        result = "\n".join(kept).strip()
+        return re.sub(r"\n{3,}", "\n\n", result)
 
-    def _load_todoist_project_routing_reference(self) -> str:
+    @staticmethod
+    def _is_empty_about_template(content: str) -> bool:
+        """Return True when about.md is empty or an unfilled default template."""
+        body = re.sub(r"\A---\r?\n.*?\r?\n---(?:\r?\n|\Z)", "", content, flags=re.S)
+        body = body.strip()
+        if not body:
+            return True
+        template_fill_sections = {"Role", "Active Operating Areas", "Working Style"}
+        allowed_sections = template_fill_sections | {"Prompt Implications"}
+        default_preamble_lines = {
+            "# About the owner",
+            (
+                "Use this note as owner context for classification and "
+                "prioritization, not as a source of invented obligations."
+            ),
+        }
+        default_prompt_implications = {
+            "- Prefer explicit commitments and current goals over assumptions.",
+            "- Do not turn biography into tasks without a concrete obligation.",
+            (
+                "- Do not infer urgency from title, age, location, "
+                "or general status."
+            ),
+        }
+        current_section: str | None = None
+        saw_fill_section = False
+        for line in body.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            heading = re.match(r"^##\s+(.+?)\s*$", stripped)
+            if heading:
+                current_section = heading.group(1).strip()
+                if current_section not in allowed_sections:
+                    return False
+                if current_section in template_fill_sections:
+                    saw_fill_section = True
+                continue
+            if current_section is None:
+                if stripped not in default_preamble_lines:
+                    return False
+            elif current_section in template_fill_sections:
+                if not re.match(r"^-\s*(?:[^:]+:\s*)?$", stripped):
+                    return False
+            elif current_section == "Prompt Implications":
+                if stripped not in default_prompt_implications:
+                    return False
+        return saw_fill_section
+
+    def _load_about_reference(self) -> str:
+        """Load owner context from vault/about.md, falling back to skill reference."""
+        vault_about = self.vault_path / "about.md"
+        if vault_about.exists():
+            content = vault_about.read_text(encoding="utf-8")
+            if not self._is_empty_about_template(content):
+                return content
+        fallback = self._load_dbrain_reference("about")
+        if fallback and not self._is_empty_about_template(fallback):
+            return fallback
+        return ""
+
+    def _load_todoist_reference(self, *, read_only: bool = False) -> str:
+        """Load Todoist reference for inclusion in prompt."""
+        reference = self._load_dbrain_reference("todoist")
+        if not reference or not read_only:
+            return reference
+        return self._strip_markdown_sections(
+            reference,
+            {
+                "Writing",
+                "Pre-Creation Checklist",
+                "Priority Rules",
+                "Due-Date Rules",
+                "Task Title Style",
+                "Project Routing",
+                "Labels",
+                "Error Handling",
+                "Recurring Tasks",
+            },
+        )
+
+    def _load_todoist_project_routing_reference(
+        self, *, include_output_contract: bool = True
+    ) -> str:
         """Load Todoist project routing rules for task-producing prompts."""
-        return self._load_dbrain_reference("todoist-project-routing")
+        reference = self._load_dbrain_reference("todoist-project-routing")
+        if not reference or include_output_contract:
+            return reference
+        match = re.search(r"(?m)^Output contract:\s*$", reference)
+        if match is None:
+            return reference
+        return reference[: match.start()].rstrip()
 
     def _load_ownership_reference(self) -> str:
         """Load shared ownership rules used by all task-producing prompt paths."""
@@ -712,14 +829,42 @@ class CliProcessor:
         return "\n".join(lines)
 
     @staticmethod
-    def _assistant_scope_rules() -> str:
-        """Rules for Telegram /do requests."""
+    def _assistant_scope_rules(*, read_only: bool = False) -> str:
+        """Rules for Telegram /do or read-only question requests."""
+        if read_only:
+            write_rule = (
+                "- Read-only mode: do not modify vault notes or Todoist tasks; "
+                "only save user-facing answer artifacts under attachments/ when needed."
+            )
+            todoist_rule = (
+                "- Use Bash + mcp-cli for read-only Todoist inspection "
+                "when current task state is needed."
+            )
+            refusal_rules = [
+                (
+                    "- Never change repository code, infrastructure, vault notes, "
+                    "or Todoist tasks from this question workflow."
+                ),
+            ]
+        else:
+            write_rule = "- Write files and save skill results only inside the vault."
+            todoist_rule = (
+                "- Use Bash + mcp-cli for Todoist when task actions are needed."
+            )
+            refusal_rules = [
+                "- Never change repository code or infrastructure from /do.",
+                (
+                    "- If the request requires repository code, deployment, "
+                    "or system changes, "
+                    "refuse briefly and tell the user to do it outside Telegram /do."
+                ),
+            ]
         return "\n".join(
             [
                 "ASSISTANT SCOPE RULES:",
                 "- Current working directory is the vault root. Stay inside it.",
-                "- Write files and save skill results only inside the vault.",
-                "- Use Bash + mcp-cli for Todoist when task actions are needed.",
+                write_rule,
+                todoist_rule,
                 (
                     "- Shared skills are available in ~/.claude/skills "
                     "(also exposed as ~/.codex/skills). You may read their "
@@ -740,12 +885,7 @@ class CliProcessor:
                     "- Never access ../, absolute paths, .env, .git, src/, scripts/, "
                     "deploy/, docs/, install/setup files, or system configuration."
                 ),
-                "- Never change repository code or infrastructure from /do.",
-                (
-                    "- If the request requires repository code, deployment, "
-                    "or system changes, "
-                    "refuse briefly and tell the user to do it outside Telegram /do."
-                ),
+                *refusal_rules,
             ]
         )
 
@@ -2300,7 +2440,14 @@ class CliProcessor:
         if calendar_context:
             calendar_context += "\n"
         phase_content = self._load_phase_content("capture")
-        about_reference = self._load_dbrain_reference("about")
+        about_reference = self._load_about_reference()
+        about_block = (
+            "=== ABOUT REFERENCE ===\n"
+            f"{about_reference}\n"
+            "=== END ABOUT REFERENCE ===\n\n"
+            if about_reference
+            else ""
+        )
         classification_reference = self._load_dbrain_reference("classification")
         goals_reference = self._load_dbrain_reference("goals")
         ownership_reference = self._load_ownership_reference()
@@ -2315,9 +2462,7 @@ class CliProcessor:
             "=== PHASE INSTRUCTIONS ===\n"
             f"{phase_content}\n"
             "=== END PHASE ===\n\n"
-            "=== ABOUT REFERENCE ===\n"
-            f"{about_reference}\n"
-            "=== END ABOUT REFERENCE ===\n\n"
+            f"{about_block}"
             "=== CLASSIFICATION REFERENCE ===\n"
             f"{classification_reference}\n"
             "=== END CLASSIFICATION REFERENCE ===\n\n"
@@ -2362,7 +2507,9 @@ class CliProcessor:
         links_reference = self._load_dbrain_reference("links")
         ownership_reference = self._load_ownership_reference()
         process_goals_reference = self._load_dbrain_reference("process-goals")
-        routing_reference = self._load_todoist_project_routing_reference()
+        routing_reference = self._load_todoist_project_routing_reference(
+            include_output_contract=False
+        )
         todoist_reference = self._load_todoist_reference()
         project_catalog = self._todoist_project_catalog_snapshot(force_refresh=True)
         return (
@@ -2451,7 +2598,7 @@ class CliProcessor:
         core_context = self._build_injected_context(
             consumer="question", target_day=owner_today()
         )
-        todoist_ref = self._load_todoist_reference()
+        todoist_ref = self._load_todoist_reference(read_only=True)
         question_reference = self._load_question_answer_reference()
         vault_retrieval_skill = self._load_vault_retrieval_skill()
         question_route = self._classify_question_route(question)
@@ -2487,13 +2634,12 @@ CONTEXT:
 
 {self._todoist_cli_rules(needs_completed_tasks=True)}
 
-{self._assistant_scope_rules()}
+{self._assistant_scope_rules(read_only=True)}
 
 QUESTION ACTION LIMITS:
 Answer by reading sources only. Do not create, update, reschedule or complete
 Todoist tasks, or modify MEMORY, goals, daily, handoff or other knowledge notes.
-The Todoist writing examples and generic write scope do not authorize actions
-in this question workflow. Only answer artifacts under attachments/ are allowed.
+Only answer artifacts under attachments/ are allowed.
 
 {self._language_instruction()}
 
@@ -2542,13 +2688,13 @@ For REQUIRED answers, finish with exactly this markdown section:
 Источники:
 - [[vault-relative/path.md]]
 
-List 2-5 фактически использованных источников. Use vault-relative wikilinks for
+List 2-5 actually used sources. Use vault-relative wikilinks for
 Markdown notes, provided `telegram:<chat>:<message>` references for original
 conversations, and inline code for other provided source paths. Do not read
 outside the vault to follow a provided repository path. Cite the source note,
 not a search-result snippet. Never cite a file you did not read. If fewer than
 two confirming sources exist, list only the real source(s) and state the evidence
-gap briefly; не выдумывай ссылку. Mark conclusions that go beyond the sources as
+gap briefly; do not invent a link. Mark conclusions that go beyond the sources as
 an inference. For OPTIONAL answers, add the same section when vault evidence
 materially supports the answer, but omit it for purely conversational guidance.
 
@@ -4197,7 +4343,8 @@ CONTEXT:
 
 {self._language_instruction()}
 
-If that block declares a history scope or explicit start point, follow it when
+If an AUTO ARCHIVE RECALL block is provided and declares a history scope or \
+explicit start point, follow it when
 deciding how far back to analyze the topic.
 If the request asks for status/history of a long-running topic, synthesize the
 history of that topic/question, not only the latest snapshot.

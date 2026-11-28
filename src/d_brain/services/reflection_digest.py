@@ -90,10 +90,10 @@ class ReflectionDigestService:
             "Return strict JSON:\n"
             '{\n  "takeaways": ["...", "..."]\n}\n\n'
             "Rules:\n"
-            "- Return an empty array when there is nothing noteworthy beyond raw "
-            "counts.\n"
-            "- Include every genuinely noteworthy takeaway from the provided "
-            "artifacts.\n"
+            "- Return 0 to 3 takeaways; return an empty array when there is nothing "
+            "noteworthy beyond raw counts.\n"
+            "- Include only the most genuinely noteworthy takeaways (at most 3) "
+            "from the provided artifacts.\n"
             "- Prefer decisions, real risks, meaningful insights, "
             "and next-step-worthy findings.\n"
             "- Report today's new entries and meaningful maintenance outcomes. "
@@ -142,7 +142,7 @@ class ReflectionDigestService:
             if not text:
                 continue
             takeaways.append(text)
-        return takeaways
+        return takeaways[:3]
 
 
 __all__ = ["ReflectionDigestService"]

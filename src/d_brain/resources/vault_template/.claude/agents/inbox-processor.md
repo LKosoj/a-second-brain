@@ -67,27 +67,27 @@ mcp-cli call todoist add-tasks '{"tasks": [{"content": "Task", "dueString": "tom
 
 If notes should be saved, write them using the current vault note conventions and real links.
 
-### Step 4: Return HTML Summary
+### Step 4: Return Markdown Summary
 
 Suggested structure:
 
-```html
-📥 <b>Inbox triage</b>
+```markdown
+📥 **Inbox triage**
 
-<b>✅ В задачи:</b>
-• {task}
+**✅ В задачи:**
+- {task}
 
-<b>🎯 В проекты:</b>
-• {project}
+**🎯 В проекты:**
+- {project}
 
-<b>📓 В архив/заметки:</b>
-• {note}
+**📓 В архив/заметки:**
+- {note}
 
-<b>⏳ Waiting:</b>
-• {follow-up task}
+**⏳ Waiting:**
+- {follow-up task}
 
-<b>🗃 Только в архив:</b>
-• {item}
+**🗃 Только в архив:**
+- {item}
 ```
 
 ## Constraints

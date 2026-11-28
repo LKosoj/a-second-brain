@@ -13,10 +13,10 @@ Generate a weekly review that matches the current project contract.
 
 ## Source Of Truth
 
-- Weekly digest runtime behavior currently lives in `src/d_brain/services/processor.py::generate_weekly_digest()`.
+- Weekly digest runtime behavior currently lives in `src/d_brain/services/processor_periodic.py::generate_weekly_digest()`.
 - `MEMORY.md` and `.session/handoff.md` may add context for the week's real story.
 - Todoist access must use `mcp-cli`.
-- Reports must be markdown (the runtime converts it for Telegram).
+- Reports must be concise Markdown (runtime converts Markdown for Telegram delivery).
 - Saving the summary is fine; rotating goal files is not implicit behavior unless the user asks for it.
 
 ## When To Run
@@ -71,14 +71,14 @@ Suggested structure:
 {status}
 
 **🏆 Что сработало:**
-• {win}
+- {win}
 
 **⚠️ Что тянуло вниз:**
-• {challenge}
+- {challenge}
 
 **📊 Итоги:**
-• Выполнено задач: {n}
-• Сохранено заметок: {n}
+- Выполнено задач: {n}
+- Сохранено заметок: {n}
 
 **⚡ Фокус на следующую неделю:**
 1. {priority}

@@ -38,6 +38,9 @@ These files define actual behavior and should be edited first when product behav
 - `src/d_brain/services/compiled_briefings.py`
 - `src/d_brain/services/reflection_digest.py`
 - `src/d_brain/services/recall_planner.py`
+- `src/d_brain/services/processor_periodic.py`
+- `src/d_brain/services/compiled_wiki_care.py`
+- `src/d_brain/services/conversation_learning.py`
 
 ### Deterministic Owner-Facing Renderers (Not Prompt Builders)
 

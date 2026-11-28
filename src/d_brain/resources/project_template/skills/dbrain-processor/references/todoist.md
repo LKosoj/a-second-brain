@@ -65,7 +65,7 @@ Translate explicit timing intent into `dueString`.
 - Preserve concrete dates when present.
 - Preserve short relative intent when the source is clear enough.
 - If workload is overloaded, shift flexible tasks, but never move a real deadline.
-- If no time intent exists, use a conservative fallback instead of leaving the task undated.
+- If no time intent exists, leave the task undated (omit `dueString` / leave due empty); never invent or infer a deadline.
 
 ## Task Title Style
 

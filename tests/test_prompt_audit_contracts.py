@@ -89,7 +89,8 @@ def test_question_prompt_keeps_read_only_actions_and_source_contract(
     assert "attachments/charts/YYYY-MM-DD-<slug>.png" in prompt
     assert "exact vault-relative path" in prompt
     assert "provided `telegram:<chat>:<message>` references" in prompt
-    assert "List 2-5 фактически использованных источников" in prompt
+    assert "List 2-5 actually used sources" in prompt
+    assert "do not invent a link" in prompt
 
 
 def test_reflect_prompt_separates_cards_memory_and_uses_vault_cwd(
@@ -247,4 +248,164 @@ def test_settle_conflicts_passes_event_dates_and_keeps_older_event_from_supersed
         row[1] == "daily/2026-10-09.md" and row[2] == "Срок — август."
         for row in service._claim_history_rows(settled)
     )
+
+
+def test_execute_prompt_names_auto_recall_block_for_history_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = CliProcessor(_processor_vault(tmp_path))
+    captured: dict[str, str] = {}
+
+    def fake_run(prompt: str) -> tuple[str, list[str]]:
+        captured["prompt"] = prompt
+        return ("Done", [])
+
+    monkeypatch.setattr(processor, "_run_assistant_prompt_with_artifacts", fake_run)
+    result = processor.execute_prompt("Покажи историю проекта", user_id=7)
+
+    assert result["processed_entries"] == 1
+    assert (
+        "If an AUTO ARCHIVE RECALL block is provided and declares a history scope "
+        "or explicit start point, follow it when" in captured["prompt"]
+    )
+    assert (
+        "If that block declares a history scope or explicit start point"
+        not in captured["prompt"]
+    )
+
+
+def test_question_prompt_uses_read_only_scope_and_todoist_slice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = CliProcessor(_processor_vault(tmp_path))
+    question_prompt = processor._build_question_answer_prompt(
+        "Какие задачи открыты на этой неделе?",
+        user_id=7,
+    )
+    execute_phase_prompt = processor._build_execute_prompt(date(2026, 10, 9))
+    captured_do: dict[str, str] = {}
+
+    def fake_run(prompt: str) -> tuple[str, list[str]]:
+        captured_do["prompt"] = prompt
+        return ("Done", [])
+
+    monkeypatch.setattr(processor, "_run_assistant_prompt_with_artifacts", fake_run)
+    processor.execute_prompt("Создай задачу на завтра", user_id=7)
+    do_prompt = captured_do["prompt"]
+
+    # Question prompt: read-only scope and read-only Todoist slice
+    assert (
+        "Read-only mode: do not modify vault notes or Todoist tasks; "
+        "only save user-facing answer artifacts under attachments/ when needed."
+        in question_prompt
+    )
+    assert (
+        "Use Bash + mcp-cli for read-only Todoist inspection "
+        "when current task state is needed." in question_prompt
+    )
+    assert (
+        "Never change repository code, infrastructure, vault notes, "
+        "or Todoist tasks from this question workflow." in question_prompt
+    )
+    assert (
+        "The Todoist writing examples and generic write scope do not authorize actions"
+        not in question_prompt
+    )
+    assert "## Task Links Format" in question_prompt
+    assert "### Reading" in question_prompt
+    assert "## Priority Rules" not in question_prompt
+    assert "### Writing" not in question_prompt
+    assert "mcp-cli call todoist add-tasks" not in question_prompt
+    assert "## Pre-Creation Checklist" not in question_prompt
+    assert "## Due-Date Rules" not in question_prompt
+    assert "## Task Title Style" not in question_prompt
+    assert "## Project Routing" not in question_prompt
+    assert "## Labels" not in question_prompt
+    assert "## Error Handling" not in question_prompt
+    assert "## Recurring Tasks" not in question_prompt
+
+    # execute_prompt() and _build_execute_prompt() still keep full write rules
+    assert "Write files and save skill results only inside the vault." in do_prompt
+    assert "Use Bash + mcp-cli for Todoist when task actions are needed." in do_prompt
+    assert "### Writing" in do_prompt
+    assert "## Priority Rules" in do_prompt
+    assert "mcp-cli call todoist add-tasks" in do_prompt
+    assert "### Writing" in execute_phase_prompt
+    assert "mcp-cli call todoist add-tasks" in execute_phase_prompt
+    assert "## Pre-Creation Checklist" in execute_phase_prompt
+
+
+def test_capture_prompt_skips_empty_about_template_and_prefers_vault_about(
+    tmp_path: Path,
+) -> None:
+    vault = _processor_vault(tmp_path)
+    processor = CliProcessor(vault)
+
+    # Unfilled default template in skills/.../references/about.md is omitted
+    prompt_without_about = processor._build_capture_prompt(date(2026, 10, 9))
+    assert "=== ABOUT REFERENCE ===" not in prompt_without_about
+
+    # Unfilled vault/about.md also omitted
+    (vault / "about.md").write_text(
+        "---\ntype: note\n---\n# About the owner\n\n## Role\n\n- Name:\n- Role:\n\n"
+        "## Active Operating Areas\n\n-\n\n## Working Style\n\n- Preferred language:\n",
+        encoding="utf-8",
+    )
+    prompt_with_empty_vault_about = processor._build_capture_prompt(date(2026, 10, 9))
+    assert "=== ABOUT REFERENCE ===" not in prompt_with_empty_vault_about
+
+    # Populated vault/about.md takes precedence over skill fallback
+    (
+        vault.parent / "skills/dbrain-processor/references/about.md"
+    ).write_text(
+        "# About the owner\n\n## Role\n\n- Name: Fallback Owner\n",
+        encoding="utf-8",
+    )
+    (vault / "about.md").write_text(
+        "# About the owner\n\n## Role\n\n- Name: Vault Owner\n",
+        encoding="utf-8",
+    )
+    prompt_with_vault_about = processor._build_capture_prompt(date(2026, 10, 9))
+    assert "=== ABOUT REFERENCE ===" in prompt_with_vault_about
+    assert "Vault Owner" in prompt_with_vault_about
+    assert "Fallback Owner" not in prompt_with_vault_about
+
+    # Custom preamble bio or custom Prompt Implications are NOT treated as empty
+    (vault / "about.md").write_text(
+        "# About the owner\n\nI lead data engineering and product ops.\n\n"
+        "## Role\n\n- Name:\n",
+        encoding="utf-8",
+    )
+    prompt_with_custom_bio = processor._build_capture_prompt(date(2026, 10, 9))
+    assert "=== ABOUT REFERENCE ===" in prompt_with_custom_bio
+    assert "I lead data engineering and product ops." in prompt_with_custom_bio
+
+    (vault / "about.md").write_text(
+        "# About the owner\n\n## Role\n\n- Name:\n\n"
+        "## Prompt Implications\n\n- Always prioritize family commitments.\n",
+        encoding="utf-8",
+    )
+    prompt_with_custom_implication = processor._build_capture_prompt(date(2026, 10, 9))
+    assert "=== ABOUT REFERENCE ===" in prompt_with_custom_implication
+    assert "Always prioritize family commitments." in prompt_with_custom_implication
+
+
+def test_execute_prompt_strips_routing_standalone_json_schema(
+    tmp_path: Path,
+) -> None:
+    processor = CliProcessor(_processor_vault(tmp_path))
+    execute_prompt = processor._build_execute_prompt(date(2026, 10, 9))
+
+    assert "=== TODOIST PROJECT ROUTING ===" in execute_prompt
+    assert "not the output schema of this EXECUTE phase" in execute_prompt
+    assert "Routing rules:" in execute_prompt
+    assert "Output contract:" not in execute_prompt
+    assert '"project_id": "todoist-project-id|inbox"' not in execute_prompt
+
+    # Default call still includes Output contract for standalone routing callers
+    full_routing = processor._load_todoist_project_routing_reference()
+    assert "Output contract:" in full_routing
+    assert '"project_id": "todoist-project-id|inbox"' in full_routing
 

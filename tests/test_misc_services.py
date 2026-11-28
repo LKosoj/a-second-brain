@@ -619,6 +619,46 @@ def test_reflection_digest_service_returns_takeaways_from_json(
     assert takeaways == ["Первый вывод", "Второй вывод"]
 
 
+def test_reflection_digest_service_caps_takeaways_to_three(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service = ReflectionDigestService(
+        tmp_path / "vault",
+        ai_cli="qwen",
+        content_language="ru",
+    )
+
+    monkeypatch.setattr(
+        service.runner,
+        "run",
+        lambda prompt, timeout: json.dumps(  # noqa: ARG005
+            {
+                "takeaways": [
+                    "  Первый вывод  ",
+                    "   ",
+                    "Второй   вывод",
+                    "Третий вывод",
+                    "Четвертый вывод",
+                ]
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    takeaways = service.summarize(
+        day=date(2026, 4, 5),
+        report_markdown="**Report**",
+        execute_payload={
+            "thoughts_saved": [],
+            "tasks_created": [],
+            "crm_updated": [],
+        },
+    )
+
+    assert takeaways == ["Первый вывод", "Второй вывод", "Третий вывод"]
+
+
 def test_image_analysis_service_parses_fenced_json(tmp_path: Path) -> None:
     image_path = tmp_path / "vault" / "attachments" / "2026-04-04" / "img-test.png"
     image_path.parent.mkdir(parents=True)

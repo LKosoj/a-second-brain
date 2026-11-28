@@ -1174,9 +1174,9 @@ def test_question_prompt_requires_source_footer_for_fact_and_history_routes(
 
     assert "SOURCE FOOTER POLICY: REQUIRED" in fact_prompt
     assert "SOURCE FOOTER POLICY: REQUIRED" in history_prompt
-    assert "2-5 фактически использованных источников" in fact_prompt
+    assert "2-5 actually used sources" in fact_prompt
     assert "telegram:<chat>:<message>" in fact_prompt
-    assert "не выдумывай ссылку" in fact_prompt
+    assert "do not invent a link" in fact_prompt
 
 
 def test_prompt_references_avoid_legacy_year_and_keyword_lists() -> None:

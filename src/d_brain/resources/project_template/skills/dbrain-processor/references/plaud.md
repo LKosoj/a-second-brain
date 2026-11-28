@@ -70,4 +70,5 @@ Critical constraints:
 - `due_hint` is an absolute `YYYY-MM-DD` date for an explicit deadline, resolved
   from the recording's local `recorded_at` date, or an empty string when absent
   or unclear. Do not shift relative deadlines to the import date.
+- `priority` is an integer `1`–`4` where `1` is the most urgent (`p1`) and `4` is the lowest (`p4`); do not use the reversed Todoist REST API scale.
 - If there is any ambiguity, prefer archive-only behavior.

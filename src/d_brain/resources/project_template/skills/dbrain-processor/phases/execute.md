@@ -127,18 +127,7 @@ For all created/updated files:
 mcp-cli call todoist find-tasks-by-date '{"startDate": "today", "daysCount": 7}'
 ```
 
-## mcp-cli retry algorithm
-
-```
-1. Call mcp-cli
-2. If it fails, wait briefly and re-read local context
-3. Retry a second time
-4. If it fails again, wait a bit longer
-5. Retry a third and final time
-```
-
-Never claim Todoist is unavailable before the retries are exhausted.
-If it still fails after the third attempt, keep the exact error text in `observations`.
+If a command still fails after retries, keep the exact error text in `observations`.
 
 ## Output Format
 
@@ -156,7 +145,7 @@ Print ONLY valid JSON:
     {"path": "thoughts/ideas/2026-02-19-layered-memory.md", "title": "AI agents need layered memory", "category": "ideas"}
   ],
   "crm_updated": [
-    {"path": "business/crm.md", "change": "Added note about Animaccord follow-up"}
+    {"path": "business/crm.md", "change": "Added note about Example Studio follow-up"}
   ],
   "links_created": [
     {"from": "thoughts/ideas/2026-02-19-layered-memory.md", "to": "business/_index.md", "context": "context: linked to current client thread"}

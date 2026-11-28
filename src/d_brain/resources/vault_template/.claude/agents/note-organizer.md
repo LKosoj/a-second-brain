@@ -66,7 +66,7 @@ Do not create new MOC families unless the vault structure clearly needs them.
 
 ### 6. Report
 
-Return Telegram HTML with:
+Return concise Markdown with:
 - graph snapshot
 - top orphan notes worth fixing
 - duplicate candidates

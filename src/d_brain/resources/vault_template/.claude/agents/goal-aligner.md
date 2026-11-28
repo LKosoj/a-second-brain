@@ -16,7 +16,7 @@ Review whether current work is aligned with weekly, monthly, and yearly goals.
 - Goals live in `goals/3-weekly.md`, `goals/2-monthly.md`, and the current yearly goals file.
 - `MEMORY.md`, `business/_index.md`, and `projects/_index.md` help resolve ambiguous work context.
 - Todoist access must go through `mcp-cli`, not direct MCP tool names.
-- Output should be Telegram-safe HTML.
+- Output should be concise Markdown (runtime converts Markdown for Telegram delivery).
 
 ## When To Run
 
@@ -73,31 +73,31 @@ Classify goal state as:
 - `quiet`
 - `stale`
 
-### Step 5: Return HTML Report
+### Step 5: Return Markdown Report
 
-Use concise Telegram HTML.
+Use concise Markdown.
 
 Suggested structure:
 
-```html
-🎯 <b>Проверка alignment</b>
+```markdown
+🎯 **Проверка alignment**
 
-<b>✅ Связано с целями:</b>
-• {task} → {goal}
+**✅ Связано с целями:**
+- {task} → {goal}
 
-<b>🧰 Операционное:</b>
-• {task}
+**🧰 Операционное:**
+- {task}
 
-<b>⚠️ Вызывает вопросы:</b>
-• {task} — <i>почему это сейчас в фокусе?</i>
+**⚠️ Вызывает вопросы:**
+- {task} — *почему это сейчас в фокусе?*
 
-<b>📉 Тихие цели:</b>
-• {goal} — {days/context}
+**📉 Тихие цели:**
+- {goal} — {days/context}
 
-<b>💡 Рекомендации:</b>
-• Start: {smallest next action}
-• Stop: {work to question}
-• Continue: {aligned momentum}
+**💡 Рекомендации:**
+- Start: {smallest next action}
+- Stop: {work to question}
+- Continue: {aligned momentum}
 ```
 
 ## Constraints

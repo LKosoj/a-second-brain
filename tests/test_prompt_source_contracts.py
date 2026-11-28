@@ -155,5 +155,7 @@ def test_reflection_digest_prompt_preserves_proposed_and_created_status(
     )
     assert "proposed is not performed" in prompt
     assert "a created task is not a completed result" in prompt
+    assert "Return 0 to 3 takeaways" in prompt
+    assert "at most 3" in prompt
     assert "Return strict JSON" in prompt
     assert '"takeaways": ["...", "..."]' in prompt
