@@ -2,6 +2,8 @@
 
 from d_brain.services.telegram_markup import (
     extract_attachment_image_refs,
+    html_to_markdown_v2,
+    markdown_to_document_html,
     markdown_to_html,
     markdown_to_markdown_v2,
     replace_markdown_image_links,
@@ -174,3 +176,40 @@ def test_markdown_to_markdown_v2_balances_backticks_for_code_with_asterisks() ->
 
     assert v2.count("`") % 2 == 0
     assert v2 == "Файлы `*.md` и `*.txt`"
+
+
+def test_markdown_to_markdown_v2_heading_with_nested_bold() -> None:
+    assert markdown_to_markdown_v2("# **Заголовок**") == "*Заголовок*"
+    assert markdown_to_markdown_v2("## **Hello** world") == "*Hello world*"
+    assert markdown_to_markdown_v2("# **Hello** *world*") == "*Hello _world_*"
+    assert "**" not in markdown_to_markdown_v2("# **Заголовок**")
+
+
+def test_html_to_markdown_v2_nested_strong_and_bold() -> None:
+    assert html_to_markdown_v2("<b><strong>Hello</strong> world</b>") == "*Hello world*"
+
+
+def test_markdown_to_document_html_sanitizes_unsafe_href_schemes() -> None:
+    markdown = (
+        "[xss1](javascript:alert(1)) "
+        "[xss2](JaVaScRiPt:alert(2)) "
+        "[xss3](vbscript:msgbox(1)) "
+        "[xss4](data:text/html,<script>alert(1)</script>) "
+        "[ok1](https://example.com/a?x=1) "
+        "[ok2](http://example.com) "
+        "[ok3](mailto:user@example.com) "
+        "[ok4](#section-1) "
+        "[ok5](/docs/page)"
+    )
+
+    rendered = markdown_to_document_html(markdown)
+
+    assert "javascript:" not in rendered.lower()
+    assert "vbscript:" not in rendered.lower()
+    assert "data:text/html" not in rendered.lower()
+    assert rendered.count('href="#"') == 4
+    assert 'href="https://example.com/a?x=1"' in rendered
+    assert 'href="http://example.com"' in rendered
+    assert 'href="mailto:user@example.com"' in rendered
+    assert 'href="#section-1"' in rendered
+    assert 'href="/docs/page"' in rendered

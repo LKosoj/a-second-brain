@@ -172,21 +172,23 @@ systemctl --user disable --now a-second-brain-qmd-maintenance.timer
 
 ## PLAUD
 
-Для импорта записей задайте:
+Установите [Plaud CLI](https://docs.plaud.ai/plaud-mcp-cli/cli) и выполните
+`plaud login` от имени пользователя, который запускает d-brain. Укажите путь
+к программе в `.env`.
 
 ```dotenv
-PLAUD_REGION=api
-PLAUD_BEARER_TOKEN=
+PLAUD_CLI_BIN=/absolute/path/to/plaud
 ```
 
-Поддерживаются регионы `api` и `api-euc1`. Необязательный ежечасный таймер
-включается только при наличии токена.
+При повторной установке служб этот параметр включает ежечасный импорт.
+Старые подключения с `PLAUD_BEARER_TOKEN` и `PLAUD_REGION` используются
+только при пустом `PLAUD_CLI_BIN`.
 
 Если Todoist принял задачи из записи, но не вернул их id, синхронизация
 присылает в Telegram их число и названия («⚠️ Не подтверждено, проверьте в
 Todoist»), как ночной отчёт.
 
-Удаление токена не отключает ранее включённый таймер:
+Ранее включённый таймер можно отключить командой ниже.
 
 ```bash
 systemctl --user disable --now a-second-brain-plaud-sync.timer

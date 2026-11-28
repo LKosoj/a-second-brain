@@ -618,3 +618,124 @@ def test_doctor_accepts_timezone_matching_system(
 
     assert "[OK] TIMEZONE UTC" in rendered
     assert "differs from the system zone" not in rendered
+
+
+def test_doctor_errors_when_plaud_cli_bin_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initialize_project(tmp_path)
+    environment = {
+        **_valid_environment(),
+        "PLAUD_CLI_BIN": str(tmp_path / "missing-plaud"),
+    }
+
+    status, rendered = _doctor_output(tmp_path, monkeypatch, environment)
+
+    assert status == 1
+    assert "[ERR] PLAUD_CLI_BIN" in rendered
+    assert "not found or is not executable" in rendered
+
+
+def test_doctor_errors_when_plaud_cli_bin_is_not_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initialize_project(tmp_path)
+    cli_file = tmp_path / "plaud"
+    cli_file.write_text("#!/bin/sh\n", encoding="utf-8")
+    cli_file.chmod(0o644)
+    environment = {**_valid_environment(), "PLAUD_CLI_BIN": str(cli_file)}
+
+    status, rendered = _doctor_output(tmp_path, monkeypatch, environment)
+
+    assert status == 1
+    assert "[ERR] PLAUD_CLI_BIN" in rendered
+    assert "not found or is not executable" in rendered
+
+
+def test_doctor_accepts_executable_plaud_cli_bin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initialize_project(tmp_path)
+    cli_file = tmp_path / "plaud"
+    cli_file.write_text("#!/bin/sh\n", encoding="utf-8")
+    cli_file.chmod(0o755)
+    environment = {**_valid_environment(), "PLAUD_CLI_BIN": str(cli_file)}
+
+    status, rendered = _doctor_output(tmp_path, monkeypatch, environment)
+
+    assert status == 0
+    assert "[OK] PLAUD integration is configured" in rendered
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::"])
+def test_doctor_warns_when_network_api_listens_on_all_interfaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host: str
+) -> None:
+    initialize_project(tmp_path)
+    environment = {
+        **_valid_environment(),
+        "NETWORK_API_TOKEN": "network-api-secret",
+        "NETWORK_API_HOST": host,
+    }
+
+    status, rendered = _doctor_output(tmp_path, monkeypatch, environment)
+
+    assert status == 0
+    assert f"[WARN] NETWORK_API_HOST is '{host}'" in rendered
+    assert "TLS" in rendered
+    assert "network-api-secret" not in rendered
+
+
+def test_doctor_does_not_warn_for_localhost_or_disabled_network_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initialize_project(tmp_path)
+    local_env = {
+        **_valid_environment(),
+        "NETWORK_API_TOKEN": "network-api-secret",
+        "NETWORK_API_HOST": "127.0.0.1",
+    }
+    disabled_env = {
+        **_valid_environment(),
+        "NETWORK_API_HOST": "0.0.0.0",
+    }
+
+    status_local, rendered_local = _doctor_output(tmp_path, monkeypatch, local_env)
+    status_disabled, rendered_disabled = _doctor_output(
+        tmp_path, monkeypatch, disabled_env
+    )
+
+    assert status_local == 0
+    assert status_disabled == 0
+    assert "NETWORK_API_HOST is" not in rendered_local
+    assert "NETWORK_API_HOST is" not in rendered_disabled
+
+
+def test_doctor_known_env_keys_cover_env_example_and_flag_lowercase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    env_example = (project_root / ".env.example").read_text(encoding="utf-8")
+    example_keys = {
+        match.group(1)
+        for line in env_example.splitlines()
+        if (match := doctor._ENV_ASSIGNMENT_RE.match(line.strip()))
+    }
+    assert example_keys <= doctor.KNOWN_ENV_KEYS
+
+    initialize_project(tmp_path)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        env_file.read_text(encoding="utf-8")
+        + "\ntimezone=UTC\nnetwork_api_host=127.0.0.1\n",
+        encoding="utf-8",
+    )
+
+    status, rendered = _doctor_output(tmp_path, monkeypatch, _valid_environment())
+
+    assert status == 0
+    assert "[WARN] .env key 'timezone' should be uppercase 'TIMEZONE'" in rendered
+    assert (
+        "[WARN] .env key 'network_api_host' should be uppercase 'NETWORK_API_HOST'"
+        in rendered
+    )

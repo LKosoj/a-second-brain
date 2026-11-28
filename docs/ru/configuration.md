@@ -94,11 +94,12 @@
 
 | Переменная | По умолчанию | Назначение |
 |---|---:|---|
-| `PLAUD_BEARER_TOKEN` | пусто | Включает импорт записей PLAUD |
+| `PLAUD_CLI_BIN` | пусто | Путь к программе Plaud CLI для импорта записей |
+| `PLAUD_BEARER_TOKEN` | пусто | Токен старого подключения Plaud |
 | `PLAUD_REGION` | `api` | `api` или `api-euc1` |
 
-Таймер PLAUD включается только при наличии токена во время установки systemd
-units.
+Установщик systemd включает таймер PLAUD при заданном `PLAUD_CLI_BIN` или
+`PLAUD_BEARER_TOKEN`.
 
 ## Поиск и совместимый model gateway
 

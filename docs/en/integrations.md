@@ -167,21 +167,22 @@ systemctl --user disable --now a-second-brain-qmd-maintenance.timer
 
 ## PLAUD
 
-Configure recording import with:
+Install [Plaud CLI](https://docs.plaud.ai/plaud-mcp-cli/cli) and run
+`plaud login` as the user running d-brain. Set the executable path in `.env`.
 
 ```dotenv
-PLAUD_REGION=api
-PLAUD_BEARER_TOKEN=
+PLAUD_CLI_BIN=/absolute/path/to/plaud
 ```
 
-Supported regions are `api` and `api-euc1`. The optional hourly timer is
-enabled only when the token is present.
+Rerun service installation to enable hourly import. Legacy connections
+using `PLAUD_BEARER_TOKEN` and `PLAUD_REGION` are used when `PLAUD_CLI_BIN`
+is empty.
 
 If Todoist accepted tasks from a recording but returned no ids for them, the
 sync sends their count and titles to Telegram ("⚠️ Не подтверждено, проверьте
 в Todoist"), the same way as the nightly report.
 
-Removing the token does not disable an already enabled timer:
+To turn off an existing timer, run the command below.
 
 ```bash
 systemctl --user disable --now a-second-brain-plaud-sync.timer

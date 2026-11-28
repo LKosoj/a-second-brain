@@ -52,17 +52,36 @@ KNOWN_ENV_KEYS = frozenset(
         "OWNER_TELEGRAM_ID",
         "AI_CLI",
         "OWNER_FULL_NAME",
+        "CONTENT_LANGUAGE",
         "TODOIST_API_KEY",
+        "TAVILY_API_KEY",
+        "JINA_API_KEY",
+        "ZAI_API_KEY",
+        "PROXY_URL",
+        "PLAUD_CLI_BIN",
         "PLAUD_BEARER_TOKEN",
         "PLAUD_REGION",
         "CALENDAR_ICS_URL",
         "VAULT_BACKUP_GPG_RECIPIENT",
         "VAULT_BACKUP_DIR",
+        "VAULT_BACKUP_RETENTION",
         "VAULT_PATH",
+        "NETWORK_API_TOKEN",
+        "NETWORK_API_HOST",
+        "NETWORK_API_PORT",
+        "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "OPENAI_MODEL",
+        "EMB_MODEL",
+        "RERANK_MODEL",
+        "CLASSIFICATION_MODEL",
+        "RECALL_PLANNER_DISABLE_THINKING",
         "MORNING_BRIEF_TIME",
         "DAILY_PROCESS_TIME",
+        "TIMEZONE",
+        "ANYTHINGLLM_BASE_URL",
+        "ANYTHINGLLM_API_KEY",
+        "ANYTHINGLLM_WORKSPACE",
     }
 )
 # (outcome, detail): detail is the bot username or an exception class name,
@@ -521,7 +540,22 @@ class ProjectDoctor:
         else:
             self.report.add("INFO", "QMD command is not installed")
 
-        if self._value("PLAUD_BEARER_TOKEN"):
+        plaud_cli_bin = self._value("PLAUD_CLI_BIN")
+        plaud_bearer = self._value("PLAUD_BEARER_TOKEN")
+        if plaud_cli_bin:
+            cli_path = Path(plaud_cli_bin).expanduser()
+            is_executable = shutil.which(plaud_cli_bin) is not None or (
+                cli_path.is_file() and os.access(cli_path, os.X_OK)
+            )
+            if is_executable:
+                self.report.add("OK", "PLAUD integration is configured")
+            else:
+                self.report.add(
+                    "ERR",
+                    f"PLAUD_CLI_BIN '{plaud_cli_bin}' was not found or is not "
+                    "executable",
+                )
+        elif plaud_bearer:
             self.report.add("OK", "PLAUD integration is configured")
         else:
             self.report.add("INFO", "PLAUD integration is not configured")
@@ -534,7 +568,20 @@ class ProjectDoctor:
                 f"PLAUD_REGION '{plaud_region}' is not one of: {supported}",
             )
 
+        self._check_network_api()
         self._check_calendar()
+
+    def _check_network_api(self) -> None:
+        if not self._value("NETWORK_API_TOKEN"):
+            return
+        host = self._value("NETWORK_API_HOST") or "127.0.0.1"
+        if host in {"0.0.0.0", "::"}:
+            self.report.add(
+                "WARN",
+                f"NETWORK_API_HOST is '{host}' with NETWORK_API_TOKEN set; "
+                "the API serves plain HTTP without TLS, so bind to 127.0.0.1 "
+                "or place it behind a TLS reverse proxy",
+            )
 
     def _check_calendar(self) -> None:
         # The link is a secret: no message below repeats it. DNS is not asked

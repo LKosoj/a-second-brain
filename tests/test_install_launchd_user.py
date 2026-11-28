@@ -78,6 +78,10 @@ def _prepare_project(project_dir: Path) -> None:
     lib_dst.mkdir(exist_ok=True)
     shutil.copy(wrapper_src, lib_dst / "run_with_env.sh")
     (lib_dst / "run_with_env.sh").chmod(stat.S_IRWXU)
+    shutil.copy(
+        REPO_ROOT / "scripts" / "lib" / "env_reader.sh",
+        lib_dst / "env_reader.sh",
+    )
 
     deploy_dst = project_dir / "deploy"
     deploy_dst.mkdir(exist_ok=True)
@@ -86,6 +90,7 @@ def _prepare_project(project_dir: Path) -> None:
         "com.second-brain.process.plist.in",
         "com.second-brain.morning-brief.plist.in",
         "com.second-brain.plaud-sync.plist.in",
+        "com.second-brain.network.plist.in",
         "com.second-brain.qmd-maintenance.plist.in",
         "com.second-brain.backup-verify.plist.in",
     ):
@@ -173,13 +178,30 @@ def test_install_skips_optional_plists(tmp_path: Path, fake_path: Path) -> None:
     assert (agent_dir / "com.second-brain.process.plist").exists()
     assert (agent_dir / "com.second-brain.backup-verify.plist").exists()
     assert not (agent_dir / "com.second-brain.plaud-sync.plist").exists()
+    assert not (agent_dir / "com.second-brain.network.plist").exists()
     assert not (
         agent_dir / "com.second-brain.qmd-maintenance.plist"
     ).exists()
 
 
-def test_install_includes_plaud_when_token_present(
+def test_install_includes_network_when_token_configured(
     tmp_path: Path, fake_path: Path
+) -> None:
+    agent_dir = _render_with_env(tmp_path, "NETWORK_API_TOKEN=secret-token\n")
+
+    network_plist = agent_dir / "com.second-brain.network.plist"
+    assert network_plist.exists()
+    body = network_plist.read_text(encoding="utf-8")
+    assert "com.second-brain.network" in body
+    assert "<string>network</string>" in body
+    assert not re.findall(r"@[A-Z_]+@", body)
+
+
+@pytest.mark.parametrize(
+    "plaud_setting", ["PLAUD_BEARER_TOKEN=token", "PLAUD_CLI_BIN=/path/to/plaud"]
+)
+def test_install_includes_plaud_when_configured(
+    tmp_path: Path, fake_path: Path, plaud_setting: str
 ) -> None:
     project_dir = tmp_path / "project"
     _prepare_project(project_dir)
@@ -187,7 +209,7 @@ def test_install_includes_plaud_when_token_present(
         "TELEGRAM_BOT_TOKEN=t\n"
         "DEEPGRAM_API_KEY=d\n"
         "OWNER_TELEGRAM_ID=1\n"
-        "PLAUD_BEARER_TOKEN=token\n",
+        f"{plaud_setting}\n",
         encoding="utf-8",
     )
 
@@ -228,6 +250,9 @@ def test_install_uninstall_removes_plists(tmp_path: Path, fake_path: Path) -> No
     (agent_dir / "com.second-brain.bot.plist").write_text(
         "<plist/>", encoding="utf-8"
     )
+    (agent_dir / "com.second-brain.network.plist").write_text(
+        "<plist/>", encoding="utf-8"
+    )
 
     env = os.environ.copy()
     env["HOME"] = str(home)
@@ -246,6 +271,7 @@ def test_install_uninstall_removes_plists(tmp_path: Path, fake_path: Path) -> No
     )
 
     assert not (agent_dir / "com.second-brain.bot.plist").exists()
+    assert not (agent_dir / "com.second-brain.network.plist").exists()
 
 
 def test_install_rejects_unknown_arg(tmp_path: Path, fake_path: Path) -> None:
@@ -286,6 +312,10 @@ def test_install_fails_without_env(tmp_path: Path, fake_path: Path) -> None:
         lib_dst / "run_with_env.sh",
     )
     (lib_dst / "run_with_env.sh").chmod(stat.S_IRWXU)
+    shutil.copy(
+        REPO_ROOT / "scripts" / "lib" / "env_reader.sh",
+        lib_dst / "env_reader.sh",
+    )
 
     home = tmp_path / "home"
     home.mkdir()
@@ -478,12 +508,18 @@ def test_install_puts_tz_into_every_plist(tmp_path: Path, fake_path: Path) -> No
     (fake_path / "qmd").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     (fake_path / "qmd").chmod(stat.S_IRWXU)
     result, agent_dir = _install_with_timezone(
-        tmp_path, ["TIMEZONE=Europe/Moscow", "PLAUD_BEARER_TOKEN=token"], "UTC"
+        tmp_path,
+        [
+            "TIMEZONE=Europe/Moscow",
+            "PLAUD_BEARER_TOKEN=token",
+            "NETWORK_API_TOKEN=secret",
+        ],
+        "UTC",
     )
 
     assert result.returncode == 0, result.stderr
     plists = sorted(agent_dir.glob("*.plist"))
-    assert len(plists) == 6
+    assert len(plists) == 7
     for plist in plists:
         env_vars = _env_vars(plist)
         assert env_vars.get("TZ") == "Europe/Moscow", plist.name
@@ -524,10 +560,12 @@ def test_rendered_plists_have_no_unreplaced_placeholders(
 ) -> None:
     (fake_path / "qmd").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     (fake_path / "qmd").chmod(stat.S_IRWXU)
-    agent_dir = _render_with_env(tmp_path, "PLAUD_BEARER_TOKEN=token\n")
+    agent_dir = _render_with_env(
+        tmp_path, "PLAUD_BEARER_TOKEN=token\nNETWORK_API_TOKEN=secret\n"
+    )
 
     plists = sorted(agent_dir.glob("*.plist"))
-    assert len(plists) == 6
+    assert len(plists) == 7
     for plist in plists:
         leftover = re.findall(r"@[A-Z_]+@", plist.read_text(encoding="utf-8"))
         assert not leftover, f"{plist.name}: {leftover}"

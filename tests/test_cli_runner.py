@@ -1477,3 +1477,42 @@ def test_run_uv_script_timeout_leaves_no_processes(
     assert processor._run_uv_script("x") is False
 
     assert _wait_pid_dead(int(pid_file.read_text()))
+
+
+def test_runner_stops_process_group_on_keyboard_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = CliRunner(Path("."), "qwen")
+    stopped: list[object] = []
+
+    class _InterruptProc:
+        returncode = None
+        stdout = None
+        stderr = None
+
+        def __enter__(self) -> _InterruptProc:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def communicate(
+            self, input: str | None = None, timeout: int | None = None
+        ) -> tuple[str, str]:
+            del input, timeout
+            raise KeyboardInterrupt
+
+    fake_proc = _InterruptProc()
+    monkeypatch.setattr(
+        "d_brain.services.cli_runner.subprocess.Popen",
+        lambda *args, **kwargs: fake_proc,
+    )
+    monkeypatch.setattr(
+        "d_brain.services.cli_runner.stop_process_group",
+        lambda proc: stopped.append(proc),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        runner.run("hello", timeout=10)
+
+    assert stopped == [fake_proc]

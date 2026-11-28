@@ -100,6 +100,10 @@ async def test_process_request_sends_rich_final_after_deleting_status(
         def __init__(self, *_args, **_kwargs) -> None:
             pass
 
+        @classmethod
+        def from_settings(cls, *_args, **_kwargs) -> "FakeProcessor":
+            return cls()
+
         def execute_prompt(self, prompt: str, user_id: int = 0) -> dict[str, object]:
             assert prompt == "Проверить статус"
             assert user_id == 42
@@ -110,7 +114,7 @@ async def test_process_request_sends_rich_final_after_deleting_status(
             }
 
     async def fake_answer_text(message, text: str, **kwargs):  # noqa: ANN001, ANN003
-        if text == "⏳ Выполняю...":
+        if text == "⏳ Выполняю поручение…":
             status = FakeStatusMessage()
             status_messages.append(status)
             return status

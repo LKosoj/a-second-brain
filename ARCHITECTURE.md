@@ -20,7 +20,7 @@ anonymized template or create temporary vaults.
 | Component | Responsibility |
 |---|---|
 | `bot/` | Telegram input, authorization, commands, and delivery |
-| `control_plane/` | Canonical workflow registry, routing, context, and write permissions |
+| `control_plane/` | Declarative catalog of core agent/scheduled workflows, question routing, and context/write metadata |
 | `services/` | Processing, imports, search, storage, backups, and integrations |
 | `resources/vault_template/` | Generic private-vault seed copied by `a-second-brain init` |
 | `cli.py` | Safe initialization and bot entrypoint |
@@ -38,16 +38,23 @@ and compiled briefings are rebuildable.
 4. Document, web, YouTube, and PLAUD integrations archive source material
    before indexing it.
 
-The complete workflow catalog is
-`src/d_brain/control_plane/registry.py`. Runtime prompt construction is in
-`src/d_brain/services/`; packaged phase and policy files support it but do not
-override the registry.
+The declarative catalog of core agent and scheduled workflows is
+`src/d_brain/control_plane/registry.py` (capture, question routes, scheduled
+maintenance, and source integrations; interactive commands such as `/do`,
+`/why`, `/find`, `/process` and standalone maintenance scripts live in `bot/`
+and `run_*.py`). Runtime prompt construction is in `src/d_brain/services/`;
+packaged phase and policy files support it but do not override the registry.
 
 ## Safety boundaries
 
 - Telegram access is restricted to `OWNER_TELEGRAM_ID`.
 - Secrets are loaded from `.env`, which is ignored by Git.
-- Vault writes are constrained by the manifest and cooperative write lock.
+- `registry.py`'s `allowed_writes` field is declarative documentation of
+  workflow scope; actual runtime write boundaries are enforced by
+  `vault-manifest.json` (`src/d_brain/manifest.py`), `VaultFileService`
+  (`src/d_brain/services/vault_file_service.py`), the cooperative `vault_write_lock`
+  (`src/d_brain/services/vault_lock.py`), and the fail-closed PreToolUse
+  control-plane protect hook (`run_control_plane_protect_hook.py`).
 - Initializers refuse to overwrite an existing vault.
 - User systemd units run without root and with basic service hardening.
   LaunchAgent plists (macOS) deliver the same schedule without root and

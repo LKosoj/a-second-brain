@@ -18,6 +18,7 @@ from d_brain.services.plaud import (
     plaud_state_lock,
     write_json_atomic,
 )
+from d_brain.services.plaud_cli import PlaudCliClient
 from d_brain.services.telegram_delivery import send_telegram_text_sync
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,7 @@ def _notify_auth_failure(
     *,
     state_path: Path,
     error_message: str,
+    cli_bin: str = "",
 ) -> bool:
     with plaud_state_lock(state_path):
         payload = _load_state(state_path)
@@ -73,10 +75,14 @@ def _notify_auth_failure(
         ):
             return False
 
+        login_hint = (
+            f"Войди в аккаунт через {cli_bin} login."
+            if cli_bin
+            else "Проверь PLAUD_BEARER_TOKEN и при необходимости "
+            "обнови bearer из PLAUD Web."
+        )
         text = (
-            "PLAUD sync: авторизация не удалась.\n"
-            "Проверь PLAUD_BEARER_TOKEN и при необходимости обнови "
-            "bearer из PLAUD Web.\n"
+            f"PLAUD sync: авторизация не удалась.\n{login_hint}\n"
             f"Ошибка: {error_message}"
         )
         send_telegram_text_sync(text)
@@ -135,8 +141,9 @@ def main() -> int:
     args = parser.parse_args()
 
     settings = get_settings()
-    if not settings.plaud_bearer_token:
-        sys.stderr.write("PLAUD_BEARER_TOKEN is not configured\n")
+    cli_bin = settings.plaud_cli_bin.strip()
+    if not cli_bin and not settings.plaud_bearer_token:
+        sys.stderr.write("PLAUD_CLI_BIN or PLAUD_BEARER_TOKEN must be configured\n")
         return 1
     state_path = settings.vault_path / ".sync" / "plaud-state.json"
 
@@ -148,6 +155,7 @@ def main() -> int:
         todoist_api_key=settings.todoist_api_key,
         owner_full_name=settings.owner_full_name,
         content_language=settings.content_language,
+        client=PlaudCliClient(cli_bin) if cli_bin else None,
     )
     try:
         result = service.sync(
@@ -179,6 +187,7 @@ def main() -> int:
             _notify_auth_failure(
                 state_path=state_path,
                 error_message=str(exc),
+                cli_bin=cli_bin,
             )
         except Exception as notify_exc:
             logger.warning("Failed to send PLAUD auth alert: %s", notify_exc)

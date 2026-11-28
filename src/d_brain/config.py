@@ -99,6 +99,10 @@ class Settings(BaseSettings):
         default="",
         description="Optional proxy reader base URL for content extraction fallback",
     )
+    plaud_cli_bin: str = Field(
+        default="",
+        description="Plaud CLI executable for recording import",
+    )
     plaud_bearer_token: str = Field(
         default="",
         description="PLAUD bearer token for recording import",

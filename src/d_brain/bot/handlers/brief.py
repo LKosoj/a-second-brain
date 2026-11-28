@@ -23,6 +23,7 @@ from d_brain.bot.dashboard import render_input, render_section
 from d_brain.bot.replies import answer_rich_text, answer_text
 from d_brain.bot.states import BriefCommandState, wait_expired, wait_started_at
 from d_brain.bot.vault_busy import VaultBusyError, run_with_vault_lock
+from d_brain.bot.voice_input import pick_voice_media
 from d_brain.clock import owner_today
 from d_brain.config import get_settings
 from d_brain.manifest import load_manifest_for_vault
@@ -42,6 +43,13 @@ logger = logging.getLogger(__name__)
 _BRIEF_TYPE_LABELS = {"decision": "решению", "topic": "теме", "project": "проекту"}
 
 
+def _optional_vault_path() -> Path | None:
+    try:
+        return getattr(get_settings(), "vault_path", None)
+    except Exception:
+        return None
+
+
 async def start_brief_flow(
     message: Message, state: FSMContext, brief_type: str,
     *, menu_message_id: int | None = None,
@@ -59,26 +67,36 @@ async def start_brief_flow(
             screen="brief_input", back="menu:brief",
             text=(
                 f"**Справка по {label}**\n\n"
-                "Отправь текстом название или вопрос.\n"
+                "Отправь текстом или голосом название или вопрос.\n"
                 "Для отмены нажми «Назад» или отправь `-`."
             ),
+            vault_path=_optional_vault_path(),
         )
         return
     await answer_text(
         message,
         f"📝 **Справка по {label}**\n\n"
-        "Отправь текстом название или запрос, чтобы найти страницу.\n"
+        "Отправь текстом или голосом название или запрос, чтобы найти страницу.\n"
         "Отправь `-`, чтобы отменить.",
     )
 
 
 @router.message(BriefCommandState.waiting_for_query)
 async def handle_brief_query(message: Message, state: FSMContext) -> None:
-    """Handle the query text after a brief type was chosen -- text only."""
+    """Handle the query after a brief type was chosen (text or voice)."""
     data = await state.get_data()
     menu_message_id = data.get("menu_message_id")
     query = (message.text or "").strip()
     expired = wait_expired(data.get("brief_entered_at"))
+
+    # Non-forwarded voice while the wait is live is handed off to voice.py
+    # with the FSM state intact so the transcript runs as the brief query.
+    if (
+        pick_voice_media(message) is not None
+        and message.forward_origin is None
+        and not expired
+    ):
+        raise SkipHandler
 
     # Non-text messages, forwards and text after the wait expired leave the
     # flow and continue to the regular capture handlers (see why.py).
@@ -91,7 +109,7 @@ async def handle_brief_query(message: Message, state: FSMContext) -> None:
         # A failed menu repaint must not stop the message from reaching the
         # regular capture handlers.
         try:
-            await _restore_menu(message, menu_message_id)
+            await restore_menu(message, menu_message_id)
         except Exception:
             logger.exception("Failed to restore the dashboard menu")
         raise SkipHandler
@@ -101,14 +119,14 @@ async def handle_brief_query(message: Message, state: FSMContext) -> None:
     if query.startswith("/"):
         await state.clear()
         try:
-            await _restore_menu(message, menu_message_id)
+            await restore_menu(message, menu_message_id)
         except Exception:
             logger.exception("Failed to restore the dashboard menu")
         raise SkipHandler
 
     brief_type = data.get("brief_type")
     await state.clear()
-    await _restore_menu(message, menu_message_id)
+    await restore_menu(message, menu_message_id)
 
     if query == "-" or not isinstance(brief_type, str) or brief_type not in BRIEF_TYPES:
         await answer_text(message, "Сбор справки отменён. Открыть меню: /menu")
@@ -117,12 +135,13 @@ async def handle_brief_query(message: Message, state: FSMContext) -> None:
     await process_brief_request(message, brief_type, query)
 
 
-async def _restore_menu(message: Message, menu_message_id: object) -> None:
+async def restore_menu(message: Message, menu_message_id: object) -> None:
     """Put the dashboard back over the "send the query" prompt."""
     if isinstance(menu_message_id, int):
         await render_section(
             cast(Bot, message.bot), chat_id=message.chat.id, section="summaries",
             preferred_message_id=menu_message_id,
+            vault_path=_optional_vault_path(),
         )
 
 
@@ -209,5 +228,5 @@ async def process_brief_request(message: Message, brief_type: str, query: str) -
             await answer_text(
                 message,
                 f"❌ Справка сохранена в `{rel_path}`, "
-                "но отправить его в чат не удалось.",
+                "но отправить её в чат не удалось.",
             )

@@ -97,7 +97,7 @@ def _key(bot: Bot) -> StorageKey:
     return StorageKey(bot_id=bot.id, chat_id=CHAT.id, user_id=USER.id)
 
 
-@pytest.mark.parametrize("make", [_voice, _photo, _document, _forward])
+@pytest.mark.parametrize("make", [_photo, _document, _forward])
 @pytest.mark.parametrize(
     "state", [WhyCommandState.waiting_for_input, BriefCommandState.waiting_for_query]
 )
@@ -112,6 +112,27 @@ async def test_non_text_during_wait_reaches_next_router(make, state) -> None:  #
 
     assert len(received) == 1
     assert await dp.storage.get_state(_key(bot)) is None
+    request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "state", [WhyCommandState.waiting_for_input, BriefCommandState.waiting_for_query]
+)
+async def test_voice_during_live_wait_preserves_state_for_voice_router(state) -> None:  # noqa: ANN001
+    received: list[Message] = []
+    dp, bot, request = _build(received)
+    await dp.storage.set_state(_key(bot), state)
+    if state is BriefCommandState.waiting_for_query:
+        await dp.storage.set_data(
+            _key(bot), {"brief_type": "decision", "brief_entered_at": time.time()}
+        )
+    else:
+        await dp.storage.set_data(_key(bot), {"why_entered_at": time.time()})
+
+    await _feed(dp, bot, _voice())
+
+    assert len(received) == 1
+    assert await dp.storage.get_state(_key(bot)) == state.state
     request.assert_not_called()
 
 

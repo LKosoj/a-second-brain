@@ -53,6 +53,7 @@ ALL_LABELS=(
     "com.second-brain.process"
     "com.second-brain.morning-brief"
     "com.second-brain.plaud-sync"
+    "com.second-brain.network"
     "com.second-brain.qmd-maintenance"
     "com.second-brain.backup-verify"
 )
@@ -73,26 +74,8 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
     exit 0
 fi
 
-# Non-empty check for PLAUD_BEARER_TOKEN: a bare grep for
-# '^PLAUD_BEARER_TOKEN=.+' also matches a quoted-empty value
-# (PLAUD_BEARER_TOKEN="") or one that is only whitespace, which would wire
-# up the PLAUD sync agent with nothing to authenticate with.
-has_plaud_token() {
-    local env_file="$1" line value
-    line="$(grep -E '^(export[[:space:]]+)?PLAUD_BEARER_TOKEN=' "$env_file" | tail -n1)" || true
-    [[ -z "$line" ]] && return 1
-    value="${line#*=}"
-    value="${value#"${value%%[![:space:]]*}"}"
-    value="${value%"${value##*[![:space:]]}"}"
-    if [[ ${#value} -ge 2 ]]; then
-        if [[ "$value" == \"*\" && "$value" == *\" ]]; then
-            value="${value:1:${#value}-2}"
-        elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
-            value="${value:1:${#value}-2}"
-        fi
-    fi
-    [[ -n "$value" ]]
-}
+# shellcheck source=scripts/lib/env_reader.sh
+source "$PROJECT_DIR/scripts/lib/env_reader.sh"
 
 LABELS=(
     "com.second-brain.bot"
@@ -107,9 +90,17 @@ PLIST_BASES=(
     "com.second-brain.backup-verify"
 )
 
-if [[ -f "$PROJECT_DIR/.env" ]] && has_plaud_token "$PROJECT_DIR/.env"; then
+if [[ -f "$PROJECT_DIR/.env" ]] && {
+    has_plaud_setting "$PROJECT_DIR/.env" PLAUD_CLI_BIN ||
+    has_plaud_setting "$PROJECT_DIR/.env" PLAUD_BEARER_TOKEN
+}; then
     LABELS+=("com.second-brain.plaud-sync")
     PLIST_BASES+=("com.second-brain.plaud-sync")
+fi
+
+if [[ -f "$PROJECT_DIR/.env" ]] && has_network_api_token "$PROJECT_DIR/.env"; then
+    LABELS+=("com.second-brain.network")
+    PLIST_BASES+=("com.second-brain.network")
 fi
 
 if command -v qmd >/dev/null 2>&1; then
@@ -134,28 +125,6 @@ if [[ ! -f "$PROJECT_DIR/.env" || ! -d "$PROJECT_DIR/vault" ]]; then
     echo "Run ./install.sh before installing LaunchAgents." >&2
     exit 1
 fi
-
-# Last KEY=value from the .env file (empty when absent), without surrounding
-# whitespace or one pair of quotes. Read from the file, not the shell
-# environment: the units load .env themselves.
-env_value() {
-    local env_file="$1" key="$2" line value
-    line="$(grep -E "^(export[[:space:]]+)?${key}[[:space:]]*=" "$env_file" | tail -n1)" || true
-    [[ -z "$line" ]] && return 0
-    value="${line#*=}"
-    value="${value#"${value%%[![:space:]]*}"}"
-    value="${value%"${value##*[![:space:]]}"}"
-    if [[ ${#value} -ge 2 ]]; then
-        if [[ "$value" == \"*\" && "$value" == *\" ]]; then
-            value="${value#?}"
-            value="${value%?}"
-        elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
-            value="${value#?}"
-            value="${value%?}"
-        fi
-    fi
-    printf '%s' "$value"
-}
 
 # HH:MM from .env, DEFAULT when unset; anything else stops the install, since
 # a timer rendered from a typo would silently never fire at the intended time.

@@ -5,15 +5,25 @@ import logging
 import re
 
 from aiogram import Bot, Router
+from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from d_brain.bot.conversations import is_reply_to_bot, save_answer
+from d_brain.bot.handlers.brief import process_brief_request, restore_menu
 from d_brain.bot.handlers.do import process_request
+from d_brain.bot.handlers.find import process_find_request
 from d_brain.bot.handlers.reminders import (
     create_reminder_from_text,
     format_reminder_confirmation,
 )
+from d_brain.bot.handlers.why import process_why_request
 from d_brain.bot.replies import answer_text
+from d_brain.bot.states import (
+    BriefCommandState,
+    FindCommandState,
+    WhyCommandState,
+    wait_expired,
+)
 from d_brain.bot.voice_input import (
     VoiceInputError,
     check_size,
@@ -23,6 +33,7 @@ from d_brain.bot.voice_input import (
 )
 from d_brain.clock import to_owner
 from d_brain.config import Settings, get_settings
+from d_brain.services.compiled_briefs import BRIEF_TYPES
 from d_brain.services.qmd import QmdService
 from d_brain.services.reminders import is_reminder_request
 from d_brain.services.session import SessionStore
@@ -115,12 +126,70 @@ async def _save_unrecognized(
         logger.exception("Failed to confirm unrecognized voice message")
 
 
+async def _route_voice_to_wait_state(
+    message: Message,
+    transcript: str,
+    state: FSMContext | None,
+) -> bool:
+    """Route a transcribed voice message into an active wait state, if any."""
+    if state is None or message.forward_origin is not None:
+        return False
+
+    current_state = await state.get_state()
+    if current_state is None:
+        return False
+    data = await state.get_data()
+
+    if current_state == FindCommandState.waiting_for_input.state:
+        expired = wait_expired(data.get("find_entered_at"))
+        await state.clear()
+        if expired:
+            return False
+        await answer_text(message, f"🎤 {transcript}", parse_mode=None)
+        await process_find_request(message, transcript, state)
+        return True
+
+    if current_state == WhyCommandState.waiting_for_input.state:
+        expired = wait_expired(data.get("why_entered_at"))
+        await state.clear()
+        if expired:
+            return False
+        await answer_text(message, f"🎤 {transcript}", parse_mode=None)
+        await process_why_request(message, transcript, state)
+        return True
+
+    if current_state == BriefCommandState.waiting_for_query.state:
+        expired = wait_expired(data.get("brief_entered_at"))
+        menu_message_id = data.get("menu_message_id")
+        brief_type = data.get("brief_type")
+        await state.clear()
+        try:
+            await restore_menu(message, menu_message_id)
+        except Exception:
+            logger.exception("Failed to restore the dashboard menu")
+        if (
+            expired
+            or not isinstance(brief_type, str)
+            or brief_type not in BRIEF_TYPES
+        ):
+            return False
+        await answer_text(message, f"🎤 {transcript}", parse_mode=None)
+        await process_brief_request(message, brief_type, transcript)
+        return True
+
+    return False
+
+
 @router.message(
     lambda m: m.voice is not None
     or m.audio is not None
     or m.video_note is not None
 )
-async def handle_voice(message: Message, bot: Bot) -> None:
+async def handle_voice(
+    message: Message,
+    bot: Bot,
+    state: FSMContext | None = None,
+) -> None:
     """Handle voice messages, audio files and video notes (all transcribed alike)."""
     picked = pick_voice_media(message)
     if picked is None or not message.from_user:
@@ -151,6 +220,9 @@ async def handle_voice(message: Message, bot: Bot) -> None:
             await _save_unrecognized(
                 message, settings, storage, file_path, audio_bytes
             )
+            return
+
+        if await _route_voice_to_wait_state(message, transcript, state):
             return
 
         if is_reply_to_bot(message):

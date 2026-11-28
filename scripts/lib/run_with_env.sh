@@ -85,8 +85,9 @@ _extra_path=(
     "/opt/homebrew/sbin"
 )
 if [[ -n "${EXTRA_PATH:-}" ]]; then
-    # shellcheck disable=SC2206
-    _extra_path+=(${EXTRA_PATH//:/ })
+    IFS=: read -ra _extra_parts <<<"$EXTRA_PATH"
+    _extra_path+=("${_extra_parts[@]}")
+    unset _extra_parts
 fi
 for _dir in "${_extra_path[@]}"; do
     if [[ -d "$_dir" && ":$PATH:" != *":$_dir:"* ]]; then

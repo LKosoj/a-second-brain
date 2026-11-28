@@ -511,7 +511,7 @@ async def test_process_brief_request_delivery_failure_still_names_the_saved_file
     assert written == [Path("/tmp/vault/summaries/briefs/b.md")]
     assert fallback == [
         "❌ Справка сохранена в `summaries/briefs/b.md`, "
-        "но отправить его в чат не удалось."
+        "но отправить её в чат не удалось."
     ]
 
 

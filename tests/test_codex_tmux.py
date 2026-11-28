@@ -285,3 +285,23 @@ def test_codex_fail_if_pane_died_stops_once_stopping(
 
     with pytest.raises(ClaudeTmuxError, match="stopping"):
         codex_tmux._fail_if_pane_died("dbrain-1-aaaaaaaaaaaa", {})
+
+
+def test_run_codex_tmux_unregisters_session_when_kill_server_times_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    fake = _FakeTmux(tmp_path)
+
+    def flaky(argv, **kwargs):  # type: ignore[no-untyped-def]
+        if argv[3] == "kill-server":
+            raise subprocess.TimeoutExpired(argv, 15)
+        return fake(argv, **kwargs)
+
+    _patch_codex(monkeypatch, flaky)
+
+    output = run_codex_tmux("prompt", Path("/work"), {"HOME": str(tmp_path)}, 30)
+
+    assert output == "Готово"
+    assert claude_tmux._ACTIVE == {}

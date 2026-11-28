@@ -106,6 +106,7 @@ def test_all_launchd_plists_export_uv_bin() -> None:
         "com.second-brain.process.plist.in",
         "com.second-brain.morning-brief.plist.in",
         "com.second-brain.plaud-sync.plist.in",
+        "com.second-brain.network.plist.in",
         "com.second-brain.qmd-maintenance.plist.in",
         "com.second-brain.backup-verify.plist.in",
     ):
@@ -145,6 +146,12 @@ def _prepare_systemd_project(project_dir: Path, plaud_line: str | None) -> None:
     script_dst = scripts_dir / "install-systemd-user.sh"
     shutil.copy(REPO_ROOT / "scripts" / "install-systemd-user.sh", script_dst)
     script_dst.chmod(0o755)
+    lib_dir = scripts_dir / "lib"
+    lib_dir.mkdir()
+    shutil.copy(
+        REPO_ROOT / "scripts" / "lib" / "env_reader.sh",
+        lib_dir / "env_reader.sh",
+    )
 
     deploy_dst = project_dir / "deploy"
     deploy_dst.mkdir()
@@ -383,17 +390,28 @@ def test_systemd_install_enable_skips_quoted_empty_plaud_token(
         text=True,
     )
     assert result.returncode == 0, result.stderr
-    log = log_path.read_text(encoding="utf-8")
-    assert "a-second-brain.service" in log
-    assert "a-second-brain-backup-verify.timer" in log
-    assert "a-second-brain-plaud-sync.timer" not in log
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    enable_lines = [line for line in lines if "enable --now" in line]
+    disable_lines = [line for line in lines if "disable --now" in line]
+    assert enable_lines
+    enable_log = "\n".join(enable_lines)
+    disable_log = "\n".join(disable_lines)
+    assert "a-second-brain.service" in enable_log
+    assert "a-second-brain-backup-verify.timer" in enable_log
+    assert "a-second-brain-plaud-sync.timer" not in enable_log
+    assert "a-second-brain-plaud-sync.timer" in disable_log
+    assert "a-second-brain-network.service" in disable_log
 
 
 @pytest.mark.parametrize(
     "plaud_line",
-    ["export PLAUD_BEARER_TOKEN=real-token", "PLAUD_BEARER_TOKEN='real-token'"],
+    [
+        "export PLAUD_BEARER_TOKEN=real-token",
+        "PLAUD_BEARER_TOKEN='real-token'",
+        "PLAUD_CLI_BIN='/path with spaces/plaud'",
+    ],
 )
-def test_systemd_install_enable_accepts_export_prefixed_plaud_token(
+def test_systemd_install_enable_accepts_plaud_configuration(
     tmp_path: Path, plaud_line: str
 ) -> None:
     project_dir = tmp_path / "project"
@@ -456,6 +474,57 @@ def test_systemd_install_enable_includes_real_plaud_token(tmp_path: Path) -> Non
     assert "a-second-brain-plaud-sync.timer" in log
 
 
+def test_systemd_uninstall_disables_and_removes_units(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project"
+    scripts_dir = project_dir / "scripts"
+    scripts_dir.mkdir(parents=True)
+    shutil.copy(
+        REPO_ROOT / "scripts" / "install-systemd-user.sh",
+        scripts_dir / "install-systemd-user.sh",
+    )
+    (scripts_dir / "install-systemd-user.sh").chmod(0o755)
+
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    log_path = tmp_path / "systemctl.log"
+    _write_stub(bin_dir, "systemctl", f'echo "$@" >> "{log_path}"\nexit 0\n')
+
+    config_home = tmp_path / "config"
+    unit_dir = config_home / "systemd" / "user"
+    unit_dir.mkdir(parents=True)
+    for unit in (
+        "a-second-brain.service",
+        "a-second-brain-network.service",
+        "a-second-brain-plaud-sync.timer",
+    ):
+        (unit_dir / unit).write_text("[Unit]\n", encoding="utf-8")
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
+    env["XDG_CONFIG_HOME"] = str(config_home)
+
+    # Works even without .env, vault, or uv on PATH.
+    result = subprocess.run(
+        [
+            "bash",
+            str(scripts_dir / "install-systemd-user.sh"),
+            "--uninstall",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    log = log_path.read_text(encoding="utf-8")
+    assert "disable --now" in log
+    assert "a-second-brain-network.service" in log
+    assert "daemon-reload" in log
+    assert not (unit_dir / "a-second-brain.service").exists()
+    assert not (unit_dir / "a-second-brain-network.service").exists()
+    assert not (unit_dir / "a-second-brain-plaud-sync.timer").exists()
+
+
 # ---------------------------------------------------------------------------
 # B) scripts/install-launchd-user.sh -- uninstall must sweep every possible
 # label, not just the ones the *current* .env/qmd state would install.
@@ -478,6 +547,10 @@ def test_launchd_uninstall_removes_all_possible_plists(tmp_path: Path) -> None:
         lib_dir / "run_with_env.sh",
     )
     (lib_dir / "run_with_env.sh").chmod(0o755)
+    shutil.copy(
+        REPO_ROOT / "scripts" / "lib" / "env_reader.sh",
+        lib_dir / "env_reader.sh",
+    )
 
     bin_dir = tmp_path / "fakebin"
     bin_dir.mkdir()
@@ -491,6 +564,7 @@ def test_launchd_uninstall_removes_all_possible_plists(tmp_path: Path) -> None:
         "com.second-brain.bot",
         "com.second-brain.process",
         "com.second-brain.plaud-sync",
+        "com.second-brain.network",
         "com.second-brain.qmd-maintenance",
         "com.second-brain.backup-verify",
     )
@@ -572,10 +646,31 @@ def test_env_parsers_avoid_negative_substring_length() -> None:
     ``run_with_env.sh`` with it, so a quoted value would abort the wrapper."""
     for rel in (
         "scripts/lib/run_with_env.sh",
+        "scripts/lib/env_reader.sh",
         "scripts/install-launchd-user.sh",
         "scripts/install-systemd-user.sh",
     ):
         assert ":-1}" not in (REPO_ROOT / rel).read_text(encoding="utf-8"), rel
+
+
+def test_run_with_env_preserves_spaces_in_extra_path(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    spaced_dir = tmp_path / "my tools bin"
+    spaced_dir.mkdir()
+    (project_dir / ".env").write_text(
+        f'EXTRA_PATH="{spaced_dir}"\n',
+        encoding="utf-8",
+    )
+    wrapper = REPO_ROOT / "scripts" / "lib" / "run_with_env.sh"
+
+    result = subprocess.run(
+        [str(wrapper), str(project_dir), "bash", "-c", 'printf "%s" "$PATH"'],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert str(spaced_dir) in result.stdout.split(":")
 
 
 def test_run_with_env_tolerates_export_spacing_and_bad_keys(
@@ -613,8 +708,20 @@ def test_install_sh_handles_restored_vault_without_env(tmp_path: Path) -> None:
     project_dir.mkdir()
     (project_dir / "vault").mkdir()  # a vault restored from backup, no .env
 
-    shutil.copy(REPO_ROOT / "install.sh", project_dir / "install.sh")
-    (project_dir / "install.sh").chmod(0o755)
+    install_copy = project_dir / "install.sh"
+    shutil.copy(REPO_ROOT / "install.sh", install_copy)
+    if os.geteuid() == 0:
+        # install.sh refuses to run as root via bash's readonly $EUID; bypass
+        # only that guard in the temporary copy so the test also works as root.
+        install_copy.write_text(
+            install_copy.read_text(encoding="utf-8").replace(
+                'if [[ "$EUID" -eq 0 ]]; then',
+                "if false; then",
+                1,
+            ),
+            encoding="utf-8",
+        )
+    install_copy.chmod(0o755)
 
     bin_dir = tmp_path / "fakebin"
     bin_dir.mkdir()

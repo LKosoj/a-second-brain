@@ -173,6 +173,10 @@ def test_handle_text_routes_questions_to_answer_path(
         def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
             pass
 
+        @classmethod
+        def from_settings(cls, *args, **kwargs):  # noqa: ANN002, ANN003
+            return cls()
+
         def classify_text_intent(self, text: str) -> dict[str, str]:
             assert text == "Какие приоритеты на эту неделю?"
             return {
@@ -237,9 +241,11 @@ def test_handle_text_routes_questions_to_answer_path(
     assert len(answers) == 1
     assert "Приоритеты недели" in answers[0]
     assert str(tmp_path / "attachments" / "plan.xml") in answers[0]
-    assert any("прямой ответ / question" in item for item in status_updates)
-    assert any("готовлю прямой ответ" in item for item in status_updates)
-    assert any("отправляю ответ" in item for item in status_updates)
+    assert any("Ищу ответ…" in item for item in status_updates)
+    assert any("Отправляю ответ…" in item for item in status_updates)
+    assert all(
+        "Ветка:" not in item and "question" not in item for item in status_updates
+    )
     assert deleted["value"] is True
     assert session_entries[0][1] == "question"
     assert delivered_files == [str(tmp_path / "attachments" / "plan.xml")]
@@ -281,6 +287,10 @@ def test_handle_text_excludes_inline_chart_image_from_answer_files(
     class FakeProcessor:
         def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
             pass
+
+        @classmethod
+        def from_settings(cls, *args, **kwargs):  # noqa: ANN002, ANN003
+            return cls()
 
         def classify_text_intent(self, text: str) -> dict[str, str]:
             return {
@@ -564,6 +574,10 @@ def test_handle_text_capture_offloads_daily_write_to_thread(
         def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
             pass
 
+        @classmethod
+        def from_settings(cls, *args, **kwargs):  # noqa: ANN002, ANN003
+            return cls()
+
         def classify_text_intent(self, text: str) -> dict[str, str]:
             assert text == "Сохрани это как заметку"
             return {
@@ -620,10 +634,10 @@ def test_handle_text_capture_offloads_daily_write_to_thread(
 
     assert calls == ["classify_text_intent", "enrich_text", "append_to_daily"]
     assert answers == ["✓ Сохранено"]
-    assert any("сохранение в daily / capture" in item for item in status_updates)
-    assert any("обогащаю текст" in item for item in status_updates)
-    assert any("сохраняю запись в daily" in item for item in status_updates)
-    assert any("отправляю ответ" in item for item in status_updates)
+    assert any("Сохраняю заметку…" in item for item in status_updates)
+    assert all(
+        "Ветка:" not in item and "capture" not in item for item in status_updates
+    )
     assert deleted["value"] is True
 
 
@@ -681,6 +695,10 @@ def test_handle_text_capture_survives_a_failed_confirmation_send(
     class FakeProcessor:
         def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
             pass
+
+        @classmethod
+        def from_settings(cls, *args, **kwargs):  # noqa: ANN002, ANN003
+            return cls()
 
         def classify_text_intent(self, text: str) -> dict[str, str]:
             return {"intent": "capture", "confidence": "high", "reason": "capture"}
@@ -2940,6 +2958,10 @@ def test_handle_text_reports_a_failed_daily_write_instead_of_a_stuck_status(
         def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
             pass
 
+        @classmethod
+        def from_settings(cls, *args, **kwargs):  # noqa: ANN002, ANN003
+            return cls()
+
         def classify_text_intent(self, text: str) -> dict[str, str]:
             return {"intent": "capture", "confidence": "high", "reason": "capture"}
 
@@ -3168,6 +3190,10 @@ def test_handle_text_reports_a_failed_session_store_setup(
     class FakeProcessor:
         def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
             pass
+
+        @classmethod
+        def from_settings(cls, *args, **kwargs):  # noqa: ANN002, ANN003
+            return cls()
 
     class FakeMessage:
         text = "Сохрани это как заметку"

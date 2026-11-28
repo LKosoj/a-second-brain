@@ -25,7 +25,7 @@ def export_vault_map(
         )
         graph = analyzer["analyze_vault"](vault_path)
     notes = []
-    for key, info in graph.get("notes", {}).items():
+    for key, info in sorted(graph.get("notes", {}).items()):
         try:
             fields = read_frontmatter(vault_path / info["path"]).fields
         except (FrontmatterError, OSError):

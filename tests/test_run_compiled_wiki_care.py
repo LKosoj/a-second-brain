@@ -106,6 +106,14 @@ def test_answer_question_closure_builds_processor_from_settings(
                 }
             )
 
+        @classmethod
+        def from_settings(cls, settings, **_overrides):  # noqa: ANN001
+            return cls(
+                settings.vault_path,
+                ai_cli=settings.ai_cli,
+                content_language=settings.content_language,
+            )
+
         def answer_question(self, question):  # noqa: ANN001
             return {
                 "filed_artifact_path": "summaries/answers/2026-08-05.md",

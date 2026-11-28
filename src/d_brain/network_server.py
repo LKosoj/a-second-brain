@@ -3,22 +3,32 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import mimetypes
 import re
+import signal
+import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from d_brain.config import Settings
+from d_brain.manifest import ManifestValidationError
+from d_brain.services.decisions_queue import (
+    list_queue_items,
+    queue_item_fingerprint,
+    queue_kind_label,
+)
 from d_brain.services.network_requests import (
     NetworkRequestError,
     NetworkRequestService,
 )
 from d_brain.services.vault_file_service import (
     MAX_FILE_BYTES,
+    VaultFileAlreadyExists,
     VaultFileConflict,
     VaultFileConflictResolved,
     VaultFileEditForbidden,
@@ -35,6 +45,7 @@ from d_brain.services.vault_find import (
     normalize_query,
     search_in_vault,
 )
+from d_brain.services.vault_lock import VaultLockTimeout
 
 logger = logging.getLogger(__name__)
 MAX_BODY_BYTES = 256 * 1024
@@ -59,9 +70,19 @@ class NetworkServer:
             self.settings.network_api_host,
             self.settings.network_api_port,
         )
+        previous_sigterm = None
+        if threading.current_thread() is threading.main_thread():
+            def _handle_sigterm(_signum: int, _frame: object) -> None:
+                logger.info("Received SIGTERM, shutting down network API")
+                threading.Thread(target=self.httpd.shutdown, daemon=True).start()
+
+            previous_sigterm = signal.getsignal(signal.SIGTERM)
+            signal.signal(signal.SIGTERM, _handle_sigterm)
         try:
             self.httpd.serve_forever()
         finally:
+            if previous_sigterm is not None:
+                signal.signal(signal.SIGTERM, previous_sigterm)
             self.requests.close()
             self.httpd.server_close()
 
@@ -188,6 +209,42 @@ class NetworkServer:
                         },
                     )
                     return
+                if path == "/v1/vault/decisions":
+                    try:
+                        items = list_queue_items(settings.vault_path)
+                    except (ManifestValidationError, OSError) as exc:
+                        logger.warning("Failed to list decisions queue: %s", exc)
+                        self._send_json(
+                            HTTPStatus.SERVICE_UNAVAILABLE,
+                            {"error": "decisions queue unavailable"},
+                        )
+                        return
+                    self._send_json(
+                        HTTPStatus.OK,
+                        {
+                            "total": len(items),
+                            "items": [
+                                {
+                                    "fingerprint": queue_item_fingerprint(item),
+                                    "kind": item.kind,
+                                    "kind_label": queue_kind_label(item.kind),
+                                    "page": item.page,
+                                    "summary": item.summary,
+                                    "since": item.since,
+                                    "candidate_page": item.candidate_page,
+                                    "source_path": item.source_path,
+                                    "source_excerpt": item.source_excerpt,
+                                    "conflict_row": (
+                                        list(item.conflict_row)
+                                        if item.conflict_row is not None
+                                        else None
+                                    ),
+                                }
+                                for item in items
+                            ],
+                        },
+                    )
+                    return
                 parts = [unquote(part) for part in path.split("/") if part]
                 if len(parts) == 3 and parts[:2] == ["v1", "jobs"]:
                     try:
@@ -234,6 +291,45 @@ class NetworkServer:
                 if not self._authorized():
                     return
                 path = urlsplit(self.path).path
+                if path == "/v1/vault/file":
+                    try:
+                        payload = self._read_json(MAX_FILE_BYTES)
+                        file_path = payload.get("path")
+                        content = payload.get("content")
+                        if not isinstance(file_path, str) or not file_path:
+                            raise VaultFileError("path is required")
+                        if not isinstance(content, str):
+                            raise VaultFileError("content must be a string")
+                        created = VaultFileService(settings.vault_path).create_file(
+                            file_path, content
+                        )
+                    except VaultFileAlreadyExists as exc:
+                        self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                        return
+                    except (VaultLockTimeout, TimeoutError) as exc:
+                        self._send_json(
+                            HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)}
+                        )
+                        return
+                    except (
+                        NetworkRequestError,
+                        ValueError,
+                        VaultFileError,
+                        json.JSONDecodeError,
+                        UnicodeDecodeError,
+                    ) as exc:
+                        self._send_file_error(exc)
+                        return
+                    self._send_json(
+                        HTTPStatus.CREATED,
+                        {
+                            "path": created.path,
+                            "size": created.size,
+                            "mtime_ns": created.mtime_ns,
+                            "etag": created.etag,
+                        },
+                    )
+                    return
                 if path.startswith("/v1/vault/conflicts/") and path.endswith(
                     "/resolve"
                 ):
@@ -266,6 +362,11 @@ class NetworkServer:
                         self._send_json(
                             HTTPStatus.UNPROCESSABLE_ENTITY,
                             {"error": str(exc), "reason": exc.reason},
+                        )
+                        return
+                    except (VaultLockTimeout, TimeoutError) as exc:
+                        self._send_json(
+                            HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)}
                         )
                         return
                     except (ValueError, VaultFileError) as exc:
@@ -341,6 +442,11 @@ class NetworkServer:
                         {"error": str(exc), "reason": exc.reason},
                     )
                     return
+                except (VaultLockTimeout, TimeoutError) as exc:
+                    self._send_json(
+                        HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)}
+                    )
+                    return
                 except (ValueError, VaultFileError) as exc:
                     self._send_file_error(exc)
                     return
@@ -356,13 +462,14 @@ class NetworkServer:
 
             def _authorized(self) -> bool:
                 expected = f"Bearer {settings.network_api_token}"
-                if self.headers.get("Authorization", "") != expected:
+                provided = self.headers.get("Authorization", "")
+                if not hmac.compare_digest(provided, expected):
                     self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
                     return False
                 return True
 
-            def _read_json(self) -> dict[str, object]:
-                body = self._read_body(MAX_BODY_BYTES)
+            def _read_json(self, maximum: int = MAX_BODY_BYTES) -> dict[str, object]:
+                body = self._read_body(maximum)
                 value = json.loads(body.decode("utf-8"))
                 if not isinstance(value, dict):
                     raise NetworkRequestError("JSON object is required")
@@ -453,14 +560,45 @@ class NetworkServer:
                     return
                 relative = str(raw_path)
                 root = settings.vault_path.resolve()
-                path = Path(relative).resolve()
-                if root not in path.parents or not path.is_file():
+                raw = Path(relative)
+                candidate = raw if raw.is_absolute() else (root / raw)
+                path = candidate.resolve()
+                if (
+                    root not in path.parents
+                    or candidate.is_symlink()
+                    or not path.is_file()
+                ):
                     self._send_json(
                         HTTPStatus.NOT_FOUND,
                         {"error": "artifact not found"},
                     )
                     return
-                data = path.read_bytes()
+                rel_path = path.relative_to(root)
+                if any(part.startswith(".") for part in rel_path.parts):
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {"error": "artifact not found"},
+                    )
+                    return
+                if (
+                    rel_path.parts[0] != "attachments"
+                    and not VaultFileService(settings.vault_path).is_user_content_path(
+                        rel_path.as_posix()
+                    )
+                ):
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {"error": "artifact not found"},
+                    )
+                    return
+                with path.open("rb") as stream:
+                    data = stream.read(MAX_FILE_BYTES + 1)
+                if len(data) > MAX_FILE_BYTES:
+                    self._send_json(
+                        HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                        {"error": "artifact is too large"},
+                    )
+                    return
                 self.send_response(HTTPStatus.OK)
                 self.send_header(
                     "Content-Type",

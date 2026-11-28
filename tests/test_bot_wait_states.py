@@ -57,7 +57,7 @@ class Harness:
         )
         monkeypatch.setattr(why, "process_why_request", fake_why)
         monkeypatch.setattr(brief, "process_brief_request", fake_brief)
-        monkeypatch.setattr(brief, "_restore_menu", AsyncMock())
+        monkeypatch.setattr(brief, "restore_menu", AsyncMock())
 
         self.dp = Dispatcher(storage=MemoryStorage())
         # Same order as bot/main.py: find, do, why, brief, then reminders.
@@ -139,7 +139,7 @@ async def test_brief_wait_lets_later_commands_through(harness, command) -> None:
     assert harness.processed == []
     assert await harness.dp.storage.get_state(harness.key) is None
     _assert_reached_next_router(harness, command)
-    brief._restore_menu.assert_awaited()  # type: ignore[attr-defined]
+    brief.restore_menu.assert_awaited()  # type: ignore[attr-defined]
 
 
 async def test_expired_why_wait_still_creates_reminder(harness) -> None:  # noqa: ANN001

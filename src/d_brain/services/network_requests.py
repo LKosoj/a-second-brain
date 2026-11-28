@@ -15,6 +15,7 @@ from typing import Any, cast
 
 from d_brain.clock import owner_now
 from d_brain.config import Settings
+from d_brain.services.atomic_io import atomic_write_file_text
 from d_brain.services.link_summary import (
     LinkSummaryService,
     format_link_summary_message,
@@ -44,6 +45,25 @@ class NetworkJobStore:
         self.path = vault_path / ".session" / "network-jobs"
         self.path.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._request_index: dict[str, str] = {}
+        self._load_request_index()
+
+    def _load_request_index(self) -> None:
+        with self._lock:
+            for path in self.path.glob("*.json"):
+                try:
+                    raw = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    logger.warning("Skipping unreadable network job %s", path)
+                    continue
+                if not isinstance(raw, dict):
+                    logger.warning("Skipping malformed network job %s", path)
+                    continue
+                job = cast(dict[str, Any], raw)
+                request_id = job.get("request_id")
+                job_id = job.get("job_id")
+                if isinstance(request_id, str) and isinstance(job_id, str):
+                    self._request_index[request_id] = job_id
 
     def create(self, request_id: str) -> dict[str, Any]:
         with self._lock:
@@ -57,18 +77,19 @@ class NetworkJobStore:
                 "created_at": owner_now().isoformat(),
             }
             self._write(job)
+            self._request_index[request_id] = str(job["job_id"])
             return job
 
     def find_by_request_id(self, request_id: str) -> dict[str, Any] | None:
-        for path in self.path.glob("*.json"):
-            try:
-                job = cast(dict[str, Any], json.loads(path.read_text(encoding="utf-8")))
-            except (OSError, json.JSONDecodeError):
-                logger.warning("Skipping unreadable network job %s", path)
-                continue
-            if job.get("request_id") == request_id:
+        with self._lock:
+            job_id = self._request_index.get(request_id)
+            if job_id is None:
+                return None
+            job = self.get(job_id)
+            if job is not None and job.get("request_id") == request_id:
                 return job
-        return None
+            self._request_index.pop(request_id, None)
+            return None
 
     def get(self, job_id: str) -> dict[str, Any] | None:
         if _JOB_ID_RE.fullmatch(job_id) is None:
@@ -102,12 +123,11 @@ class NetworkJobStore:
 
     def _write(self, job: dict[str, Any]) -> None:
         path = self.path / f"{job['job_id']}.json"
-        temporary = path.with_suffix(".json.tmp")
-        temporary.write_text(
+        atomic_write_file_text(
+            path,
             json.dumps(job, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
+            new_file_mode=0o600,
         )
-        temporary.replace(path)
 
 
 class NetworkRequestService:
@@ -203,9 +223,19 @@ class NetworkRequestService:
             self._schedule(str(job["job_id"]), text)
 
     def _schedule(self, job_id: str, text: str) -> None:
-        if job_id in self._futures and not self._futures[job_id].done():
-            return
-        self._futures[job_id] = self.executor.submit(self._run, job_id, text)
+        with self._lock:
+            existing = self._futures.get(job_id)
+            if existing is not None and not existing.done():
+                return
+            future = self.executor.submit(self._run, job_id, text)
+            self._futures[job_id] = future
+
+        def _cleanup_future(done_future: Future[None]) -> None:
+            with self._lock:
+                if self._futures.get(job_id) is done_future:
+                    self._futures.pop(job_id, None)
+
+        future.add_done_callback(_cleanup_future)
 
     def _run(self, job_id: str, text: str) -> None:
         self.jobs.update(job_id, status="running", started_at=owner_now().isoformat())
@@ -227,21 +257,7 @@ class NetworkRequestService:
             self._condition.notify_all()
 
     def _processor(self) -> CliProcessor:
-        settings = self.settings
-        return CliProcessor(
-            settings.vault_path,
-            settings.todoist_api_key,
-            settings.ai_cli,
-            settings.owner_full_name,
-            settings.content_language,
-            settings.openai_api_key,
-            settings.openai_base_url,
-            settings.openai_model,
-            settings.tavily_api_key,
-            0,
-            settings.recall_planner_disable_thinking,
-            settings.classification_model,
-        )
+        return CliProcessor.from_settings(self.settings, owner_telegram_id=0)
 
     def _dispatch(self, text: str, job_id: str) -> dict[str, Any]:
         processor = self._processor()

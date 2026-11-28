@@ -564,3 +564,25 @@ def test_cleanup_ignores_huge_pid_in_socket_name(
 
 def test_pid_alive_treats_overflow_as_dead() -> None:
     assert claude_tmux._pid_alive(10**30) is False
+
+
+def test_run_claude_tmux_unregisters_session_when_kill_server_times_out(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fast_polling: None,
+) -> None:
+    home = tmp_path / "home"
+    fake = _FakeTmux(home)
+
+    def flaky(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        if cmd[3] == "kill-server":
+            raise subprocess.TimeoutExpired(cmd, 15)
+        return fake(cmd, **kwargs)
+
+    monkeypatch.setattr(claude_tmux.subprocess, "run", flaky)
+    monkeypatch.setattr(claude_tmux.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    output = run_claude_tmux("prompt", tmp_path / "work", {"HOME": str(home)}, 30)
+
+    assert output == "answer text"
+    assert claude_tmux._ACTIVE == {}

@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from functools import partial
+from pathlib import Path
 from typing import cast
 
 from aiogram import Bot, F, Router
@@ -65,6 +66,13 @@ _ALBUM_REQUEST = "Разбери эти изображения."
 _DOCUMENT_REQUEST = "Разбери этот документ."
 
 
+def _optional_vault_path() -> Path | None:
+    try:
+        return getattr(get_settings(), "vault_path", None)
+    except Exception:
+        return None
+
+
 async def start_do_flow(
     message: Message, state: FSMContext, *, menu_message_id: int | None = None
 ) -> None:
@@ -81,6 +89,7 @@ async def start_do_flow(
                 "или фото/файл с подписью.\n"
                 "Для отмены нажми «Назад» или отправь `-`."
             ),
+            vault_path=_optional_vault_path(),
         )
         return
     await answer_text(
@@ -254,22 +263,10 @@ async def _run_album_request(message: Message, entries: list[PhotoEntry]) -> Non
 
 async def process_request(message: Message, prompt: str, user_id: int = 0) -> None:
     """Process the user's request with the configured CLI."""
-    status_msg = await answer_text(message, "⏳ Выполняю...")
+    status_msg = await answer_text(message, "⏳ Выполняю поручение…")
 
     settings = get_settings()
-    processor = CliProcessor(
-        settings.vault_path,
-        settings.todoist_api_key,
-        settings.ai_cli,
-        settings.owner_full_name,
-        settings.content_language,
-        getattr(settings, "openai_api_key", ""),
-        getattr(settings, "openai_base_url", ""),
-        getattr(settings, "openai_model", ""),
-        getattr(settings, "tavily_api_key", ""),
-        0,
-        getattr(settings, "recall_planner_disable_thinking", False),
-    )
+    processor = CliProcessor.from_settings(settings, owner_telegram_id=0)
 
     async def run_with_progress() -> dict[str, object]:
         context = await reply_context(message, settings.vault_path, user_id)
@@ -283,7 +280,7 @@ async def process_request(message: Message, prompt: str, user_id: int = 0) -> No
             try:
                 await edit_text(
                     status_msg,
-                    f"⏳ Выполняю... ({elapsed // 60}m {elapsed % 60}s)",
+                    f"⏳ Выполняю поручение… ({elapsed // 60}m {elapsed % 60}s)",
                 )
             except Exception:
                 pass

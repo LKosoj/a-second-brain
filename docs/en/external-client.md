@@ -9,9 +9,9 @@ API. The client sends plain text, and the server decides whether to:
 - save a daily entry;
 - execute a request on the server.
 
-The current request API does not provide arbitrary filesystem access to the
-vault. Use a separate remote-folder or synchronization mechanism when the
-client needs to edit files.
+The server also provides a scoped file API for directories listed in
+`user_content_roots` (see section 5) and QMD search (see section 6). Arbitrary
+filesystem access outside the allowed roots remains blocked.
 
 ## 1. Configure the server
 

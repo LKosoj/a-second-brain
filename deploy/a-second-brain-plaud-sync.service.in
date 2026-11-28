@@ -8,5 +8,6 @@ Type=oneshot
 WorkingDirectory=@PROJECT_DIR@
 EnvironmentFile=@PROJECT_DIR@/.env
 Environment=UV_BIN=@UV_BIN@@TZ_ENVIRONMENT@
+TimeoutStartSec=30m
 ExecStart=@UV_BIN@ run --frozen --no-dev python -m d_brain.run_plaud_sync
 NoNewPrivileges=true

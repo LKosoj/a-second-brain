@@ -94,11 +94,12 @@ you accept.
 
 | Variable | Default | Purpose |
 |---|---:|---|
-| `PLAUD_BEARER_TOKEN` | empty | Enables PLAUD recording import |
+| `PLAUD_CLI_BIN` | empty | Path to the Plaud CLI executable for recording import |
+| `PLAUD_BEARER_TOKEN` | empty | Token for legacy Plaud connections |
 | `PLAUD_REGION` | `api` | `api` or `api-euc1` |
 
-The PLAUD systemd timer is enabled only when the token is present during unit
-installation.
+The systemd installer enables the Plaud timer when `PLAUD_CLI_BIN` or
+`PLAUD_BEARER_TOKEN` is set.
 
 ## Search and compatible model gateway
 

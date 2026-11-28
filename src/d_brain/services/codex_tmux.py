@@ -396,8 +396,12 @@ def run_codex_tmux(
         )
         answer = _wait_for_answer(socket, rollout, prompt, tmux_env, deadline)
     finally:
-        _tmux(socket, "kill-server", env=tmux_env, check=False)
-        unregister_session(socket)
+        try:
+            _tmux(socket, "kill-server", env=tmux_env, check=False)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning("Failed to kill tmux session %s: %s", socket, exc)
+        finally:
+            unregister_session(socket)
     if rollout is not None:
         _cleanup_rollout(rollout)
     return answer

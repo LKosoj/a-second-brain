@@ -33,11 +33,12 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from d_brain.clock import owner_today, owner_tz
+from d_brain.clock import owner_today, owner_tz, to_owner
 from d_brain.config import get_settings
 from d_brain.manifest import ManifestValidationError
 from d_brain.services import calendar_ics
 from d_brain.services.decisions_queue import CONFLICT_KIND, list_queue_items
+from d_brain.services.reminders import list_pending as list_pending_reminders
 from d_brain.services.telegram_delivery import send_telegram_text_sync
 from d_brain.services.todoist_tasks import TodoistTasks
 
@@ -45,6 +46,7 @@ logger = logging.getLogger(__name__)
 
 MAX_CHECKBOXES = 5
 MAX_TODOIST_OVERDUE = 3
+MAX_REMINDERS = 8
 MAX_ON_THIS_DAY = 2
 MAX_ON_THIS_DAY_CHARS = 140
 MAX_LOOKBACK_MONTHS = 60
@@ -274,6 +276,23 @@ def _on_this_day(vault_path: Path, today: date) -> list[tuple[date, str]]:
     return found
 
 
+def _today_reminders(vault_path: Path, today: date) -> list[str]:
+    """Pending reminders due on ``today`` in the owner's timezone."""
+    try:
+        pending = list_pending_reminders(vault_path)
+    except OSError as exc:
+        logger.warning("Skipping reminders block: %s", exc)
+        return []
+
+    due_today = [
+        (to_owner(record.due_at), record.id, record.text)
+        for record in pending
+        if to_owner(record.due_at).date() == today
+    ]
+    due_today.sort(key=lambda item: (item[0], item[1]))
+    return [f"{due:%H:%M} — {text}" for due, _rid, text in due_today[:MAX_REMINDERS]]
+
+
 def build_morning_brief(
     vault_path: Path,
     today: date,
@@ -293,6 +312,7 @@ def build_morning_brief(
 
     checkboxes = _open_checkboxes(vault_path, yesterday)[:MAX_CHECKBOXES]
     one_big_thing = _weekly_one_big_thing(vault_path)
+    reminders_today = _today_reminders(vault_path, today)
     overdue = [
         str(item).strip() for item in (todoist_overdue or []) if str(item).strip()
     ][:MAX_TODOIST_OVERDUE]
@@ -303,6 +323,7 @@ def build_morning_brief(
     if not (
         checkboxes
         or one_big_thing
+        or reminders_today
         or overdue
         or conflict_pages
         or meeting_lines
@@ -318,6 +339,10 @@ def build_morning_brief(
 
     if one_big_thing:
         lines.extend(["", "**Главное на неделе**", one_big_thing])
+
+    if reminders_today:
+        lines.extend(["", "**Напоминания на сегодня**"])
+        lines.extend(f"- {item}" for item in reminders_today)
 
     if meeting_lines:
         lines.extend(["", "**Встречи сегодня**", *meeting_lines])

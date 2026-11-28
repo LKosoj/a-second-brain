@@ -30,20 +30,7 @@ logger = logging.getLogger(__name__)
 
 def _build_processor() -> CliProcessor:
     """Build processor from runtime settings."""
-    settings = get_settings()
-    return CliProcessor(
-        settings.vault_path,
-        settings.todoist_api_key,
-        settings.ai_cli,
-        settings.owner_full_name,
-        settings.content_language,
-        getattr(settings, "openai_api_key", ""),
-        getattr(settings, "openai_base_url", ""),
-        getattr(settings, "openai_model", ""),
-        getattr(settings, "tavily_api_key", ""),
-        settings.owner_telegram_id,
-        getattr(settings, "recall_planner_disable_thinking", False),
-    )
+    return CliProcessor.from_settings(get_settings())
 
 
 async def _run_process_command(

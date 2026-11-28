@@ -55,11 +55,13 @@ async def test_plain_text_action_runs_without_capture(tmp_path, monkeypatch, pre
     monkeypatch.setattr(
         text,
         "CliProcessor",
-        lambda *args, **kwargs: SimpleNamespace(
-            classify_text_intent=lambda value: {
-                "intent": "action",
-                "confidence": "high",
-            },
+        SimpleNamespace(
+            from_settings=lambda *args, **kwargs: SimpleNamespace(
+                classify_text_intent=lambda value: {
+                    "intent": "action",
+                    "confidence": "high",
+                },
+            )
         ),
     )
     monkeypatch.setattr(text, "SessionStore", lambda path: SimpleNamespace())
@@ -100,8 +102,10 @@ async def test_document_caption_action_receives_original_file(
     monkeypatch.setattr(
         document,
         "CliProcessor",
-        lambda *args, **kwargs: SimpleNamespace(
-            classify_text_intent=lambda value: {"intent": intent},
+        SimpleNamespace(
+            from_settings=lambda *args, **kwargs: SimpleNamespace(
+                classify_text_intent=lambda value: {"intent": intent},
+            )
         ),
     )
     execute = AsyncMock()

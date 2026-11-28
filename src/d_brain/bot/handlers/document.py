@@ -299,14 +299,13 @@ async def _classify_document_caption(message: Message) -> str:
     if not message.caption or not message.from_user or message.forward_origin:
         return TEXT_INTENT_CAPTURE
     settings = get_settings()
-    processor = CliProcessor(
-        settings.vault_path,
-        ai_cli=settings.ai_cli,
-        content_language=settings.content_language,
-        openai_api_key=getattr(settings, "openai_api_key", ""),
-        openai_base_url=getattr(settings, "openai_base_url", ""),
-        openai_model=getattr(settings, "openai_model", ""),
-        classification_model=getattr(settings, "classification_model", ""),
+    processor = CliProcessor.from_settings(
+        settings,
+        todoist_api_key="",
+        owner_full_name="",
+        tavily_api_key="",
+        owner_telegram_id=0,
+        recall_planner_disable_thinking=False,
     )
     intent = await asyncio.to_thread(processor.classify_text_intent, message.caption)
     return intent["intent"]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from d_brain.services.frontmatter import (
 )
 from d_brain.services.qmd import RECALL_CONFIDENCE_THRESHOLD, QmdService
 from d_brain.services.session import SessionStore
+from d_brain.services.vault_lock import vault_write_lock
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,21 @@ _TOOL_SUCCESS_RE = re.compile(
     r"(?:\bexit\s+code\s*0\b|\b\d+\s+passed\b|\bpassed\b)",
     re.IGNORECASE,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class LearningLesson:
+    """One saved conversation-learning card under ``thoughts/learnings/``."""
+
+    lesson_id: str
+    rel_path: str
+    kind: str
+    created: str
+    condition: str
+    text: str
+    outcome: str
+    source: str
+    exceptions: tuple[str, ...] = ()
 
 
 class ConversationLearningService:
@@ -577,5 +594,109 @@ Empty arrays are correct when evidence is absent or a reusable lesson is unsuppo
         lines.append("=== END CONDITIONAL USER LESSONS ===")
         return "\n".join(lines)
 
+    def _lesson_files(self) -> list[Path]:
+        root = self.vault_path / "thoughts/learnings"
+        if not root.exists():
+            return []
+        return sorted(
+            [
+                *root.glob("*-user-correction-*.md"),
+                *root.glob("*-confirmed-practice-*.md"),
+            ],
+            key=lambda path: path.name,
+            reverse=True,
+        )
 
-__all__ = ["ConversationLearningService"]
+    def list_lessons(self) -> list[LearningLesson]:
+        """List saved conversation-learning lessons, newest first."""
+        lessons: list[LearningLesson] = []
+        for path in self._lesson_files():
+            try:
+                fields = parse_frontmatter_bytes(path.read_bytes()).fields
+            except OSError:
+                continue
+            condition = self._nonempty(fields.get("condition"))
+            lesson_text = self._nonempty(fields.get("lesson"))
+            practice_text = self._nonempty(fields.get("practice"))
+            text = lesson_text or practice_text
+            if not text:
+                continue
+            kind = (
+                "confirmed-practice"
+                if "-confirmed-practice-" in path.name
+                else "user-correction"
+            )
+            outcome = self._nonempty(fields.get("outcome"))
+            source = self._nonempty(fields.get("source"))
+            created = self._nonempty(fields.get("created")) or path.name[:10]
+            exceptions = tuple(self._exceptions(fields.get("exceptions")) or ())
+            lessons.append(
+                LearningLesson(
+                    lesson_id=path.stem,
+                    rel_path=path.relative_to(self.vault_path).as_posix(),
+                    kind=kind,
+                    created=created,
+                    condition=condition,
+                    text=text,
+                    outcome=outcome,
+                    source=source,
+                    exceptions=exceptions,
+                )
+            )
+        return lessons
+
+    def delete_lesson(
+        self, lesson_id: str, *, timeout_seconds: float | None = None
+    ) -> bool:
+        """Delete one saved lesson card by ``lesson_id`` under the vault lock."""
+        cleaned = lesson_id.strip()
+        if (
+            not cleaned
+            or "/" in cleaned
+            or "\\" in cleaned
+            or ".." in cleaned
+            or (
+                "-user-correction-" not in cleaned
+                and "-confirmed-practice-" not in cleaned
+            )
+        ):
+            return False
+        root = (self.vault_path / "thoughts/learnings").resolve()
+        candidate = self.vault_path / "thoughts/learnings" / f"{cleaned}.md"
+        with vault_write_lock(self.vault_path, timeout=timeout_seconds):
+            if not candidate.exists() or candidate.is_symlink():
+                return False
+            try:
+                resolved = candidate.resolve()
+                resolved.relative_to(root)
+            except ValueError:
+                return False
+            if not resolved.is_file():
+                return False
+            resolved.unlink()
+        return True
+
+
+def list_lessons(vault_path: Path | str) -> list[LearningLesson]:
+    """Return all saved conversation-learning lessons in ``vault_path``."""
+    return ConversationLearningService(vault_path).list_lessons()
+
+
+def delete_lesson(
+    vault_path: Path | str,
+    lesson_id: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> bool:
+    """Delete one conversation-learning lesson card by ``lesson_id``."""
+    return ConversationLearningService(vault_path).delete_lesson(
+        lesson_id, timeout_seconds=timeout_seconds
+    )
+
+
+__all__ = [
+    "ConversationLearningService",
+    "LearningLesson",
+    "delete_lesson",
+    "list_lessons",
+]

@@ -991,7 +991,7 @@ async def test_handle_menu_callback_queueitem_mismatched_fingerprint_refuses_to_
     rendered: list[int] = []
 
     async def fake_render_queue_item(
-        bot, *, chat_id, index, preferred_message_id=None, notice=None
+        bot, *, chat_id, index, preferred_message_id=None, notice=None, vault_path=None
     ):  # noqa: ANN001
         rendered.append(index)
         return session.queue_items[index]
@@ -1030,7 +1030,7 @@ async def test_handle_menu_callback_queueitem_matching_fingerprint_opens_the_ite
     rendered: list[int] = []
 
     async def fake_render_queue_item(
-        bot, *, chat_id, index, preferred_message_id=None, notice=None
+        bot, *, chat_id, index, preferred_message_id=None, notice=None, vault_path=None
     ):  # noqa: ANN001
         rendered.append(index)
         return session.queue_items[index]

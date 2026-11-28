@@ -935,7 +935,7 @@ def test_run_daily_process_sends_scheduled_digest_with_changes(
     monkeypatch.setattr(
         run_daily_process,
         "CliProcessor",
-        lambda *args: FakeProcessor(),
+        SimpleNamespace(from_settings=lambda *args, **kwargs: FakeProcessor()),
     )
     monkeypatch.setattr(
         run_daily_process,
@@ -1032,7 +1032,7 @@ def test_run_daily_process_sends_scheduled_digest_when_nothing_new(
     monkeypatch.setattr(
         run_daily_process,
         "CliProcessor",
-        lambda *args: FakeProcessor(),
+        SimpleNamespace(from_settings=lambda *args, **kwargs: FakeProcessor()),
     )
     monkeypatch.setattr(
         run_daily_process,
@@ -1172,7 +1172,7 @@ def test_run_daily_process_sends_scheduled_error_digest(
     monkeypatch.setattr(
         run_daily_process,
         "CliProcessor",
-        lambda *args: FakeProcessor(),
+        SimpleNamespace(from_settings=lambda *args, **kwargs: FakeProcessor()),
     )
     monkeypatch.setattr(
         run_daily_process,
@@ -1220,6 +1220,7 @@ def test_run_plaud_sync_sends_unconfirmed_tasks_notice(
         run_plaud_sync,
         "get_settings",
         lambda: SimpleNamespace(
+            plaud_cli_bin="",
             plaud_bearer_token="token",
             vault_path=tmp_path,
             plaud_region="api-euc1",
@@ -1250,7 +1251,7 @@ def test_run_plaud_sync_refreshes_qmd_with_embeddings_after_import(
     class FakePlaudService:
         def __init__(self, vault_path: Path, **kwargs) -> None:  # noqa: ANN003
             assert vault_path == tmp_path
-            del kwargs
+            assert kwargs["client"].executable == "/usr/local/bin/plaud"
 
         def sync(self, **kwargs):  # noqa: ANN003, ANN202
             assert kwargs == {
@@ -1281,7 +1282,8 @@ def test_run_plaud_sync_refreshes_qmd_with_embeddings_after_import(
         run_plaud_sync,
         "get_settings",
         lambda: SimpleNamespace(
-            plaud_bearer_token="token",
+            plaud_cli_bin="/usr/local/bin/plaud",
+            plaud_bearer_token="",
             vault_path=tmp_path,
             plaud_region="api-euc1",
             ai_cli="codex",

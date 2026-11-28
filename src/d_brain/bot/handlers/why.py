@@ -26,6 +26,7 @@ from aiogram.types import (
 
 from d_brain.bot.replies import answer_rich_text, answer_text
 from d_brain.bot.states import WhyCommandState, wait_expired, wait_started_at
+from d_brain.bot.voice_input import pick_voice_media
 from d_brain.config import get_settings
 from d_brain.services.compiled_why import (
     WhyChoice,
@@ -46,7 +47,7 @@ async def start_why_flow(message: Message, state: FSMContext) -> None:
     await answer_text(
         message,
         "🔍 **Почему страница так говорит?**\n\n"
-        "Отправь текстом название решения, темы, проекта или страницы.\n"
+        "Отправь текстом или голосом название решения, темы, проекта или страницы.\n"
         "Повтори `/why` или отправь `-`, чтобы отменить.",
     )
 
@@ -78,15 +79,23 @@ async def cmd_why(message: Message, command: CommandObject, state: FSMContext) -
 
 @router.message(WhyCommandState.waiting_for_input)
 async def handle_why_input(message: Message, state: FSMContext) -> None:
-    """Handle input after /why command -- text only (ТЗ: no voice for /why)."""
+    """Handle input after /why command (text or voice)."""
     data = await state.get_data()
     expired = wait_expired(data.get("why_entered_at"))
     text = (message.text or "").strip()
 
-    # Anything but a plain text message (voice, photo, document, forward)
-    # leaves the wait and goes on to the regular capture handlers, so it is
-    # saved as a normal entry instead of being refused. Same for text that
-    # arrives after the wait has expired.
+    # Non-forwarded voice while the wait is live is handed off to voice.py
+    # with the FSM state intact so the transcript runs as the /why query.
+    if (
+        pick_voice_media(message) is not None
+        and message.forward_origin is None
+        and not expired
+    ):
+        raise SkipHandler
+
+    # Anything else (photo, document, forward) leaves the wait and goes on to
+    # the regular capture handlers, so it is saved as a normal entry instead
+    # of being refused. Same for text that arrives after the wait has expired.
     if message.text is None or message.forward_origin is not None:
         await state.clear()
         raise SkipHandler

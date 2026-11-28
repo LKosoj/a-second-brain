@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import httpx
 
@@ -71,8 +71,20 @@ class PlaudAuthError(RuntimeError):
     """PLAUD rejected the bearer token or session."""
 
 
+class PlaudRecordingNotFoundError(RuntimeError):
+    """The recording is no longer available from PLAUD."""
+
+
 class PlaudSyncAlreadyRunningError(RuntimeError):
     """Another PLAUD sync process is already holding the state lock."""
+
+
+class PlaudRecordingClient(Protocol):
+    def iter_recordings(
+        self, *, limit: int, max_pages: int | None
+    ) -> Iterator[dict[str, Any]]: ...
+
+    def get_recording(self, file_id: str) -> dict[str, Any]: ...
 
 
 def _utc_now() -> datetime:
@@ -464,13 +476,19 @@ class PlaudSyncService:
         todoist_api_key: str = "",
         owner_full_name: str = "",
         content_language: str = "ru",
-        client: PlaudClient | None = None,
+        client: PlaudRecordingClient | None = None,
     ) -> None:
         self.vault_path = Path(vault_path).absolute()
         self.content_language = normalize_language(content_language)
         self._manifest: VaultManifest | None = None
         self.storage = VaultStorage(self.vault_path, self.content_language)
-        self.client = client or PlaudClient(bearer_token, region)
+        self._owned_client: PlaudClient | None
+        if client is None:
+            self._owned_client = PlaudClient(bearer_token, region)
+            client = self._owned_client
+        else:
+            self._owned_client = None
+        self.client = client
         self.ai_cli = ai_cli
         self.todoist_api_key = todoist_api_key
         self.owner_full_name = owner_full_name.strip()
@@ -485,7 +503,6 @@ class PlaudSyncService:
             todoist_api_key=todoist_api_key,
             catalog=self.project_catalog,
         )
-        self._owns_client = client is None
         # Titles of tasks Todoist accepted without an id during the current sync.
         self._unconfirmed_titles: list[str] = []
         self._workflow = self._load_control_plane_workflow()
@@ -514,8 +531,8 @@ class PlaudSyncService:
 
     def close(self) -> None:
         """Close the HTTP client if we own it."""
-        if self._owns_client:
-            self.client.close()
+        if self._owned_client is not None:
+            self._owned_client.close()
 
     @property
     def _state_path(self) -> Path:
@@ -1408,6 +1425,9 @@ class PlaudSyncService:
             )
         except PlaudAuthError:
             raise
+        except PlaudRecordingNotFoundError:
+            logger.info("PLAUD recording is unavailable: %s", file_id)
+            return
         except Exception as exc:
             logger.warning("PLAUD sync failed for %s: %s", file_id, exc)
             errors.append(f"{file_id}: {exc}")

@@ -4,17 +4,46 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 ENABLE=0
+UNINSTALL=0
 
-if [[ "${1:-}" == "--enable" ]]; then
-  ENABLE=1
-elif [[ $# -gt 0 ]]; then
-  echo "Usage: $0 [--enable]" >&2
-  exit 2
-fi
+case "${1:-}" in
+  --enable) ENABLE=1 ;;
+  --uninstall) UNINSTALL=1 ;;
+  "") ;;
+  *)
+    echo "Usage: $0 [--enable|--uninstall]" >&2
+    exit 2
+    ;;
+esac
 
 if ! command -v systemctl >/dev/null 2>&1; then
   echo "systemctl is required" >&2
   exit 1
+fi
+
+ALL_UNITS=(
+  a-second-brain.service
+  a-second-brain-process.timer
+  a-second-brain-process.service
+  a-second-brain-morning-brief.timer
+  a-second-brain-morning-brief.service
+  a-second-brain-backup-verify.timer
+  a-second-brain-backup-verify.service
+  a-second-brain-plaud-sync.timer
+  a-second-brain-plaud-sync.service
+  a-second-brain-network.service
+  a-second-brain-qmd-maintenance.timer
+  a-second-brain-qmd-maintenance.service
+)
+
+if [[ "$UNINSTALL" -eq 1 ]]; then
+  systemctl --user disable --now "${ALL_UNITS[@]}" 2>/dev/null || true
+  for unit in "${ALL_UNITS[@]}"; do
+    rm -f "$UNIT_DIR/$unit"
+  done
+  systemctl --user daemon-reload
+  echo "User units uninstalled from $UNIT_DIR"
+  exit 0
 fi
 
 UV_BIN="$(command -v uv || true)"
@@ -28,71 +57,14 @@ if [[ ! -f "$PROJECT_DIR/.env" || ! -d "$PROJECT_DIR/vault" ]]; then
   exit 1
 fi
 
+# shellcheck source=scripts/lib/env_reader.sh
+source "$PROJECT_DIR/scripts/lib/env_reader.sh"
+
 escape_sed() {
   local value="$1"
   value="${value//\\/\\\\}"
   value="${value//&/\\&}"
   value="${value//|/\\|}"
-  printf '%s' "$value"
-}
-
-# Non-empty check for PLAUD_BEARER_TOKEN: a bare grep for
-# '^PLAUD_BEARER_TOKEN=.+' also matches a quoted-empty value
-# (PLAUD_BEARER_TOKEN="") or one that is only whitespace, which would wire
-# up the PLAUD sync timer with nothing to authenticate with.
-has_plaud_token() {
-  local env_file="$1" line value
-  line="$(grep -E '^(export[[:space:]]+)?PLAUD_BEARER_TOKEN=' "$env_file" | tail -n1)" || true
-  [[ -z "$line" ]] && return 1
-  value="${line#*=}"
-  value="${value#"${value%%[![:space:]]*}"}"
-  value="${value%"${value##*[![:space:]]}"}"
-  if [[ ${#value} -ge 2 ]]; then
-    if [[ "$value" == \"*\" && "$value" == *\" ]]; then
-      value="${value:1:${#value}-2}"
-    elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
-      value="${value:1:${#value}-2}"
-    fi
-  fi
-  [[ -n "$value" ]]
-}
-
-has_network_api_token() {
-  local env_file="$1" line value
-  line="$(grep -E '^(export[[:space:]]+)?NETWORK_API_TOKEN=' "$env_file" | tail -n1)" || true
-  [[ -z "$line" ]] && return 1
-  value="${line#*=}"
-  value="${value#"${value%%[![:space:]]*}"}"
-  value="${value%"${value##*[![:space:]]}"}"
-  if [[ ${#value} -ge 2 ]]; then
-    if [[ "$value" == \"* && "$value" == *\" ]]; then
-      value="${value:1:${#value}-2}"
-    elif [[ "$value" == \'* && "$value" == *\' ]]; then
-      value="${value:1:${#value}-2}"
-    fi
-  fi
-  [[ -n "$value" ]]
-}
-
-# Last KEY=value from the .env file (empty when absent), without surrounding
-# whitespace or one pair of quotes. Read from the file, not the shell
-# environment: the units load .env themselves.
-env_value() {
-  local env_file="$1" key="$2" line value
-  line="$(grep -E "^(export[[:space:]]+)?${key}[[:space:]]*=" "$env_file" | tail -n1)" || true
-  [[ -z "$line" ]] && return 0
-  value="${line#*=}"
-  value="${value#"${value%%[![:space:]]*}"}"
-  value="${value%"${value##*[![:space:]]}"}"
-  if [[ ${#value} -ge 2 ]]; then
-    if [[ "$value" == \"*\" && "$value" == *\" ]]; then
-      value="${value#?}"
-      value="${value%?}"
-    elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
-      value="${value#?}"
-      value="${value%?}"
-    fi
-  fi
   printf '%s' "$value"
 }
 
@@ -169,16 +141,27 @@ if [[ "$ENABLE" -eq 1 ]]; then
     a-second-brain-morning-brief.timer
     a-second-brain-backup-verify.timer
   )
-  if has_plaud_token "$PROJECT_DIR/.env"; then
+  disable_units=()
+  if has_plaud_setting "$PROJECT_DIR/.env" PLAUD_CLI_BIN ||
+    has_plaud_setting "$PROJECT_DIR/.env" PLAUD_BEARER_TOKEN; then
     units+=(a-second-brain-plaud-sync.timer)
+  else
+    disable_units+=(a-second-brain-plaud-sync.timer)
   fi
   if has_network_api_token "$PROJECT_DIR/.env"; then
     units+=(a-second-brain-network.service)
+  else
+    disable_units+=(a-second-brain-network.service)
   fi
   if command -v qmd >/dev/null 2>&1; then
     units+=(a-second-brain-qmd-maintenance.timer)
+  else
+    disable_units+=(a-second-brain-qmd-maintenance.timer)
   fi
   systemctl --user enable --now "${units[@]}"
+  if [[ "${#disable_units[@]}" -gt 0 ]]; then
+    systemctl --user disable --now "${disable_units[@]}" 2>/dev/null || true
+  fi
 fi
 
 echo "User units installed in $UNIT_DIR"

@@ -555,8 +555,12 @@ def run_claude_tmux(
         _send_prompt(socket, prompt, root, session_id, tmux_env, deadline)
         answer = _wait_for_answer(socket, root, session_id, tmux_env, deadline)
     finally:
-        _tmux(socket, "kill-server", env=tmux_env, check=False)
-        unregister_session(socket)
+        try:
+            _tmux(socket, "kill-server", env=tmux_env, check=False)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning("Failed to kill tmux session %s: %s", socket, exc)
+        finally:
+            unregister_session(socket)
     _cleanup_transcript(root, session_id)
     return answer
 

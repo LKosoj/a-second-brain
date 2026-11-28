@@ -34,10 +34,17 @@ def main() -> int:
     settings = get_settings()
 
     def _answer_question(question: str) -> dict[str, Any]:
-        return CliProcessor(
-            settings.vault_path,
-            ai_cli=settings.ai_cli,
-            content_language=settings.content_language,
+        return CliProcessor.from_settings(
+            settings,
+            todoist_api_key="",
+            owner_full_name="",
+            openai_api_key="",
+            openai_base_url="",
+            openai_model="",
+            tavily_api_key="",
+            owner_telegram_id=0,
+            recall_planner_disable_thinking=False,
+            classification_model="",
         ).answer_question(question)
 
     try:

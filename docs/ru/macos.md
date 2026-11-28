@@ -52,7 +52,7 @@ sudo pmset -a sleep 0 disksleep 0 displaysleep 0
 | `com.second-brain.bot` | `RunAtLoad` + `KeepAlive` | `a-second-brain run` |
 | `com.second-brain.process` | ежедневно в 21:00 по умолчанию (`DAILY_PROCESS_TIME`) | `python -m d_brain.run_daily_process --mode scheduled` |
 | `com.second-brain.morning-brief` | ежедневно в 08:00 по умолчанию (`MORNING_BRIEF_TIME`) | `python -m d_brain.run_morning_brief` |
-| `com.second-brain.plaud-sync` | каждый час (только при `PLAUD_BEARER_TOKEN`) | `python -m d_brain.run_plaud_sync` |
+| `com.second-brain.plaud-sync` | каждый час (при `PLAUD_CLI_BIN` или `PLAUD_BEARER_TOKEN`) | `python -m d_brain.run_plaud_sync` |
 | `com.second-brain.qmd-maintenance` | воскресенье 03:30 (только при `qmd` в `PATH`) | `a-second-brain qmd cleanup` |
 | `com.second-brain.backup-verify` | воскресенье 04:15 | `python -m d_brain.run_vault_backup --verify` |
 

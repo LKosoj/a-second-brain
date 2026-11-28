@@ -346,7 +346,7 @@ async def test_send_text_escapes_raw_html_in_html_file() -> None:
 
 def _patch_vault_path(monkeypatch: pytest.MonkeyPatch, vault_path) -> None:
     monkeypatch.setattr(
-        "d_brain.bot.replies.get_settings",
+        "d_brain.services.telegram_delivery.get_settings",
         lambda: SimpleNamespace(vault_path=vault_path),
     )
 
@@ -438,7 +438,9 @@ async def test_answer_text_falls_back_to_alt_text_for_oversized_file(
     (vault_path / "attachments").mkdir(parents=True)
     (vault_path / "attachments" / "chart.png").write_bytes(b"0123456789")
     _patch_vault_path(monkeypatch, vault_path)
-    monkeypatch.setattr("d_brain.bot.replies.MAX_INLINE_IMAGE_BYTES", 5)
+    monkeypatch.setattr(
+        "d_brain.services.telegram_delivery.MAX_INLINE_IMAGE_BYTES", 5
+    )
     message = _FakeMessage()
 
     await answer_text(message, "Итог: ![chart](attachments/chart.png)")
@@ -470,3 +472,76 @@ async def test_answer_text_without_images_keeps_previous_short_reply_behavior() 
 
     assert message.documents == []
     assert len(message.answers) == 1
+
+
+@pytest.mark.asyncio
+async def test_answer_text_falls_back_to_plain_text_on_bad_request() -> None:
+    from aiogram.methods import SendMessage
+
+    class _FlakyAnswerMessage(_FakeMessage):
+        async def answer(self, text: str, **kwargs):
+            self.answers.append((text, kwargs.get("parse_mode")))
+            if kwargs.get("parse_mode") is not None:
+                raise TelegramBadRequest(
+                    SendMessage(chat_id=42, text=text),
+                    "Bad Request: can't parse entities",
+                )
+            return SimpleNamespace(text=text)
+
+    message = _FlakyAnswerMessage()
+
+    await answer_text(message, "**Готово** _текст_")
+
+    assert message.answers == [
+        ("*Готово* \\_текст\\_", "MarkdownV2"),
+        ("Готово _текст_", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_text_falls_back_to_plain_text_on_bad_request() -> None:
+    from aiogram.methods import SendMessage
+
+    class _FlakySendBot(_FakeBot):
+        async def send_message(self, *, chat_id: int, text: str, **kwargs):
+            self.calls.append((chat_id, text, kwargs.get("parse_mode")))
+            if kwargs.get("parse_mode") is not None:
+                raise TelegramBadRequest(
+                    SendMessage(chat_id=chat_id, text=text),
+                    "Bad Request: can't parse entities",
+                )
+            return SimpleNamespace(chat=SimpleNamespace(id=chat_id), text=text)
+
+    bot = _FlakySendBot()
+
+    await send_text(bot, chat_id=42, text="**Готово**")
+
+    assert bot.calls == [
+        (42, "*Готово*", "MarkdownV2"),
+        (42, "Готово", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_edit_text_falls_back_to_plain_text_on_bad_request() -> None:
+    from aiogram.methods import EditMessageText
+
+    class _FlakyEditMessage(_FakeMessage):
+        async def edit_text(self, text: str | None = None, **kwargs):
+            assert text is not None
+            self.edits.append((text, kwargs.get("parse_mode")))
+            if kwargs.get("parse_mode") is not None:
+                raise TelegramBadRequest(
+                    EditMessageText(text=text),
+                    "Bad Request: can't parse entities",
+                )
+            return SimpleNamespace(text=text)
+
+    message = _FlakyEditMessage()
+
+    await edit_text(message, "**Готово**")
+
+    assert message.edits == [
+        ("*Готово*", "MarkdownV2"),
+        ("Готово", None),
+    ]

@@ -278,7 +278,7 @@ import logging
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from d_brain.clock import owner_today
 from d_brain.manifest import VaultManifest, load_manifest_for_vault
@@ -349,6 +349,20 @@ PAGE_ENCODING_BROKEN_KIND = "page-encoding-broken"
 # A page whose <!-- human:start/end --> markers are ambiguous (see module
 # docstring and ``CompiledBriefingService._queue_human_zone_ambiguous``).
 HUMAN_ZONE_AMBIGUOUS_KIND = "human-zone-ambiguous"
+
+OWNER_DECISION_GROUP: Literal["owner"] = "owner"
+TECHNICAL_ATTENTION_GROUP: Literal["technical"] = "technical"
+QueueGroup = Literal["owner", "technical"]
+
+# Technical/system alerts vs substantive owner decisions.
+TECHNICAL_ATTENTION_KINDS = frozenset(
+    {
+        PAGE_ENCODING_BROKEN_KIND,
+        HUMAN_ZONE_AMBIGUOUS_KIND,
+        VERIFY_REJECTED_KIND,
+        DRIFT_KIND,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1102,6 +1116,28 @@ _QUEUE_DOCUMENT_RELATIVE_PATH = Path("summaries") / "compile" / "decisions-queue
 _EMPTY_QUEUE_DOCUMENT_TEXT = "Очередь пуста — открытых пунктов нет."
 
 
+def queue_item_group(item: QueueItem | str) -> QueueGroup:
+    """Classify a queue item (or kind) into owner decision vs technical attention."""
+    kind = item.kind if isinstance(item, QueueItem) else item
+    if kind in TECHNICAL_ATTENTION_KINDS:
+        return TECHNICAL_ATTENTION_GROUP
+    return OWNER_DECISION_GROUP
+
+
+def partition_queue_items(
+    items: list[QueueItem],
+) -> tuple[list[QueueItem], list[QueueItem]]:
+    """Split queue items into ``(owner_decisions, technical_attention)``."""
+    owner_items: list[QueueItem] = []
+    technical_items: list[QueueItem] = []
+    for item in items:
+        if queue_item_group(item) == TECHNICAL_ATTENTION_GROUP:
+            technical_items.append(item)
+        else:
+            owner_items.append(item)
+    return owner_items, technical_items
+
+
 def queue_kind_label(kind: str) -> str:
     """Honest label for a queue item's kind -- an unsupported kind (задача L,
     ТЗ 7.2: no producer exists for one today, but the UI must not hide or
@@ -1137,7 +1173,17 @@ def render_queue_document(items: list[QueueItem]) -> str:
     if not items:
         lines.append(_EMPTY_QUEUE_DOCUMENT_TEXT)
         return "\n".join(lines) + "\n"
-    lines.extend(format_queue_item_line(item) for item in items)
+    owner_items, technical_items = partition_queue_items(items)
+    if owner_items:
+        lines.append("## Решения владельца")
+        lines.append("")
+        lines.extend(format_queue_item_line(item) for item in owner_items)
+    if technical_items:
+        if owner_items:
+            lines.append("")
+        lines.append("## Техническое внимание")
+        lines.append("")
+        lines.extend(format_queue_item_line(item) for item in technical_items)
     return "\n".join(lines) + "\n"
 
 

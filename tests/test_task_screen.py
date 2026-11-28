@@ -265,7 +265,11 @@ async def test_task_explanation_requests_light_model_and_saves_conversation(
     )
     answer = Mock(return_value={"report": "Task explanation", "artifact_paths": []})
     monkeypatch.setattr(
-        tasks, "CliProcessor", lambda *a: SimpleNamespace(answer_question=answer)
+        tasks,
+        "CliProcessor",
+        SimpleNamespace(
+            from_settings=lambda *a, **k: SimpleNamespace(answer_question=answer)
+        ),
     )
     monkeypatch.setattr(
         tasks,

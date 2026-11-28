@@ -95,7 +95,11 @@ def test_main_exits_nonzero_but_still_notifies_when_only_daily_failed(
             owner_telegram_id=42,
         ),
     )
-    monkeypatch.setattr(run_daily_process, "CliProcessor", lambda *a: FakeProcessor())
+    monkeypatch.setattr(
+        run_daily_process,
+        "CliProcessor",
+        SimpleNamespace(from_settings=lambda *a, **k: FakeProcessor()),
+    )
     monkeypatch.setattr(
         run_daily_process,
         "_build_digest_takeaways",
@@ -251,7 +255,9 @@ def test_main_notifies_with_fallback_when_takeaways_build_raises(
         run_daily_process, "get_settings", lambda: _fake_settings(tmp_path)
     )
     monkeypatch.setattr(
-        run_daily_process, "CliProcessor", lambda *args: FakeProcessor()
+        run_daily_process,
+        "CliProcessor",
+        SimpleNamespace(from_settings=lambda *args, **kwargs: FakeProcessor()),
     )
     monkeypatch.setattr(
         run_daily_process,
@@ -315,7 +321,9 @@ def test_takeaways_fallback_does_not_hide_new_thoughts_section(
         run_daily_process, "get_settings", lambda: _fake_settings(tmp_path)
     )
     monkeypatch.setattr(
-        run_daily_process, "CliProcessor", lambda *args: FakeProcessor()
+        run_daily_process,
+        "CliProcessor",
+        SimpleNamespace(from_settings=lambda *args, **kwargs: FakeProcessor()),
     )
     monkeypatch.setattr(
         run_daily_process,
@@ -370,7 +378,9 @@ def test_takeaways_fallback_truncates_long_exception_text(
         run_daily_process, "get_settings", lambda: _fake_settings(tmp_path)
     )
     monkeypatch.setattr(
-        run_daily_process, "CliProcessor", lambda *args: FakeProcessor()
+        run_daily_process,
+        "CliProcessor",
+        SimpleNamespace(from_settings=lambda *args, **kwargs: FakeProcessor()),
     )
     monkeypatch.setattr(
         run_daily_process,
@@ -415,7 +425,9 @@ def test_main_still_notifies_when_takeaways_ok_and_delivery_fails(
         run_daily_process, "get_settings", lambda: _fake_settings(tmp_path)
     )
     monkeypatch.setattr(
-        run_daily_process, "CliProcessor", lambda *args: FakeProcessor()
+        run_daily_process,
+        "CliProcessor",
+        SimpleNamespace(from_settings=lambda *args, **kwargs: FakeProcessor()),
     )
     monkeypatch.setattr(
         run_daily_process, "_build_digest_takeaways", lambda *a, **k: []
@@ -650,7 +662,9 @@ def test_main_explicit_date_overrides_catchup_detection(
         run_daily_process, "get_settings", lambda: _fake_settings(tmp_path)
     )
     monkeypatch.setattr(
-        run_daily_process, "CliProcessor", lambda *args: FakeProcessor()
+        run_daily_process,
+        "CliProcessor",
+        SimpleNamespace(from_settings=lambda *args, **kwargs: FakeProcessor()),
     )
     monkeypatch.setattr(
         sys,
@@ -687,7 +701,9 @@ def test_main_scheduled_catchup_without_explicit_date_processes_yesterday(
         run_daily_process, "get_settings", lambda: _fake_settings(tmp_path)
     )
     monkeypatch.setattr(
-        run_daily_process, "CliProcessor", lambda *args: FakeProcessor()
+        run_daily_process,
+        "CliProcessor",
+        SimpleNamespace(from_settings=lambda *args, **kwargs: FakeProcessor()),
     )
     monkeypatch.setattr(
         sys,
@@ -759,7 +775,9 @@ def _run_main_recording_order(
         run_daily_process, "get_settings", lambda: _fake_settings(tmp_path)
     )
     monkeypatch.setattr(
-        run_daily_process, "CliProcessor", lambda *args: FakeProcessor()
+        run_daily_process,
+        "CliProcessor",
+        SimpleNamespace(from_settings=lambda *args, **kwargs: FakeProcessor()),
     )
     monkeypatch.setattr(run_daily_process, "_retry_unrecognized_voice", fake_retry)
     monkeypatch.setattr(

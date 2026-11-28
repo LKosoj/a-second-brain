@@ -248,6 +248,88 @@ def test_empty_stdout_is_no_results(vault, monkeypatch) -> None:  # noqa: ANN001
     assert find_in_vault(vault, "q") == []
 
 
+def test_fresh_daily_fallback_finds_today_and_yesterday_without_qmd_reindex(
+    vault, monkeypatch
+) -> None:  # noqa: ANN001
+    from datetime import date
+
+    fixed_today = date(2026, 6, 15)
+    monkeypatch.setattr(vault_find, "owner_today", lambda: fixed_today)
+    (vault / "daily" / "2026-06-15.md").write_text(
+        "## 10:00 [text]\nОбсудили БЮДЖЕТ проекта Альфа\n", encoding="utf-8"
+    )
+    (vault / "daily" / "2026-06-14.md").write_text(
+        "## 18:00 [voice]\nПлан по проекту альфа и бюджет на квартал\n",
+        encoding="utf-8",
+    )
+    (vault / "daily" / "2026-06-13.md").write_text(
+        "## 09:00 [text]\nСтарый бюджет альфа не должен попасть\n", encoding="utf-8"
+    )
+    _fake_qmd(monkeypatch, "[]")
+
+    hits = find_in_vault(vault, "альфа бюджет")
+
+    assert [h.rel_path for h in hits] == [
+        "daily/2026-06-15.md",
+        "daily/2026-06-14.md",
+    ]
+    assert "БЮДЖЕТ" in hits[0].snippet
+
+
+def test_fresh_daily_fallback_avoids_duplicates_with_qmd(vault, monkeypatch) -> None:  # noqa: ANN001
+    from datetime import date
+
+    fixed_today = date(2026, 6, 15)
+    monkeypatch.setattr(vault_find, "owner_today", lambda: fixed_today)
+    (vault / "daily" / "2026-06-15.md").write_text(
+        "## 10:00 [text]\nРелиз версии 2\n", encoding="utf-8"
+    )
+    items = [
+        _hit("daily/2026-06-15.md", title="Сегодня", snippet="из qmd"),
+        _hit("notes/a.md", title="A", snippet="релиз"),
+    ]
+    _fake_qmd(monkeypatch, json.dumps(items))
+
+    hits = find_in_vault(vault, "релиз")
+
+    assert [h.rel_path for h in hits] == ["daily/2026-06-15.md", "notes/a.md"]
+    assert hits[0].title == "Сегодня"
+
+
+def test_fresh_daily_fallback_works_when_qmd_unavailable(vault, monkeypatch) -> None:  # noqa: ANN001
+    from datetime import date
+
+    fixed_today = date(2026, 6, 15)
+    monkeypatch.setattr(vault_find, "owner_today", lambda: fixed_today)
+    (vault / "daily" / "2026-06-15.md").write_text(
+        "## 11:00 [text]\nСрочная заметка про сервер\n", encoding="utf-8"
+    )
+    _fake_qmd(monkeypatch, exc=FileNotFoundError("qmd"))
+
+    hits = find_in_vault(vault, "сервер")
+
+    assert [h.rel_path for h in hits] == ["daily/2026-06-15.md"]
+    assert "сервер" in hits[0].snippet.lower()
+
+
+def test_fresh_daily_surfaced_even_when_qmd_fills_limit(vault, monkeypatch) -> None:  # noqa: ANN001
+    from datetime import date
+
+    fixed_today = date(2026, 6, 15)
+    monkeypatch.setattr(vault_find, "owner_today", lambda: fixed_today)
+    (vault / "daily" / "2026-06-15.md").write_text(
+        "## 11:00 [text]\nСвежая запись про бюджет\n", encoding="utf-8"
+    )
+    for i in range(5):
+        (vault / "notes" / f"n{i}.md").write_text("бюджет", encoding="utf-8")
+    _fake_qmd(monkeypatch, json.dumps([_hit(f"notes/n{i}.md") for i in range(5)]))
+
+    hits = find_in_vault(vault, "бюджет", limit=5)
+
+    assert len(hits) == 5
+    assert "daily/2026-06-15.md" in [h.rel_path for h in hits]
+
+
 def test_resolve_findable_file(vault) -> None:  # noqa: ANN001
     assert (
         resolve_findable_file(vault, "notes/a.md") == (vault / "notes/a.md").resolve()

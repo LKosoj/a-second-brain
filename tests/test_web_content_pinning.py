@@ -196,3 +196,43 @@ def test_backend_keeps_timeout_type_when_all_addresses_time_out(
     )
     with pytest.raises(httpcore.ConnectTimeout):
         _PinnedPublicBackend(inner=inner).connect_tcp("rebind.test", 80)
+
+
+def test_blocked_redirect_skips_fallback_readers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from d_brain.services import web_content
+
+    blocked = web_content.WebContentResult(
+        url="http://127.0.0.1/secret",
+        title="",
+        content="",
+        source="blocked-url",
+    )
+    monkeypatch.setattr(web_content, "_direct_extract", lambda *a, **kw: blocked)
+
+    called: list[str] = []
+    for name in (
+        "_proxy_extract",
+        "_tavily_extract",
+        "_jina_extract",
+        "_zai_extract",
+    ):
+        monkeypatch.setattr(
+            web_content,
+            name,
+            lambda *a, _name=name, **kw: called.append(_name) or None,
+        )
+
+    result = extract_web_content(
+        "https://example.com/start",
+        config=web_content.WebContentConfig(
+            proxy_url="http://proxy.test",
+            tavily_api_key="t",
+            jina_api_key="j",
+            zai_api_key="z",
+        ),
+    )
+
+    assert result == blocked
+    assert called == []

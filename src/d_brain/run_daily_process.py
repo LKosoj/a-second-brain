@@ -463,19 +463,7 @@ def main() -> int:
         # Before classification, so a recording recognized now is processed
         # with the rest of the day.
         _retry_unrecognized_voice(settings, day)
-    processor = CliProcessor(
-        settings.vault_path,
-        settings.todoist_api_key,
-        settings.ai_cli,
-        settings.owner_full_name,
-        settings.content_language,
-        getattr(settings, "openai_api_key", ""),
-        getattr(settings, "openai_base_url", ""),
-        getattr(settings, "openai_model", ""),
-        getattr(settings, "tavily_api_key", ""),
-        settings.owner_telegram_id,
-        getattr(settings, "recall_planner_disable_thinking", False),
-    )
+    processor = CliProcessor.from_settings(settings)
     try:
         result = _run_processor_cycle(processor, day, args.mode)
     except Exception as exc:  # pragma: no cover - CLI boundary

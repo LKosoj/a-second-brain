@@ -1,4 +1,13 @@
-"""Canonical control-plane workflow registry."""
+"""Declarative control-plane catalog of core agent and scheduled workflows.
+
+``CONTROL_PLANE_REGISTRY`` declares entrypoints, routing metadata, and expected
+write scopes for the core capture, question, scheduled-maintenance, and
+integration workflows. Interactive bot commands (``/do``, ``/why``, ``/find``,
+``/process``) and standalone CLI runners live outside this catalog, and actual
+runtime write enforcement is handled by ``vault-manifest.json``,
+``VaultFileService``, ``vault_write_lock``, and the fail-closed PreToolUse
+control-plane protect hook.
+"""
 
 from __future__ import annotations
 

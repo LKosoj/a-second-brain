@@ -30,3 +30,35 @@ def test_network_unit_uses_private_network_command() -> None:
     assert "a-second-brain network" in content
     assert "EnvironmentFile=@PROJECT_DIR@/.env" in content
     assert "NoNewPrivileges=true" in content
+
+
+def test_oneshot_services_have_timeout_start_sec() -> None:
+    for name in (
+        "a-second-brain-morning-brief.service.in",
+        "a-second-brain-plaud-sync.service.in",
+        "a-second-brain-qmd-maintenance.service.in",
+    ):
+        content = (PROJECT_ROOT / "deploy" / name).read_text(encoding="utf-8")
+        assert "TimeoutStartSec=30m" in content, name
+
+
+def test_process_service_waits_for_network_online() -> None:
+    content = (
+        PROJECT_ROOT / "deploy" / "a-second-brain-process.service.in"
+    ).read_text(encoding="utf-8")
+
+    assert "After=network-online.target" in content
+    assert "Wants=network-online.target" in content
+
+
+def test_network_launchd_plist_template() -> None:
+    content = (
+        PROJECT_ROOT / "deploy" / "com.second-brain.network.plist.in"
+    ).read_text(encoding="utf-8")
+
+    assert "<string>com.second-brain.network</string>" in content
+    assert "<string>a-second-brain</string>" in content
+    assert "<string>network</string>" in content
+    assert "<key>UV_BIN</key>" in content
+    assert "<key>KeepAlive</key>" in content
+    assert "@LOG_DIR@/network.out.log" in content

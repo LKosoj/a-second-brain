@@ -5,6 +5,42 @@ and semantic versioning.
 
 ## [Unreleased]
 
+### Added
+
+- Private HTTP network API (`a-second-brain network`) with request job queue,
+  long-polling (`wait`), artifact downloads, idempotent vault file reads/writes
+  with `ETag`/`If-Match`/`If-None-Match`/`X-Content-SHA256`, conflict
+  resolution, owner-notes protection for `compiled/*.md`, and QMD search.
+- macOS LaunchAgent template (`deploy/com.second-brain.network.plist.in`) and
+  automatic install/uninstall in `scripts/install-launchd-user.sh` when
+  `NETWORK_API_TOKEN` is configured.
+- `--uninstall` flag for `scripts/install-systemd-user.sh` and automatic
+  disabling of optional systemd units (`plaud-sync`, `network`,
+  `qmd-maintenance`) when their configuration is removed.
+- Shared `.env` reader helper `scripts/lib/env_reader.sh` used by
+  `install-systemd-user.sh`, `install-launchd-user.sh`, and
+  `restart-service.sh`.
+- Support for shared and built-in skills in the project template and updated
+  instructions.
+
+### Changed
+
+- Hardened systemd oneshot templates: added `TimeoutStartSec=30m` to
+  `morning-brief`, `plaud-sync`, and `qmd-maintenance` units, and added
+  `After=network-online.target` / `Wants=network-online.target` to
+  `a-second-brain-process.service.in`.
+- Pinned upper major version bounds in `pyproject.toml` for `httpx`,
+  `pydantic`, `pydantic-settings`, and `PyYAML`.
+- Clarified the introduction in `docs/ru/external-client.md` and
+  `docs/en/external-client.md` so it matches the documented scoped file API.
+
+### Fixed
+
+- Deterministic sorting of notes by key in `services/vault_map.py`.
+- Preserved spaces inside `EXTRA_PATH` entries in `scripts/lib/run_with_env.sh`.
+- Made `test_install_sh_handles_restored_vault_without_env` pass when tests run
+  as `root`.
+
 ## [0.2.0] - 2026-10-26
 
 ### Added

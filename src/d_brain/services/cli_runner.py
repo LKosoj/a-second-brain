@@ -854,6 +854,9 @@ class CliRunner:
                         if proc.stderr:
                             proc.stderr.close()
                 raise TimeoutError(str(exc)) from exc
+            except BaseException:
+                stop_process_group(proc)
+                raise
 
         if proc.returncode != 0:
             structured_error = ""

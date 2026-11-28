@@ -12,8 +12,10 @@ import re
 import subprocess
 import unicodedata
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path, PurePosixPath
 
+from d_brain.clock import owner_today
 from d_brain.services.file_browser import FileBrowserError, FileBrowserService
 from d_brain.services.qmd import QmdService
 
@@ -30,6 +32,7 @@ TITLE_MAX_CHARS = 80
 
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
 _SPACES_RE = re.compile(r"\s+")
+_WORD_RE = re.compile(r"[\w$]+")
 
 
 class FindUnavailable(Exception):
@@ -226,15 +229,71 @@ def _clean_title(raw: object, rel_path: str) -> str:
     return title
 
 
-def search_in_vault(
+def _query_tokens(query: str) -> list[str]:
+    normalized = normalize_query(query).casefold()
+    if not normalized:
+        return []
+    tokens = _WORD_RE.findall(normalized)
+    return tokens if tokens else [normalized]
+
+
+def _extract_matching_snippet(content: str, tokens: list[str]) -> str:
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    best_line = ""
+    best_score = 0
+    for line in lines:
+        lowered = line.casefold()
+        score = sum(1 for tok in tokens if tok in lowered)
+        if score > best_score:
+            best_score = score
+            best_line = line
+            if score == len(tokens):
+                break
+    return _clean_snippet(best_line or content[:SNIPPET_MAX_CHARS])
+
+
+def _search_fresh_daily(
     vault_path: Path | str,
     query: str,
     *,
-    limit: int = FIND_LIMIT,
-) -> FindSearchResult:
-    """Run qmd and return safe hits plus fixed-limit metadata."""
-    if limit < 1:
-        raise ValueError("limit must be positive")
+    exclude: set[str],
+) -> list[FindHit]:
+    """Direct case-insensitive fallback search over today's and yesterday's daily."""
+    tokens = _query_tokens(query)
+    if not tokens:
+        return []
+    today = owner_today()
+    hits: list[FindHit] = []
+    for offset in (0, 1):
+        day = today - timedelta(days=offset)
+        rel_path = f"daily/{day.isoformat()}.md"
+        if rel_path in exclude:
+            continue
+        resolved = resolve_findable_file(vault_path, rel_path)
+        if resolved is None:
+            continue
+        try:
+            content = resolved.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        lowered = content.casefold()
+        if all(tok in lowered for tok in tokens):
+            hits.append(
+                FindHit(
+                    rel_path=rel_path,
+                    title=_clean_title("", rel_path),
+                    snippet=_extract_matching_snippet(content, tokens),
+                )
+            )
+    return hits
+
+
+def _search_qmd_hits(
+    vault_path: Path | str,
+    query: str,
+    *,
+    limit: int,
+) -> tuple[list[FindHit], set[str]]:
     service = QmdService(Path(vault_path))
     try:
         result = service.run(
@@ -255,7 +314,7 @@ def search_in_vault(
 
     stdout = (result.stdout or "").strip()
     if not stdout:
-        return FindSearchResult((), 0, False)
+        return [], set()
     try:
         items = json.loads(stdout)
     except ValueError as exc:
@@ -292,8 +351,43 @@ def search_in_vault(
                 snippet=_clean_snippet(item.get("snippet")),
             )
         )
-    limited = len(hits) >= limit
-    return FindSearchResult(tuple(hits[:limit]), min(len(hits), limit), limited)
+    return hits, seen
+
+
+def search_in_vault(
+    vault_path: Path | str,
+    query: str,
+    *,
+    limit: int = FIND_LIMIT,
+) -> FindSearchResult:
+    """Run qmd and merge fresh daily fallback hits with fixed-limit metadata."""
+    if limit < 1:
+        raise ValueError("limit must be positive")
+
+    qmd_error: FindUnavailable | None = None
+    hits: list[FindHit] = []
+    seen: set[str] = set()
+    try:
+        hits, seen = _search_qmd_hits(vault_path, query, limit=limit)
+    except FindUnavailable as exc:
+        qmd_error = exc
+
+    fresh_hits = _search_fresh_daily(vault_path, query, exclude=seen)
+    if qmd_error is not None:
+        if fresh_hits:
+            limited = len(fresh_hits) >= limit
+            return FindSearchResult(
+                tuple(fresh_hits[:limit]), min(len(fresh_hits), limit), limited
+            )
+        raise qmd_error
+
+    if fresh_hits and len(hits) >= limit:
+        keep_qmd = max(0, limit - len(fresh_hits))
+        combined = hits[:keep_qmd] + fresh_hits
+    else:
+        combined = hits + fresh_hits
+    limited = len(hits) + len(fresh_hits) >= limit
+    return FindSearchResult(tuple(combined[:limit]), min(len(combined), limit), limited)
 
 
 def find_in_vault(

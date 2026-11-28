@@ -272,6 +272,10 @@ async def test_reply_to_last_separate_file_restores_whole_discussion(
         def __init__(self, *args) -> None:
             pass
 
+        @classmethod
+        def from_settings(cls, *args, **kwargs):  # noqa: ANN002, ANN003
+            return cls()
+
         def classify_text_intent(self, text: str):
             return {"intent": "question"}
 
@@ -342,6 +346,10 @@ async def test_do_saves_answer_and_passes_context_only_for_reply(
     class Processor:
         def __init__(self, *args) -> None:
             pass
+
+        @classmethod
+        def from_settings(cls, *args, **kwargs):  # noqa: ANN002, ANN003
+            return cls()
 
         def execute_prompt(self, prompt, user_id, **kwargs):
             captured.update(kwargs)

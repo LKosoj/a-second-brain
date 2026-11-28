@@ -20,6 +20,7 @@ from d_brain.services.atomic_io import atomic_write_file_bytes
 from d_brain.services.vault_lock import vault_write_lock
 
 MAX_FILE_BYTES = 16 * 1024 * 1024
+LOCK_TIMEOUT_SECONDS = 15.0
 _CONFLICT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _OPEN_CONFLICT_RETENTION = timedelta(days=7)
 _RESOLVED_CONFLICT_RETENTION = timedelta(days=1)
@@ -35,6 +36,10 @@ class VaultFileNotFound(VaultFileError):
 
 class VaultFileForbidden(VaultFileError):
     """The requested path is outside the user-content allowlist."""
+
+
+class VaultFileAlreadyExists(VaultFileError):
+    """Raised when creating a file at a path that already exists."""
 
 
 class VaultFileConflict(VaultFileError):
@@ -171,6 +176,23 @@ class VaultFileService:
             mimetypes.guess_type(target.name)[0] or "application/octet-stream",
         )
 
+    def create_file(self, path: str, content: bytes | str) -> VaultWriteResult:
+        raw_content = content.encode("utf-8") if isinstance(content, str) else content
+        if len(raw_content) > MAX_FILE_BYTES:
+            raise VaultFileError("file is too large")
+        relative = self._normalize_path(path)
+        target = self._resolve_new_target(relative)
+        with vault_write_lock(self.vault_path, timeout=LOCK_TIMEOUT_SECONDS):
+            target = self._resolve_new_target(relative)
+            if target.exists() or target.is_symlink():
+                raise VaultFileAlreadyExists("file already exists")
+            try:
+                atomic_write_file_bytes(target, raw_content, require_absent=True)
+            except FileExistsError as exc:
+                raise VaultFileAlreadyExists("file already exists") from exc
+            result = self.read_file(relative)
+        return VaultWriteResult(result.path, result.size, result.mtime_ns, result.etag)
+
     def update_file(
         self, path: str, content: bytes, expected_etag: str
     ) -> VaultWriteResult:
@@ -179,7 +201,7 @@ class VaultFileService:
         relative = self._normalize_path(path)
         target = self._resolve_existing(relative)
         self._require_regular(target)
-        with vault_write_lock(self.vault_path):
+        with vault_write_lock(self.vault_path, timeout=LOCK_TIMEOUT_SECONDS):
             current = self.read_file(relative)
             if current.etag == self._etag(content):
                 return VaultWriteResult(
@@ -274,7 +296,7 @@ class VaultFileService:
         if decision not in {"replace", "cancel"}:
             raise VaultFileError("decision must be replace or cancel")
         metadata_path = self.conflicts_path / f"{conflict_id}.json"
-        with vault_write_lock(self.vault_path):
+        with vault_write_lock(self.vault_path, timeout=LOCK_TIMEOUT_SECONDS):
             self._cleanup_conflicts()
             if not metadata_path.is_file():
                 raise VaultFileNotFound("conflict not found")
@@ -353,22 +375,33 @@ class VaultFileService:
         self.conflicts_path.mkdir(parents=True, exist_ok=True)
         proposed_etag = self._etag(content)
         self._cleanup_conflicts()
+        now = self._now()
         for metadata_path in self.conflicts_path.glob("*.json"):
             try:
                 existing = json.loads(metadata_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
+            if existing.get("status") != "open" or existing.get("path") != path:
+                continue
             if (
-                existing.get("status") == "open"
-                and existing.get("path") == path
-                and existing.get("proposed_etag") == proposed_etag
+                existing.get("proposed_etag") == proposed_etag
+                and existing.get("current_etag") == current_etag
             ):
                 return dict(existing)
+            if existing.get("current_etag") != current_etag:
+                existing.update(
+                    {
+                        "status": "superseded",
+                        "resolved_at": now,
+                        "updated_at": now,
+                    }
+                )
+                self._write_metadata(metadata_path, existing)
+                metadata_path.with_suffix(".bin").unlink(missing_ok=True)
 
         conflict_id = uuid.uuid4().hex
         payload_path = self.conflicts_path / f"{conflict_id}.bin"
         metadata_path = self.conflicts_path / f"{conflict_id}.json"
-        now = self._now()
         atomic_write_file_bytes(payload_path, content, new_file_mode=0o600)
         record: dict[str, Any] = {
             "conflict_id": conflict_id,
@@ -393,7 +426,7 @@ class VaultFileService:
             except (OSError, json.JSONDecodeError):
                 continue
             status = metadata.get("status")
-            if status not in {"open", "cancelled", "replaced"}:
+            if status not in {"open", "cancelled", "replaced", "superseded"}:
                 continue
             field = "created_at" if status == "open" else "resolved_at"
             timestamp = self._parse_timestamp(metadata.get(field))
@@ -513,6 +546,52 @@ class VaultFileService:
                 raise VaultFileForbidden("symlink path is not allowed")
         return target
 
+    def _resolve_new_target(self, relative: str) -> Path:
+        path = PurePosixPath(relative)
+        parts = path.parts
+        if any(part.startswith(".") for part in parts):
+            raise VaultFileForbidden("path is not user content")
+        if parts and parts[0] == "compiled":
+            raise VaultFileForbidden("creating files in compiled/ is not allowed")
+        if not self.is_user_content_path(relative):
+            raise VaultFileForbidden("path is not user content")
+        manifest = load_manifest_for_vault(self.vault_path)
+        for root in manifest.user_content_roots:
+            root_path = PurePosixPath(root).relative_to(
+                PurePosixPath(manifest.memory_root)
+            )
+            if path == root_path and not root_path.suffix:
+                raise VaultFileForbidden("path matches a root directory")
+        target = self.vault_path / relative
+        try:
+            target.relative_to(self.vault_path)
+        except ValueError as exc:
+            raise VaultFileForbidden("path is outside vault") from exc
+        current = self.vault_path
+        for component in parts:
+            current = current / component
+            if current.is_symlink():
+                raise VaultFileForbidden("symlink path is not allowed")
+        return target
+
+    def is_user_content_path(self, relative: str) -> bool:
+        if not relative:
+            return False
+        path = PurePosixPath(relative)
+        if any(part.startswith(".") for part in path.parts):
+            return False
+        manifest = load_manifest_for_vault(self.vault_path)
+        roots = {
+            PurePosixPath(root)
+            .relative_to(PurePosixPath(manifest.memory_root))
+            .as_posix()
+            for root in manifest.user_content_roots
+        }
+        return any(
+            path == PurePosixPath(root) or PurePosixPath(root) in path.parents
+            for root in roots
+        )
+
     def _is_visible(self, relative: str) -> bool:
         if relative == "":
             return True
@@ -602,7 +681,9 @@ class VaultFileService:
 
 
 __all__ = [
+    "LOCK_TIMEOUT_SECONDS",
     "MAX_FILE_BYTES",
+    "VaultFileAlreadyExists",
     "VaultFileConflict",
     "VaultFileConflictResolved",
     "VaultFileEditForbidden",

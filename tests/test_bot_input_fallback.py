@@ -503,6 +503,10 @@ def _patch_text_env(monkeypatch, tmp_path: Path) -> list[str]:  # noqa: ANN001
         def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
             raise AssertionError("unknown command must not reach the classifier")
 
+        @classmethod
+        def from_settings(cls, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            raise AssertionError("unknown command must not reach the classifier")
+
     monkeypatch.setattr(text_handler, "get_settings", lambda: _settings(tmp_path))
     monkeypatch.setattr(text_handler, "answer_text", fake_answer_text)
     monkeypatch.setattr(text_handler, "CliProcessor", NoClassifier)

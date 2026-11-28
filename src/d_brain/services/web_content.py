@@ -202,6 +202,8 @@ def extract_web_content(
         timeout=timeout,
         allowed_url=allowed_url,
     )
+    if direct_result.source == "blocked-url":
+        return direct_result
     if _is_usable_content(direct_result):
         return direct_result
 
@@ -403,6 +405,13 @@ def _direct_extract(
                 )
     except httpx.HTTPError as exc:
         logger.warning("Direct content fetch failed for %s: %s", url, exc)
+        if "resolves to a non-public address" in str(exc):
+            return WebContentResult(
+                url=url,
+                title="",
+                content="",
+                source="blocked-url",
+            )
         return WebContentResult(url=url, title="", content="", source="direct")
 
     extracted = html_to_text(raw_text) if "<html" in raw_text.lower() else {

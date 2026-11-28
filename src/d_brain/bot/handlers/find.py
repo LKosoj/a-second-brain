@@ -26,6 +26,7 @@ from aiogram.types import (
 
 from d_brain.bot.replies import answer_callback_once, answer_text
 from d_brain.bot.states import FindCommandState, wait_expired, wait_started_at
+from d_brain.bot.voice_input import pick_voice_media
 from d_brain.config import get_settings
 from d_brain.services.file_browser import TELEGRAM_MAX_DOCUMENT_BYTES
 from d_brain.services.vault_find import (
@@ -52,7 +53,7 @@ async def start_find_flow(message: Message, state: FSMContext) -> None:
     await answer_text(
         message,
         "🔍 **Что искать в заметках?**\n\n"
-        "Отправь текстом слова для поиска.\n"
+        "Отправь текстом или голосом слова для поиска.\n"
         "Повтори `/find` или отправь `-`, чтобы отменить.",
     )
 
@@ -83,14 +84,23 @@ async def cmd_find(message: Message, command: CommandObject, state: FSMContext) 
 
 @router.message(FindCommandState.waiting_for_input)
 async def handle_find_input(message: Message, state: FSMContext) -> None:
-    """Handle the query after a bare /find -- plain text only."""
+    """Handle the query after a bare /find (text or voice)."""
     data = await state.get_data()
     expired = wait_expired(data.get("find_entered_at"))
     text = (message.text or "").strip()
 
-    # Anything but plain text (voice, photo, document, forward), late text and
-    # another command leave the wait and go on to the next routers, so they are
-    # handled or saved as usual instead of being used as a search query.
+    # Non-forwarded voice while the wait is live is handed off to voice.py
+    # with the FSM state intact so the transcript runs as the /find query.
+    if (
+        pick_voice_media(message) is not None
+        and message.forward_origin is None
+        and not expired
+    ):
+        raise SkipHandler
+
+    # Anything else (photo, document, forward), late input and another command
+    # leave the wait and go on to the next routers, so they are handled or
+    # saved as usual instead of being used as a search query.
     if message.text is None or message.forward_origin is not None:
         await state.clear()
         raise SkipHandler

@@ -52,7 +52,7 @@ The `--enable` step renders up to six plists from `deploy/*.plist.in`:
 | `com.second-brain.bot` | `RunAtLoad` + `KeepAlive` | `a-second-brain run` |
 | `com.second-brain.process` | daily 21:00 by default (`DAILY_PROCESS_TIME`) | `python -m d_brain.run_daily_process --mode scheduled` |
 | `com.second-brain.morning-brief` | daily 08:00 by default (`MORNING_BRIEF_TIME`) | `python -m d_brain.run_morning_brief` |
-| `com.second-brain.plaud-sync` | hourly (only if `PLAUD_BEARER_TOKEN` is set) | `python -m d_brain.run_plaud_sync` |
+| `com.second-brain.plaud-sync` | hourly (when `PLAUD_CLI_BIN` or `PLAUD_BEARER_TOKEN` is set) | `python -m d_brain.run_plaud_sync` |
 | `com.second-brain.qmd-maintenance` | weekly Sun 03:30 (only if `qmd` is on `PATH`) | `a-second-brain qmd cleanup` |
 | `com.second-brain.backup-verify` | weekly Sun 04:15 | `python -m d_brain.run_vault_backup --verify` |
 

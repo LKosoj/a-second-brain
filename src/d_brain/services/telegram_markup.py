@@ -290,6 +290,42 @@ def markdown_to_html(markdown_text: str) -> str:
     return "\n".join(rendered_lines)
 
 
+_ANCHOR_TAG_RE = re.compile(r"<a\b([^>]*)>", re.IGNORECASE)
+_HREF_ATTR_RE = re.compile(
+    r"""(\bhref\s*=\s*)(?:"([^"]*)"|'([^']*)')""",
+    re.IGNORECASE,
+)
+
+
+def _is_safe_document_href(raw_href: str) -> bool:
+    """Allow only http(s), mailto, and relative `#...` / `/...` links."""
+
+    decoded = html.unescape(raw_href).strip()
+    if not decoded:
+        return False
+    normalized = re.sub(r"[\x00-\x20]+", "", decoded).lower()
+    if normalized.startswith(("#", "/")):
+        return True
+    return normalized.startswith(("http://", "https://", "mailto:"))
+
+
+def _sanitize_document_html_links(rendered_html: str) -> str:
+    """Neutralize unsafe URI schemes in `<a href=...>` attributes."""
+
+    def _replace_href(match: re.Match[str]) -> str:
+        prefix = match.group(1)
+        href_value = match.group(2) if match.group(2) is not None else match.group(3)
+        if href_value is not None and _is_safe_document_href(href_value):
+            return match.group(0)
+        return f'{prefix}"#"'
+
+    def _sanitize_anchor(match: re.Match[str]) -> str:
+        attrs = _HREF_ATTR_RE.sub(_replace_href, match.group(1))
+        return f"<a{attrs}>"
+
+    return _ANCHOR_TAG_RE.sub(_sanitize_anchor, rendered_html)
+
+
 def markdown_to_document_html(markdown_text: str) -> str:
     """Render markdown as full HTML body markup for a standalone document.
 
@@ -305,7 +341,7 @@ def markdown_to_document_html(markdown_text: str) -> str:
     renderer = markdown_lib.Markdown(extensions=DOCUMENT_HTML_EXTENSIONS)
     renderer.preprocessors.deregister("html_block")
     renderer.inlinePatterns.deregister("html")
-    return renderer.convert(value)
+    return _sanitize_document_html_links(renderer.convert(value))
 
 
 def markdown_to_plain_text(markdown_text: str) -> str:
@@ -336,12 +372,17 @@ class _HtmlToMarkdownV2Parser(HTMLParser):
         super().__init__(convert_charrefs=False)
         self.parts: list[str] = []
         self.tag_stack: list[tuple[str, str]] = []
+        self._bold_depth = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag_name = tag.lower()
+        if tag_name == "strong":
+            tag_name = "b"
         attrs_map = {key: value or "" for key, value in attrs}
         if tag_name == "b":
-            self.parts.append("*")
+            if self._bold_depth == 0:
+                self.parts.append("*")
+            self._bold_depth += 1
             self.tag_stack.append(("b", ""))
         elif tag_name == "i":
             self.parts.append("_")
@@ -366,13 +407,17 @@ class _HtmlToMarkdownV2Parser(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         tag_name = tag.lower()
+        if tag_name == "strong":
+            tag_name = "b"
         if not self.tag_stack:
             return
 
         while self.tag_stack:
             current_tag, value = self.tag_stack.pop()
             if current_tag == "b":
-                self.parts.append("*")
+                self._bold_depth = max(0, self._bold_depth - 1)
+                if self._bold_depth == 0:
+                    self.parts.append("*")
             elif current_tag == "i":
                 self.parts.append("_")
             elif current_tag == "s":

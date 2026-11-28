@@ -32,17 +32,9 @@ router = Router(name="text")
 logger = logging.getLogger(__name__)
 
 
-def _text_branch_label(intent: str, workflow: str = "") -> str:
-    """Human-readable label for the resolved text route."""
-    workflow_suffix = f" / {workflow}" if workflow else ""
-    if intent == TEXT_INTENT_QUESTION:
-        return f"прямой ответ / question{workflow_suffix}"
-    return f"сохранение в daily / capture{workflow_suffix}"
-
-
-def _text_status(branch: str, step: str) -> str:
-    """One compact status payload for text routing."""
-    return f"⏳ **Ветка:** {branch}\n**Сейчас:** {step}"
+def _text_status(step: str) -> str:
+    """One compact status payload for text handling."""
+    return f"⏳ {step}"
 
 
 async def _safe_delete_status(status_message: Message | None) -> None:
@@ -59,11 +51,10 @@ async def _upsert_status_message(
     source_message: Message,
     status_message: Message | None,
     *,
-    branch: str,
     step: str,
 ) -> Message | None:
     """Edit the current status message or replace it if edit fails."""
-    payload = _text_status(branch, step)
+    payload = _text_status(step)
     if status_message is not None:
         try:
             await edit_text(status_message, payload)
@@ -84,19 +75,17 @@ async def _run_to_thread_with_status(
     status_message: Message | None,
     func: Callable[..., Any],
     *,
-    branch: str,
     step: str,
     args: tuple[Any, ...] = (),
     kwargs: dict[str, Any] | None = None,
 ) -> tuple[Any, Message | None]:
-    """Run one blocking step in a worker thread while preserving branch status."""
+    """Run one blocking step in a worker thread while keeping status updated."""
     runner_kwargs = kwargs or {}
     task = asyncio.create_task(asyncio.to_thread(func, *args, **runner_kwargs))
     elapsed = 0
     status_message = await _upsert_status_message(
         source_message,
         status_message,
-        branch=branch,
         step=step,
     )
     while True:
@@ -112,7 +101,6 @@ async def _run_to_thread_with_status(
         status_message = await _upsert_status_message(
             source_message,
             status_message,
-            branch=branch,
             step=f"{step} ({elapsed // 60}m {elapsed % 60}s)",
         )
     return await task, status_message
@@ -129,25 +117,11 @@ async def handle_text(message: Message) -> None:
         return
 
     settings = get_settings()
-    processor = CliProcessor(
-        settings.vault_path,
-        settings.todoist_api_key,
-        settings.ai_cli,
-        settings.owner_full_name,
-        settings.content_language,
-        getattr(settings, "openai_api_key", ""),
-        getattr(settings, "openai_base_url", ""),
-        getattr(settings, "openai_model", ""),
-        getattr(settings, "tavily_api_key", ""),
-        0,
-        getattr(settings, "recall_planner_disable_thinking", False),
-        getattr(settings, "classification_model", ""),
-    )
+    processor = CliProcessor.from_settings(settings, owner_telegram_id=0)
     status_message = await _upsert_status_message(
         message,
         None,
-        branch="определяю ветку",
-        step="запускаю роутинг",
+        step="Читаю сообщение…",
     )
 
     # Wrapped like photo/voice/document (code review): this handler used to
@@ -169,25 +143,19 @@ async def handle_text(message: Message) -> None:
             message,
             status_message,
             processor.classify_text_intent,
-            branch="определяю ветку",
-            step="анализирую сообщение",
+            step="Читаю сообщение…",
             args=(message.text,),
         )
         if intent["intent"] == TEXT_INTENT_ACTION:
             await _safe_delete_status(status_message)
             await process_request(message, message.text, message.from_user.id)
             return
-        branch = _text_branch_label(
-            intent["intent"],
-            str(intent.get("workflow") or ""),
-        )
         if intent["intent"] == TEXT_INTENT_QUESTION:
             report, status_message = await _run_to_thread_with_status(
                 message,
                 status_message,
                 processor.answer_question,
-                branch=branch,
-                step="готовлю прямой ответ",
+                step="Ищу ответ…",
                 args=(message.text, message.from_user.id),
             )
             session.append(
@@ -204,8 +172,7 @@ async def handle_text(message: Message) -> None:
             status_message = await _upsert_status_message(
                 message,
                 status_message,
-                branch=branch,
-                step="отправляю ответ",
+                step="Отправляю ответ…",
             )
             await _safe_delete_status(status_message)
             final_sender = answer_text if "error" in report else answer_rich_text
@@ -263,8 +230,7 @@ async def handle_text(message: Message) -> None:
             message,
             status_message,
             link_summary.enrich_text,
-            branch=branch,
-            step="обогащаю текст",
+            step="Сохраняю заметку…",
             args=(message.text,),
             kwargs={
                 "timestamp": timestamp,
@@ -283,8 +249,7 @@ async def handle_text(message: Message) -> None:
             message,
             status_message,
             storage.append_to_daily,
-            branch=branch,
-            step="сохраняю запись в daily",
+            step="Сохраняю заметку…",
             args=(content, timestamp, "[text]"),
             kwargs={"source": source},
         )
@@ -309,12 +274,6 @@ async def handle_text(message: Message) -> None:
         if link_summary_message:
             reply += "\n\n" + link_summary_message
 
-        status_message = await _upsert_status_message(
-            message,
-            status_message,
-            branch=branch,
-            step="отправляю ответ",
-        )
         await _safe_delete_status(status_message)
         # Guarded separately from the handler below (code review): the status
         # message has just been deleted and the entry is already saved, so an

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import errno
-import fcntl
 import hashlib
 import json
 import logging
@@ -15,18 +14,16 @@ import subprocess
 import sys
 import threading
 import time
-import traceback
-from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
 from d_brain.clock import owner_now, owner_today
 from d_brain.manifest import VaultManifest, load_manifest_for_vault
-from d_brain.services import compiled_page
+from d_brain.services import compiled_page, compiled_renderer
 from d_brain.services.atomic_io import atomic_write_file_bytes, atomic_write_file_text
 from d_brain.services.cli_runner import (
     CliExecutionError,
@@ -42,6 +39,99 @@ from d_brain.services.compiled_page import (
 )
 from d_brain.services.compiled_page import (
     defuse_human_zone_markers as _defuse_human_zone_markers,
+)
+from d_brain.services.compiled_queue import (
+    DEFAULT_QUEUE_CLAIM_STALE_SECONDS as DEFAULT_QUEUE_CLAIM_STALE_SECONDS,
+)
+from d_brain.services.compiled_queue import (
+    DEFAULT_WORKER_STALE_SECONDS as DEFAULT_WORKER_STALE_SECONDS,
+)
+from d_brain.services.compiled_queue import (
+    QUEUE_STARVATION_SKIP_LIMIT as QUEUE_STARVATION_SKIP_LIMIT,
+)
+from d_brain.services.compiled_queue import (
+    QUEUE_WORKER_HISTORY_LIMIT as QUEUE_WORKER_HISTORY_LIMIT,
+)
+from d_brain.services.compiled_queue import (
+    SOURCE_STATE_VERSION as SOURCE_STATE_VERSION,
+)
+from d_brain.services.compiled_queue import (
+    CompiledQueueMixin,
+)
+from d_brain.services.compiled_queue import (
+    CompiledSourceStateError as CompiledSourceStateError,
+)
+from d_brain.services.compiled_renderer import (
+    AMBIGUOUS_HUMAN_ZONE as _AMBIGUOUS_HUMAN_ZONE,
+)
+from d_brain.services.compiled_renderer import (
+    CLAIM_HISTORY_ROW_RE as CLAIM_HISTORY_ROW_RE,
+)
+from d_brain.services.compiled_renderer import (
+    CONFIDENCE_VALUES as CONFIDENCE_VALUES,
+)
+from d_brain.services.compiled_renderer import (
+    CORE_FRONTMATTER_FIELDS as CORE_FRONTMATTER_FIELDS,
+)
+from d_brain.services.compiled_renderer import (
+    DATE_ONLY_RE as DATE_ONLY_RE,
+)
+from d_brain.services.compiled_renderer import (
+    DATED_BULLET_ROW_RE as DATED_BULLET_ROW_RE,
+)
+from d_brain.services.compiled_renderer import (
+    DECISION_STATUS_VALUES as DECISION_STATUS_VALUES,
+)
+from d_brain.services.compiled_renderer import (
+    DEFAULT_SOURCES_TRUST as DEFAULT_SOURCES_TRUST,
+)
+from d_brain.services.compiled_renderer import (
+    EXPLICIT_EVENT_DATE_RE as EXPLICIT_EVENT_DATE_RE,
+)
+from d_brain.services.compiled_renderer import (
+    FRESHNESS_VALUES as FRESHNESS_VALUES,
+)
+from d_brain.services.compiled_renderer import (
+    HUMAN_ZONE_DUPLICATE_MIN_TOKENS as HUMAN_ZONE_DUPLICATE_MIN_TOKENS,
+)
+from d_brain.services.compiled_renderer import (
+    HUMAN_ZONE_DUPLICATE_OVERLAP_THRESHOLD as HUMAN_ZONE_DUPLICATE_OVERLAP_THRESHOLD,
+)
+from d_brain.services.compiled_renderer import (
+    HUMAN_ZONE_END as HUMAN_ZONE_END,
+)
+from d_brain.services.compiled_renderer import (
+    HUMAN_ZONE_START as HUMAN_ZONE_START,
+)
+from d_brain.services.compiled_renderer import (
+    INCIDENT_SEVERITY_VALUES as INCIDENT_SEVERITY_VALUES,
+)
+from d_brain.services.compiled_renderer import (
+    MAX_OUTPUT_ARTIFACT_CHARS as MAX_OUTPUT_ARTIFACT_CHARS,
+)
+from d_brain.services.compiled_renderer import (
+    OPEN_CONFLICTS_ROW_RE as OPEN_CONFLICTS_ROW_RE,
+)
+from d_brain.services.compiled_renderer import (
+    RECORD_KIND_VALUES as RECORD_KIND_VALUES,
+)
+from d_brain.services.compiled_renderer import (
+    SOURCES_SHAPED_TABLE_ROW_RE as SOURCES_SHAPED_TABLE_ROW_RE,
+)
+from d_brain.services.compiled_renderer import (
+    SOURCES_TRUST_VALUES as SOURCES_TRUST_VALUES,
+)
+from d_brain.services.compiled_renderer import (
+    STATUS_VALUES as STATUS_VALUES,
+)
+from d_brain.services.compiled_renderer import (
+    CompiledRendererMixin,
+)
+from d_brain.services.compiled_renderer import (
+    HumanZoneMarkerError as HumanZoneMarkerError,
+)
+from d_brain.services.compiled_renderer import (
+    human_zone_markers_look_corrupted as human_zone_markers_look_corrupted,
 )
 from d_brain.services.frontmatter import (
     FrontmatterError,
@@ -62,21 +152,10 @@ if TYPE_CHECKING:
     from d_brain.services.decisions_queue import QueueItem
 
 logger = logging.getLogger(__name__)
-QueueLockResult = TypeVar("QueueLockResult")
 
 
 class CompiledBriefingWriteConflict(RuntimeError):
     """Raised when a briefing changes while its replacement is being built."""
-
-
-class HumanZoneMarkerError(ValueError):
-    """Raised when a page's human-zone markers are missing or malformed.
-
-    Subclasses ``ValueError`` (not ``RuntimeError``) on purpose: callers
-    already catch ``ValueError`` around briefing writes (``refresh_after_write``,
-    ``_backfill_freshness_notes``), so this fails the page closed for free
-    without new except clauses — better to skip a page than lose owner text.
-    """
 
 
 class CompiledPageEncodingError(ValueError):
@@ -132,20 +211,6 @@ class CompiledBriefingPassBudgetExceededError(RuntimeError):
     """
 
 
-class CompiledSourceStateError(ValueError):
-    """Raised by ``_load_source_state_unlocked`` when
-    ``.compiled/source-state.json`` is corrupt or in an unsupported shape.
-
-    Code review Finding 2: this used to only ever surface on the nightly
-    path (``freshness_issues``, ``initialize_source_state``), where it is a
-    real signal the owner must see. ``_source_tier_ranks`` now also reads
-    source-state, but only to *order* an already-ready queue -- a distinct
-    subclass lets that one read-site catch narrowly and degrade instead of
-    crashing the ordinary queue-only CLI run, without loosening the nightly
-    path's strictness (it still lets this propagate).
-    """
-
-
 COMPILED_BRIEFING_DOMAINS = (
     "projects",
     "people",
@@ -168,62 +233,6 @@ DOMAIN_HINTS = {
         "клиенту или дате"
     ),
 }
-STATUS_VALUES = {"active", "draft", "pending", "done", "inactive"}
-FRESHNESS_VALUES = {"fresh", "watch", "stale"}
-CONFIDENCE_VALUES = {"high", "medium", "low"}
-RECORD_KIND_VALUES = {"decision", "incident", "briefing"}
-DECISION_STATUS_VALUES = {"proposed", "accepted", "rejected", "superseded"}
-# The four levels the incident prompt offers (see ``severity`` there). Like
-# ``decision_status`` above, this renders as a bare ``severity: {value}``
-# line, so an off-menu answer is dropped rather than trusted into YAML.
-INCIDENT_SEVERITY_VALUES = {"low", "medium", "high", "critical"}
-SOURCES_TRUST_VALUES = {"own", "forwarded", "integration", "inferred"}
-DEFAULT_SOURCES_TRUST = "inferred"
-# Every frontmatter key ``_render_briefing`` computes itself (whether or not
-# a given pass actually emits it -- the decision/incident fields are
-# conditional on ``record_kind``, but still core-owned). Used to tell apart
-# fields the owner layer writes out-of-band (e.g. ``duplicate_of`` via
-# decisions_queue._apply_duplicate_link) from fields core must always
-# recompute fresh -- see the passthrough loop at the end of the frontmatter
-# ``lines`` build in ``_render_briefing``.
-CORE_FRONTMATTER_FIELDS = frozenset(
-    {
-        "type",
-        "domain",
-        "aliases",
-        "directions",
-        "projects",
-        "description",
-        "status",
-        "created",
-        "updated",
-        "last_compiled_at",
-        "freshness_state",
-        "confidence",
-        "source_count",
-        "last_accessed",
-        "relevance",
-        "tier",
-        "sources_trust",
-        "last_verified",
-        "last_source_checked",
-        "enrichment_count",
-        "conflicts_open",
-        "human_reviewed",
-        "human_zone_populated",
-        "quality_status",
-        "quality_reason",
-        "record_kind",
-        "decision_status",
-        "decision_owner",
-        "decision_date",
-        "supersedes",
-        "superseded_by",
-        "incident_date",
-        "severity",
-        "source_event_dates",
-    }
-)
 # ТЗ 4.4 "Правила": the two trust levels strong enough, alone, to justify an
 # automatic action with consequences (task creation, CRM edit, silently
 # superseding an existing claim). forwarded/inferred must not, alone,
@@ -373,11 +382,6 @@ TIER_RANK = {
     "cold": 2,
     "archive": 1,
 }
-# Code review Finding 1: how many drain cycles a ready queue event may be
-# passed over by higher-tier arrivals before ``_claim_ready_queue_events``
-# forces it to the front regardless of tier. See that function's aging
-# comment for the full rationale.
-QUEUE_STARVATION_SKIP_LIMIT = 5
 QUESTION_DOMAIN_HINTS = {
     "projects": ("проект", "клиент", "лид", "статус", "pipeline"),
     "people": ("человек", "контакт", "клиент", "партнер", "partner", "founder"),
@@ -390,7 +394,6 @@ QUESTION_CONTEXT_LIMIT = 3
 MAX_SOURCE_EXCERPT_CHARS = 8000
 MAX_EXISTING_NOTE_CHARS = 10000
 MAX_BODY_SNIPPET_CHARS = 2500
-MAX_OUTPUT_ARTIFACT_CHARS = 12000
 MAX_JSON_REPAIR_CHARS = 12000
 IMPACT_TIMEOUT_SECONDS = 360
 COMPILE_TIMEOUT_SECONDS = 180
@@ -400,9 +403,6 @@ DEFAULT_DEBOUNCE_SECONDS = 45
 DEFAULT_QUEUE_BATCH_SIZE = 8
 DEFAULT_WORKER_IDLE_SECONDS = DEFAULT_DEBOUNCE_SECONDS + 15
 DEFAULT_WORKER_POLL_SECONDS = 5.0
-DEFAULT_WORKER_STALE_SECONDS = 90
-DEFAULT_QUEUE_CLAIM_STALE_SECONDS = 900
-QUEUE_WORKER_HISTORY_LIMIT = 10
 IMPACT_CATALOG_MAX_ITEMS = 48
 IMPACT_CATALOG_MAX_CHARS = 48000
 # Resolve stage thresholds (ТЗ 5.2 "Resolve", 5.6 "Параметры по умолчанию").
@@ -416,7 +416,6 @@ RESOLVE_MAX_CANDIDATES_PER_SOURCE = 5
 BATCH_CONSOLIDATION_MIN_EVENTS = 2
 BATCH_CONSOLIDATION_MAX_EVENTS = 6
 BATCH_CONSOLIDATION_EXCERPT_CHARS = 1600
-SOURCE_STATE_VERSION = 1
 SOURCE_STATE_IGNORED_FRONTMATTER_FIELDS = {
     "last_accessed",
     "last_source_checked",
@@ -534,30 +533,6 @@ DAILY_ENTRY_SPLIT_RE = re.compile(
     re.MULTILINE,
 )
 
-# Human-owned zone markers (see HumanZoneMarkerError below): the block they
-# wrap survives every recompilation, archival, and link-repair pass verbatim.
-HUMAN_ZONE_START = "<!-- human:start -->"
-HUMAN_ZONE_END = "<!-- human:end -->"
-# Model-authored text that starts a line with "## " is the same class of
-# forgery one level up: _section_text/_replace_section/_insert_section_before
-# find every section of a compiled page with "^##\s+" (MULTILINE), and take
-# the *first* match, so a forged heading landing before the real one makes
-# the page's own accumulated rows unreachable -- they stop being rendered
-# on the next pass. _paragraph needs this because it keeps the newlines a
-# forged heading needs. _clean_line/_normalize_list collapse their value
-# onto one line, which is almost always written after a "- " or "| " prefix
-# and so cannot start a line -- the one exception is next_check, which is
-# rendered as a bare line and therefore defuses its own value (see
-# _render_briefing). Any new field rendered that way has to do the same.
-_EMBEDDED_HEADING_RE = re.compile(r"^(##\s)", re.MULTILINE)
-
-
-def _defuse_embedded_headings(text: str) -> str:
-    """Indent any line of model-authored text that reads as a page heading."""
-
-    return _EMBEDDED_HEADING_RE.sub(r" \1", text)
-
-
 # JSON allows a "\ud800"-style escape with no matching second half, and
 # json.loads accepts it: the result is a valid Python str holding an
 # unpaired UTF-16 surrogate, which is not encodable as UTF-8 at all.
@@ -598,135 +573,8 @@ def _strip_payload_surrogates(payload: dict[str, Any]) -> dict[str, Any]:
         str(_strip_lone_surrogates(key)): _strip_lone_surrogates(value)
         for key, value in payload.items()
     }
-# Sentinel span meaning a page's human-zone markers are ambiguous (see
-# CompiledBriefingService._human_zone_span): two or more of either marker,
-# or a single pair in reversed order. Mirrors add_links.py's
-# AMBIGUOUS_HUMAN_ZONE / fix_links.py's _protect_human_zone -- which START
-# pairs with which END can't be guessed without risking silent corruption
-# of the owner's text.
-_AMBIGUOUS_HUMAN_ZONE = (-1, -1)
-# First corruption detector for the "zero exact markers" case (see
-# _extract_human_zone/_human_zone_span below, and the mirrored copies in
-# add_links.py::human_zone_span / fix_links.py::_protect_human_zone): a
-# page that genuinely never had a human zone has no "## Owner Notes"
-# heading either, since _render_briefing always writes that heading
-# together with the zone markers -- real or scaffold -- on every single
-# render (see the end of _render_briefing below). So finding the heading
-# with zero exact markers is a structural fact, not a guess: this code
-# cannot have produced that combination itself, so the markers must have
-# been corrupted since -- a typo, a homoglyph, a stray dash, a missing
-# colon, extra text inside the comment, whatever it looks like lexically.
-# A regex trying to name every way a marker can be mangled is a losing
-# race (looser catches more corruption but also more ordinary prose that
-# merely mentions a marker; stricter does the opposite) -- checking for the
-# heading instead sidesteps that tradeoff entirely, because it does not
-# care what the corruption looks like, only whether it happened.
-#
-# Not sufficient alone, though (code review defect 1): this heading is
-# ordinary text living in the page body, so it can be damaged by the exact
-# same kind of external edit that damages the markers themselves -- a
-# Pandoc round-trip, markdownlint's `{#owner-notes}` autofix, a plain-text
-# sanitizer stripping HTML comments -- leaving *both* signals negative at
-# once. See _HUMAN_ZONE_POPULATED_RE below for the second, independent
-# signal that catches that case.
-_OWNER_NOTES_HEADING_RE = re.compile(r"^##\s+Owner Notes\s*$", re.MULTILINE)
-# Second, independent corruption signal (code review, defect 1): the heading
-# above lives in the page body, so a single external edit that reformats or
-# strips prose -- a Pandoc round-trip, markdownlint's `{#owner-notes}`
-# autofix, a plain-text sanitizer dropping HTML comments -- can take the
-# heading down together with the exact markers, leaving
-# ``human_zone_markers_look_corrupted`` with nothing to see. This flag lives
-# in the frontmatter instead, a different part of the file maintained by a
-# different mechanism (``_render_briefing``'s frontmatter rebuild, never the
-# body-text regex editing that damages the heading), so it survives a
-# body-only edit. ``_render_briefing`` sets it the first time this page's
-# human zone ever holds real, non-scaffold text (see CORE_FRONTMATTER_FIELDS)
-# and never clears it again -- once a page has held owner text, losing every
-# marker is corruption regardless of what the zone would render as now.
-_HUMAN_ZONE_POPULATED_RE = re.compile(
-    r"^human_zone_populated:\s*true\s*$", re.MULTILINE
-)
 
 
-def human_zone_markers_look_corrupted(text: str) -> bool:
-    """True if ``text`` shows structural evidence of a human zone that zero
-    exact markers should not be possible for.
-
-    Only meaningful when the caller has already confirmed zero *exact*
-    ``HUMAN_ZONE_START``/``HUMAN_ZONE_END`` matches -- see
-    ``_AMBIGUOUS_HUMAN_ZONE`` above for why that case needs a second look
-    before it can be treated as "no zone yet". Structural rather than
-    lexical: a page this code has ever rendered always carries the ``##
-    Owner Notes`` heading together with the markers, and once a page's zone
-    has ever held real text ``_render_briefing`` also marks it in the
-    frontmatter (see ``_HUMAN_ZONE_POPULATED_RE`` above) -- either signal
-    surviving with zero exact markers present means the markers were
-    corrupted since, regardless of what that corruption looks like or
-    whether it also took the heading down with it. Prose that merely
-    mentions marker-like text on a page with neither signal is not
-    corruption and is not flagged.
-
-    Both signals below are matched against a copy of ``text`` with every
-    newline convention -- "\\r\\n", a bare "\\r" (classic Mac line endings,
-    see ``_FRONTMATTER_BOUNDARY_RE`` above for why that style must be
-    tolerated at all), and "\\n" -- folded to "\\n": ``_OWNER_NOTES_HEADING_RE``
-    and ``_HUMAN_ZONE_POPULATED_RE`` are both ``re.MULTILINE``, and Python's
-    ``^``/``$`` in that mode only ever treat "\\n" as a line boundary, so a
-    bare-"\\r" page would otherwise trip neither signal and this function
-    would report "not corrupted" with nothing actually checked. Safe to fold
-    here, unlike in ``_body_without_frontmatter``: this function only
-    returns a bool and never slices or returns the normalized copy itself.
-    """
-    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
-    if _OWNER_NOTES_HEADING_RE.search(normalized) is not None:
-        return True
-    frontmatter_match = FRONTMATTER_RE.match(normalized)
-    if frontmatter_match is None:
-        return False
-    return _HUMAN_ZONE_POPULATED_RE.search(frontmatter_match.group(1)) is not None
-
-
-# Duplicate-of-human-zone filter (see _text_duplicates_human_zone): a
-# candidate line is dropped once this fraction of its tokens also appears in
-# the human zone. Below HUMAN_ZONE_DUPLICATE_MIN_TOKENS tokens the ratio is
-# meaningless -- one shared word ("SLA") would already hit 100% overlap on a
-# one-token line -- so the filter does not apply at all under that length.
-HUMAN_ZONE_DUPLICATE_OVERLAP_THRESHOLD = 0.8
-HUMAN_ZONE_DUPLICATE_MIN_TOKENS = 5
-# Strict YYYY-MM-DD check for the last_verified/human_reviewed frontmatter
-# fields (see _validated_date_field). Those two fields render without
-# json.dumps escaping, so a stray value containing a colon would otherwise
-# produce invalid YAML that fails validation on every future write.
-DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-# Event dates are evidence only when the source labels them as such. A date
-# embedded in a file name or supplied by the processing clock is received-at
-# metadata, never an event date.
-EXPLICIT_EVENT_DATE_RE = re.compile(
-    r"(?im)^(?:event_date|дата\s+события)\s*:\s*[\"']?(\d{4}-\d{2}-\d{2})"
-)
-# One rendered "Sources That Shaped This Page" row: "| date | [[source]] | what |".
-SOURCES_SHAPED_TABLE_ROW_RE = re.compile(
-    r"^\|\s*(\S+)\s*\|\s*\[\[([^\]]+)\]\]\s*\|\s*(.*?)\s*\|\s*$"
-)
-# One rendered "Claim History" row:
-# "| date | [[old source]] | claim | [[new source]] |".
-CLAIM_HISTORY_ROW_RE = re.compile(
-    r"^\|\s*(\S+)\s*\|\s*\[\[([^\]]+)\]\]\s*\|\s*(.*?)\s*\|\s*\[\[([^\]]+)\]\]\s*\|\s*$"
-)
-# One rendered "Open Conflicts" row:
-# "| date | existing claim | [[existing source]] | new claim | [[new source]] |".
-OPEN_CONFLICTS_ROW_RE = re.compile(
-    r"^\|\s*(\S+)\s*\|\s*(.*?)\s*\|\s*\[\[([^\]]+)\]\]\s*\|\s*(.*?)\s*\|\s*\[\[([^\]]+)\]\]\s*\|\s*$"
-)
-# One rendered "Recent Changes" / "Open Loops" / "History" dated bullet:
-# "- YYYY-MM-DD: text (source: [[source]])", or without the trailing
-# "(source: ...)" clause when no source is known (ТЗ 6.3 accumulation, see
-# ``_dated_rows``/``_render_dated_bullets``). The source group is optional so
-# a bullet written before this format existed still parses (as a row with no
-# known source) instead of being silently dropped.
-DATED_BULLET_ROW_RE = re.compile(
-    r"^-\s+(\d{4}-\d{2}-\d{2}):\s+(.*?)(?:\s+\(source:\s*\[\[([^\]]+)\]\]\))?\s*$"
-)
 # Entry-type marker convention (see vault/.claude/rules/daily-format.md and
 # bot/handlers/forward.py:119): the SOURCE trust rule (ТЗ 4.4) reads this off
 # the excerpt's own entry headers (see _source_trust_level), not off the model
@@ -1057,7 +905,7 @@ class CompileEnrichPass:
     import_sweep: dict[str, int] = field(default_factory=dict)
 
 
-class CompiledBriefingService:
+class CompiledBriefingService(CompiledRendererMixin, CompiledQueueMixin):
     """Maintain a derived compiled layer above raw vault notes."""
 
     def __init__(
@@ -4841,756 +4689,6 @@ class CompiledBriefingService:
             f"{source_excerpt}\n"
         )
 
-    def _render_briefing(
-        self,
-        *,
-        target: CompiledBriefingTarget,
-        payload: dict[str, Any],
-        source_rel_path: str,
-        existing_text: str,
-        existing_meta: dict[str, str],
-        signal: dict[str, Any] | None,
-        source_excerpt: str = "",
-        claims: list[dict[str, str]] | None = None,
-        conflicts: list[dict[str, str]] | None = None,
-        record_side_effects: bool = True,
-        adjudication_cache: dict[tuple[str, str, str, str, str], tuple[str, str]]
-        | None = None,
-    ) -> str:
-        claims = claims or []
-        conflicts = conflicts or []
-
-        # Extract (and validate) the human zone before anything else: a
-        # malformed marker pair must raise before the vault lock is taken, so
-        # a bad page is skipped rather than partially rewritten. Passed the
-        # full ``existing_text`` (frontmatter included), not just the body --
-        # see _extract_human_zone / human_zone_populated below for why.
-        human_zone = self._extract_human_zone(existing_text)
-        human_zone_inner = human_zone[
-            len(HUMAN_ZONE_START) : len(human_zone) - len(HUMAN_ZONE_END)
-        ].strip()
-        human_zone_tokens = (
-            compiled_page.tokens(human_zone_inner) if human_zone_inner else set()
-        )
-        # Code review defect 1: sticky once true (see _HUMAN_ZONE_POPULATED_RE
-        # / human_zone_markers_look_corrupted) -- sets the frontmatter flag
-        # the first time this page's zone holds real text, and keeps it set
-        # on every later render even if the owner clears their notes again,
-        # so a future corruption that also destroys the "## Owner Notes"
-        # heading is still caught.
-        human_zone_populated = bool(human_zone_inner) or (
-            existing_meta.get("human_zone_populated") == "true"
-        )
-
-        # A claim that just restates the owner's own human-zone text must
-        # never be re-added as "new" machine-zone content (same rule as
-        # recent_changes/open_loops/etc. below). Any conflict pointing at a
-        # dropped claim becomes moot and is dropped with it.
-        if claims and human_zone_tokens:
-            kept_claim_texts = set(
-                self._filter_list_duplicating_human_zone(
-                    [claim["text"] for claim in claims], human_zone_tokens
-                )
-            )
-            claims = [claim for claim in claims if claim["text"] in kept_claim_texts]
-            conflicts = [
-                conflict
-                for conflict in conflicts
-                if conflict["new_claim"] in kept_claim_texts
-            ]
-
-        today = owner_today().isoformat()
-        compiled_at = datetime.now().astimezone().isoformat(timespec="seconds")
-        # Needed below only to queue a "blocked-action" owner decision when
-        # ``_apply_claims_and_conflicts`` blocks a low-trust supersession
-        # (ТЗ 4.4/7.2) -- computed once here rather than inside that method,
-        # which otherwise has no notion of ``target``/the page's own path.
-        page_rel_path = (
-            self._target_path(target).relative_to(self.vault_path).as_posix()
-        )
-        description = self._clean_line(payload.get("description")) or target.description
-        status = str(payload.get("status") or existing_meta.get("status") or "active")
-        if status not in STATUS_VALUES:
-            status = "active"
-        freshness_state = str(
-            payload.get("freshness_state")
-            or existing_meta.get("freshness_state")
-            or "watch"
-        )
-        if freshness_state not in FRESHNESS_VALUES:
-            freshness_state = "watch"
-        confidence = str(
-            payload.get("confidence")
-            or existing_meta.get("confidence")
-            or "medium"
-        )
-        if confidence not in CONFIDENCE_VALUES:
-            confidence = "medium"
-        quality_status = existing_meta.get("quality_status", "").strip()
-        quality_reason = existing_meta.get("quality_reason", "").strip()
-        if payload.get("_quality_verification_completed") is True:
-            quality_issues = payload.get("_quality_issues")
-            if isinstance(quality_issues, list) and quality_issues:
-                quality_status = "needs_review"
-                quality_reason = "; ".join(
-                    str(issue).strip()
-                    for issue in quality_issues
-                    if str(issue).strip()
-                )
-            else:
-                quality_status = ""
-                quality_reason = ""
-
-        current_state = self._paragraph(payload.get("current_state"))
-        def without_leading_date(items: list[str]) -> list[str]:
-            cleaned = [
-                re.sub(r"^\d{4}-\d{2}-\d{2}:\s*", "", item).strip()
-                for item in items
-            ]
-            return [item for item in cleaned if item]
-
-        recent_changes = without_leading_date(
-            compiled_page.normalize_list(payload.get("recent_changes"))
-        )
-        open_loops = without_leading_date(
-            compiled_page.normalize_list(payload.get("open_loops"))
-        )
-        # Filtered here, before any accepted-decision restoration below can
-        # overwrite it with immutable existing-page content: the duplicate
-        # filter must only ever see freshly generated model output, never
-        # text that was already on the page (see the accepted-decision
-        # branch further down).
-        key_decisions = self._filter_list_duplicating_human_zone(
-            compiled_page.normalize_list(payload.get("key_decisions")),
-            human_zone_tokens,
-        )
-        # The one _clean_line field rendered as a bare line of its own (see
-        # "## Next Check" below), so unlike every other one it can forge a
-        # heading -- and the forgery would sit above the real headings that
-        # follow it, which is what the section readers find first.
-        next_check = _defuse_embedded_headings(
-            self._clean_line(payload.get("next_check"))
-        )
-
-        record_kind = ""
-        decision_status = ""
-        decision_owner = ""
-        decision_date = ""
-        rationale = ""
-        alternatives: list[str] = []
-        supersedes: list[str] = []
-        superseded_by = ""
-        decision_evidence: list[str] = []
-        incident_date = ""
-        severity = ""
-        timeline: list[str] = []
-        root_cause = ""
-        what_worked: list[str] = []
-        what_did_not_work: list[str] = []
-        corrective_actions: list[str] = []
-        generalizable_learning = ""
-        if target.domain == "decisions":
-            existing_record_kind = compiled_page.metadata_value(
-                existing_meta.get("record_kind")
-            )
-            existing_decision_status = compiled_page.metadata_value(
-                existing_meta.get("decision_status")
-            )
-            record_kind = compiled_page.metadata_value(
-                payload.get("record_kind")
-                or existing_record_kind
-                or "decision"
-            )
-            if (
-                existing_record_kind == "decision"
-                and existing_decision_status == "accepted"
-            ):
-                record_kind = "decision"
-            if record_kind not in RECORD_KIND_VALUES:
-                record_kind = "decision"
-            if record_kind == "decision":
-                decision_status = compiled_page.metadata_value(
-                    payload.get("decision_status")
-                    or existing_meta.get("decision_status")
-                    or "proposed"
-                )
-                if decision_status not in DECISION_STATUS_VALUES:
-                    decision_status = "proposed"
-                decision_owner = compiled_page.metadata_value(
-                    payload.get("decision_owner")
-                    or existing_meta.get("decision_owner")
-                )
-                decision_date = self._validated_date_field(
-                    payload.get("decision_date")
-                    or existing_meta.get("decision_date"),
-                    field="decision_date",
-                    page_path=f"compiled/{target.domain}/{target.slug}.md",
-                )
-                # Same reasoning as key_decisions above: filter the fresh
-                # model output now, before the accepted-decision branch
-                # below can replace it with immutable existing-page text.
-                rationale = self._filter_text_duplicating_human_zone(
-                    self._paragraph(payload.get("rationale")), human_zone_tokens
-                )
-                alternatives = self._filter_list_duplicating_human_zone(
-                    compiled_page.normalize_list(payload.get("alternatives_considered")),
-                    human_zone_tokens,
-                )
-                supersedes = compiled_page.normalize_list(payload.get("supersedes"))
-                superseded_by = self._clean_line(payload.get("superseded_by"))
-                decision_evidence = self._normalize_paths(
-                    payload.get("decision_evidence")
-                )
-
-                explicit_supersession = (
-                    decision_status == "superseded" and bool(superseded_by)
-                )
-                if existing_decision_status == "accepted" and not explicit_supersession:
-                    decision_status = "accepted"
-                    decision_owner = compiled_page.metadata_value(
-                        existing_meta.get("decision_owner")
-                    ) or decision_owner
-                    decision_date = self._validated_date_field(
-                        existing_meta.get("decision_date"),
-                        field="decision_date",
-                        page_path=f"compiled/{target.domain}/{target.slug}.md",
-                    ) or decision_date
-                    rationale = (
-                        self._section_text(existing_text, "Rationale") or rationale
-                    )
-                    alternatives = self._section_bullets(
-                        existing_text,
-                        "Alternatives Considered",
-                    ) or alternatives
-                    key_decisions = self._section_bullets(
-                        existing_text,
-                        "Key Decisions",
-                    ) or key_decisions
-                if decision_status == "accepted" and not key_decisions:
-                    key_decisions = [target.title]
-            elif record_kind == "incident":
-                incident_date = self._validated_date_field(
-                    payload.get("incident_date")
-                    or existing_meta.get("incident_date"),
-                    field="incident_date",
-                    page_path=f"compiled/{target.domain}/{target.slug}.md",
-                )
-                severity = compiled_page.metadata_value(
-                    payload.get("severity") or existing_meta.get("severity")
-                )
-                if severity and severity not in INCIDENT_SEVERITY_VALUES:
-                    logger.warning(
-                        "Compiled briefing %s has invalid severity value %r; "
-                        "clearing it",
-                        f"compiled/{target.domain}/{target.slug}.md",
-                        severity,
-                    )
-                    severity = ""
-                timeline = compiled_page.normalize_list(payload.get("timeline"))
-                root_cause = self._paragraph(payload.get("root_cause"))
-                what_worked = compiled_page.normalize_list(payload.get("what_worked"))
-                what_did_not_work = compiled_page.normalize_list(
-                    payload.get("what_did_not_work")
-                )
-                corrective_actions = compiled_page.normalize_list(
-                    payload.get("corrective_actions")
-                )
-                generalizable_learning = self._paragraph(
-                    payload.get("generalizable_learning")
-                )
-
-        # Drop any freshly generated content that just restates the human
-        # zone (>=80% token overlap) so the owner never sees their own note
-        # echoed back as a "machine" bullet. key_decisions/rationale/
-        # alternatives are filtered earlier, before the accepted-decision
-        # branch can replace them with immutable existing-page text (see
-        # above) -- filtering them again here would wrongly apply the
-        # duplicate check to that inherited text.
-        recent_changes = self._filter_list_duplicating_human_zone(
-            recent_changes, human_zone_tokens
-        )
-        open_loops = self._filter_list_duplicating_human_zone(
-            open_loops, human_zone_tokens
-        )
-
-        # ТЗ 6.3: Recent Changes / Open Loops accumulate across compile
-        # passes (like "Sources That Shaped This Page" below), instead of
-        # being overwritten with only this pass's items -- the ТЗ 6.3
-        # invariant ("last 5 items, the rest to History") only makes sense
-        # against an accumulated history. Rendering here stays unbounded on
-        # purpose: capping to RECENT_CHANGES_KEEP / dropping stale Open
-        # Loops is the dedicated nightly compression step's job
-        # (``_compress_cooled_pages``), which only runs for warm/cold/
-        # archive tiers -- a `core`/`active` page is expected to keep
-        # growing while it stays hot.
-        source_date_value = self.qmd._record_date_for_rel_path(
-            source_rel_path, signal
-        )
-        source_date = (
-            source_date_value.isoformat() if source_date_value is not None else today
-        )
-        recent_changes_rows = self._dated_rows(
-            existing_text,
-            "Recent Changes",
-            empty_placeholder="No recent changes captured yet.",
-        )
-        existing_recent_pairs = {
-            (row_text, row_source) for _, row_text, row_source in recent_changes_rows
-        }
-        for item in recent_changes:
-            pair = (item, source_rel_path)
-            if pair not in existing_recent_pairs:
-                recent_changes_rows.append((source_date, item, source_rel_path))
-                existing_recent_pairs.add(pair)
-
-        open_loops_rows = self._dated_rows(
-            existing_text,
-            "Open Loops",
-            empty_placeholder="No open loops captured yet.",
-        )
-        existing_open_pairs = {
-            (row_text, row_source) for _, row_text, row_source in open_loops_rows
-        }
-        for item in open_loops:
-            pair = (item, source_rel_path)
-            if pair not in existing_open_pairs:
-                open_loops_rows.append((source_date, item, source_rel_path))
-                existing_open_pairs.add(pair)
-
-        # History (ТЗ 6.3) is only ever written by ``_compress_candidate_text``
-        # -- a normal compile pass just carries any existing rows forward
-        # unchanged, the same way it carries forward claim history/open
-        # conflicts below.
-        history_rows = self._dated_rows(
-            existing_text, "History", empty_placeholder="(nothing archived yet)"
-        )
-
-        timeline = self._filter_list_duplicating_human_zone(
-            timeline, human_zone_tokens
-        )
-        root_cause = self._filter_text_duplicating_human_zone(
-            root_cause, human_zone_tokens
-        )
-        what_worked = self._filter_list_duplicating_human_zone(
-            what_worked, human_zone_tokens
-        )
-        what_did_not_work = self._filter_list_duplicating_human_zone(
-            what_did_not_work, human_zone_tokens
-        )
-        corrective_actions = self._filter_list_duplicating_human_zone(
-            corrective_actions, human_zone_tokens
-        )
-        generalizable_learning = self._filter_text_duplicating_human_zone(
-            generalizable_learning, human_zone_tokens
-        )
-
-        old_sources = compiled_page.source_links_from_note(existing_text)
-        new_sources = self._normalize_paths(payload.get("source_links"))
-        all_sources = self._merge_paths(old_sources, [source_rel_path, *new_sources])
-        created = existing_meta.get("created") or today
-        relevance = self._merged_relevance(existing_meta, signal)
-        tier = self._merged_tier(existing_meta, signal)
-
-        # "Sources That Shaped This Page" accumulates one row per (date,
-        # source) pair across compile passes; rows are only ever appended,
-        # never re-sorted or dropped, and duplicates for the same day are
-        # skipped as a hygiene measure. What-added is a heuristic fallback
-        # for passes without claims (first recent_changes bullet, else
-        # description, else target reason); when claims are present, each
-        # verified claim becomes its own row instead (see
-        # _apply_claims_and_conflicts).
-        shaped_rows = self._sources_shaped_rows(existing_text)
-        source_event_dates = self._source_event_dates(existing_text)
-        # "Related Pages" (T5 "Еженедельный уход за вики") is a code-owned
-        # section written only by the wiki-care pass, not by this compile
-        # path -- carried over untouched across every regeneration so a
-        # nightly refresh never drops the links wiki-care added.
-        related_pages = self._section_bullets(existing_text, "Related Pages")
-        claim_history_rows = self._claim_history_rows(existing_text)
-        open_conflict_rows_before = self._open_conflicts_rows(existing_text)
-        open_conflict_rows = open_conflict_rows_before
-        if claims:
-            shaped_rows, claim_history_rows, open_conflict_rows = (
-                self._apply_claims_and_conflicts(
-                    claims=claims,
-                    conflicts=conflicts,
-                    shaped_rows=shaped_rows,
-                    claim_history_rows=claim_history_rows,
-                    open_conflict_rows=open_conflict_rows,
-                    source_rel_path=source_rel_path,
-                    source_excerpt=source_excerpt,
-                    signal=signal,
-                    today=today,
-                    page_rel_path=page_rel_path,
-                    page_state=self._section_text(existing_text, "Current State"),
-                    payload=payload,
-                    source_event_dates=source_event_dates,
-                    record_side_effects=record_side_effects,
-                    adjudication_cache=adjudication_cache,
-                )
-            )
-            if payload.get("_preserve_existing_current_state"):
-                current_state = self._section_text(existing_text, "Current State")
-        else:
-            what_added = (
-                (recent_changes[0] if recent_changes else "")
-                or description
-                or target.reason
-                or "(not captured)"
-            )
-            if what_added == NOT_ENRICHMENT_SOURCE_MARKER:
-                # Cheap guard: this row is a real enrichment, so its text
-                # must never collide with the sentinel
-                # NOT_ENRICHMENT_SOURCE_MARKER used to mark a non-enrichment
-                # row -- free-form model output landing on that exact
-                # string would otherwise let this row silently escape the
-                # monthly enrichment budget filter below.
-                what_added += "."
-            existing_shaped_pairs = {(row[0], row[1]) for row in shaped_rows}
-            if (source_date, source_rel_path) not in existing_shaped_pairs:
-                shaped_rows = [
-                    *shaped_rows,
-                    (source_date, source_rel_path, what_added),
-                ]
-        new_open_conflicts = len(open_conflict_rows) - len(open_conflict_rows_before)
-
-        # Provenance/trust frontmatter fields (profile `derived`, optional --
-        # not added to vault-manifest.json / KNOWN_FRONTMATTER_PROFILES
-        # because `frontmatter_required` there is shared with summaries/ and
-        # has no notion of optional fields; existing compiled pages simply
-        # lack these fields until their next enrichment):
-        #   sources_trust    - own|forwarded|integration|inferred; minimum
-        #                       trust level among the page's sources. Set by
-        #                       code, never by the model. Only recomputed
-        #                       for passes that add claims (see below) --
-        #                       a compile pass without claims leaves the
-        #                       page's accumulated minimum untouched.
-        #   last_verified    - YYYY-MM-DD or empty (renders as YAML null);
-        #                       when the page's claims were last confirmed.
-        #   enrichment_count - how many times this page has been enriched;
-        #                       always existing value + 1, since _render_briefing
-        #                       rebuilds frontmatter from scratch each pass.
-        #   conflicts_open   - number of unresolved factual conflicts;
-        #                       code-maintained counter, incremented by the
-        #                       factual conflicts newly opened this pass.
-        #   human_reviewed   - YYYY-MM-DD or empty (renders as YAML null);
-        #                       when the owner last confirmed this page.
-        #   human_zone_populated - present (``true``) once the owner's
-        #                       ``<!-- human:start/end -->`` zone has ever
-        #                       held real text; omitted otherwise. Sticky --
-        #                       never cleared once set (see the
-        #                       ``human_zone_populated`` local computed
-        #                       above and ``human_zone_markers_look_corrupted``,
-        #                       code review defect 1).
-        existing_sources_trust = existing_meta.get("sources_trust", "").strip()
-        if claims:
-            current_trust = self._source_trust_level(source_rel_path, source_excerpt)
-            # No prior accumulated value yet -- the current pass's trust
-            # *is* the page's trust, not the minimum against the
-            # "no data yet" placeholder (which would otherwise permanently
-            # floor every new page's first claims-bearing pass at
-            # DEFAULT_SOURCES_TRUST regardless of the real source).
-            if existing_sources_trust in SOURCES_TRUST_VALUES:
-                sources_trust = compiled_page.min_trust(
-                    existing_sources_trust, current_trust
-                )
-            else:
-                sources_trust = current_trust
-        elif existing_sources_trust in SOURCES_TRUST_VALUES:
-            sources_trust = existing_sources_trust
-        else:
-            sources_trust = DEFAULT_SOURCES_TRUST
-        page_path = f"compiled/{target.domain}/{target.slug}.md"
-        last_verified = self._validated_date_field(
-            existing_meta.get("last_verified"),
-            field="last_verified",
-            page_path=page_path,
-        )
-        if claims and quality_status != "needs_review":
-            last_verified = today
-        enrichment_count = (
-            compiled_page.int_value(existing_meta.get("enrichment_count"), default=0)
-            + 1
-        )
-        # The delta is negative when a pass closes more conflicts than it
-        # opens (a superseded side leaves the ledger, see
-        # _apply_claims_and_conflicts); a page that somehow starts with a
-        # counter lower than its table must still never go below zero.
-        conflicts_open = max(
-            0,
-            compiled_page.int_value(existing_meta.get("conflicts_open"), default=0)
-            + new_open_conflicts,
-        )
-        if open_conflict_rows and confidence == "high":
-            confidence = "medium"
-        shaped_source_count = len(
-            {
-                source
-                for _, source, what_added in shaped_rows
-                if what_added != NOT_ENRICHMENT_SOURCE_MARKER
-            }
-        )
-        human_reviewed = self._validated_date_field(
-            existing_meta.get("human_reviewed"),
-            field="human_reviewed",
-            page_path=page_path,
-        )
-        event_date = self._event_date_for_source(source_rel_path, source_excerpt)
-        if event_date:
-            source_event_dates[source_rel_path] = event_date
-
-        lines = [
-            "---",
-            "type: compiled-briefing",
-            f"domain: {target.domain}",
-            f"description: {json.dumps(description, ensure_ascii=False)}",
-            f"status: {status}",
-            f"created: {created}",
-            f"updated: {today}",
-            f"last_compiled_at: {compiled_at}",
-            f"freshness_state: {freshness_state}",
-            f"confidence: {confidence}",
-            f"source_count: {shaped_source_count}",
-            f"last_accessed: {today}",
-            f"relevance: {relevance:.2f}",
-            f"tier: {tier}",
-            f"sources_trust: {sources_trust}",
-            f"last_verified: {last_verified}",
-            "last_source_checked: " + self._validated_date_field(
-                existing_meta.get("last_source_checked"),
-                field="last_source_checked", page_path=page_path,
-            ),
-            f"enrichment_count: {enrichment_count}",
-            f"conflicts_open: {conflicts_open}",
-            f"human_reviewed: {human_reviewed}",
-        ]
-        metadata = self._target_metadata(target, existing_text, page_path)
-        aliases, directions, projects = (
-            metadata["aliases"], metadata["directions"], metadata["projects"]
-        )
-        if aliases and target.domain in {"people", "projects"}:
-            lines.append("aliases: " + json.dumps(aliases, ensure_ascii=False))
-        if directions:
-            lines.append("directions: " + json.dumps(directions, ensure_ascii=False))
-        if projects:
-            lines.append("projects: " + json.dumps(projects, ensure_ascii=False))
-            related_pages = list(dict.fromkeys((
-                *related_pages,
-                *[f"[[{path}]] — основной проект" for path in projects],
-            )))
-        if human_zone_populated:
-            lines.append("human_zone_populated: true")
-        if source_event_dates:
-            lines.append(
-                "source_event_dates: "
-                + json.dumps(source_event_dates, ensure_ascii=False, sort_keys=True)
-            )
-        if quality_status == "needs_review" and quality_reason:
-            lines.extend(
-                [
-                    "quality_status: needs_review",
-                    f"quality_reason: {json.dumps(quality_reason, ensure_ascii=False)}",
-                ]
-            )
-        if record_kind:
-            lines.append(f"record_kind: {record_kind}")
-        if record_kind == "decision":
-            lines.extend(
-                [
-                    f"decision_status: {decision_status}",
-                    f"decision_owner: {json.dumps(decision_owner, ensure_ascii=False)}",
-                    f"decision_date: {decision_date}",
-                    f"supersedes: {json.dumps(supersedes, ensure_ascii=False)}",
-                    f"superseded_by: {json.dumps(superseded_by, ensure_ascii=False)}",
-                ]
-            )
-        elif record_kind == "incident":
-            lines.extend(
-                [
-                    f"incident_date: {incident_date}",
-                    f"severity: {severity}",
-                ]
-            )
-        # This is a full frontmatter rebuild, not a patch -- any key the
-        # owner layer wrote out-of-band (e.g. ``duplicate_of``, see
-        # CORE_FRONTMATTER_FIELDS above) must be carried forward explicitly
-        # here, or it silently vanishes on this page's very next recompile.
-        # Goes through _extra_frontmatter_lines, not existing_meta -- the
-        # latter flattens every value to a plain string, which is fine for
-        # the fields this code owns (always simple scalars) but silently
-        # changes an owner field's YAML type (number/bool/list/null) if
-        # reused here. See _extra_frontmatter_lines for the fix.
-        lines.extend(
-            self._extra_frontmatter_lines(existing_text, page_path=page_path)
-        )
-        lines.extend(["---", "", f"# {target.title}", ""])
-        if record_kind == "decision":
-            lines.extend(
-                [
-                    "## Decision Record",
-                    f"- Status: {decision_status}",
-                    f"- Date: {decision_date or '(unknown)'}",
-                    f"- Owner: {decision_owner or '(unknown)'}",
-                    *([f"- Supersedes: {', '.join(supersedes)}"] if supersedes else []),
-                    *([f"- Superseded by: {superseded_by}"] if superseded_by else []),
-                    "",
-                    "## Rationale",
-                    rationale or "No rationale captured yet.",
-                    "",
-                    "## Alternatives Considered",
-                    *self._render_bullets(
-                        alternatives,
-                        empty="No alternatives captured yet.",
-                    ),
-                    "",
-                    "## Decision Evidence",
-                    *self._render_sources(decision_evidence),
-                    "",
-                ]
-            )
-        elif record_kind == "incident":
-            lines.extend(
-                [
-                    "## Incident Debrief",
-                    f"- Date: {incident_date or '(unknown)'}",
-                    f"- Severity: {severity or '(unknown)'}",
-                    "",
-                    "## Timeline",
-                    *self._render_bullets(timeline, empty="No timeline captured yet."),
-                    "",
-                    "## Root Cause",
-                    root_cause or "No reliable root cause captured yet.",
-                    "",
-                    "## What Worked",
-                    *self._render_bullets(
-                        what_worked,
-                        empty="Nothing captured yet.",
-                    ),
-                    "",
-                    "## What Did Not Work",
-                    *self._render_bullets(
-                        what_did_not_work,
-                        empty="Nothing captured yet.",
-                    ),
-                    "",
-                    "## Corrective Actions",
-                    *self._render_bullets(
-                        corrective_actions,
-                        empty="No corrective actions captured yet.",
-                    ),
-                    "",
-                    "## Generalizable Learning",
-                    generalizable_learning or "No reusable learning captured yet.",
-                    "",
-                ]
-            )
-        lines.extend(
-            [
-                "## Current State",
-                current_state or "No reliable current state yet.",
-                "",
-                "## Recent Changes",
-                *self._render_dated_bullets(
-                    recent_changes_rows,
-                    empty="No recent changes captured yet.",
-                ),
-                "",
-                "## Open Loops",
-                *self._render_dated_bullets(
-                    open_loops_rows,
-                    empty="No open loops captured yet.",
-                ),
-                "",
-                "## Key Decisions",
-                *self._render_bullets(
-                    key_decisions,
-                    empty="No key decisions captured yet.",
-                ),
-                "",
-                "## Next Check",
-                next_check or "Review after the next meaningful update.",
-                "",
-            ]
-        )
-        # "Related Pages" (T5) is only ever written by the wiki-care pass, so
-        # it is only rendered once that pass has actually populated it --
-        # an empty placeholder here would otherwise land on every compiled
-        # page's next nightly regeneration and change its rendered text.
-        if related_pages:
-            lines.extend(
-                [
-                    "## Related Pages",
-                    *self._render_bullets(related_pages, empty="(none yet)"),
-                    "",
-                ]
-            )
-        lines.extend(
-            [
-                "## Sources",
-                *self._render_sources(all_sources),
-                "",
-                "## Sources That Shaped This Page",
-                *compiled_page.render_sources_shaped_table(shaped_rows),
-                "",
-                "## Open Conflicts",
-                *compiled_page.render_open_conflicts_table(open_conflict_rows),
-                "",
-                "## Claim History",
-                *compiled_page.render_claim_history(claim_history_rows),
-                "",
-            ]
-        )
-        # ТЗ 6.3: History is conditional -- only rendered once compression
-        # has actually moved something into it, so a page that never cooled
-        # never grows an empty section. Deliberately not added to
-        # ``lint_notes``'s required-sections set (see there).
-        if history_rows:
-            lines.extend(
-                [
-                    "## History",
-                    *self._render_dated_bullets(
-                        history_rows, empty="(nothing archived yet)"
-                    ),
-                    "",
-                ]
-            )
-        lines.extend(
-            [
-                "## Owner Notes",
-                human_zone,
-                "",
-            ]
-        )
-        rendered = "\n".join(lines)
-        # Last line of defence for the owner's zone, mirroring the check this
-        # function opens with -- that one validates the page it reads, this
-        # one the page it is about to hand to the writer. Every model-authored
-        # field is already defused (see _defuse_human_zone_markers), so this
-        # only fires if some future field reaches the body without passing
-        # through _clean_line/_paragraph/_normalize_list. Raising here means
-        # the pass skips the page (_upsert_briefing turns this into
-        # _record_human_zone_ambiguous) and the page stays readable, instead
-        # of being written with a second marker pair that would make every
-        # later pass fail on reading it.
-        human_span = self._human_zone_span(rendered)
-        if human_span is _AMBIGUOUS_HUMAN_ZONE:
-            raise HumanZoneMarkerError(
-                "rendered page would carry ambiguous human zone markers: "
-                f"start={rendered.count(HUMAN_ZONE_START)} "
-                f"end={rendered.count(HUMAN_ZONE_END)}"
-            )
-        def canonical_link(match: re.Match[str]) -> str:
-            if (human_span is not None
-                    and human_span[0] <= match.start() < human_span[1]):
-                return match.group(0)
-            return match.group(0).replace(
-                match.group(1),
-                compiled_page.canonical_source_reference(match.group(1)),
-                1,
-            )
-
-        return WIKILINK_RE.sub(canonical_link, rendered)
-
     def _apply_partial_sections(
         self,
         *,
@@ -5598,89 +4696,11 @@ class CompiledBriefingService:
         rendered: str,
         payload: dict[str, Any],
     ) -> str:
-        """Keep unmentioned existing content sections byte-for-byte intact.
-
-        It is required for an existing page and must name only sections
-        already on it; accepting a malformed list would turn a partial update
-        into a silent whole-page rewrite. A new page has no content to
-        preserve, so it does not require the field.
-        """
-        if not existing_text:
-            return rendered
-        if "changed_sections" not in payload:
-            raise ValueError("changed_sections is required for an existing briefing")
-        changed_sections = payload["changed_sections"]
-        if not isinstance(changed_sections, list) or any(
-            not isinstance(heading, str) for heading in changed_sections
-        ):
-            raise ValueError("changed_sections must be a list of section headings")
-        if len(changed_sections) != len(set(changed_sections)):
-            raise ValueError("changed_sections must not repeat a section heading")
-
-        content_headings = {
-            "Current State",
-            "Recent Changes",
-            "Open Loops",
-            "Key Decisions",
-            "Next Check",
-            "Decision Record",
-            "Rationale",
-            "Alternatives Considered",
-            "Decision Evidence",
-            "Incident Debrief",
-            "Timeline",
-            "Root Cause",
-            "What Worked",
-            "What Did Not Work",
-            "Corrective Actions",
-            "Generalizable Learning",
-        }
-        requested = set(changed_sections)
-        if not requested.issubset(content_headings):
-            raise ValueError("changed_sections contains a protected or unknown section")
-        if any(
-            not self._has_section(existing_text, heading)
-            or not self._has_section(rendered, heading)
-            for heading in requested
-        ):
-            raise ValueError("changed_sections must name existing rendered sections")
-
-        # These ledgers are maintained by Python from verified claims. They
-        # retain their old rows in `_render_briefing` and may gain a row even
-        # when the model changed only Current State.
-        preserved_by_model = requested | {
-            "Sources",
-            "Sources That Shaped This Page",
-            "Open Conflicts",
-            "Claim History",
-            "Owner Notes",
-            "Related Pages",
-        }
-        existing_headings = self._sections_from_text(existing_text)
-        new_content_headings = (
-            self._sections_from_text(rendered) - existing_headings
-        ) & content_headings
-        if new_content_headings:
-            raise ValueError(
-                "partial update must not add content sections: "
-                + ", ".join(sorted(new_content_headings))
-            )
-        # Start with the generated page so frontmatter, provenance and claim
-        # handling retain their established contracts, then restore only the
-        # body sections that this source did not affect.
-        for heading in existing_headings:
-            if heading in preserved_by_model:
-                continue
-            existing_span = self._section_span(existing_text, heading)
-            rendered_span = self._section_span(rendered, heading)
-            if existing_span is None or rendered_span is None:
-                raise ValueError("partial update cannot preserve an existing section")
-            rendered = (
-                rendered[: rendered_span[0]]
-                + existing_text[existing_span[0] : existing_span[1]]
-                + rendered[rendered_span[1] :]
-            )
-        return rendered
+        return compiled_renderer.apply_partial_sections(
+            existing_text=existing_text,
+            rendered=rendered,
+            payload=payload,
+        )
 
     def _impact_catalog(
         self,
@@ -5883,739 +4903,13 @@ class CompiledBriefingService:
         self.state_root.mkdir(parents=True, exist_ok=True)
         self.answers_root.mkdir(parents=True, exist_ok=True)
 
-    @contextmanager
-    def _launcher_lock(self, *, blocking: bool) -> Iterator[bool]:
-        self._ensure_state_dirs()
-        with self.launcher_lock_path.open("a+", encoding="utf-8") as handle:
-            flags = fcntl.LOCK_EX
-            if not blocking:
-                flags |= fcntl.LOCK_NB
-            try:
-                fcntl.flock(handle.fileno(), flags)
-            except BlockingIOError:
-                yield False
-                return
-            try:
-                yield True
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    @staticmethod
+    def _now() -> datetime:
+        return datetime.now().astimezone()
 
-    @contextmanager
-    def _worker_lock(self, *, blocking: bool) -> Iterator[bool]:
-        self._ensure_state_dirs()
-        with self.worker_lock_path.open("a+", encoding="utf-8") as handle:
-            flags = fcntl.LOCK_EX
-            if not blocking:
-                flags |= fcntl.LOCK_NB
-            try:
-                fcntl.flock(handle.fileno(), flags)
-            except BlockingIOError:
-                yield False
-                return
-            try:
-                yield True
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-    @contextmanager
-    def _state_lock(self) -> Iterator[None]:
-        """The one lock over every ``.compiled``/give-up state file: the
-        refresh queue, ``source-state.json``, and the dropped-sources
-        journal.
-
-        These were three separate helpers over the same ``state.lock`` file,
-        which read as three independent locks while behaving as one -- taking
-        any of them inside another deadlocked on the spot, since ``flock`` on
-        a second open file description of the same file blocks against the
-        first even within one process. The three shared a file on purpose
-        (their writes interleave at the same moments: a queue event is acked
-        exactly when a source finally compiles), so they are now one lock
-        that says so, and nesting is simply allowed.
-
-        Re-entrancy is tracked per *thread*, not per instance: two threads
-        sharing one service must still serialize against each other (see
-        ``test_compiled_briefings_concurrent_give_up_writes_do_not_lose_each_other``),
-        and they do -- each takes its own file description and blocks on
-        ``flock`` as before. Only a nested take on the thread that already
-        holds it passes straight through.
-        """
-        depth = getattr(self._state_lock_depth, "value", 0)
-        if depth:
-            self._state_lock_depth.value = depth + 1
-            try:
-                yield
-            finally:
-                self._state_lock_depth.value = depth
-            return
-        self._ensure_state_dirs()
-        with self.state_lock_path.open("a+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            self._state_lock_depth.value = 1
-            try:
-                yield
-            finally:
-                self._state_lock_depth.value = 0
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-    def _with_queue_lock(
-        self,
-        callback: Callable[[], QueueLockResult],
-    ) -> QueueLockResult:
-        with self._state_lock():
-            return callback()
-
-    def _load_source_state(self) -> dict[str, Any]:
-        with self._state_lock():
-            return self._load_source_state_unlocked()
-
-    def _load_source_state_unlocked(self) -> dict[str, Any]:
-        if not self.source_state_path.exists():
-            return {"version": SOURCE_STATE_VERSION, "entries": {}}
-        try:
-            payload = json.loads(
-                self.source_state_path.read_text(encoding="utf-8")
-            )
-        except json.JSONDecodeError as exc:
-            raise CompiledSourceStateError(
-                f"invalid compiled source state: {self.source_state_path}"
-            ) from exc
-        if not isinstance(payload, dict):
-            raise CompiledSourceStateError(
-                "compiled source state must be a JSON object"
-            )
-        if payload.get("version") != SOURCE_STATE_VERSION:
-            raise CompiledSourceStateError(
-                "unsupported compiled source state version"
-            )
-        entries = payload.get("entries")
-        if not isinstance(entries, dict):
-            raise CompiledSourceStateError(
-                "compiled source state entries must be a JSON object"
-            )
-        for rel_path, entry in entries.items():
-            if not isinstance(rel_path, str) or not isinstance(entry, dict):
-                raise CompiledSourceStateError("invalid compiled source state entry")
-            if not isinstance(entry.get("sources"), dict):
-                raise CompiledSourceStateError(
-                    f"invalid compiled source state entry: {rel_path}"
-                )
-        return payload
-
-    def _write_source_state_unlocked(self, state: dict[str, Any]) -> None:
-        atomic_write_file_text(
-            self.source_state_path,
-            json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        )
-
-    def _load_worker_state(self) -> dict[str, Any]:
-        if not self.worker_state_path.exists():
-            return {}
-        try:
-            payload = json.loads(self.worker_state_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            logger.warning(
-                "Invalid compiled worker state payload at %s",
-                self.worker_state_path,
-            )
-            return {}
-        return payload if isinstance(payload, dict) else {}
-
-    def _save_worker_state(self, payload: dict[str, Any]) -> None:
-        atomic_write_file_text(
-            self.worker_state_path,
-            json.dumps(payload, ensure_ascii=False, indent=2),
-        )
-
-    def _clear_worker_state_unlocked(self) -> None:
-        self.worker_state_path.unlink(missing_ok=True)
-
-    def _parse_iso_datetime(self, raw: str) -> datetime | None:
-        try:
-            return datetime.fromisoformat(raw)
-        except ValueError:
-            return None
-
-    def _pid_is_alive(self, pid: int) -> bool:
-        if pid <= 0:
-            return False
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return False
-        return True
-
-    def _worker_state_is_live(
-        self,
-        state: dict[str, Any],
-        *,
-        stale_after_seconds: int = DEFAULT_WORKER_STALE_SECONDS,
-    ) -> bool:
-        pid = int(state.get("pid") or 0)
-        heartbeat_raw = str(state.get("heartbeat_at") or state.get("started_at") or "")
-        heartbeat_at = self._parse_iso_datetime(heartbeat_raw)
-        if not self._pid_is_alive(pid):
-            return False
-        if heartbeat_at is None:
-            return True
-        age_seconds = (
-            datetime.now().astimezone() - heartbeat_at.astimezone()
-        ).total_seconds()
-        return age_seconds <= stale_after_seconds
-
-    def _write_worker_state(
-        self,
-        *,
-        pid: int,
-        status: str,
-        started_at: str | None = None,
-    ) -> None:
-        now = datetime.now().astimezone().isoformat()
-
-        def write_state() -> None:
-            state = self._load_worker_state()
-            existing_started_at = str(state.get("started_at") or "").strip()
-            self._save_worker_state(
-                {
-                    "pid": pid,
-                    "status": status,
-                    "started_at": started_at or existing_started_at or now,
-                    "heartbeat_at": now,
-                }
-            )
-
-        with self._launcher_lock(blocking=True):
-            write_state()
-
-    def _touch_worker_state(self, pid: int) -> None:
-        self._write_worker_state(pid=pid, status="running")
-
-    def _clear_worker_state(self, *, pid: int | None = None) -> None:
-        def clear_state() -> None:
-            if pid is None:
-                self._clear_worker_state_unlocked()
-                return
-            state = self._load_worker_state()
-            current_pid = int(state.get("pid") or 0)
-            if current_pid in {0, pid}:
-                self._clear_worker_state_unlocked()
-
-        with self._launcher_lock(blocking=True):
-            clear_state()
-
-    def _start_queue_worker_journal(
-        self,
-        *,
-        pid: int,
-        started_at: str,
-        force: bool,
-        max_events: int,
-        refresh_qmd: bool,
-        initial_queue_size: int,
-    ) -> None:
-        started = datetime.fromisoformat(started_at)
-        filename = f"{started.strftime('%Y-%m-%d-%H%M%S')}-{pid}.json"
-        self.queue_worker_history_root.mkdir(parents=True, exist_ok=True)
-        self._active_queue_worker_journal_path = (
-            self.queue_worker_history_root / filename
-        )
-        self._active_queue_worker_journal = {
-            "pid": pid,
-            "status": "running",
-            "started_at": started_at,
-            "parameters": {
-                "force": force,
-                "max_events": max_events,
-                "refresh_qmd": refresh_qmd,
-            },
-            "initial_queue_size": initial_queue_size,
-            "events": [],
-        }
-        self._write_active_queue_worker_journal()
-        self._rotate_queue_worker_journals()
-
-    def _write_active_queue_worker_journal(self) -> None:
-        if (
-            self._active_queue_worker_journal is None
-            or self._active_queue_worker_journal_path is None
-        ):
-            return
-        atomic_write_file_text(
-            self._active_queue_worker_journal_path,
-            json.dumps(
-                self._active_queue_worker_journal,
-                ensure_ascii=False,
-                indent=2,
-            )
-            + "\n",
-        )
-
-    def _record_queue_worker_event(
-        self,
-        event: dict[str, Any],
-        *,
-        outcome: str,
-        updated: list[str],
-        errors: list[str],
-        attempts: int | None = None,
-    ) -> None:
-        if self._active_queue_worker_journal is None:
-            return
-        source_path = str(event.get("source_path") or "")
-        date_match = re.search(r"\d{4}-\d{2}-\d{2}", source_path)
-        self._active_queue_worker_journal["events"].append(
-            {
-                "source_path": source_path,
-                "source_date": date_match.group(0) if date_match else None,
-                "enqueued_at": event.get("enqueued_at"),
-                "last_enqueued_at": event.get("last_enqueued_at"),
-                "claimed_at": event.get("claimed_at"),
-                "finished_at": datetime.now().astimezone().isoformat(),
-                "attempts": (
-                    attempts
-                    if attempts is not None
-                    else int(event.get("attempts") or 0)
-                ),
-                "outcome": outcome,
-                "updated": list(updated),
-                "errors": list(errors),
-            }
-        )
-        self._write_active_queue_worker_journal()
-
-    def _finish_queue_worker_journal(
-        self,
-        *,
-        status: str,
-        remaining_queue_size: int,
-        totals: dict[str, int] | None = None,
-        error: dict[str, str] | None = None,
-    ) -> None:
-        if self._active_queue_worker_journal is None:
-            return
-        self._active_queue_worker_journal["status"] = status
-        self._active_queue_worker_journal["finished_at"] = (
-            datetime.now().astimezone().isoformat()
-        )
-        self._active_queue_worker_journal["remaining_queue_size"] = (
-            remaining_queue_size
-        )
-        if totals is not None:
-            self._active_queue_worker_journal["totals"] = totals
-        if error is not None:
-            self._active_queue_worker_journal["error"] = error
-        self._write_active_queue_worker_journal()
-        self._rotate_queue_worker_journals()
-        self._active_queue_worker_journal = None
-        self._active_queue_worker_journal_path = None
-
-    def _rotate_queue_worker_journals(self) -> None:
-        journals = sorted(
-            self.queue_worker_history_root.glob("*.json"),
-            key=lambda path: path.name,
-            reverse=True,
-        )
-        for path in journals[QUEUE_WORKER_HISTORY_LIMIT:]:
-            path.unlink()
-
-    def _write_queue_worker_crash_journal(
-        self, *, pid: int, started_at: str, exc: Exception
-    ) -> None:
-        """Persist an owner-visible trace of an unexpected ``run_queue_worker``
-        crash to ``.session/compile-queue-worker.json`` (resilience review
-        defect 1). ``spawn_background_drain`` runs this worker detached with
-        stdout/stderr sent to DEVNULL, so this file -- same ``.session/``
-        journal convention as ``_write_pass_journal``'s
-        ``.session/compile-enrich.json`` -- is the only surviving record of
-        *why* the queue stopped draining. Always overwrites the previous
-        crash, mirroring that journal's own "latest pass only" convention.
-
-        Best-effort, same as ``decisions_queue.write_queue_document``: the
-        crash this records has already happened and is about to be
-        re-raised by the caller regardless, so a failure writing *this*
-        trace (e.g. the same full disk that caused the original crash) must
-        never replace that original exception with this one -- caught
-        broadly and logged instead of raised (code review defect 2).
-        """
-        payload = {
-            "pid": pid,
-            "started_at": started_at,
-            "crashed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "error": {"type": type(exc).__name__, "message": str(exc)},
-            "traceback": traceback.format_exc(),
-        }
-        journal_path = self.vault_path / ".session" / "compile-queue-worker.json"
-        try:
-            atomic_write_file_text(
-                journal_path,
-                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            )
-        except Exception as journal_exc:  # noqa: BLE001 - best-effort trace
-            logger.warning(
-                "Failed to write queue worker crash journal (original "
-                "crash: %r): %s",
-                exc,
-                journal_exc,
-            )
-
-    def _dropped_sources_journal_path(self) -> Path:
-        return self.vault_path / ".session" / "compile-dropped-sources.json"
-
-    def _load_dropped_queue_sources(self) -> list[dict[str, Any]]:
-        """Read the give-up journal, fail-safe like ``_load_queue``."""
-
-        try:
-            payload = json.loads(
-                self._dropped_sources_journal_path().read_text(encoding="utf-8")
-            )
-        except FileNotFoundError:
-            return []
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            logger.warning(
-                "Invalid dropped-sources journal at %s",
-                self._dropped_sources_journal_path(),
-            )
-            return []
-        if not isinstance(payload, dict):
-            return []
-        entries = payload.get("sources")
-        if not isinstance(entries, list):
-            return []
-        return [item for item in entries if isinstance(item, dict)]
-
-    def _record_dropped_queue_source(
-        self, *, source_rel_path: str, errors: list[str], attempts: int
-    ) -> None:
-        """Persist an owner-visible trace of a source the queue gave up on.
-
-        Once ``_drain_queue_once`` acks a failed event -- after the third
-        attempt, or immediately for an error it will never retry -- the
-        queue entry is deleted, and that entry was the only thing that would
-        ever have compiled this source: nothing retries it and nothing else
-        points at it. Until now the only report was the drain's returned
-        ``errors`` list, and the drain that handles nearly every real event
-        is the detached one ``spawn_background_drain`` starts with
-        stdout/stderr on DEVNULL -- so in practice the owner's note simply
-        never reached a compiled page and no trace of that survived
-        anywhere.
-
-        Same ``.session/`` journal convention as
-        ``_write_queue_worker_crash_journal``; read back by
-        ``compiled_enrich_report`` into the digest's "Требует решения"
-        block. Entries accumulate, one per source with the newest write
-        winning, and are cleared only by a later drain that runs the same
-        source to a conclusion -- a compiled page, or the impact stage
-        deciding it affects no page at all (``_clear_dropped_queue_source``;
-        that second outcome is a finished answer, not a failure, so leaving
-        the entry up would nag the owner about a note the system has already
-        settled). Deliberately *not*
-        expired by calendar day, unlike the fact-check journal: like
-        ``human_zone_ambiguous_pages`` this is unresolved business rather
-        than a dated event, and a source that is still missing from
-        ``compiled/`` a week later is still missing.
-
-        Best-effort, same reasoning as
-        ``_write_queue_worker_crash_journal``: this records a failure that
-        already happened, so failing to record it must not also take down
-        the rest of the drain.
-        """
-
-        normalized = source_rel_path.strip()
-        if not normalized:
-            return
-        try:
-            with self._state_lock():
-                entries = [
-                    item
-                    for item in self._load_dropped_queue_sources()
-                    if str(item.get("source_path") or "") != normalized
-                ]
-                entries.append(
-                    {
-                        "source_path": normalized,
-                        "dropped_at": datetime.now()
-                        .astimezone()
-                        .isoformat(timespec="seconds"),
-                        "attempts": attempts,
-                        "errors": [str(item) for item in errors],
-                    }
-                )
-                atomic_write_file_text(
-                    self._dropped_sources_journal_path(),
-                    json.dumps({"sources": entries}, ensure_ascii=False, indent=2)
-                    + "\n",
-                )
-        except Exception as exc:  # noqa: BLE001 - best-effort trace
-            logger.warning(
-                "Failed to record dropped compiled source %s: %s", normalized, exc
-            )
-
-    def _clear_dropped_queue_source(
-        self, source_rel_path: str, updated_paths: tuple[str, ...] = ()
-    ) -> None:
-        """Drop a source's give-up trace once a drain has run it to a
-        conclusion -- a compiled page written, or the impact stage deciding
-        the source affects no page at all. Both are finished business; only
-        a failure is not.
-
-        The counterpart to ``_record_dropped_queue_source``: that journal
-        holds unresolved business, so leaving an entry behind after the
-        source finally made it through would keep the digest asking the
-        owner to fix something already fixed.
-
-        Inside a pass the clear is deferred rather than applied (code
-        review): ``run_nightly_maintenance``'s ТЗ 5.5 inv 5 gate can roll
-        the whole pass back *after* this point -- e.g. when a page this
-        pass wrote ends up with no source link at all -- which restores the
-        compiled pages but not the queue entry this drain already acked.
-        Clearing immediately would then leave the owner with no trace at
-        all of a source that is once again uncompiled and no longer queued.
-        ``updated_paths`` -- the pages this drain wrote, empty when it wrote
-        none -- is carried along so that gate can tell which deferred clears
-        its rollback actually invalidated; see
-        ``CompileEnrichPass.dropped_sources_cleared``. The background drain
-        (``run_queue_worker``) has no active pass and nothing that can undo
-        its writes, so it still clears inline.
-        """
-
-        normalized = source_rel_path.strip()
-        if not normalized:
-            return
-        if self._active_pass is not None:
-            pending = self._active_pass.dropped_sources_cleared
-            for index, (existing_source, existing_pages) in enumerate(pending):
-                if existing_source != normalized:
-                    continue
-                # One source can be drained more than once in a pass, each
-                # time writing different pages; the rollback check below has
-                # to see all of them, so they merge rather than the second
-                # call being dropped as a duplicate.
-                merged = tuple(dict.fromkeys((*existing_pages, *updated_paths)))
-                pending[index] = (normalized, merged)
-                return
-            pending.append((normalized, tuple(dict.fromkeys(updated_paths))))
-            return
-        self._forget_dropped_queue_source(normalized)
-
-    def _forget_dropped_queue_source(self, normalized: str) -> None:
-        """Actually remove one give-up entry -- see
-        ``_clear_dropped_queue_source`` for when this is allowed to run."""
-
-        try:
-            with self._state_lock():
-                entries = self._load_dropped_queue_sources()
-                remaining = [
-                    item
-                    for item in entries
-                    if str(item.get("source_path") or "") != normalized
-                ]
-                if len(remaining) == len(entries):
-                    return
-                atomic_write_file_text(
-                    self._dropped_sources_journal_path(),
-                    json.dumps({"sources": remaining}, ensure_ascii=False, indent=2)
-                    + "\n",
-                )
-        except Exception as exc:  # noqa: BLE001 - best-effort bookkeeping
-            logger.warning(
-                "Failed to clear dropped compiled source %s: %s", normalized, exc
-            )
-
-    def _load_queue(self) -> list[dict[str, Any]]:
-        if not self.queue_path.exists():
-            return []
-        try:
-            payload = json.loads(self.queue_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            logger.warning("Invalid compiled queue payload at %s", self.queue_path)
-            return []
-        if not isinstance(payload, list):
-            return []
-        return [item for item in payload if isinstance(item, dict)]
-
-    def _save_queue(self, payload: list[dict[str, Any]]) -> None:
-        atomic_write_file_text(
-            self.queue_path,
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        )
-
-    def _recover_stale_claims(
-        self,
-        queue: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], bool]:
-        now = datetime.now().astimezone()
-        mutated = False
-        for event in queue:
-            if str(event.get("state") or "pending") != "in_flight":
-                continue
-            claim_token = str(event.get("claim_token") or "").strip()
-            if not claim_token:
-                event["state"] = "pending"
-                event["claimed_at"] = ""
-                event["claimed_pid"] = 0
-                mutated = True
-                continue
-            claimed_at = self._parse_iso_datetime(str(event.get("claimed_at") or ""))
-            claimed_pid = int(event.get("claimed_pid") or 0)
-            stale_claim = (
-                claimed_at is None
-                or (now - claimed_at.astimezone()).total_seconds()
-                > DEFAULT_QUEUE_CLAIM_STALE_SECONDS
-                or not self._pid_is_alive(claimed_pid)
-            )
-            if not stale_claim:
-                continue
-            event["state"] = "pending"
-            event["claim_token"] = ""
-            event["claimed_at"] = ""
-            event["claimed_pid"] = 0
-            mutated = True
-        return queue, mutated
-
-    def _source_tier_ranks(self) -> dict[str, int]:
-        """Best-known memory-tier rank (``TIER_RANK``) for each source path,
-        used only to order the compile-enrich queue (ТЗ 6.2: "the queue is
-        processed by tier priority -- core and active first").
-
-        A queue event only carries the *source* that changed, not the
-        compiled page(s) it affects -- that mapping is the Impact model
-        call in ``_resolve_targets``, which is far too expensive to run
-        just to pick a claim order. Instead this reuses two things already
-        read elsewhere on this same code path, at no extra model cost: the
-        page tiers from ``_iter_candidates()`` and the page->source
-        associations already recorded in source-state.json by the last
-        successful write to each page.
-        """
-        page_ranks = {
-            candidate.rel_path: TIER_RANK.get(candidate.tier, 0)
-            for candidate in self._iter_candidates()
-        }
-        ranks: dict[str, int] = {}
-        try:
-            state = self._load_source_state_unlocked()
-        except CompiledSourceStateError:
-            # Code review Finding 2: this read only feeds the queue's tier
-            # sort (ТЗ 6.2), an ordering optimization -- not a condition for
-            # the queue to make progress at all. A corrupt source-state file
-            # must not crash the ordinary queue-only drain (unlike the
-            # nightly path's own reads of the same file, e.g.
-            # ``freshness_issues``/``initialize_source_state``, which keep
-            # raising on purpose). Degrade to no known ranks: every event
-            # falls back to ``default_rank`` in the caller and the sort's
-            # stability keeps arrival order, same as an all-tied batch.
-            logger.warning(
-                "Повреждён файл состояния источников %s -- приоритет "
-                "очереди по уровню памяти временно отключён, события "
-                "разбираются в порядке поступления",
-                self.source_state_path,
-            )
-            return ranks
-        for page_rel_path, entry in state.get("entries", {}).items():
-            if not isinstance(entry, dict):
-                continue
-            sources = entry.get("sources")
-            if not isinstance(sources, dict):
-                continue
-            rank = page_ranks.get(page_rel_path, 0)
-            for source_rel_path in sources:
-                if rank > ranks.get(source_rel_path, -1):
-                    ranks[source_rel_path] = rank
-        return ranks
-
-    def _claim_ready_queue_events(
-        self,
-        *,
-        force: bool,
-        max_events: int,
-    ) -> list[dict[str, Any]]:
-        now = datetime.now().astimezone()
-        now_ts = now.timestamp()
-
-        def claim_events() -> list[dict[str, Any]]:
-            queue = self._load_queue()
-            queue, recovered = self._recover_stale_claims(queue)
-            ready_indices: list[int] = []
-            for index, event in enumerate(queue):
-                if str(event.get("state") or "pending") != "pending":
-                    continue
-                due_at = float(event.get("due_at") or 0)
-                if force or due_at <= now_ts:
-                    ready_indices.append(index)
-            skipped_updated = False
-            if len(ready_indices) > 1:
-                # A source with no page citing it yet ranks as "active" --
-                # new content should not be starved behind existing
-                # cold/warm pages just because its eventual target is
-                # still unresolved. `list.sort` is stable, so events tied
-                # on rank keep arrival order (unchanged behavior).
-                default_rank = TIER_RANK["active"]
-                source_ranks = self._source_tier_ranks()
-                ready_indices.sort(
-                    key=lambda index: -source_ranks.get(
-                        str(queue[index].get("source_path") or ""),
-                        default_rank,
-                    )
-                )
-                # Code review Finding 1 (starvation): rank alone can starve
-                # a low-tier event forever if higher-tier sources keep
-                # arriving ahead of it. Each cycle it is ready but not
-                # claimed bumps ``skipped_cycles``; once it crosses
-                # QUEUE_STARVATION_SKIP_LIMIT it is forced to the very front
-                # for this claim, regardless of tier. This only reorders
-                # among events already in ``ready_indices`` (i.e. already
-                # due), so a not-yet-due event still cannot jump ahead, and
-                # it leaves the tier sort untouched below the limit (ТЗ 6.2).
-                starved = [
-                    index
-                    for index in ready_indices
-                    if int(queue[index].get("skipped_cycles") or 0)
-                    >= QUEUE_STARVATION_SKIP_LIMIT
-                ]
-                if starved:
-                    rest = [index for index in ready_indices if index not in starved]
-                    ready_indices = starved + rest
-            claimed_indices = set(ready_indices[:max_events])
-            selected: list[dict[str, Any]] = []
-            for index in ready_indices[:max_events]:
-                event = queue[index]
-                claim_token = uuid4().hex
-                event["state"] = "in_flight"
-                event["claim_token"] = claim_token
-                event["claimed_at"] = now.isoformat()
-                event["claimed_pid"] = os.getpid()
-                selected.append(dict(event))
-            if len(ready_indices) > 1:
-                for index in ready_indices:
-                    if index in claimed_indices:
-                        continue
-                    queue[index]["skipped_cycles"] = (
-                        int(queue[index].get("skipped_cycles") or 0) + 1
-                    )
-                    skipped_updated = True
-            if recovered or selected or skipped_updated:
-                self._save_queue(queue)
-            return selected
-
-        return self._with_queue_lock(claim_events)
-
-    def _ack_claimed_queue_event(self, event: dict[str, Any]) -> None:
-        source_path = str(event.get("source_path") or "")
-        claim_token = str(event.get("claim_token") or "")
-
-        def ack_event() -> None:
-            queue = self._load_queue()
-            updated = [
-                item
-                for item in queue
-                if not (
-                    str(item.get("source_path") or "") == source_path
-                    and str(item.get("claim_token") or "") == claim_token
-                    and str(item.get("state") or "") == "in_flight"
-                )
-            ]
-            if len(updated) != len(queue):
-                self._save_queue(updated)
-
-        self._with_queue_lock(ack_event)
+    @staticmethod
+    def _write_text_atomic(path: Path, content: str) -> None:
+        atomic_write_file_text(path, content)
 
     def _on_source_finished(
         self,
@@ -6834,55 +5128,6 @@ class CompiledBriefingService:
             "requeued": requeued,
             "skipped": skipped,
         }
-
-    def _release_claimed_queue_event(
-        self,
-        event: dict[str, Any],
-        *,
-        attempts: int,
-        due_at: float,
-        backoff: bool = False,
-    ) -> None:
-        """Release a claimed event back to "pending".
-
-        ``backoff`` (code review defect 1): marks ``due_at`` as a retry
-        backoff rather than a plain debounce wait. A single claim (this
-        method's caller, or a fresh ``--force`` invocation) still honors
-        ``force`` unconditionally, same as before -- the flag only
-        matters to ``run_queue_worker``'s own ``while True`` loop, which
-        reads it to decide whether to immediately re-drain again or fall
-        back to the normal wait/poll path. Without it, an event released
-        without incrementing ``attempts`` (see the `requeueable` caller in
-        ``_drain_queue_once``) combined with that loop's own
-        "force ignores due_at" check reclaimed the same event every loop
-        iteration with no exit condition, all within one process.
-        """
-        source_path = str(event.get("source_path") or "")
-        claim_token = str(event.get("claim_token") or "")
-
-        def release_event() -> None:
-            queue = self._load_queue()
-            updated = False
-            for item in queue:
-                if str(item.get("source_path") or "") != source_path:
-                    continue
-                if str(item.get("claim_token") or "") != claim_token:
-                    continue
-                if str(item.get("state") or "") != "in_flight":
-                    continue
-                item["attempts"] = attempts
-                item["due_at"] = due_at
-                item["backoff"] = backoff
-                item["state"] = "pending"
-                item["claim_token"] = ""
-                item["claimed_at"] = ""
-                item["claimed_pid"] = 0
-                updated = True
-                break
-            if updated:
-                self._save_queue(queue)
-
-        self._with_queue_lock(release_event)
 
     def _normalize_rel_path(self, value: str | Path) -> str:
         path = Path(value)
@@ -7422,103 +5667,38 @@ class CompiledBriefingService:
 
     @staticmethod
     def _clean_line(value: Any) -> str:
-        text = " ".join(str(value or "").split())
-        return _defuse_human_zone_markers(text.strip())
+        return compiled_renderer.clean_line(value)
 
     @staticmethod
     def _paragraph(value: Any) -> str:
-        text = str(value or "").strip()
-        if not text:
-            return ""
-        # Line endings first: MULTILINE "^" reacts to "\n" alone, so a bare
-        # "\r" is not a line start for _defuse_embedded_headings below --
-        # but it is one for anything that reads the page with translated
-        # line endings, which would resurrect the forged heading it just
-        # let through. Model output has no reason to carry "\r" anyway.
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
-        return _defuse_embedded_headings(
-            _defuse_human_zone_markers(re.sub(r"\n{3,}", "\n\n", text))
-        )
-
-
+        return compiled_renderer.paragraph(value)
 
     def _normalize_paths(self, value: Any) -> list[str]:
-        if not isinstance(value, list):
-            return []
-        paths: list[str] = []
-        project_root = self.vault_path.parent.resolve()
-        for item in value:
-            raw = compiled_page.canonical_source_reference(str(item or "").strip())
-            if not raw:
-                continue
-            if raw.startswith("/"):
-                absolute_path = Path(raw)
-                try:
-                    raw = absolute_path.relative_to(self.vault_path).as_posix()
-                except ValueError:
-                    try:
-                        raw = absolute_path.relative_to(project_root).as_posix()
-                    except ValueError:
-                        continue
-            raw = self._strip_relative_prefix(raw)
-            if raw.startswith("claude/"):
-                raw = f".{raw}"
-            if raw.startswith("vault/"):
-                raw = raw[len("vault/") :]
-            if raw.endswith(".md") or "/" in raw:
-                paths.append(raw)
-        return paths
-
+        return compiled_renderer.normalize_paths(value, vault_path=self.vault_path)
 
     @staticmethod
     def _strip_relative_prefix(raw: str) -> str:
-        value = str(raw or "").strip()
-        while value.startswith("./"):
-            value = value[2:]
-        return value
+        return compiled_renderer.strip_relative_prefix(raw)
 
     @staticmethod
     def _merge_paths(*groups: list[str]) -> list[str]:
-        merged: list[str] = []
-        seen: set[str] = set()
-        for group in groups:
-            for item in group:
-                path = str(item or "").strip()
-                if not path or path in seen:
-                    continue
-                seen.add(path)
-                merged.append(path)
-        return merged
+        return compiled_renderer.merge_paths(*groups)
 
     @staticmethod
     def _render_bullets(lines: list[str], *, empty: str) -> list[str]:
-        if not lines:
-            return [f"- {empty}"]
-        return [f"- {line}" for line in lines]
+        return compiled_renderer.render_bullets(lines, empty=empty)
 
     @staticmethod
     def _render_sources(paths: list[str]) -> list[str]:
-        if not paths:
-            return ["- (none)"]
-        return [f"- [[{path}]]" for path in paths]
+        return compiled_renderer.render_sources(paths)
 
     @staticmethod
     def _sections_from_text(text: str) -> set[str]:
-        return set(re.findall(r"^##\s+(.+?)\s*$", text or "", re.MULTILINE))
-
+        return compiled_renderer.sections_from_text(text)
 
     @staticmethod
     def _explicit_event_date(text: str) -> str:
-        """Return an explicitly labelled event date, never an inferred one."""
-        match = EXPLICIT_EVENT_DATE_RE.search(text or "")
-        if match is None:
-            return ""
-        value = match.group(1)
-        try:
-            date.fromisoformat(value)
-        except ValueError:
-            return ""
-        return value
+        return compiled_renderer.explicit_event_date(text)
 
     def _event_date_for_source(self, source_rel_path: str, excerpt: str = "") -> str:
         event_date = self._explicit_event_date(excerpt)
@@ -7533,47 +5713,11 @@ class CompiledBriefingService:
 
     @staticmethod
     def _source_event_dates(text: str) -> dict[str, str]:
-        try:
-            raw = parse_frontmatter_bytes(text.encode("utf-8")).fields.get(
-                "source_event_dates", {}
-            )
-        except FrontmatterError:
-            return {}
-        if not isinstance(raw, dict):
-            return {}
-        result: dict[str, str] = {}
-        for source, event_date in raw.items():
-            if not isinstance(source, str) or not isinstance(event_date, str):
-                continue
-            try:
-                date.fromisoformat(event_date)
-            except ValueError:
-                continue
-            result[source] = event_date
-        return result
+        return compiled_renderer.source_event_dates(text)
 
     @classmethod
     def _sources_shaped_rows(cls, text: str) -> list[tuple[str, str, str]]:
-        """Parse existing "Sources That Shaped This Page" table rows.
-
-        Rows are only ever appended by ``_render_briefing``, in the order
-        they first appeared; this parser preserves that order so a second
-        compile pass never loses or reorders an earlier row.
-        """
-        section = cls._section_text(text, "Sources That Shaped This Page")
-        rows: list[tuple[str, str, str]] = []
-        for line in section.splitlines():
-            match = SOURCES_SHAPED_TABLE_ROW_RE.match(line.strip())
-            if match is None:
-                continue
-            date_value, source_value, what_value = match.groups()
-            source_text = compiled_page.unescape_table_cell(source_value)
-            what_text = compiled_page.unescape_table_cell(what_value)
-            if what_text == NOT_ENRICHMENT_SOURCE_MARKER:
-                continue
-            rows.append((date_value, source_text, what_text))
-        return rows
-
+        return compiled_renderer.sources_shaped_rows(text)
 
     @classmethod
     def _dated_rows(
@@ -7583,37 +5727,9 @@ class CompiledBriefingService:
         *,
         empty_placeholder: str,
     ) -> list[tuple[str, str, str]]:
-        """Parse a dated-bullet section (Recent Changes / Open Loops /
-        History, ТЗ 6.3) into ``(date, text, source)`` rows, oldest first.
-
-        Rows are only ever appended by ``_render_briefing`` (new items) or
-        moved in by ``_compress_candidate_text`` (Recent Changes overflow,
-        stale Open Loops), so this parser preserves order the same way
-        ``_sources_shaped_rows`` does. A bullet written before this dated
-        format existed (a plain ``"- text"`` line) is kept as a best-effort
-        row -- dated with this page's own ``updated`` field, no source --
-        instead of being silently dropped when a page first accumulates
-        under the new format.
-        """
-        section = cls._section_text(text, heading)
-        fallback_date = (
-            compiled_page.frontmatter_fields(text).get("updated")
-            or owner_today().isoformat()
+        return compiled_renderer.dated_rows(
+            text, heading, empty_placeholder=empty_placeholder
         )
-        rows: list[tuple[str, str, str]] = []
-        for line in section.splitlines():
-            stripped = line.strip()
-            if not stripped.startswith("- ") or stripped == f"- {empty_placeholder}":
-                continue
-            match = DATED_BULLET_ROW_RE.match(stripped)
-            if match is not None:
-                row_date, row_text, row_source = match.groups()
-                rows.append((row_date, row_text.strip(), (row_source or "").strip()))
-                continue
-            plain_text = stripped[2:].strip()
-            if plain_text:
-                rows.append((fallback_date, plain_text, ""))
-        return rows
 
     @staticmethod
     def _render_dated_bullets(
@@ -7621,128 +5737,25 @@ class CompiledBriefingService:
         *,
         empty: str,
     ) -> list[str]:
-        if not rows:
-            return [f"- {empty}"]
-        lines = []
-        for row_date, row_text, row_source in rows:
-            if row_source:
-                lines.append(f"- {row_date}: {row_text} (source: [[{row_source}]])")
-            else:
-                lines.append(f"- {row_date}: {row_text}")
-        return lines
+        return compiled_renderer.render_dated_bullets(rows, empty=empty)
 
     @classmethod
     def _existing_claims_catalog(cls, existing_text: str) -> str:
-        """Existing "Sources That Shaped This Page" rows as JSON, shown to
-        the model so ``conflicts[].existing_claim``/``existing_source`` can
-        reference real page content (see ``_build_compile_prompt``) instead
-        of being invented. This table is the sole storage location for
-        claims (ТЗ 4.2), so it doubles as the existing-claims catalog.
-        """
-        rows = cls._sources_shaped_rows(existing_text)
-        catalog = [{"source": source, "text": what} for _, source, what in rows]
-        return json.dumps(catalog, ensure_ascii=False, indent=2)
+        return compiled_renderer.existing_claims_catalog(existing_text)
 
     @classmethod
     def _claim_history_rows(cls, text: str) -> list[tuple[str, str, str, str]]:
-        """Parse existing "Claim History" table rows: (date, old source,
-        claim, new/superseding source). Same append-only contract as
-        ``_sources_shaped_rows``.
-        """
-        section = cls._section_text(text, "Claim History")
-        rows: list[tuple[str, str, str, str]] = []
-        for line in section.splitlines():
-            match = CLAIM_HISTORY_ROW_RE.match(line.strip())
-            if match is None:
-                continue
-            date_value, source_value, claim_value, superseded_value = match.groups()
-            rows.append(
-                (
-                    date_value,
-                    compiled_page.unescape_table_cell(source_value),
-                    compiled_page.unescape_table_cell(claim_value),
-                    compiled_page.unescape_table_cell(superseded_value),
-                )
-            )
-        return rows
-
+        return compiled_renderer.claim_history_rows(text)
 
     @classmethod
     def _open_conflicts_rows(
         cls, text: str
     ) -> list[tuple[str, str, str, str, str]]:
-        """Parse existing "Open Conflicts" table rows: (date, existing
-        claim, existing source, new claim, new source). Same append-only
-        contract as ``_sources_shaped_rows``.
-        """
-        section = cls._section_text(text, "Open Conflicts")
-        rows: list[tuple[str, str, str, str, str]] = []
-        for line in section.splitlines():
-            match = OPEN_CONFLICTS_ROW_RE.match(line.strip())
-            if match is None:
-                continue
-            date_value, existing_claim, existing_source, new_claim, new_source = (
-                match.groups()
-            )
-            rows.append(
-                (
-                    date_value,
-                    compiled_page.unescape_table_cell(existing_claim),
-                    compiled_page.unescape_table_cell(existing_source),
-                    compiled_page.unescape_table_cell(new_claim),
-                    compiled_page.unescape_table_cell(new_source),
-                )
-            )
-        return rows
-
-
-
+        return compiled_renderer.open_conflicts_rows(text)
 
     @staticmethod
     def _human_zone_span(text: str) -> tuple[int, int] | None:
-        """Byte span of the owner's human zone within ``text``, or ``None``.
-
-        ``_section_text``/``_replace_section``/``_insert_section_before``
-        find ``## heading`` boundaries with a plain textual regex. The human
-        zone is only designed to live inside ``## Owner Notes`` (always the
-        last section), but nothing stops an owner from relocating the
-        marker pair elsewhere by hand -- and if the note they write inside
-        it happens to contain a line that reads exactly like one of the
-        system headings those three functions search for, the naive
-        first-match search would treat that line as a real section boundary
-        and let a point-edit write clobber text inside the zone. This
-        returns the zone's span so callers can skip any heading match that
-        falls inside it.
-
-        Mirrors ``add_links.py::human_zone_span`` / ``fix_links.py::
-        _protect_human_zone``: a well-ordered single marker pair returns its
-        span. Zero exact markers with no ``## Owner Notes`` heading either
-        (see ``human_zone_markers_look_corrupted``) means there is nothing
-        to protect (matches ``_extract_human_zone``'s "no zone yet" case)
-        and returns ``None``. Anything else -- two or more markers of
-        either kind, a single pair in reversed order, a single lone marker
-        with no pair, or zero exact markers alongside the heading this
-        code always renders together with them (see
-        ``human_zone_markers_look_corrupted``) -- is ambiguous
-        (``_extract_human_zone`` itself raises ``HumanZoneMarkerError`` on
-        the same cases) -- which START pairs with which END (or whether a
-        real pair exists at all) can't be guessed without risking silent
-        corruption -- and returns the shared ``_AMBIGUOUS_HUMAN_ZONE``
-        sentinel instead so the caller can fail closed.
-        """
-        starts = text.count(HUMAN_ZONE_START)
-        ends = text.count(HUMAN_ZONE_END)
-        if starts == 0 and ends == 0:
-            if human_zone_markers_look_corrupted(text):
-                return _AMBIGUOUS_HUMAN_ZONE
-            return None
-        if starts != 1 or ends != 1:
-            return _AMBIGUOUS_HUMAN_ZONE
-        start_index = text.find(HUMAN_ZONE_START)
-        end_index = text.find(HUMAN_ZONE_END)
-        if end_index < start_index:
-            return _AMBIGUOUS_HUMAN_ZONE
-        return (start_index, end_index + len(HUMAN_ZONE_END))
+        return compiled_renderer.human_zone_span(text)
 
     @staticmethod
     def _heading_match(
@@ -7752,157 +5765,31 @@ class CompiledBriefingService:
         *,
         start: int = 0,
     ) -> re.Match[str] | None:
-        """First match of ``pattern`` at or after ``start``, skipping any
-        match that starts inside ``zone`` (see ``_human_zone_span``).
-        """
-        for match in pattern.finditer(text, start):
-            if zone is not None and zone[0] <= match.start() < zone[1]:
-                continue
-            return match
-        return None
+        return compiled_renderer.heading_match(text, pattern, zone, start=start)
 
     @classmethod
     def _section_text(cls, text: str, heading: str) -> str:
-        text = text or ""
-        zone = cls._human_zone_span(text)
-        if zone == _AMBIGUOUS_HUMAN_ZONE:
-            # Fail closed (see _human_zone_span): can't tell what's inside
-            # the zone and what isn't, so treat the section as unreadable
-            # rather than risk surfacing text the owner meant to protect.
-            return ""
-        heading_pattern = re.compile(
-            rf"^##\s+{re.escape(heading)}\s*$\n", re.MULTILINE
-        )
-        heading_match = cls._heading_match(text, heading_pattern, zone)
-        if heading_match is None:
-            return ""
-        boundary_pattern = re.compile(r"^##\s+", re.MULTILINE)
-        boundary_match = cls._heading_match(
-            text, boundary_pattern, zone, start=heading_match.end()
-        )
-        body_end = boundary_match.start() if boundary_match is not None else len(text)
-        # The zone has no heading of its own to stop at -- if it sits
-        # inside this body span (e.g. relocated between two system
-        # sections, with no real "## ..." line between the target heading
-        # and the zone), the plain next-heading search above walks straight
-        # through it to whatever real heading comes after. Clamp the body
-        # to end where the zone starts instead, so the zone is never read
-        # as part of this section's text.
-        if zone is not None and heading_match.end() <= zone[0] < body_end:
-            body_end = zone[0]
-        return text[heading_match.end() : body_end].strip()
+        return compiled_renderer.section_text(text, heading)
 
     @classmethod
     def _section_span(cls, text: str, heading: str) -> tuple[int, int] | None:
-        """Return the exact section slice, excluding any relocated human zone."""
-        zone = cls._human_zone_span(text)
-        if zone == _AMBIGUOUS_HUMAN_ZONE:
-            return None
-        heading_pattern = re.compile(
-            rf"^##\s+{re.escape(heading)}\s*$\n", re.MULTILINE
-        )
-        heading_match = cls._heading_match(text, heading_pattern, zone)
-        if heading_match is None:
-            return None
-        boundary_match = cls._heading_match(
-            text,
-            re.compile(r"^##\s+", re.MULTILINE),
-            zone,
-            start=heading_match.end(),
-        )
-        end = boundary_match.start() if boundary_match is not None else len(text)
-        if zone is not None and heading_match.end() <= zone[0] < end:
-            end = zone[0]
-        return heading_match.start(), end
+        return compiled_renderer.section_span(text, heading)
 
     @classmethod
     def _section_bullets(cls, text: str, heading: str) -> list[str]:
-        section = cls._section_text(text, heading)
-        return [
-            line[2:].strip()
-            for line in section.splitlines()
-            if line.startswith("- ") and line[2:].strip()
-        ]
+        return compiled_renderer.section_bullets(text, heading)
 
     @classmethod
     def _replace_section(cls, text: str, heading: str, new_lines: list[str]) -> str:
-        """Replace one ``## heading`` section's body in place.
-
-        Every other section -- including the human zone -- is left
-        byte-identical. Used by the ТЗ 6.3 compression step and by the ТЗ
-        6.1 non-enrichment source write, both of which must only ever touch
-        the one section they own. A no-op (returns ``text`` unchanged) when
-        the heading is not present at all -- callers that need to create the
-        section use ``_insert_section_before`` instead. Also a no-op when
-        the human zone's markers are ambiguous (see ``_human_zone_span``):
-        refusing to guess a heading's true position beats risking a write
-        into the zone.
-        """
-        zone = cls._human_zone_span(text)
-        if zone == _AMBIGUOUS_HUMAN_ZONE:
-            return text
-        heading_pattern = re.compile(
-            rf"^##\s+{re.escape(heading)}\s*$\n", re.MULTILINE
-        )
-        heading_match = cls._heading_match(text, heading_pattern, zone)
-        if heading_match is None:
-            return text
-        boundary_pattern = re.compile(r"^##\s+", re.MULTILINE)
-        boundary_match = cls._heading_match(
-            text, boundary_pattern, zone, start=heading_match.end()
-        )
-        body_end = boundary_match.start() if boundary_match is not None else len(text)
-        # Same clamp as _section_text: without a heading of its own, a zone
-        # relocated between this section and the next real heading is part
-        # of the naive body span. Stop the replaced range at the zone
-        # instead of at the next real heading, or the splice below
-        # (text[:heading_match.end()] + replacement + text[body_end:])
-        # would drop the zone along with the body it is replacing.
-        if zone is not None and heading_match.end() <= zone[0] < body_end:
-            body_end = zone[0]
-        replacement_body = "\n".join(new_lines) + "\n\n"
-        return text[: heading_match.end()] + replacement_body + text[body_end:]
+        return compiled_renderer.replace_section(text, heading, new_lines)
 
     @classmethod
     def _has_section(cls, text: str, heading: str) -> bool:
-        """Whether ``## heading`` exists on this page, outside the human zone.
-
-        ``_replace_section`` is a documented no-op on a missing heading, so
-        anything that moves content *between* two sections has to ask first:
-        otherwise the removal half of the move lands and the write half
-        silently does not, and the content is simply gone. Retiring a losing
-        claim into "Claim History" is exactly that kind of move.
-        """
-        zone = cls._human_zone_span(text)
-        if zone == _AMBIGUOUS_HUMAN_ZONE:
-            return False
-        pattern = re.compile(rf"^##\s+{re.escape(heading)}\s*$\n", re.MULTILINE)
-        return cls._heading_match(text, pattern, zone) is not None
+        return compiled_renderer.has_section(text, heading)
 
     @classmethod
     def _ensure_claim_history_section(cls, text: str) -> str:
-        """Put an empty "Claim History" section back on a page that lost it.
-
-        Every page ``_render_page`` writes carries one, so a page without it
-        was edited by hand. Refusing to retire a claim there (see
-        ``_has_section``) protects the claim, but on its own it would also
-        park that page's conflicts forever -- the one dead end left in an
-        otherwise self-draining queue. So the section is restored, empty, in
-        its canonical slot, and the caller re-checks.
-
-        A no-op -- and the caller then still declines to retire anything --
-        when the section is already there, when the human zone's markers are
-        ambiguous, or when neither anchor heading exists on the page.
-        """
-        if cls._has_section(text, "Claim History"):
-            return text
-        anchor = "History" if cls._has_section(text, "History") else "Owner Notes"
-        return cls._insert_section_before(
-            text,
-            heading="Claim History",
-            before_heading=anchor,
-            new_lines=compiled_page.render_claim_history([]),
-        )
+        return compiled_renderer.ensure_claim_history_section(text)
 
     @classmethod
     def _insert_section_before(
@@ -7913,30 +5800,12 @@ class CompiledBriefingService:
         before_heading: str,
         new_lines: list[str],
     ) -> str:
-        """Insert a brand-new ``## heading`` section right before an
-        existing ``## before_heading`` section, matching the one-blank-line
-        spacing every other section uses.
-
-        Used only to add the ТЗ 6.3 History section the first time a page
-        compresses -- once present, later passes go through
-        ``_replace_section`` instead. A no-op when ``before_heading`` is not
-        present (should not happen: ``## Owner Notes`` is always rendered)
-        or when the human zone's markers are ambiguous (see
-        ``_human_zone_span``): a real ``before_heading`` line living inside
-        a relocated, malformed zone must not be mistaken for the anchor.
-        """
-        zone = cls._human_zone_span(text)
-        if zone == _AMBIGUOUS_HUMAN_ZONE:
-            return text
-        before_pattern = re.compile(
-            rf"^##\s+{re.escape(before_heading)}\s*$", re.MULTILINE
+        return compiled_renderer.insert_section_before(
+            text,
+            heading=heading,
+            before_heading=before_heading,
+            new_lines=new_lines,
         )
-        before_match = cls._heading_match(text, before_pattern, zone)
-        if before_match is None:
-            return text
-        block = f"## {heading}\n" + "\n".join(new_lines) + "\n\n"
-        return text[: before_match.start()] + block + text[before_match.start() :]
-
 
     @classmethod
     def _validated_date_field(
@@ -7946,147 +5815,25 @@ class CompiledBriefingService:
         field: str,
         page_path: str,
     ) -> str:
-        """Return a plain YYYY-MM-DD value, or "" (renders as YAML null).
-
-        ``last_verified``/``human_reviewed`` render as a bare
-        ``field: {value}`` line, unlike description/decision_owner which go
-        through ``json.dumps``. A value containing a colon (e.g. a stray
-        "unverified: check again") would therefore produce invalid YAML,
-        which fails the write validation on every subsequent compile pass
-        and freezes the page silently. Anything that is not a plain date is
-        dropped instead, with a warning so the loss is visible.
-        """
-        value = compiled_page.metadata_value(raw_value)
-        if not value:
-            return ""
-        if DATE_ONLY_RE.match(value):
-            return value
-        logger.warning(
-            "Compiled briefing %s has invalid %s value %r; clearing it",
-            page_path,
-            field,
-            value,
+        return compiled_renderer.validated_date_field(
+            raw_value, field=field, page_path=page_path
         )
-        return ""
-
 
     @classmethod
     def _extra_frontmatter_lines(
         cls, existing_text: str, *, page_path: str
     ) -> list[str]:
-        """Frontmatter lines for owner-layer fields this code does not own
-        (the passthrough loop in ``_render_briefing``, e.g. ``duplicate_of``).
-
-        Deliberately re-parses the real frontmatter YAML instead of reusing
-        ``existing_meta``/``_frontmatter_fields``: that dict flattens every
-        value to a plain Python string, which is harmless for the fields
-        this code owns (always simple scalars it wrote itself) but silently
-        changes an *owner*-written field's YAML type on the very next
-        render -- a number or boolean becomes a quoted string, a list
-        becomes its bracketed text, a null becomes the literal string
-        "null", and a multi-line block scalar loses everything past its
-        first line. Re-parsing with the real loader keeps each value's
-        actual type, so ``json.dumps`` re-emits it losslessly (numbers and
-        booleans as themselves, null as ``null``, lists/dicts as flow
-        syntax, multi-line strings as one escaped quoted line -- all valid
-        YAML). A value the safe loader could not construct at all, or
-        frontmatter that fails to reparse, is dropped with a warning
-        instead of written wrong.
-        """
-        try:
-            document = parse_frontmatter_bytes(existing_text.encode("utf-8"))
-        except FrontmatterError as exc:
-            logger.warning(
-                "Compiled briefing %s has frontmatter this rebuild cannot "
-                "reparse (%s); owner-layer fields cannot be carried "
-                "forward this pass",
-                page_path,
-                exc,
-            )
-            return []
-        lines: list[str] = []
-        for key, value in document.fields.items():
-            if key in CORE_FRONTMATTER_FIELDS:
-                continue
-            try:
-                encoded = json.dumps(value, ensure_ascii=False)
-            except (TypeError, ValueError):
-                logger.warning(
-                    "Compiled briefing %s carries owner-layer field %r "
-                    "whose value cannot be preserved without corrupting "
-                    "it; dropping it instead of writing it wrong",
-                    page_path,
-                    key,
-                )
-                continue
-            lines.append(f"{key}: {encoded}")
-        return lines
-
-
-
-
+        return compiled_renderer.extra_frontmatter_lines(
+            existing_text, page_path=page_path
+        )
 
     @classmethod
     def _extract_human_zone(cls, text: str) -> str:
-        """Extract the human-owned zone verbatim, or build an empty scaffold.
-
-        Fail-closed by design: a page must carry exactly one well-ordered
-        marker pair, or none at all. Anything else (missing end marker,
-        duplicated markers, reversed order) raises ``HumanZoneMarkerError``
-        rather than guessing, so the caller skips the page instead of
-        risking the owner's text.
-
-        Zero exact markers is not automatically "no zone yet" -- see
-        ``human_zone_markers_look_corrupted``: a page carrying the ``##
-        Owner Notes`` heading this code always renders together with the
-        markers, or one whose frontmatter says the zone has held real text
-        before (``human_zone_populated``), but no exact markers, has had
-        them corrupted since (any typo, homoglyph, stray dash, or other
-        mangling that drives the exact count to zero -- possibly alongside
-        damage to the heading too, see ``human_zone_markers_look_corrupted``
-        for why the frontmatter flag exists). Treating that as "never had a
-        zone" would silently discard the owner's text between them by
-        returning an empty scaffold, so that case also raises rather than
-        guessing.
-
-        Takes the full page text (frontmatter included), not just the
-        body -- unlike ``_body_without_frontmatter``'s other caller, this
-        one needs ``human_zone_markers_look_corrupted`` to see the
-        frontmatter too, so the corresponding body is derived here instead
-        of by the caller.
-        """
-        body = compiled_page.body_without_frontmatter(text)
-        starts = body.count(HUMAN_ZONE_START)
-        ends = body.count(HUMAN_ZONE_END)
-        if starts == 0 and ends == 0:
-            if human_zone_markers_look_corrupted(text):
-                raise HumanZoneMarkerError(
-                    "human zone markers look corrupted: '## Owner Notes' "
-                    "heading or human_zone_populated frontmatter flag found "
-                    "but no exact marker present"
-                )
-            return f"{HUMAN_ZONE_START}\n{HUMAN_ZONE_END}"
-        if starts != 1 or ends != 1:
-            raise HumanZoneMarkerError(
-                "expected exactly one human zone marker pair, found "
-                f"start={starts} end={ends}"
-            )
-        start_index = body.index(HUMAN_ZONE_START)
-        end_index = body.index(HUMAN_ZONE_END)
-        if end_index < start_index:
-            raise HumanZoneMarkerError(
-                "human zone end marker appears before the start marker"
-            )
-        return body[start_index : end_index + len(HUMAN_ZONE_END)]
+        return compiled_renderer.extract_human_zone(text)
 
     @staticmethod
     def _float_value(value: str | None, *, default: float) -> float:
-        try:
-            return float(str(value or "").strip())
-        except ValueError:
-            return default
-
-
+        return compiled_renderer.float_value(value, default=default)
 
     @classmethod
     def _text_duplicates_human_zone(
@@ -8094,15 +5841,9 @@ class CompiledBriefingService:
         text: str,
         human_zone_tokens: set[str],
     ) -> bool:
-        if not human_zone_tokens or not text:
-            return False
-        text_tokens = compiled_page.tokens(text)
-        if len(text_tokens) < HUMAN_ZONE_DUPLICATE_MIN_TOKENS:
-            return False
-        overlap = len(text_tokens & human_zone_tokens)
-        return (
-            overlap / len(text_tokens)
-        ) >= HUMAN_ZONE_DUPLICATE_OVERLAP_THRESHOLD
+        return compiled_renderer.text_duplicates_human_zone(
+            text, human_zone_tokens
+        )
 
     @classmethod
     def _filter_list_duplicating_human_zone(
@@ -8110,13 +5851,9 @@ class CompiledBriefingService:
         lines: list[str],
         human_zone_tokens: set[str],
     ) -> list[str]:
-        if not human_zone_tokens:
-            return lines
-        return [
-            line
-            for line in lines
-            if not cls._text_duplicates_human_zone(line, human_zone_tokens)
-        ]
+        return compiled_renderer.filter_list_duplicating_human_zone(
+            lines, human_zone_tokens
+        )
 
     @classmethod
     def _filter_text_duplicating_human_zone(
@@ -8124,9 +5861,9 @@ class CompiledBriefingService:
         text: str,
         human_zone_tokens: set[str],
     ) -> str:
-        if cls._text_duplicates_human_zone(text, human_zone_tokens):
-            return ""
-        return text
+        return compiled_renderer.filter_text_duplicating_human_zone(
+            text, human_zone_tokens
+        )
 
     def _merged_relevance(
         self,
@@ -10447,10 +8184,7 @@ class CompiledBriefingService:
 
     @staticmethod
     def _artifact_title(request: str) -> str:
-        first = " ".join(str(request or "").split()).strip()
-        if not first:
-            return "Assistant Output"
-        return first[:80].rstrip(" .!?") or "Assistant Output"
+        return compiled_renderer.artifact_title(request)
 
     def _render_output_artifact(
         self,
@@ -10461,24 +8195,13 @@ class CompiledBriefingService:
         artifact_type: str,
         created_at: datetime,
     ) -> str:
-        body = compiled_page.clip(output_markdown.strip(), MAX_OUTPUT_ARTIFACT_CHARS)
-        return (
-            "---\n"
-            f"date: {created_at.date().isoformat()}\n"
-            "type: assistant-output\n"
-            f"description: {json.dumps(title, ensure_ascii=False)}\n"
-            f"artifact_type: {artifact_type}\n"
-            f"created: {created_at.date().isoformat()}\n"
-            f"updated: {created_at.date().isoformat()}\n"
-            f"last_accessed: {created_at.date().isoformat()}\n"
-            "relevance: 1.0\n"
-            "tier: active\n"
-            "---\n\n"
-            f"# {title}\n\n"
-            "## Request\n"
-            f"{request.strip()}\n\n"
-            "## Output\n"
-            f"{body}\n"
+        return compiled_renderer.render_output_artifact(
+            title=title,
+            request=request,
+            output_markdown=output_markdown,
+            artifact_type=artifact_type,
+            created_at=created_at,
+            max_chars=MAX_OUTPUT_ARTIFACT_CHARS,
         )
 
     def _render_batch_consolidation(
@@ -10489,50 +8212,11 @@ class CompiledBriefingService:
         events: list[CompiledBatchConsolidationEvent],
         created_at: datetime,
     ) -> str:
-        summary = (
-            self._paragraph(payload.get("summary"))
-            or "No durable cross-source pattern captured yet."
-        )
-        themes = compiled_page.normalize_list(payload.get("themes"))
-        follow_ups = compiled_page.normalize_list(payload.get("follow_ups"))
-        source_paths = self._merge_paths([event.source_rel_path for event in events])
-        updated_paths = self._merge_paths(
-            *[list(event.updated_paths) for event in events]
-        )
-        themes_block = "\n".join(
-            self._render_bullets(themes, empty="No strong recurring themes yet.")
-        )
-        follow_ups_block = "\n".join(
-            self._render_bullets(
-                follow_ups,
-                empty="No immediate follow-ups captured.",
-            )
-        )
-        updated_block = "\n".join(self._render_sources(updated_paths))
-        sources_block = "\n".join(self._render_sources(source_paths))
-        return (
-            "---\n"
-            f"date: {created_at.date().isoformat()}\n"
-            "type: compiled-consolidation\n"
-            f"description: {json.dumps(headline, ensure_ascii=False)}\n"
-            "artifact_type: compiled-batch\n"
-            f"created: {created_at.date().isoformat()}\n"
-            f"updated: {created_at.date().isoformat()}\n"
-            f"last_accessed: {created_at.date().isoformat()}\n"
-            "relevance: 1.0\n"
-            "tier: active\n"
-            "---\n\n"
-            f"# {headline}\n\n"
-            "## Summary\n"
-            f"{summary}\n\n"
-            "## Themes\n"
-            f"{themes_block}\n\n"
-            "## Follow-ups\n"
-            f"{follow_ups_block}\n\n"
-            "## Updated Briefings\n"
-            f"{updated_block}\n\n"
-            "## Sources\n"
-            f"{sources_block}\n"
+        return compiled_renderer.render_batch_consolidation(
+            headline=headline,
+            payload=payload,
+            events=events,
+            created_at=created_at,
         )
 
     # Public surface for the sibling ``compiled_*`` modules and the runners.
