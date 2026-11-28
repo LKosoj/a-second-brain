@@ -60,7 +60,7 @@ def run_json_phase(
 class DailyWorkflow:
     """Coordinate the existing daily phases through a CliProcessor facade."""
 
-    def __init__(self, host: "CliProcessor") -> None:
+    def __init__(self, host: CliProcessor) -> None:
         self._host = host
 
     def run(

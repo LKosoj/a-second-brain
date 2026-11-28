@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from acp import RequestError, text_block
+from acp import RequestError
 from acp.schema import (
     AgentMessageChunk,
     AgentThoughtChunk,
@@ -15,6 +15,7 @@ from acp.schema import (
     DeniedOutcome,
     PermissionOption,
     ResourceContentBlock,
+    TextContentBlock,
 )
 
 from d_brain.services import kimi_acp
@@ -91,14 +92,16 @@ async def test_session_update_collects_only_agent_text() -> None:
     await client.session_update(
         "s1",
         AgentMessageChunk(
-            content=text_block("Hello "), session_update="agent_message_chunk"
+            content=TextContentBlock(text="Hello "),
+            session_update="agent_message_chunk",
         ),
     )
     # the model's reasoning, non-text content and other updates are not answer text
     await client.session_update(
         "s1",
         AgentThoughtChunk(
-            content=text_block("thinking"), session_update="agent_thought_chunk"
+            content=TextContentBlock(text="thinking"),
+            session_update="agent_thought_chunk",
         ),
     )
     await client.session_update(
@@ -110,11 +113,13 @@ async def test_session_update_collects_only_agent_text() -> None:
             session_update="agent_message_chunk",
         ),
     )
-    await client.session_update("s1", SimpleNamespace(content=text_block("x")))
+    await client.session_update(
+        "s1", SimpleNamespace(content=TextContentBlock(text="x"))
+    )
     await client.session_update(
         "s1",
         AgentMessageChunk(
-            content=text_block("world"), session_update="agent_message_chunk"
+            content=TextContentBlock(text="world"), session_update="agent_message_chunk"
         ),
     )
 
@@ -156,7 +161,8 @@ def _fake_spawn(monkeypatch: pytest.MonkeyPatch, *, reply: list[str]) -> dict:
                 await client.session_update(
                     "s1",
                     AgentMessageChunk(
-                        content=text_block(part), session_update="agent_message_chunk"
+                        content=TextContentBlock(text=part),
+                        session_update="agent_message_chunk",
                     ),
                 )
 
@@ -180,7 +186,7 @@ async def test_run_returns_the_joined_stripped_answer(
     assert seen["workdir"] == tmp_path
     assert seen["env"] == {"K": "v"}
     assert seen["prompt"]["session_id"] == "s1"
-    assert seen["prompt"]["prompt"] == [text_block("Question?")]
+    assert seen["prompt"]["prompt"] == [TextContentBlock(text="Question?")]
     seen["connection"].initialize.assert_awaited_once()
     seen["connection"].new_session.assert_awaited_once_with(
         cwd=str(tmp_path), mcp_servers=[]

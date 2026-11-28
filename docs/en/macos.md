@@ -11,7 +11,7 @@ LaunchAgents — one plist per service, all in
 
 | Tool | Install |
 | --- | --- |
-| Python 3.12 | `brew install python@3.12` (Apple Silicon or Intel) |
+| Python 3.14 | `brew install python@3.14` (Apple Silicon or Intel) |
 | `uv` | `brew install uv` or `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | `opencode` (or any other AI CLI) | `brew install anomalyco/tap/opencode`, then `opencode auth login` |
 | `git` | `brew install git` if not already present |

@@ -11,7 +11,7 @@ Never use a populated personal vault as test data.
 uv sync --frozen --group dev
 ```
 
-Python 3.12 is the minimum supported version. Runtime dependencies are locked
+The project uses Python 3.14. Runtime dependencies are locked
 in `uv.lock`; ordinary installation excludes the development group. Install
 `shellcheck` separately on the host before running all gates.
 

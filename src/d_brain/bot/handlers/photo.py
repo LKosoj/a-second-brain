@@ -41,14 +41,14 @@ ALBUM_SETTLE_SECONDS = 1.0
 # flushed. Past this many seconds, flush whatever is already collected.
 ALBUM_MAX_WAIT_SECONDS = 120.0
 _album_lock = asyncio.Lock()
-_album_items: dict[str, list["PhotoEntry"]] = {}
+_album_items: dict[str, list[PhotoEntry]] = {}
 _album_tasks: dict[str, asyncio.Task[None]] = {}
 # Photos still being downloaded/analyzed for a media group, keyed by
 # media_group_id -- see _flush_album for why this exists.
 _album_pending: dict[str, int] = {}
 # Albums sent to /do: run once with every saved photo after the grouped
 # daily entry is written.
-_album_requests: dict[str, Callable[[list["PhotoEntry"]], Awaitable[None]]] = {}
+_album_requests: dict[str, Callable[[list[PhotoEntry]], Awaitable[None]]] = {}
 
 
 @dataclass(slots=True)

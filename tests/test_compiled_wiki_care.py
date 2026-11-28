@@ -79,7 +79,7 @@ def _wiki_page(
     sources: tuple[str, ...] = (),
     related: tuple[str, ...] = (),
     body_lower: str = "",
-) -> "compiled_wiki_care._WikiCarePage":
+) -> compiled_wiki_care._WikiCarePage:
     return compiled_wiki_care._WikiCarePage(
         rel_path=rel_path,
         title=title,
@@ -437,7 +437,7 @@ def test_link_related_page_missing_page_reports_error(
 # --- _apply_missing_links (batching/budget, ПОПРАВКА 2) -------------------
 
 
-def _fake_candidates(count: int) -> list["compiled_wiki_care._LinkCandidate"]:
+def _fake_candidates(count: int) -> list[compiled_wiki_care._LinkCandidate]:
     return [
         compiled_wiki_care._LinkCandidate(
             rel_path_a=f"compiled/topics/a{i}.md",

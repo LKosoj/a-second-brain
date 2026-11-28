@@ -333,7 +333,7 @@ class CliProcessor:
     @classmethod
     def from_settings(
         cls,
-        settings: "Settings",
+        settings: Settings,
         *,
         todoist_api_key: str | None = None,
         ai_cli: str | None = None,
@@ -346,7 +346,7 @@ class CliProcessor:
         owner_telegram_id: int | None = None,
         recall_planner_disable_thinking: bool | None = None,
         classification_model: str | None = None,
-    ) -> "CliProcessor":
+    ) -> CliProcessor:
         """Build a processor from runtime Settings with optional overrides."""
         return cls(
             settings.vault_path,

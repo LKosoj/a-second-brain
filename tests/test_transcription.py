@@ -12,7 +12,7 @@ from d_brain.services.transcription import DeepgramTranscriber
 class _FakeClient:
     """Stands in for ``AsyncDeepgramClient``; records how it was built."""
 
-    instances: list["_FakeClient"] = []
+    instances: list[_FakeClient] = []
 
     def __init__(self, api_key: str) -> None:
         self.api_key = api_key

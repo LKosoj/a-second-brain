@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
 
-from acp import PROTOCOL_VERSION, Client, RequestError, text_block
+from acp import PROTOCOL_VERSION, Client, RequestError
 from acp.client.connection import ClientSideConnection
 from acp.schema import (
     AgentMessageChunk,
@@ -156,7 +156,7 @@ async def _run_kimi_acp(
         session = await connection.new_session(cwd=str(workdir), mcp_servers=[])
         await connection.prompt(
             session_id=session.session_id,
-            prompt=[text_block(prompt)],
+            prompt=[TextContentBlock(text=prompt)],
         )
         await asyncio.sleep(0)
 

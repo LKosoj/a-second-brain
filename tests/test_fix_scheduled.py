@@ -49,7 +49,7 @@ def _fake_popen(calls: list[dict[str, object]], *, stdout: str):
             calls.append({"args": args, "kwargs": kwargs})
             self.returncode = 0
 
-        def __enter__(self) -> "_FakeProcess":
+        def __enter__(self) -> _FakeProcess:
             return self
 
         def __exit__(self, *exc_info: object) -> bool:

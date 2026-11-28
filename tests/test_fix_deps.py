@@ -2,7 +2,7 @@
 
 Audit finding: `pyproject.toml` pulled in `todoist-api-python` (never
 imported — the project talks to Todoist over MCP, not this SDK), left
-`openai` unbounded (a `2 -> 3` major jump would land without review), and
+`openai` unbounded (major updates could land without review), and
 kept `jpype1` (a JVM bridge only used by the optional `ms-project` skill
 scripts) in the core dependency set that every install pays for.
 """
@@ -25,7 +25,7 @@ def test_openai_dependency_has_a_major_version_ceiling() -> None:
     deps = _PYPROJECT["project"]["dependencies"]
     openai_specs = [dep for dep in deps if dep.lower().startswith("openai")]
 
-    assert openai_specs == ["openai>=1.99.1,<3"]
+    assert openai_specs == ["openai>=3.60.0,<4"]
 
 
 def test_jpype1_is_an_optional_ms_project_extra_not_a_core_dependency() -> None:
@@ -34,4 +34,4 @@ def test_jpype1_is_an_optional_ms_project_extra_not_a_core_dependency() -> None:
     assert not any(dep.lower().startswith("jpype1") for dep in deps)
 
     extras = _PYPROJECT["project"]["optional-dependencies"]
-    assert extras["ms-project"] == ["jpype1>=1.7.0"]
+    assert extras["ms-project"] == ["jpype1>=1.7.1"]

@@ -187,8 +187,8 @@ that is absent from the file itself.
 
 ## Requirements
 
-- a dedicated unprivileged Linux account with Python 3.12 or newer (macOS is
-  also supported via launchd, see [macOS deployment](docs/en/macos.md))
+- a dedicated unprivileged Linux account with Python 3.14 (macOS is also
+  supported via launchd, see [macOS deployment](docs/en/macos.md))
 - [uv](https://docs.astral.sh/uv/)
 - `jq`
 - a Telegram bot token from BotFather
@@ -228,7 +228,7 @@ the private vault only when `vault/` does not already exist.
 
 Download the wheel from the Git host's Releases page, or build it in a source
 checkout with `uv build`. Put one wheel in the current directory. In an
-activated Python 3.12+ environment with `pip`, run:
+activated Python 3.14 environment with `pip`, run:
 
 ```bash
 python -m pip install ./a_second_brain-*.whl

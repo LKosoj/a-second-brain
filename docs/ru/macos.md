@@ -11,7 +11,7 @@
 
 | Утилита | Установка |
 | --- | --- |
-| Python 3.12 | `brew install python@3.12` (Apple Silicon или Intel) |
+| Python 3.14 | `brew install python@3.14` (Apple Silicon или Intel) |
 | `uv` | `brew install uv` или `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | `opencode` (или другой AI-CLI) | `brew install anomalyco/tap/opencode`, затем `opencode auth login` |
 | `git` | `brew install git`, если ещё нет |

@@ -101,7 +101,7 @@ async def test_process_request_sends_rich_final_after_deleting_status(
             pass
 
         @classmethod
-        def from_settings(cls, *_args, **_kwargs) -> "FakeProcessor":
+        def from_settings(cls, *_args, **_kwargs) -> FakeProcessor:
             return cls()
 
         def execute_prompt(self, prompt: str, user_id: int = 0) -> dict[str, object]:

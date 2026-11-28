@@ -7,7 +7,7 @@ public code repository.
 
 ## Requirements
 
-- Linux or macOS (see [macOS deployment](macos.md)) and Python 3.12 or newer
+- Linux or macOS (see [macOS deployment](macos.md)) and Python 3.14
 - `uv` and `jq`
 - a Telegram bot token from BotFather
 - a Deepgram API key for voice transcription (optional; without it voice is

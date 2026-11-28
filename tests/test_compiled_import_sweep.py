@@ -25,7 +25,7 @@ class FakeService:
     """Records every call instead of doing real queue/model/file work, like
     ``test_run_compiled_pass.py``'s ``FakeService`` for the sibling CLI."""
 
-    created: list["FakeService"] = []
+    created: list[FakeService] = []
 
     def __init__(self, vault_path, content_language="ru", ai_cli=None) -> None:  # noqa: ANN001
         self.vault_path = Path(vault_path)
